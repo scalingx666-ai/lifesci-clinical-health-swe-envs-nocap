@@ -1,0 +1,120 @@
+diff --git a/grails-app/domain/org/pih/warehouse/requisition/RequisitionItem.groovy b/grails-app/domain/org/pih/warehouse/requisition/RequisitionItem.groovy
+index af726f773ad..4aa6b7d6a36 100644
+--- a/grails-app/domain/org/pih/warehouse/requisition/RequisitionItem.groovy
++++ b/grails-app/domain/org/pih/warehouse/requisition/RequisitionItem.groovy
+@@ -672,10 +672,17 @@ class RequisitionItem implements Comparable<RequisitionItem>, Serializable {
+                 quantityBackordered ? (quantity - quantityBackordered) : null
+     }
+ 
++    /**
++     * Quantity that still needs to be picked from ordinary stock: the ordered quantity after any
++     * cancellation, less anything backordered and waiting on an inbound delivery. A revised item
++     * carries its own quantity and backorder, so the modification item answers for itself.
++     */
+     def calculateQuantityRequired() {
+-        return modificationItem ? modificationItem?.quantity :
+-                quantityCanceled ? (quantity - quantityCanceled) :
+-                quantityBackordered ? (quantity - quantityBackordered) : quantity
++        if (modificationItem) {
++            return modificationItem.calculateQuantityRequired()
++        }
++        Integer quantityOrdered = quantityCanceled ? (quantity - quantityCanceled) : quantity
++        return Math.max(0, (quantityOrdered ?: 0) - (quantityBackordered ?: 0))
+     }
+ 
+     def calculateQuantityRemaining() {
+diff --git a/grails-app/services/org/pih/warehouse/allocation/AllocationService.groovy b/grails-app/services/org/pih/warehouse/allocation/AllocationService.groovy
+index 2d39726cf93..9e0f1537cbb 100644
+--- a/grails-app/services/org/pih/warehouse/allocation/AllocationService.groovy
++++ b/grails-app/services/org/pih/warehouse/allocation/AllocationService.groovy
+@@ -306,15 +306,16 @@ class AllocationService {
+         allAvailableItems = allAvailableItems.findAll { !it.binLocation?.isNegativeInventoryFallbackLocation() }
+ 
+         boolean isBackordered = requisitionItem.isBackordered()
+-        if (isBackordered) {
+-            quantityRequired = requisitionItem.quantityBackordered
+-        }
+ 
+-        // A backordered line waits for its cross-dock delivery and is not covered from ordinary stock.
+-        // Until the cross-dock putaway has run there is nothing to allocate
++        // The backordered quantity waits for its cross-dock delivery, so ordinary stock only ever covers
++        // the rest of the line
+         if (isBackordered && !crossDockRelease) {
+-            log.info("Requisition item ${requisitionItem.id} is backordered, skipping ordinary allocation")
+-            return []
++            Integer quantityExcludingBackorder = requisitionItem.calculateQuantityRequired() ?: 0
++            if (quantityExcludingBackorder <= 0) {
++                log.info("Requisition item ${requisitionItem.id} is fully backordered, skipping ordinary allocation")
++                return []
++            }
++            quantityRequired = Math.min(quantityRequired ?: 0, quantityExcludingBackorder)
+         }
+ 
+         List<AllocationSourceStrategy> resolvedStrategies = resolveStrategies(requisitionItem.requisition, strategies)
+diff --git a/grails-app/services/org/pih/warehouse/allocation/BackorderMatchingService.groovy b/grails-app/services/org/pih/warehouse/allocation/BackorderMatchingService.groovy
+index 9338de9aaea..ab66c9c252b 100644
+--- a/grails-app/services/org/pih/warehouse/allocation/BackorderMatchingService.groovy
++++ b/grails-app/services/org/pih/warehouse/allocation/BackorderMatchingService.groovy
+@@ -25,7 +25,7 @@ class BackorderMatchingService {
+     List<BackorderMatch> match(Requisition backorder, Collection<ShipmentItem> inboundItems) {
+         List<BackorderMatch> matches = []
+         Map<String, Integer> quantityRemainingByDemand = [:]
+-        backorder.requisitionItems.each { RequisitionItem demand ->
++        demandItems(backorder).each { RequisitionItem demand ->
+             quantityRemainingByDemand[demand.id] = remainingDemand(demand)
+         }
+ 
+@@ -64,7 +64,7 @@ class BackorderMatchingService {
+             if (!backorder) {
+                 return null
+             }
+-            demand = backorder.requisitionItems
++            demand = demandItems(backorder)
+                     .findAll { it.product == product && remainingDemand(it) > 0 }
+                     .sort { remainingDemand(it) }
+                     .find()
+@@ -115,8 +115,43 @@ class BackorderMatchingService {
+      */
+     private List<RequisitionItem> candidatesFor(Requisition backorder, Product product,
+                                                 Map<String, Integer> quantityRemainingByDemand) {
+-        return backorder.requisitionItems
++        return demandItems(backorder)
+                 .findAll { it.product == product && quantityRemainingByDemand[it.id] > 0 }
+                 .sort { quantityRemainingByDemand[it.id] }
+     }
++
++    /**
++     * Items that carry demand in their own right. A revised or substituted line keeps its original row
++     * on the requisition alongside the row that replaced it, and both report the same quantity, so
++     * matching against the original as well would cover the same demand twice and would record the
++     * cross-dock allocation against the row that is never picked. Walk down from the original lines
++     * and take only the item at the end of each chain.
++     */
++    private static List<RequisitionItem> demandItems(Requisition backorder) {
++        return backorder.initialRequisitionItems.collectMany { RequisitionItem item ->
++            effectiveItems(item)
++        }
++    }
++
++    /**
++     * The item itself, or the items that replaced it. A substitution is not carried any backorder
++     * recorded against the line it replaces: the product has usually changed, and even when it has
++     * not the substitution starts from its own quantity.
++     */
++    private static List<RequisitionItem> effectiveItems(RequisitionItem item) {
++        if (item.isSubstituted()) {
++            // isSubstituted() also covers a substitution linked only through substitutionItem, in which
++            // case the typed child collection is empty
++            Collection<RequisitionItem> substitutions = item.substitutionItems ?: [item.substitutionItem].findAll()
++            return substitutions.collectMany { effectiveItems(it) }
++        }
++        if (item.modificationItem) {
++            return effectiveItems(item.modificationItem)
++        }
++        // Cancellation is all or nothing (cancelQuantity sets quantityCanceled to the full quantity), so
++        // a canceled line has no demand left. isCanceled() cannot be used here because it reports false
++        // while a backorder is still recorded against the item.
++        boolean isFullyCanceled = (item.quantityCanceled ?: 0) >= (item.quantity ?: 0)
++        return isFullyCanceled ? [] : [item]
++    }
+ }

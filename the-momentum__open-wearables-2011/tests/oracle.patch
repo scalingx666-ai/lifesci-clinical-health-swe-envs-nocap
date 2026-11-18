@@ -1,0 +1,527 @@
+diff --git a/backend/app/repositories/health_score_repository.py b/backend/app/repositories/health_score_repository.py
+index 8a8d1f5506..33e5fe5854 100644
+--- a/backend/app/repositories/health_score_repository.py
++++ b/backend/app/repositories/health_score_repository.py
+@@ -3,7 +3,7 @@
+ from typing import cast as typing_cast
+ from uuid import UUID
+ 
+-from sqlalchemy import Date, and_, cast, func, or_, select, tuple_
++from sqlalchemy import Date, and_, cast, func, literal_column, or_, select, tuple_
+ from sqlalchemy.dialects.postgresql import insert
+ 
+ from app.database import DbSession
+@@ -121,6 +121,29 @@ def bulk_create(self, db_session: DbSession, creators: list[HealthScoreCreate])
+         # Caller is responsible for commit — allows batching with other operations
+         return WriteCounts(inserted, 0)
+ 
++    def bulk_create_keeping_highest(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> WriteCounts:
++        """Bulk upsert health scores, keeping the higher value when a score for the same time is sent again.
++
++        For a peak the provider resends with more data as the day goes on, e.g. Garmin body battery.
++        Scores without a value are skipped.
++        """
++        # The highest of each key: ON CONFLICT DO UPDATE can't touch a row twice in one statement
++        with_value = sorted((c for c in creators if c.value is not None), key=lambda c: c.value or 0)
++        highest = {(c.user_id, c.provider, c.data_source_id, c.category, c.recorded_at): c for c in with_value}
++        if not highest:
++            return WriteCounts(0, 0)
++
++        stmt = insert(HealthScore).values([c.model_dump() for c in highest.values()])
++        stmt = stmt.on_conflict_do_update(
++            index_elements=["user_id", "provider", "data_source_id", "category", "recorded_at"],
++            set_={"value": stmt.excluded.value},
++            where=or_(HealthScore.value.is_(None), stmt.excluded.value > HealthScore.value),
++        ).returning(literal_column("xmax = 0"))
++        was_insert = db_session.execute(stmt).scalars().all()
++        inserted = sum(was_insert)
++        # Caller is responsible for commit — allows batching with other operations
++        return WriteCounts(inserted, len(was_insert) - inserted)
++
+     def get_latest_by_category(
+         self,
+         db_session: DbSession,
+diff --git a/backend/app/services/health_score_service.py b/backend/app/services/health_score_service.py
+index 7b7f163e57..7f03d81c9b 100644
+--- a/backend/app/services/health_score_service.py
++++ b/backend/app/services/health_score_service.py
+@@ -38,6 +38,10 @@ def get_by_any_component(self, db_session: DbSession, components: list[str]) ->
+     def bulk_create(self, db_session: DbSession, scores: list[HealthScoreCreate]) -> WriteCounts:
+         return self.crud.bulk_create(db_session, scores)
+ 
++    @handle_exceptions
++    def bulk_create_keeping_highest(self, db_session: DbSession, scores: list[HealthScoreCreate]) -> WriteCounts:
++        return self.crud.bulk_create_keeping_highest(db_session, scores)
++
+     @handle_exceptions
+     def get_latest_by_category(
+         self,
+diff --git a/backend/app/services/providers/garmin/data_247.py b/backend/app/services/providers/garmin/data_247.py
+index 5f931ea3d3..4f7aef4d31 100644
+--- a/backend/app/services/providers/garmin/data_247.py
++++ b/backend/app/services/providers/garmin/data_247.py
+@@ -1928,6 +1928,7 @@ def process_items_batch(
+         all_sleep_details: list[EventRecordDetailCreate] = []
+         all_mct_details: list[MenstrualCycleDetailCreate] = []
+         all_health_scores: list[HealthScoreCreate] = []
++        body_battery_peaks: list[HealthScoreCreate] = []
+         epoch_items: list[dict[str, Any]] = []
+ 
+         for item in items:
+@@ -1948,7 +1949,7 @@ def process_items_batch(
+                     case "stressDetails":
+                         all_samples.extend(self._build_stress_samples(user_id, item))
+                         if score := self._normalize_body_battery_health_score(user_id, item):
+-                            all_health_scores.append(score)
++                            body_battery_peaks.append(score)
+                     case "allDayRespiration":
+                         all_samples.extend(self._build_respiration_samples(user_id, item))
+                     case "pulseox":
+@@ -2153,6 +2154,10 @@ def process_items_batch(
+         if all_health_scores:
+             count += health_score_service.bulk_create(db, all_health_scores)
+             db.commit()
++        if body_battery_peaks:
++            # A day may already hold a lower peak from an earlier push
++            count += health_score_service.bulk_create_keeping_highest(db, body_battery_peaks)
++            db.commit()
+ 
+         return count
+ 
+diff --git a/backend/scripts/data_migrations/raise_garmin_body_battery_peaks.py b/backend/scripts/data_migrations/raise_garmin_body_battery_peaks.py
+new file mode 100644
+index 0000000000..7fc4144c51
+--- /dev/null
++++ b/backend/scripts/data_migrations/raise_garmin_body_battery_peaks.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python3
++"""Raise each Garmin body battery score to the highest body battery sample of its day.
++
++The daily ``body_battery`` score is the highest value of a stressDetails summary. Garmin sends a
++day's summary again, with more data, after every sync, but the score was inserted with ON
++CONFLICT DO NOTHING, so it kept the peak of the day's first push: usually the hours after
++midnight, before the battery charged overnight. Ingestion now keeps the highest value of every
++push, and this raises the scores already stored.
++
++A score's day runs from its ``recorded_at``, the summary's start, to the start of the user's next
++body battery score when that comes within 25 hours, so a 23- or 25-hour day (a daylight-saving
++change, or travel) ends where the next one starts; otherwise it lasts 24 hours. Its samples are the
++user's Garmin ``garmin_body_battery`` samples in that window. A sample keeps the latest value pushed
++for its timestamp, so a peak Garmin later revised down is gone and the score is raised only to what
++the samples still hold. A score is only ever raised. Days whose samples retention deleted keep their
++score.
++
++Runs once per instance (``data_migration``), one committed statement per Garmin user.
++
++Usage (inside Docker):
++    docker compose exec app uv run python scripts/data_migrations/raise_garmin_body_battery_peaks.py --dry-run
++    docker compose exec app uv run python scripts/data_migrations/raise_garmin_body_battery_peaks.py
++"""
++
++import argparse
++
++from sqlalchemy import text
++from sqlalchemy.orm import Session
++
++from app.database import engine
++from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_id
++from app.services.data_migration_service import data_migration_service
++
++_USERS = text("""
++    SELECT user_id, array_agg(id) FROM data_source
++    WHERE provider = :provider
++    GROUP BY user_id ORDER BY user_id
++""")
++# Per user, with the user's Garmin sources bound, so each day is one range of the (source, type, time)
++# index and every statement is short: no snapshot held across the whole history, no table-wide scan
++_LOW_PEAKS = """
++    WITH days AS (
++        SELECT id, value, recorded_at AS day_start,
++               lead(recorded_at) OVER (ORDER BY recorded_at) AS next_start
++        FROM health_score
++        WHERE user_id = :user_id AND provider = :provider AND category = :category
++    )
++    SELECT days.id, peak.value AS peak
++    FROM days
++    CROSS JOIN LATERAL (
++        SELECT max(s.value) AS value
++        FROM series_sample s
++        WHERE s.data_source_id = ANY(:source_ids)
++          AND s.series_type_definition_id = :series_type_id
++          AND s.recorded_at >= days.day_start
++          AND s.recorded_at < CASE
++              WHEN days.next_start <= days.day_start + interval '25 hours' THEN days.next_start
++              ELSE days.day_start + interval '24 hours'
++          END
++    ) peak
++    WHERE peak.value > days.value
++"""
++_COUNT = text(f"SELECT count(*) FROM ({_LOW_PEAKS}) low_peaks")
++# Only ever up: ingestion may have raised a score past its peak in the meantime
++_RAISE = text(f"""
++    UPDATE health_score hs SET value = low.peak
++    FROM ({_LOW_PEAKS}) low
++    WHERE hs.id = low.id AND low.peak > hs.value
++""")
++# A sync writing the same scores holds their rows; behind one, a statement fails and the next start
++# retries instead of holding the startup
++_LOCK_TIMEOUT = text("SET lock_timeout = '10s'")
++
++
++def raise_garmin_body_battery_peaks(db: Session, *, dry_run: bool) -> int:
++    """Commits per user, so an interrupted run keeps what it raised."""
++    params = {
++        "provider": ProviderName.GARMIN.value,
++        "category": HealthScoreCategory.BODY_BATTERY.value,
++        "series_type_id": get_series_type_id(SeriesType.garmin_body_battery),
++    }
++    statement = _COUNT if dry_run else _RAISE
++    found = 0
++    for user_id, source_ids in db.execute(_USERS, params).all():
++        result = db.execute(statement, {**params, "user_id": user_id, "source_ids": source_ids})
++        found += (result.scalar() or 0) if dry_run else result.rowcount  # ty: ignore[unresolved-attribute]
++        if not dry_run:
++            db.commit()
++    if dry_run:
++        print(f"Would raise {found} Garmin body battery score(s).\n\nDry run: no changes made.")
++    else:
++        print(f"Raised {found} Garmin body battery score(s).")
++    return found
++
++
++def _migrate(db: Session, dry_run: bool) -> bool:
++    raise_garmin_body_battery_peaks(db, dry_run=dry_run)
++    return not dry_run
++
++
++def main(dry_run: bool) -> None:
++    with engine.connect() as connection, Session(bind=connection) as db:
++        db.execute(_LOCK_TIMEOUT)
++        data_migration_service.run(
++            db, "raise_garmin_body_battery_peaks", lambda: _migrate(db, dry_run), dry_run=dry_run
++        )
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--dry-run", action="store_true", help="Preview affected rows without modifying data")
++    args = parser.parse_args()
++    main(dry_run=args.dry_run)
+diff --git a/backend/scripts/start/app.sh b/backend/scripts/start/app.sh
+index f8d29ce6c3..91674e6980 100755
+--- a/backend/scripts/start/app.sh
++++ b/backend/scripts/start/app.sh
+@@ -161,6 +161,13 @@ echo 'Running Google sleep type backfill...'
+ uv run python scripts/data_migrations/backfill_google_sleep_type.py \
+     || echo "Warning: Google sleep type backfill failed — will retry on next startup."
+ 
++# TODO: Remove this after ~2027-03-01 once all deployments have migrated.
++# Raises each Garmin body battery score to the highest sample of its day; scores kept the peak of
++# the day's first stressDetails push. Runs once per instance (data_migration).
++echo 'Running Garmin body battery peak backfill...'
++uv run python scripts/data_migrations/raise_garmin_body_battery_peaks.py \
++    || echo "Warning: Garmin body battery peak backfill failed — will retry on next startup."
++
+ # Initialize archival settings
+ echo 'Initializing archival settings...'
+ uv run python scripts/init/seed_archival_settings.py
+diff --git a/backend/tests/providers/garmin/test_garmin_247.py b/backend/tests/providers/garmin/test_garmin_247.py
+index 76d0df6aaa..766349fbe4 100644
+--- a/backend/tests/providers/garmin/test_garmin_247.py
++++ b/backend/tests/providers/garmin/test_garmin_247.py
+@@ -4,15 +4,16 @@
+ from decimal import Decimal
+ from typing import Any
+ from unittest.mock import MagicMock, patch
+-from uuid import uuid4
++from uuid import UUID, uuid4
+ 
+ import pytest
+ from sqlalchemy.orm import Session
+ 
+-from app.models import DataSource, SeriesAggregate, SeriesSample, SleepDetails
++from app.models import DataSource, HealthScore, SeriesAggregate, SeriesSample, SleepDetails
+ from app.repositories.data_point_series_repository import WriteCounts
+ from app.repositories.event_record_detail_repository import EventRecordDetailRepository
+ from app.repositories.user_connection_repository import UserConnectionRepository
++from app.schemas.enums import HealthScoreCategory
+ from app.schemas.enums.series_types import SeriesType, get_series_type_id
+ from app.schemas.model_crud.activities import CalendarPeriod
+ from app.schemas.sync_status import SyncScope, SyncSource
+@@ -22,6 +23,10 @@
+ from app.utils.context import sync_run_var
+ from tests.factories import UserConnectionFactory, UserFactory
+ 
++# One day's stressDetails as Garmin sends it after midnight, and again in the morning with more data
++_AFTER_MIDNIGHT = {"startTimeInSeconds": 1705276800, "timeOffsetBodyBatteryValues": {"0": 20, "3600": 46}}
++_MORNING = {"startTimeInSeconds": 1705276800, "timeOffsetBodyBatteryValues": {"0": 20, "3600": 46, "25200": 78}}
++
+ 
+ class TestGarmin247Data:
+     """Tests for Garmin247Data class."""
+@@ -830,6 +835,32 @@ def test_build_stress_samples(self, garmin_247: Garmin247Data) -> None:
+         samples = garmin_247._build_stress_samples(user_id, stress_data)
+         assert len(samples) == 4  # 2 stress + 2 battery
+ 
++    # Webhook pushes and backfills both go through process_items_batch
++    def test_a_later_push_of_the_day_raises_the_body_battery_peak(self, garmin_247: Garmin247Data, db: Session) -> None:
++        user = UserFactory()
++
++        garmin_247.process_items_batch(db, user.id, "stressDetails", [_AFTER_MIDNIGHT])
++        garmin_247.process_items_batch(db, user.id, "stressDetails", [_MORNING])
++
++        assert self._body_battery_peaks(db, user.id) == [Decimal("78")]
++
++    def test_an_earlier_push_arriving_last_keeps_the_body_battery_peak(
++        self, garmin_247: Garmin247Data, db: Session
++    ) -> None:
++        user = UserFactory()
++
++        garmin_247.process_items_batch(db, user.id, "stressDetails", [_MORNING])
++        garmin_247.process_items_batch(db, user.id, "stressDetails", [_AFTER_MIDNIGHT])
++
++        assert self._body_battery_peaks(db, user.id) == [Decimal("78")]
++
++    @staticmethod
++    def _body_battery_peaks(db: Session, user_id: UUID) -> list[Decimal]:
++        scores = db.query(HealthScore).filter(
++            HealthScore.user_id == user_id, HealthScore.category == HealthScoreCategory.BODY_BATTERY
++        )
++        return [score.value for score in scores]
++
+     def test_build_respiration_samples_webhook_field(self, garmin_247: Garmin247Data) -> None:
+         """allDayRespiration webhook payload uses timeOffsetEpochToBreaths."""
+         user_id = uuid4()
+diff --git a/backend/tests/repositories/test_health_score_repository.py b/backend/tests/repositories/test_health_score_repository.py
+index 21a55bc8e3..c0251c1fea 100644
+--- a/backend/tests/repositories/test_health_score_repository.py
++++ b/backend/tests/repositories/test_health_score_repository.py
+@@ -7,12 +7,13 @@
+ - get_latest_by_category
+ - get_latest_per_category
+ - bulk_create with on_conflict_do_nothing
++- bulk_create_keeping_highest
+ """
+ 
+ from datetime import datetime, timedelta, timezone
+ from decimal import Decimal
+ from typing import Any
+-from uuid import uuid4
++from uuid import UUID, uuid4
+ 
+ import pytest
+ from sqlalchemy import text
+@@ -512,3 +513,69 @@ def test_returns_each_score_with_its_source(self, db: Session, repo: HealthScore
+         results, _ = repo.get_with_filters(db, user.id, HealthScoreQueryParams(), *_orders(db))
+ 
+         assert results == [(score, source)]
++
++
++def _body_battery(user_id: UUID, recorded_at: datetime, value: str | None) -> HealthScoreCreate:
++    return HealthScoreCreate(
++        id=uuid4(),
++        user_id=user_id,
++        provider=ProviderName.GARMIN,
++        category=HealthScoreCategory.BODY_BATTERY,
++        value=Decimal(value) if value is not None else None,
++        recorded_at=recorded_at,
++    )
++
++
++class TestHealthScoreRepositoryBulkCreateKeepingHighest:
++    def test_a_higher_value_replaces_the_stored_one(self, db: Session, repo: HealthScoreRepository) -> None:
++        user = UserFactory()
++        day = datetime(2026, 10, 28, tzinfo=timezone.utc)
++
++        first = repo.bulk_create_keeping_highest(db, [_body_battery(user.id, day, "46")])
++        higher = repo.bulk_create_keeping_highest(db, [_body_battery(user.id, day, "78")])
++        lower = repo.bulk_create_keeping_highest(db, [_body_battery(user.id, day, "60")])
++        db.commit()
++
++        [score] = db.query(HealthScore).filter(HealthScore.user_id == user.id).all()
++        assert score.value == Decimal("78")
++        assert (first.inserted, first.updated) == (1, 0)
++        assert (higher.inserted, higher.updated) == (0, 1)
++        assert (lower.inserted, lower.updated) == (0, 0)
++
++    def test_one_batch_keeps_the_highest_of_a_day(self, db: Session, repo: HealthScoreRepository) -> None:
++        # ON CONFLICT DO UPDATE can't touch a row twice in one statement
++        user = UserFactory()
++        day = datetime(2026, 10, 28, tzinfo=timezone.utc)
++        scores = [_body_battery(user.id, day, value) for value in ("46", "78", "60")]
++
++        written = repo.bulk_create_keeping_highest(db, scores)
++        db.commit()
++
++        [score] = db.query(HealthScore).filter(HealthScore.user_id == user.id).all()
++        assert score.value == Decimal("78")
++        assert (written.inserted, written.updated) == (1, 0)
++
++    def test_a_value_replaces_a_stored_empty_one(self, db: Session, repo: HealthScoreRepository) -> None:
++        user = UserFactory()
++        day = datetime(2026, 10, 28, tzinfo=timezone.utc)
++        repo.bulk_create(db, [_body_battery(user.id, day, None)])
++
++        written = repo.bulk_create_keeping_highest(db, [_body_battery(user.id, day, "78")])
++        db.commit()
++
++        [score] = db.query(HealthScore).filter(HealthScore.user_id == user.id).all()
++        assert score.value == Decimal("78")
++        assert (written.inserted, written.updated) == (0, 1)
++
++    def test_a_score_without_a_value_is_skipped(self, db: Session, repo: HealthScoreRepository) -> None:
++        user = UserFactory()
++
++        written = repo.bulk_create_keeping_highest(db, [_body_battery(user.id, datetime.now(timezone.utc), None)])
++
++        assert (written.inserted, written.updated) == (0, 0)
++        assert db.query(HealthScore).filter(HealthScore.user_id == user.id).count() == 0
++
++    def test_empty(self, db: Session, repo: HealthScoreRepository) -> None:
++        written = repo.bulk_create_keeping_highest(db, [])
++
++        assert (written.inserted, written.updated) == (0, 0)
+diff --git a/backend/tests/scripts/test_raise_garmin_body_battery_peaks.py b/backend/tests/scripts/test_raise_garmin_body_battery_peaks.py
+new file mode 100644
+index 0000000000..e426b03584
+--- /dev/null
++++ b/backend/tests/scripts/test_raise_garmin_body_battery_peaks.py
+@@ -0,0 +1,138 @@
++"""Tests for raising Garmin body battery scores to the highest sample of their day."""
++
++import importlib.util
++from datetime import datetime, timedelta, timezone
++from decimal import Decimal
++from pathlib import Path
++from types import ModuleType
++
++from sqlalchemy.orm import Session
++
++from app.models import DataSource, HealthScore, SeriesTypeDefinition, User
++from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_id
++from tests.factories import DataPointSeriesFactory, DataSourceFactory, HealthScoreFactory, UserFactory
++
++_SCRIPT_PATH = (
++    Path(__file__).resolve().parents[2] / "scripts" / "data_migrations" / "raise_garmin_body_battery_peaks.py"
++)
++
++
++def _load_module() -> ModuleType:
++    spec = importlib.util.spec_from_file_location("raise_garmin_body_battery_peaks", _SCRIPT_PATH)
++    assert spec is not None
++    assert spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++module = _load_module()
++raise_garmin_body_battery_peaks = module.raise_garmin_body_battery_peaks
++
++DAY = datetime(2026, 10, 27, 23, tzinfo=timezone.utc)  # a stressDetails day starting at local midnight, +01:00
++
++
++def _garmin(user: User) -> DataSource:
++    return DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
++
++
++def _samples(db: Session, source: DataSource, day: datetime, values: dict[float, int]) -> None:
++    """Body battery samples at `day` plus each offset in hours."""
++    series_type = db.get_one(SeriesTypeDefinition, get_series_type_id(SeriesType.garmin_body_battery))
++    for hours, value in values.items():
++        DataPointSeriesFactory(
++            data_source=source, series_type=series_type, recorded_at=day + timedelta(hours=hours), value=value
++        )
++
++
++def _peak(user: User, day: datetime, value: str) -> HealthScore:
++    return HealthScoreFactory(
++        user_id=user.id,
++        data_source_id=None,
++        provider=ProviderName.GARMIN,
++        category=HealthScoreCategory.BODY_BATTERY,
++        value=Decimal(value),
++        recorded_at=day,
++        qualifier=None,
++    )
++
++
++def _value(db: Session, score: HealthScore) -> Decimal:
++    db.expire_all()
++    return db.get_one(HealthScore, score.id).value
++
++
++class TestRaiseGarminBodyBatteryPeaks:
++    def test_raises_a_score_to_its_days_highest_sample(self, db: Session) -> None:
++        user = UserFactory()
++        source = _garmin(user)
++        _samples(db, source, DAY, {1: 20, 7: 78, 15: 40})
++        _samples(db, source, DAY + timedelta(days=1), {7: 95})  # the next day's peak doesn't count
++        low = _peak(user, DAY, "46")
++        _samples(db, source, DAY - timedelta(days=1), {7: 81})
++        other_low = _peak(user, DAY - timedelta(days=1), "30")
++
++        raised = raise_garmin_body_battery_peaks(db, dry_run=False)
++
++        assert raised == 2
++        assert _value(db, low) == Decimal("78")
++        assert _value(db, other_low) == Decimal("81")
++
++    def test_raises_every_users_scores_from_all_their_garmin_sources(self, db: Session) -> None:
++        user, other_user = UserFactory(), UserFactory()
++        _samples(db, _garmin(user), DAY, {7: 70})
++        _samples(db, DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin_connect"), DAY, {9: 85})
++        _samples(db, _garmin(other_user), DAY, {7: 64})
++        score, other_score = _peak(user, DAY, "46"), _peak(other_user, DAY, "50")
++
++        assert raise_garmin_body_battery_peaks(db, dry_run=False) == 2
++        assert _value(db, score) == Decimal("85")
++        assert _value(db, other_score) == Decimal("64")
++
++    def test_a_day_ends_where_the_next_one_starts(self, db: Session) -> None:
++        # A 23-hour day (spring forward, or travelling east): the next day's samples don't count
++        user = UserFactory()
++        source = _garmin(user)
++        next_day = DAY + timedelta(hours=23)
++        _samples(db, source, DAY, {7: 60})
++        _samples(db, source, next_day, {0.5: 90})
++        short_day = _peak(user, DAY, "46")
++        _peak(user, next_day, "95")
++
++        raise_garmin_body_battery_peaks(db, dry_run=False)
++
++        assert _value(db, short_day) == Decimal("60")
++
++    def test_a_day_without_a_next_one_lasts_24_hours(self, db: Session) -> None:
++        user = UserFactory()
++        _samples(db, _garmin(user), DAY, {23.5: 60, 24.5: 90})
++        score = _peak(user, DAY, "46")
++
++        raise_garmin_body_battery_peaks(db, dry_run=False)
++
++        assert _value(db, score) == Decimal("60")
++
++    def test_never_lowers_a_score(self, db: Session) -> None:
++        user = UserFactory()
++        _samples(db, _garmin(user), DAY, {7: 78})
++        score = _peak(user, DAY, "80")
++
++        assert raise_garmin_body_battery_peaks(db, dry_run=False) == 0
++        assert _value(db, score) == Decimal("80")
++
++    def test_reads_only_the_users_garmin_samples(self, db: Session) -> None:
++        user = UserFactory()
++        _samples(db, _garmin(UserFactory()), DAY, {7: 90})
++        _samples(db, DataSourceFactory(user=user, provider=ProviderName.APPLE), DAY, {7: 90})
++        score = _peak(user, DAY, "46")
++
++        assert raise_garmin_body_battery_peaks(db, dry_run=False) == 0
++        assert _value(db, score) == Decimal("46")
++
++    def test_dry_run_counts_and_changes_nothing(self, db: Session) -> None:
++        user = UserFactory()
++        _samples(db, _garmin(user), DAY, {7: 78})
++        score = _peak(user, DAY, "46")
++
++        assert raise_garmin_body_battery_peaks(db, dry_run=True) == 1
++        assert _value(db, score) == Decimal("46")

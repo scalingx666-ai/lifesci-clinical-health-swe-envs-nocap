@@ -1,0 +1,304 @@
+diff --git a/packages/docs/docs/auth/how-mfa-works.md b/packages/docs/docs/auth/how-mfa-works.md
+index 1b1e350c4d8..2c9be04f68a 100644
+--- a/packages/docs/docs/auth/how-mfa-works.md
++++ b/packages/docs/docs/auth/how-mfa-works.md
+@@ -110,7 +110,7 @@ For TOTP, `login-enroll` both enrolls the user and verifies the supplied code, c
+ 
+ ## Flow: Self-enrolling from a settings page
+ 
+-These flows assume the user is already authenticated (you have a bearer token). Start by reading status:
++These flows assume the user is already authenticated (you have a bearer token). The token must not be limited by SMART resource scopes. Start by reading status:
+ 
+ ```ts
+ const status = await medplum.get('auth/mfa/status', { cache: 'no-cache' });
+diff --git a/packages/server/src/auth/me.test.ts b/packages/server/src/auth/me.test.ts
+index 685feb7f432..9438645d49d 100644
+--- a/packages/server/src/auth/me.test.ts
++++ b/packages/server/src/auth/me.test.ts
+@@ -356,6 +356,25 @@ describe('Me', () => {
+     expect(res5.body.security.sessions.map((s: any) => s.id)).toContainExactly([login.id, res1.body.login]);
+   });
+ 
++  test('SMART-scoped login does not get security details', async () => {
++    const { accessToken } = await withTestContext(() =>
++      registerNew({
++        firstName: 'Alexander',
++        lastName: 'Hamilton',
++        projectName: 'SMART-scoped /auth/me',
++        email: `alex${randomUUID()}@example.com`,
++        password: 'password!@#',
++        scope: 'openid user/Observation.rs',
++      })
++    );
++
++    const res = await request(app).get('/auth/me').set('Authorization', `Bearer ${accessToken}`);
++    expect(res).toHaveStatus(200);
++    expect(res.body.profile.resourceType).toBe('Practitioner');
++    expect(res.body.user).toBeDefined();
++    expect(res.body.security).toBeUndefined();
++  });
++
+   test('Project features are returned in /auth/me', async () => {
+     const email = `alice${randomUUID()}@example.com`;
+     const password = randomUUID();
+diff --git a/packages/server/src/auth/me.ts b/packages/server/src/auth/me.ts
+index 2462d11390d..79b51f58003 100644
+--- a/packages/server/src/auth/me.ts
++++ b/packages/server/src/auth/me.ts
+@@ -18,7 +18,7 @@ import { getAccessPolicyForLogin } from '../fhir/accesspolicy';
+ import { membershipProfileTypes, readMembershipReference } from '../fhir/projectmembership';
+ import type { SystemRepository } from '../fhir/repo';
+ import { rewriteAttachments, RewriteMode } from '../fhir/rewrite';
+-import { isMfaRequired } from './utils';
++import { hasSmartResourceScopes, isMfaRequired } from './utils';
+ 
+ interface UserSession {
+   id: string;
+@@ -55,6 +55,10 @@ export async function meHandler(req: Request, res: Response): Promise<void> {
+   let security: UserSecurity | undefined = undefined;
+   if (membership.user?.reference?.startsWith('User/')) {
+     user = await systemRepo.readReference<User>(membership.user as Reference<User>);
++  }
++
++  // Account security details are only for logins that can manage the account (see getCallerUserReference)
++  if (user && !hasSmartResourceScopes(authState.login)) {
+     const sessions = await getSessions(systemRepo, user);
+     const memberships = await systemRepo.searchResources<ProjectMembership>({
+       resourceType: 'ProjectMembership',
+diff --git a/packages/server/src/auth/mfa.test.ts b/packages/server/src/auth/mfa.test.ts
+index 5c54a2aa82b..8b5c47bc741 100644
+--- a/packages/server/src/auth/mfa.test.ts
++++ b/packages/server/src/auth/mfa.test.ts
+@@ -12,6 +12,7 @@ import type { ParsedMail } from 'mailparser';
+ import { simpleParser } from 'mailparser';
+ import { authenticator } from 'otplib';
+ import request from 'supertest';
++import { inviteUser } from '../admin/invite';
+ import { initApp, shutdownApp } from '../app';
+ import { loadTestConfig } from '../config/loader';
+ import { MFA_LOGIN_EXPIRATION_MS, MFA_USER_ATTEMPT_LIMIT } from '../constants';
+@@ -169,6 +170,118 @@ describe('MFA', () => {
+     expect(res).toHaveStatus(403);
+   });
+ 
++  test('Login with SMART resource scopes cannot read status', async () => {
++    const { accessToken } = await withTestContext(() =>
++      registerNew({
++        firstName: 'Smart',
++        lastName: 'Scoped',
++        projectName: 'Smart Scoped Project',
++        email: `smart${randomUUID()}@example.com`,
++        password: 'password!@#',
++        scope: 'openid user/Observation.rs',
++      })
++    );
++
++    const res = await request(app).get('/auth/mfa/status').set('Authorization', `Bearer ${accessToken}`);
++    expect(res).toHaveStatus(403);
++    expect(res.body.enrollUri).toBeUndefined();
++  });
++
++  test('Login without SMART resource scopes can read status', async () => {
++    const { accessToken } = await withTestContext(() =>
++      registerNew({
++        firstName: 'Smart',
++        lastName: 'Unscoped',
++        projectName: 'Smart Unscoped Project',
++        email: `smart${randomUUID()}@example.com`,
++        password: 'password!@#',
++        scope: 'openid profile email fhirUser launch/patient offline_access',
++      })
++    );
++
++    const res = await request(app).get('/auth/mfa/status').set('Authorization', `Bearer ${accessToken}`);
++    expect(res).toHaveStatus(200);
++    expect(res.body.enrollUri).toBeDefined();
++  });
++
++  test('SMART app login cannot read MFA status', async () => {
++    const email = `smart${randomUUID()}@example.com`;
++    const password = 'password!@#';
++
++    // User enrolls in TOTP from their own session
++    const { accessToken } = await withTestContext(() =>
++      registerNew({
++        firstName: 'Smart',
++        lastName: 'Scoped',
++        projectName: 'Smart Project',
++        email,
++        password,
++      })
++    );
++    const secret = await enrollTotpMfa(accessToken);
++
++    // The user is also a member of a project with a SMART app
++    const { project: smartAppProject, client } = await withTestContext(() => createTestProject({ withClient: true }));
++    await withTestContext(() =>
++      inviteUser({
++        project: smartAppProject,
++        email,
++        resourceType: 'Practitioner',
++        firstName: 'Smart',
++        lastName: 'Scoped',
++        sendEmail: false,
++      })
++    );
++
++    // User signs in to the SMART app with a narrow resource scope
++    const res1 = await request(app).post('/auth/login').type('json').send({
++      clientId: client.id,
++      email,
++      password,
++      scope: 'openid user/Observation.rs',
++      codeChallenge: 'xyz',
++      codeChallengeMethod: 'plain',
++    });
++    expect(res1).toHaveStatus(200);
++    expect(res1.body.mfaRequired).toBe(true);
++
++    const res2 = await request(app)
++      .post('/auth/mfa/verify')
++      .type('json')
++      .send({ login: res1.body.login, token: authenticator.generate(secret) });
++    expect(res2).toHaveStatus(200);
++    expect(res2.body.code).toBeDefined();
++
++    const res3 = await request(app).post('/oauth2/token').type('form').send({
++      grant_type: 'authorization_code',
++      client_id: client.id,
++      code: res2.body.code,
++      code_verifier: 'xyz',
++    });
++    expect(res3).toHaveStatus(200);
++    const scopedToken = res3.body.access_token as string;
++
++    // The scoped token works for the granted FHIR resources
++    const res4 = await request(app).get('/fhir/R4/Observation').set('Authorization', `Bearer ${scopedToken}`);
++    expect(res4).toHaveStatus(200);
++
++    // The scoped token cannot read MFA status
++    const res5 = await request(app).get('/auth/mfa/status').set('Authorization', `Bearer ${scopedToken}`);
++    expect(res5).toHaveStatus(403);
++    expect(res5.body.enrollUri).toBeUndefined();
++
++    // The scoped token does not see account security details
++    const res6 = await request(app).get('/auth/me').set('Authorization', `Bearer ${scopedToken}`);
++    expect(res6).toHaveStatus(200);
++    expect(res6.body.profile).toBeDefined();
++    expect(res6.body.security).toBeUndefined();
++
++    // The user's own session can still read MFA status
++    const res7 = await request(app).get('/auth/mfa/status').set('Authorization', `Bearer ${accessToken}`);
++    expect(res7).toHaveStatus(200);
++    expect(res7.body.enrolled).toBe(true);
++  });
++
+   test('Enroll end-to-end', async () => {
+     const email = `alex${randomUUID()}@example.com`;
+     const password = 'password!@#';
+diff --git a/packages/server/src/auth/utils.test.ts b/packages/server/src/auth/utils.test.ts
+index b00e5663702..a765c239f9f 100644
+--- a/packages/server/src/auth/utils.test.ts
++++ b/packages/server/src/auth/utils.test.ts
+@@ -1,9 +1,16 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+ import { OperationOutcomeError } from '@medplum/core';
+-import type { Project, User } from '@medplum/fhirtypes';
++import type { Login, Project, ProjectMembership, User } from '@medplum/fhirtypes';
+ import { MAX_PASSWORD_LENGTH } from '../constants';
+-import { bcryptHashPassword, isMfaRequired, isPractitionerEmailDomainAllowed } from './utils';
++import type { AuthenticatedRequestContext } from '../context';
++import {
++  bcryptHashPassword,
++  getCallerUserReference,
++  hasSmartResourceScopes,
++  isMfaRequired,
++  isPractitionerEmailDomainAllowed,
++} from './utils';
+ 
+ describe('isMfaRequired', () => {
+   function createMfaTestUser(mfaRequired?: boolean): User {
+@@ -141,3 +148,41 @@ describe('bcryptHashPassword', () => {
+     expect(() => bcryptHashPassword(multibyte)).toThrow(OperationOutcomeError);
+   });
+ });
++
++function makeLogin(scope: string | undefined): Login {
++  return { resourceType: 'Login', user: { reference: 'User/123' }, authMethod: 'password', authTime: '', scope };
++}
++
++describe('hasSmartResourceScopes', () => {
++  test.each([
++    [undefined, false],
++    ['openid', false],
++    ['openid profile email fhirUser launch/patient offline_access', false],
++    ['openid user/Observation.rs', true],
++    ['openid patient/*.rs', true],
++    ['openid user/*.*', true],
++  ])('%s', (scope, expected) => {
++    expect(hasSmartResourceScopes(makeLogin(scope))).toBe(expected);
++  });
++});
++
++describe('getCallerUserReference', () => {
++  const membership: ProjectMembership = {
++    resourceType: 'ProjectMembership',
++    project: { reference: 'Project/123' },
++    user: { reference: 'User/123' },
++    profile: { reference: 'Practitioner/123' },
++  };
++
++  function getContext(scope: string): AuthenticatedRequestContext {
++    return { authState: { login: makeLogin(scope), membership } } as unknown as AuthenticatedRequestContext;
++  }
++
++  test('Returns the user for a login without SMART resource scopes', () => {
++    expect(getCallerUserReference(getContext('openid offline_access'))).toStrictEqual({ reference: 'User/123' });
++  });
++
++  test('Rejects a login with SMART resource scopes', () => {
++    expect(() => getCallerUserReference(getContext('openid user/Observation.rs'))).toThrow(OperationOutcomeError);
++  });
++});
+diff --git a/packages/server/src/auth/utils.ts b/packages/server/src/auth/utils.ts
+index 7ba4963fd68..ae3dce002c4 100644
+--- a/packages/server/src/auth/utils.ts
++++ b/packages/server/src/auth/utils.ts
+@@ -33,6 +33,7 @@ import { sendOutcome } from '../fhir/outcomes';
+ import { getInactiveReason } from '../fhir/projectmembership';
+ import type { SystemRepository } from '../fhir/repo';
+ import { getGlobalSystemRepo } from '../fhir/repo';
++import { parseSmartScopes } from '../fhir/smart';
+ import { getLogger } from '../logger';
+ import { getClientApplication, getMembershipsForLogin } from '../oauth/utils';
+ 
+@@ -44,15 +45,26 @@ const DEFAULT_APP_NAME = 'Medplum';
+ /** Authenticator app issuer used for projects that have not been white-labeled. */
+ const DEFAULT_MFA_ISSUER = 'medplum.com';
+ 
++/**
++ * Returns true if the login is limited by SMART resource scopes (e.g. `patient/Observation.rs`).
++ * @param login - The login.
++ * @returns True if the login has SMART resource scopes.
++ */
++export function hasSmartResourceScopes(login: Login): boolean {
++  return parseSmartScopes(login.scope).length > 0;
++}
++
+ /**
+  * Returns the User reference of the authenticated caller, for routes that manage the caller's own account.
+  * On-Behalf-Of is not allowed, because these routes must act on the caller's account, not the target's.
++ * Logins with SMART resource scopes are not allowed, because they grant access to specific FHIR resources
++ * rather than to the user's account.
+  * @param ctx - The authenticated request context.
+  * @returns The caller's User reference.
+  */
+ export function getCallerUserReference(ctx: AuthenticatedRequestContext): Reference<User> {
+-  const { membership, onBehalfOfMembership } = ctx.authState;
+-  if (onBehalfOfMembership || !membership.user?.reference?.startsWith('User/')) {
++  const { login, membership, onBehalfOfMembership } = ctx.authState;
++  if (onBehalfOfMembership || !membership.user?.reference?.startsWith('User/') || hasSmartResourceScopes(login)) {
+     throw new OperationOutcomeError(forbidden);
+   }
+   return membership.user as Reference<User>;

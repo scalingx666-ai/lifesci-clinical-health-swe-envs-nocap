@@ -1,0 +1,662 @@
+diff --git a/workflow/src/main/java/com/google/android/fhir/workflow/activity/ActivityFlow.kt b/workflow/src/main/java/com/google/android/fhir/workflow/activity/ActivityFlow.kt
+index ede47ac171..aa4c264b49 100644
+--- a/workflow/src/main/java/com/google/android/fhir/workflow/activity/ActivityFlow.kt
++++ b/workflow/src/main/java/com/google/android/fhir/workflow/activity/ActivityFlow.kt
+@@ -17,23 +17,36 @@
+ package com.google.android.fhir.workflow.activity
+ 
+ import androidx.annotation.WorkerThread
++import ca.uhn.fhir.model.api.IQueryParameterType
++import ca.uhn.fhir.rest.param.ReferenceParam
+ import com.google.android.fhir.workflow.activity.phase.Phase
+ import com.google.android.fhir.workflow.activity.phase.Phase.PhaseName
+ import com.google.android.fhir.workflow.activity.phase.Phase.PhaseName.ORDER
+ import com.google.android.fhir.workflow.activity.phase.Phase.PhaseName.PERFORM
+ import com.google.android.fhir.workflow.activity.phase.Phase.PhaseName.PLAN
+ import com.google.android.fhir.workflow.activity.phase.Phase.PhaseName.PROPOSAL
++import com.google.android.fhir.workflow.activity.phase.ReadOnlyRequestPhase
+ import com.google.android.fhir.workflow.activity.phase.event.PerformPhase
++import com.google.android.fhir.workflow.activity.phase.event.PerformPhase.Companion.`class`
++import com.google.android.fhir.workflow.activity.phase.idType
+ import com.google.android.fhir.workflow.activity.phase.request.OrderPhase
+ import com.google.android.fhir.workflow.activity.phase.request.PlanPhase
+ import com.google.android.fhir.workflow.activity.phase.request.ProposalPhase
+ import com.google.android.fhir.workflow.activity.resource.event.CPGCommunicationEvent
+ import com.google.android.fhir.workflow.activity.resource.event.CPGEventResource
+ import com.google.android.fhir.workflow.activity.resource.event.CPGOrderMedicationEvent
++import com.google.android.fhir.workflow.activity.resource.event.EventStatus
+ import com.google.android.fhir.workflow.activity.resource.request.CPGCommunicationRequest
+ import com.google.android.fhir.workflow.activity.resource.request.CPGMedicationRequest
+ import com.google.android.fhir.workflow.activity.resource.request.CPGRequestResource
+ import com.google.android.fhir.workflow.activity.resource.request.Intent
++import com.google.android.fhir.workflow.activity.resource.request.Status
++import org.hl7.fhir.r4.model.Bundle
++import org.hl7.fhir.r4.model.Communication
++import org.hl7.fhir.r4.model.CommunicationRequest
++import org.hl7.fhir.r4.model.MedicationDispense
++import org.hl7.fhir.r4.model.MedicationRequest
++import org.hl7.fhir.r4.model.Reference
+ import org.opencds.cqf.fhir.api.Repository
+ 
+ /**
+@@ -181,6 +194,37 @@ private constructor(
+     return currentPhase
+   }
+ 
++  /** Returns a read only list of all the previous phases of the flow. */
++  fun getPreviousPhases(): List<ReadOnlyRequestPhase<R>> {
++    val phases = mutableListOf<ReadOnlyRequestPhase<R>>()
++    var current: Phase? = currentPhase
++
++    while (current != null) {
++      val basedOn: Reference? =
++        if (current is Phase.RequestPhase<*>) {
++          (current).getRequestResource().getBasedOn()
++        } else if (current is Phase.EventPhase<*>) {
++          (current).getEventResource().getBasedOn()
++        } else {
++          null
++        }
++
++      val basedOnRequest =
++        basedOn?.let {
++          repository.read(it.`class`, it.idType)?.let { CPGRequestResource.of(it) as R }
++        }
++      current =
++        when (basedOnRequest?.getIntent()) {
++          Intent.PROPOSAL -> ProposalPhase(repository, basedOnRequest)
++          Intent.PLAN -> PlanPhase(repository, basedOnRequest)
++          Intent.ORDER -> OrderPhase(repository, basedOnRequest)
++          else -> null
++        }
++      current?.let { phases.add(it as ReadOnlyRequestPhase<R>) }
++    }
++    return phases
++  }
++
+   /**
+    * Prepares a plan resource based on the state of the [currentPhase] and returns it to the caller
+    * without persisting any changes into [repository].
+@@ -303,5 +347,116 @@ private constructor(
+       resource: CPGOrderMedicationEvent<*>,
+     ): ActivityFlow<CPGMedicationRequest, CPGOrderMedicationEvent<*>> =
+       ActivityFlow(repository, null, resource)
++
++    /** Returns a list of active flows associated with the [patientId]. */
++    fun of(
++      repository: Repository,
++      patientId: String,
++    ): List<ActivityFlow<CPGRequestResource<*>, CPGEventResource<*>>> {
++      /**
++       * NOTE: After adding a new
++       * [activity](https://build.fhir.org/ig/HL7/cqf-recommendations/examples-activities.html), add
++       * appropriate resource classes to eventTypes & requestTypes for the api to be able to search
++       * for flows in database.
++       */
++      val eventTypes =
++        listOf(
++          MedicationDispense::class.java,
++          Communication::class.java,
++        )
++
++      val events =
++        eventTypes
++          .flatMap {
++            repository
++              .search(
++                Bundle::class.java,
++                it,
++                mutableMapOf<String, MutableList<IQueryParameterType>>(
++                  "subject" to mutableListOf(ReferenceParam("Patient/$patientId")),
++                ),
++                null,
++              )
++              .entry
++              .map { it.resource }
++          }
++          .map { CPGEventResource.of(it) }
++
++      val requestTypes =
++        listOf(
++          MedicationRequest::class.java,
++          CommunicationRequest::class.java,
++        )
++
++      // This is used to fetch the `basedOn` resource for a request/event to form RequestChain
++      val idToRequestMap: MutableMap<String, CPGRequestResource<*>> =
++        requestTypes
++          .flatMap {
++            repository
++              .search(
++                Bundle::class.java,
++                it,
++                mutableMapOf<String, MutableList<IQueryParameterType>>(
++                  "subject" to mutableListOf(ReferenceParam("Patient/$patientId")),
++                ),
++                null,
++              )
++              .entry
++              .map { it.resource }
++          }
++          .map { CPGRequestResource.of(it) }
++          .associateByTo(LinkedHashMap()) { "${it.resourceType}/${it.logicalId}" }
++
++      fun addBasedOn(
++        request: RequestChain,
++      ): RequestChain? {
++        val basedOn = request.request?.getBasedOn() ?: request.event?.getBasedOn()
++        // look up the cache for the parent resource and add to the chain
++        return basedOn?.let { reference ->
++          idToRequestMap[reference.reference]?.let { requestResource ->
++            idToRequestMap.remove(reference.reference)
++            RequestChain(request = requestResource).apply { this.basedOn = addBasedOn(this) }
++          }
++        }
++      }
++
++      val requestChain =
++        events.map { RequestChain(event = it).apply { this.basedOn = addBasedOn(this) } } +
++          idToRequestMap.values
++            .filter {
++              it.getIntent() == Intent.ORDER ||
++                it.getIntent() == Intent.PLAN ||
++                it.getIntent() == Intent.PROPOSAL
++            }
++            .sortedByDescending { it.getIntent().code }
++            .mapNotNull {
++              if (idToRequestMap.containsKey("${it.resourceType}/${it.logicalId}")) {
++                RequestChain(request = it).apply { this.basedOn = addBasedOn(this) }
++              } else {
++                null
++              }
++            }
++      return requestChain
++        .filter {
++          if (it.event != null) {
++            it.event.getStatus() != EventStatus.COMPLETED
++          } else if (it.request != null) {
++            it.request.getStatus() != Status.COMPLETED
++          } else {
++            false
++          }
++        }
++        .map { ActivityFlow(repository, it.request, it.event) }
++    }
+   }
+ }
++
++/**
++ * Represents the chain of event/requests of an activity flow. A [RequestChain] would either have a
++ * [request] or an [event].
++ */
++private data class RequestChain(
++  val request: CPGRequestResource<*>? = null,
++  val event: CPGEventResource<*>? = null,
++  var basedOn: RequestChain? = null,
++)
+diff --git a/workflow/src/main/java/com/google/android/fhir/workflow/activity/phase/Phase.kt b/workflow/src/main/java/com/google/android/fhir/workflow/activity/phase/Phase.kt
+index a11ce85e23..56910b6b1c 100644
+--- a/workflow/src/main/java/com/google/android/fhir/workflow/activity/phase/Phase.kt
++++ b/workflow/src/main/java/com/google/android/fhir/workflow/activity/phase/Phase.kt
+@@ -17,6 +17,7 @@
+ package com.google.android.fhir.workflow.activity.phase
+ 
+ import androidx.annotation.WorkerThread
++import com.google.android.fhir.workflow.activity.phase.Phase.PhaseName
+ import com.google.android.fhir.workflow.activity.resource.event.CPGEventResource
+ import com.google.android.fhir.workflow.activity.resource.request.CPGRequestResource
+ import org.hl7.fhir.r4.model.IdType
+@@ -35,8 +36,7 @@ sealed interface Phase {
+   fun getPhaseName(): PhaseName
+ 
+   /** Activity Phases for a CPG Request. */
+-  interface RequestPhase<R : CPGRequestResource<*>> : Phase {
+-    fun getRequestResource(): R
++  interface RequestPhase<R : CPGRequestResource<*>> : Phase, ReadOnlyRequestPhase<R> {
+ 
+     @WorkerThread fun update(r: R): Result<Unit>
+ 
+@@ -77,3 +77,11 @@ internal fun checkEquals(a: Reference, b: Reference) = a.reference == b.referenc
+ /** Returns an [IdType] of a [Reference]. This is required for [Repository.read] api. */
+ internal val Reference.idType
+   get() = IdType(reference)
++
++/** Provides a read-only view of a request phase. */
++interface ReadOnlyRequestPhase<R : CPGRequestResource<*>> {
++  /** Returns the [Phase.PhaseName] of this phase. */
++  fun getPhaseName(): PhaseName
++
++  fun getRequestResource(): R
++}
+diff --git a/workflow/src/main/java/com/google/android/fhir/workflow/activity/phase/event/PerformPhase.kt b/workflow/src/main/java/com/google/android/fhir/workflow/activity/phase/event/PerformPhase.kt
+index 168c95bdca..60f0ce6cd9 100644
+--- a/workflow/src/main/java/com/google/android/fhir/workflow/activity/phase/event/PerformPhase.kt
++++ b/workflow/src/main/java/com/google/android/fhir/workflow/activity/phase/event/PerformPhase.kt
+@@ -139,7 +139,7 @@ class PerformPhase<E : CPGEventResource<*>>(
+      * Returns the [Resource] class for the resource. e.g. If the Reference is `Patient/1234`, then
+      * this would return the `Class` for `org.hl7.fhir.r4.model.Patient`.
+      */
+-    private val Reference.`class`
++    internal val Reference.`class`
+       get() = getResourceClass<Resource>(reference.split("/")[0])
+ 
+     /**
+@@ -165,7 +165,7 @@ class PerformPhase<E : CPGEventResource<*>>(
+         "${inputPhase.getPhaseName().name} request is still in ${inputRequest.getStatusCode()} status."
+       }
+ 
+-      val eventRequest = CPGEventResource.of(inputRequest, eventClass)
++      val eventRequest = CPGEventResource.from(inputRequest, eventClass)
+       eventRequest.setStatus(EventStatus.PREPARATION)
+       eventRequest.setBasedOn(inputRequest.asReference())
+       eventRequest as E
+diff --git a/workflow/src/main/java/com/google/android/fhir/workflow/activity/resource/event/CPGEventResource.kt b/workflow/src/main/java/com/google/android/fhir/workflow/activity/resource/event/CPGEventResource.kt
+index 699545c416..3d6cc6018c 100644
+--- a/workflow/src/main/java/com/google/android/fhir/workflow/activity/resource/event/CPGEventResource.kt
++++ b/workflow/src/main/java/com/google/android/fhir/workflow/activity/resource/event/CPGEventResource.kt
+@@ -23,6 +23,7 @@ import com.google.android.fhir.workflow.activity.resource.request.CPGMedicationR
+ import com.google.android.fhir.workflow.activity.resource.request.CPGRequestResource
+ import com.google.android.fhir.workflow.activity.resource.request.CPGRequestResource.Companion.of
+ import org.hl7.fhir.r4.model.Communication
++import org.hl7.fhir.r4.model.MedicationDispense
+ import org.hl7.fhir.r4.model.Reference
+ import org.hl7.fhir.r4.model.Resource
+ import org.hl7.fhir.r4.model.ResourceType
+@@ -41,7 +42,7 @@ import org.hl7.fhir.r4.model.ResourceType
+  * [CPGEventResource]s.
+  */
+ sealed class CPGEventResource<out R>(
+-  internal open val resource: R,
++  open val resource: R,
+   internal val mapper: EventStatusCodeMapper,
+ ) where R : Resource {
+ 
+@@ -65,12 +66,22 @@ sealed class CPGEventResource<out R>(
+ 
+   companion object {
+ 
+-    fun of(request: CPGRequestResource<*>, eventClass: Class<*>): CPGEventResource<*> {
+-      return when (request) {
+-        is CPGCommunicationRequest -> CPGCommunicationEvent.from(request)
+-        is CPGMedicationRequest -> CPGOrderMedicationEvent.from(request, eventClass)
++    internal fun from(from: CPGRequestResource<*>, to: Class<*>): CPGEventResource<*> {
++      return when (from) {
++        is CPGCommunicationRequest -> CPGCommunicationEvent.from(from)
++        is CPGMedicationRequest -> CPGOrderMedicationEvent.from(from, to)
+         else -> {
+-          throw IllegalArgumentException("Unknown CPG Request type ${request::class}.")
++          throw IllegalArgumentException("Unknown CPG Request type ${from::class}.")
++        }
++      }
++    }
++
++    fun of(event: Resource): CPGEventResource<*> {
++      return when (event) {
++        is Communication -> CPGCommunicationEvent(event)
++        is MedicationDispense -> CPGMedicationDispenseEvent(event)
++        else -> {
++          throw IllegalArgumentException("Unknown CPG event type ${event::class}.")
+         }
+       }
+     }
+diff --git a/workflow/src/main/java/com/google/android/fhir/workflow/activity/resource/request/CPGRequestResource.kt b/workflow/src/main/java/com/google/android/fhir/workflow/activity/resource/request/CPGRequestResource.kt
+index 34a959fa2c..33cf02126a 100644
+--- a/workflow/src/main/java/com/google/android/fhir/workflow/activity/resource/request/CPGRequestResource.kt
++++ b/workflow/src/main/java/com/google/android/fhir/workflow/activity/resource/request/CPGRequestResource.kt
+@@ -19,7 +19,6 @@ package com.google.android.fhir.workflow.activity.resource.request
+ import com.google.android.fhir.logicalId
+ import com.google.android.fhir.workflow.activity.resource.request.CPGRequestResource.Companion.of
+ import com.google.android.fhir.workflow.activity.resource.request.Intent.ORDER
+-import com.google.android.fhir.workflow.activity.resource.request.Intent.OTHER
+ import com.google.android.fhir.workflow.activity.resource.request.Intent.PLAN
+ import com.google.android.fhir.workflow.activity.resource.request.Intent.PROPOSAL
+ import org.hl7.fhir.r4.model.CommunicationRequest
+@@ -28,8 +27,6 @@ import org.hl7.fhir.r4.model.MedicationRequest
+ import org.hl7.fhir.r4.model.Reference
+ import org.hl7.fhir.r4.model.Resource
+ import org.hl7.fhir.r4.model.ResourceType
+-import org.hl7.fhir.r4.model.ServiceRequest
+-import org.hl7.fhir.r4.model.Task
+ 
+ /**
+  * This abstracts the
+@@ -52,7 +49,7 @@ import org.hl7.fhir.r4.model.Task
+  * create the appropriate [CPGRequestResource].
+  */
+ sealed class CPGRequestResource<R>(
+-  internal open val resource: R,
++  open val resource: R,
+   internal val mapper: StatusCodeMapper,
+ ) where R : Resource {
+ 
+@@ -64,7 +61,7 @@ sealed class CPGRequestResource<R>(
+ 
+   internal abstract fun setIntent(intent: Intent)
+ 
+-  internal abstract fun getIntent(): Intent
++  abstract fun getIntent(): Intent
+ 
+   abstract fun setStatus(status: Status, reason: String? = null)
+ 
+@@ -125,9 +122,7 @@ sealed class CPGRequestResource<R>(
+      */
+     fun <R : Resource> of(resource: R): CPGRequestResource<R> {
+       return when (resource) {
+-        is Task -> of(resource)
+         is MedicationRequest -> of(resource)
+-        is ServiceRequest -> of(resource)
+         is CommunicationRequest -> of(resource)
+         else -> {
+           throw IllegalArgumentException("Unknown CPG Request type ${resource::class}.")
+@@ -145,7 +140,7 @@ sealed class CPGRequestResource<R>(
+  * See [codesystem-request-intent](https://www.hl7.org/FHIR/codesystem-request-intent.html) for the
+  * list of intents.
+  */
+-internal sealed class Intent(val code: String?) {
++sealed class Intent(val code: String?) {
+   data object PROPOSAL : Intent("proposal")
+ 
+   data object PLAN : Intent("plan")
+diff --git a/workflow/src/test/java/com/google/android/fhir/workflow/activity/ActivityFlowTest.kt b/workflow/src/test/java/com/google/android/fhir/workflow/activity/ActivityFlowTest.kt
+index 6356b26b78..2058ea6e34 100644
+--- a/workflow/src/test/java/com/google/android/fhir/workflow/activity/ActivityFlowTest.kt
++++ b/workflow/src/test/java/com/google/android/fhir/workflow/activity/ActivityFlowTest.kt
+@@ -642,4 +642,45 @@ class ActivityFlowTest {
+       // check that the flow is still in old phase (proposal).
+       assertThat(flow.getCurrentPhase().getPhaseName()).isEqualTo(Phase.PhaseName.PROPOSAL)
+     }
++
++  @Test
++  fun `getPreviousPhases should return a list of all previous phases`(): Unit =
++    runBlockingOnWorkerThread {
++      val cpgCommunicationRequest =
++        CPGRequestResource.of(
++            CommunicationRequest().apply {
++              id = "com-req-01"
++              status = CommunicationRequest.CommunicationRequestStatus.ACTIVE
++              subject = Reference("Patient/pat-01")
++              meta.addProfile(
++                "http://hl7.org/fhir/uv/cpg/StructureDefinition/cpg-communicationrequest",
++              )
++
++              addPayload().apply { content = StringType("Proposal") }
++            },
++          )
++          .apply { setIntent(Intent.PROPOSAL) }
++      val repository = FhirEngineRepository(FhirContext.forR4Cached(), fhirEngine)
++      repository.create(cpgCommunicationRequest.resource)
++
++      val flow = ActivityFlow.of(repository, cpgCommunicationRequest)
++
++      flow.initiatePlan(
++        flow.preparePlan().getOrThrow().apply { setStatus(Status.ACTIVE) },
++      )
++
++      flow.initiateOrder(
++        flow.prepareOrder().getOrThrow().apply { setStatus(Status.ACTIVE) },
++      )
++
++      flow.initiatePerform(
++        flow.preparePerform(CPGCommunicationEvent::class.java).getOrThrow().apply {
++          setStatus(EventStatus.INPROGRESS)
++        },
++      )
++
++      val result = flow.getPreviousPhases()
++      assertThat(result.map { it.getPhaseName() })
++        .containsExactly(Phase.PhaseName.ORDER, Phase.PhaseName.PLAN, Phase.PhaseName.PROPOSAL)
++    }
+ }
+diff --git a/workflow_demo/src/main/java/com/google/android/fhir/workflow/demo/ui/main/ActivityHandler.kt b/workflow_demo/src/main/java/com/google/android/fhir/workflow/demo/ui/main/ActivityHandler.kt
+index bdc668ad59..cbb6d96a0e 100644
+--- a/workflow_demo/src/main/java/com/google/android/fhir/workflow/demo/ui/main/ActivityHandler.kt
++++ b/workflow_demo/src/main/java/com/google/android/fhir/workflow/demo/ui/main/ActivityHandler.kt
+@@ -23,7 +23,7 @@ import com.google.android.fhir.workflow.activity.resource.request.CPGRequestReso
+ import com.google.android.fhir.workflow.activity.resource.request.Status
+ 
+ class ActivityHandler(
+-  private val activityFlow: ActivityFlow<CPGRequestResource<*>, CPGEventResource<*>>,
++  val activityFlow: ActivityFlow<CPGRequestResource<*>, CPGEventResource<*>>,
+ ) {
+ 
+   suspend fun prepareAndInitiatePlan(): Result<Boolean> {
+diff --git a/workflow_demo/src/main/java/com/google/android/fhir/workflow/demo/ui/main/MainViewModel.kt b/workflow_demo/src/main/java/com/google/android/fhir/workflow/demo/ui/main/MainViewModel.kt
+index 9116182bc4..4e076721f8 100644
+--- a/workflow_demo/src/main/java/com/google/android/fhir/workflow/demo/ui/main/MainViewModel.kt
++++ b/workflow_demo/src/main/java/com/google/android/fhir/workflow/demo/ui/main/MainViewModel.kt
+@@ -25,18 +25,18 @@ import com.google.android.fhir.FhirEngine
+ import com.google.android.fhir.FhirEngineConfiguration
+ import com.google.android.fhir.FhirEngineProvider
+ import com.google.android.fhir.knowledge.KnowledgeManager
+-import com.google.android.fhir.search.search
+ import com.google.android.fhir.workflow.FhirOperator
+ import com.google.android.fhir.workflow.activity.ActivityFlow
++import com.google.android.fhir.workflow.activity.phase.Phase
+ import com.google.android.fhir.workflow.activity.resource.event.CPGEventResource
+ import com.google.android.fhir.workflow.activity.resource.event.CPGMedicationDispenseEvent
+-import com.google.android.fhir.workflow.activity.resource.request.CPGMedicationRequest
+ import com.google.android.fhir.workflow.activity.resource.request.CPGRequestResource
+ import com.google.android.fhir.workflow.repositories.FhirEngineRepository
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.flowOn
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import org.hl7.fhir.r4.model.MedicationDispense
+@@ -89,42 +89,22 @@ class MainViewModel(private val application: Application) : AndroidViewModel(app
+ 
+   val adapterData =
+     combine(activityOptionFlow, enabledPhaseFlow) { configuration, phase ->
+-      Log.d("TAG", "phaseFlow configuration: $configuration phase: $phase")
+-      val nextPhase = loadChainAndReturnNextPhase()
+-      enabledPhaseFlow.value = nextPhase
+-
+-      // Initialize the activity flow
+-      if (activityHandler == null) {
+-        val resource =
+-          if (order != null) {
+-            order
+-          } else if (plan != null) {
+-            plan
+-          } else if (proposal != null) {
+-            proposal
+-          } else {
+-            null
+-          }
++        Log.d("MVModel", "phaseFlow configuration: ${configuration.id} phase: $phase")
++        val nextPhase = loadChainAndReturnNextPhase()
+ 
+-        resource?.let {
+-          activityHandler =
+-            perform?.let {
+-              ActivityHandler(
+-                ActivityFlow.of(repository, CPGMedicationDispenseEvent(it as MedicationDispense))
+-                  as ActivityFlow<CPGRequestResource<*>, CPGEventResource<*>>,
+-              )
+-            }
+-              ?: ActivityHandler(
+-                ActivityFlow.of(repository, CPGRequestResource.of(it) as CPGMedicationRequest)
+-                  as ActivityFlow<CPGRequestResource<*>, CPGEventResource<*>>,
+-              )
++        // Initialize the activity flow
++        if (activityHandler == null) {
++          ActivityFlow.of(repository, "active_apple_guy").firstOrNull()?.let {
++            activityHandler = ActivityHandler(it)
++          }
+         }
++        enabledPhaseFlow.value = nextPhase
++        generateData(nextPhase, ::handleOnClick)
+       }
+-      generateData(nextPhase, ::handleOnClick)
+-    }
++      .flowOn(Dispatchers.IO)
+ 
+   private fun handleOnClick(phase: FlowPhase) {
+-    Log.d("TAG", "handleOnClick: $phase")
++    Log.d("MVModel", "handleOnClick: $phase")
+     viewModelScope.launch(Dispatchers.IO) {
+       when (phase) {
+         FlowPhase.PROPOSAL -> {
+@@ -206,36 +186,41 @@ class MainViewModel(private val application: Application) : AndroidViewModel(app
+   }
+ 
+   private suspend fun loadChainAndReturnNextPhase(): FlowPhase {
+-    // TODO : Add logic to load resources as per the selected configuration.
+-    val request =
+-      fhirEngine.search<MedicationRequest> {
+-        filter(MedicationRequest.SUBJECT, { value = "Patient/active_apple_guy" })
+-      }
+-
+-    val request2 =
+-      fhirEngine.search<MedicationDispense> {
+-        filter(MedicationRequest.SUBJECT, { value = "Patient/active_apple_guy" })
+-      }
+-
+-    // take the last resource and move backwards
+-
+     proposal = null
+     plan = null
+     order = null
+     perform = null
+-    request.forEach {
+-      if (it.resource.intent == MedicationRequest.MedicationRequestIntent.PROPOSAL) {
+-        proposal = it.resource
+-      } else if (it.resource.intent == MedicationRequest.MedicationRequestIntent.PLAN) {
+-        plan = it.resource
+-      } else if (it.resource.intent == MedicationRequest.MedicationRequestIntent.ORDER) {
+-        order = it.resource
++
++    fun setPhase(curPhase: Phase.PhaseName, resource: Resource) {
++      if (curPhase == Phase.PhaseName.PERFORM) {
++        perform = resource
++      } else if (curPhase == Phase.PhaseName.ORDER) {
++        order = resource
++      } else if (curPhase == Phase.PhaseName.PLAN) {
++        plan = resource
++      } else if (curPhase == Phase.PhaseName.PROPOSAL) {
++        proposal = resource
++      }
++    }
++
++    fun setPhase(curPhase: Phase) {
++      if (curPhase is Phase.EventPhase<*>) {
++        setPhase(curPhase.getPhaseName(), curPhase.getEventResource().resource)
+       } else {
+-        // perform = it.resource
++        setPhase(
++          curPhase.getPhaseName(),
++          (curPhase as Phase.RequestPhase<*>).getRequestResource().resource,
++        )
+       }
+     }
+ 
+-    perform = request2.firstOrNull()?.resource
++    activityHandler?.let {
++      val curPhase = it.activityFlow.getCurrentPhase()
++      setPhase(curPhase)
++      it.activityFlow.getPreviousPhases().forEach {
++        setPhase(it.getPhaseName(), it.getRequestResource().resource)
++      }
++    }
+ 
+     return if (!proposalHandler.checkInstalledDependencies(activityOptionFlow.value)) {
+       FlowPhase.INITIALIZE
+@@ -287,79 +272,41 @@ class MainViewModel(private val application: Application) : AndroidViewModel(app
+     return list
+   }
+ 
+-  //  TODO: CPGRequestResource : make getIntent public and then uncomment this.
+-  //  private fun getPhaseDetails(requestResource: Resource?): String {
+-  //    return if (requestResource == null) {
+-  //      ""
+-  //    } else if (requestResource is MedicationRequest) {
+-  //      val cpgRequestResource = CPGRequestResource.of(requestResource)
+-  //
+-  //      val dosage =
+-  //        FhirContext.forR4Cached()
+-  //          .newJsonParser()
+-  //          .encodeToString(requestResource.dosageInstruction.first())
+-  //
+-  //      """
+-  //        ID     : ${cpgRequestResource.resourceType}/${cpgRequestResource.logicalId}
+-  //        Intent : ${cpgRequestResource.getIntent().code}
+-  //        Status : ${cpgRequestResource.getStatusCode()}
+-  //        BasedOn: ${cpgRequestResource.getBasedOn()?.reference}
+-  //
+-  //        Additional Info: $dosage
+-  //            """
+-  //        .trimIndent()
+-  //    } else if (requestResource is MedicationDispense) {
+-  //      val cpgRequestResource = CPGMedicationDispenseEvent(requestResource)
+-  //
+-  //      val dosage =
+-  //        FhirContext.forR4Cached()
+-  //          .newJsonParser()
+-  //          .encodeToString(requestResource.dosageInstruction.first())
+-  //
+-  //      """
+-  //        ID     : ${cpgRequestResource.resourceType}/${cpgRequestResource.logicalId}
+-  //        Status : ${cpgRequestResource.getStatusCode()}
+-  //        BasedOn: ${cpgRequestResource.getBasedOn()?.reference}
+-  //
+-  //        Additional Info: $dosage
+-  //            """
+-  //        .trimIndent()
+-  //    } else {
+-  //      ""
+-  //    }
+-  //  }
+-
+   private fun getPhaseDetails(requestResource: Resource?): String {
+     return if (requestResource == null) {
+       ""
+     } else if (requestResource is MedicationRequest) {
++      val cpgRequestResource = CPGRequestResource.of(requestResource)
++
+       val dosage =
+         FhirContext.forR4Cached()
+           .newJsonParser()
+           .encodeToString(requestResource.dosageInstruction.first())
+ 
+       """
+-        ID     : ${requestResource.resourceType}/${requestResource.logicalId}
+-        Intent : ${requestResource.intent.display}
+-        Status : ${requestResource.status.display}
+-        BasedOn: ${requestResource.getBasedOn().firstOrNull()?.reference}
+-        
+-        Additional Info: $dosage
+-            """
++          ID     : ${cpgRequestResource.resourceType}/${cpgRequestResource.logicalId}
++          Intent : ${cpgRequestResource.getIntent().code}
++          Status : ${cpgRequestResource.getStatusCode()}
++          BasedOn: ${cpgRequestResource.getBasedOn()?.reference}
++
++          Additional Info: $dosage
++              """
+         .trimIndent()
+     } else if (requestResource is MedicationDispense) {
++      val cpgRequestResource = CPGMedicationDispenseEvent(requestResource)
++
+       val dosage =
+         FhirContext.forR4Cached()
+           .newJsonParser()
+           .encodeToString(requestResource.dosageInstruction.first())
+ 
+       """
+-        ID     : ${requestResource.resourceType}/${requestResource.logicalId}
+-        Status : ${requestResource.status.display}
+-        BasedOn: ${requestResource.authorizingPrescription.firstOrNull()?.reference}
+-        
+-        Additional Info: $dosage
+-            """
++          ID     : ${cpgRequestResource.resourceType}/${cpgRequestResource.logicalId}
++          Status : ${cpgRequestResource.getStatusCode()}
++          BasedOn: ${cpgRequestResource.getBasedOn()?.reference}
++
++          Additional Info: $dosage
++              """
+         .trimIndent()
+     } else {
+       ""

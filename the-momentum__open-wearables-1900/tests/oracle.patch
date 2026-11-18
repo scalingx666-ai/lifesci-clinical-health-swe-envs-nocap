@@ -1,0 +1,696 @@
+diff --git a/backend/app/api/routes/v1/oauth.py b/backend/app/api/routes/v1/oauth.py
+index 1cdac48f6f..ab1bcec004 100644
+--- a/backend/app/api/routes/v1/oauth.py
++++ b/backend/app/api/routes/v1/oauth.py
+@@ -1,4 +1,4 @@
+-from datetime import datetime, timedelta, timezone
++from datetime import datetime, timezone
+ from typing import Annotated
+ from uuid import UUID
+ 
+@@ -108,7 +108,7 @@ def oauth_callback(
+ 
+     # Stamp last_synced_at=now so the first periodic sync uses the connection
+     # timestamp as its live-sync cursor and won't attempt to pull all history.
+-    user_connection_service.stamp_last_synced_at(db, oauth_state.user_id, provider_name.value)
++    previous_synced_at = user_connection_service.stamp_last_synced_at(db, oauth_state.user_id, provider_name.value)
+ 
+     # Grace-period flag: automatically kick off a historical sync so integrators
+     # who haven't yet adopted the explicit /sync/historical call still get backfill.
+@@ -116,13 +116,18 @@ def oauth_callback(
+     if settings.historical_sync_on_connect:
+         caps = strategy.capabilities
+         if caps.webhook_callback:
+-            start_garmin_full_backfill.delay(str(oauth_state.user_id))
++            gap_start = user_connection_service.reconnect_gap_start(
++                db, oauth_state.user_id, provider_name.value, previous_synced_at
++            )
++            start_garmin_full_backfill.delay(str(oauth_state.user_id), gap_start.isoformat() if gap_start else None)
+         elif caps.rest_pull:
+             now = datetime.now(timezone.utc)
+-            start_date = (now - timedelta(days=90)).isoformat()
++            start_date = user_connection_service.historical_start_on_connect(
++                db, oauth_state.user_id, provider_name.value, previous_synced_at, days=90
++            )
+             sync_vendor_data.delay(
+                 user_id=str(oauth_state.user_id),
+-                start_date=start_date,
++                start_date=start_date.isoformat(),
+                 end_date=now.isoformat(),
+                 providers=[provider_name.value],
+                 is_historical=True,
+diff --git a/backend/app/integrations/celery/tasks/garmin/backfill_task.py b/backend/app/integrations/celery/tasks/garmin/backfill_task.py
+index 6234e61358..ae031f254a 100644
+--- a/backend/app/integrations/celery/tasks/garmin/backfill_task.py
++++ b/backend/app/integrations/celery/tasks/garmin/backfill_task.py
+@@ -8,6 +8,7 @@
+ Redis state management lives in ``app.services.providers.garmin.backfill_state``.
+ """
+ 
++from datetime import datetime, timedelta, timezone
+ from logging import getLogger
+ from typing import Any
+ from uuid import UUID
+@@ -61,6 +62,7 @@
+     emit_sync_completed,
+     emit_sync_progress,
+     emit_sync_started,
++    last_backfill_requested_until,
+ )
+ from app.utils.structured_logging import log_structured
+ 
+@@ -110,12 +112,13 @@ def _release_shared_backfill_primary(user_id: str, *, overall_status: SyncStatus
+ 
+ 
+ @shared_task(name=CeleryTask.GARMIN_START_FULL_BACKFILL)
+-def start_full_backfill(user_id: str) -> dict[str, Any]:
++def start_full_backfill(user_id: str, since: str | None = None) -> dict[str, Any]:
+     """Initialize and start full 30-day backfill for all backfill data types.
+ 
+     This is called after OAuth connection to auto-trigger historical sync.
+     Triggers the first type and the rest will chain via webhooks.
+     If existing state is detected (resume after crash), resumes from current window.
++    On a reconnect, ``since`` (ISO) limits the backfill to the gap since the last sync.
+     """
+ 
+     try:
+@@ -157,6 +160,19 @@ def start_full_backfill(user_id: str) -> dict[str, Any]:
+             )
+             return {"status": "skipped", "reason": "HISTORICAL_DATA_EXPORT permission not granted"}
+ 
++        # Garmin rejects a range it was already asked for with a 409 and sends nothing, so a reconnect
++        # requests only the gap, starting after the last accepted backfill window (+1s for second truncation).
++        start = None
++        if since is not None:
++            start = datetime.fromisoformat(since)
++            if start.tzinfo is None:
++                start = start.replace(tzinfo=timezone.utc)
++            requested_until = last_backfill_requested_until(db, UUID(user_id), "garmin")
++            if requested_until is not None:
++                start = max(start, requested_until + timedelta(seconds=1))
++            if start >= datetime.now(timezone.utc):
++                return {"status": "skipped", "reason": "No gap since the last backfill"}
++
+     # Acquire exclusive lock
+     if not acquire_backfill_lock(user_id):
+         log_structured(
+@@ -303,7 +319,7 @@ def start_full_backfill(user_id: str) -> dict[str, Any]:
+         }
+ 
+     # Fresh start
+-    init_window_state(user_id, total_windows=BACKFILL_WINDOW_COUNT)
++    init_window_state(user_id, total_windows=BACKFILL_WINDOW_COUNT, start=start)
+ 
+     log_structured(
+         logger,
+diff --git a/backend/app/integrations/celery/tasks/garmin/backfill_trigger.py b/backend/app/integrations/celery/tasks/garmin/backfill_trigger.py
+index b023a0ac72..ffd9529bd4 100644
+--- a/backend/app/integrations/celery/tasks/garmin/backfill_trigger.py
++++ b/backend/app/integrations/celery/tasks/garmin/backfill_trigger.py
+@@ -4,7 +4,7 @@
+ and scheduling the timeout checker.
+ """
+ 
+-from datetime import timedelta
++from datetime import datetime, timedelta
+ from logging import getLogger
+ from typing import Any
+ from uuid import UUID
+@@ -45,12 +45,18 @@
+ )
+ from app.services.providers.garmin.handlers.backfill import GarminBackfillService
+ from app.services.providers.garmin.oauth import GarminOAuth
++from app.services.sync_status_service import record_requested_window
+ from app.utils.sentry_helpers import log_and_capture_error
+ from app.utils.structured_logging import log_structured
+ 
+ logger = getLogger(__name__)
+ 
+ 
++def _record_accepted_window(user_id: str, trace_id: str | None, start_time: datetime, end_time: datetime) -> None:
++    run_id = f"garmin_backfill_{user_id}_{trace_id}" if trace_id else f"garmin_backfill_{user_id}"
++    record_requested_window(run_id, start_time, end_time)
++
++
+ @shared_task(name=CeleryTask.GARMIN_TRIGGER_BACKFILL_FOR_TYPE)
+ def trigger_backfill_for_type(user_id: str, data_type: str) -> dict[str, Any]:
+     """Trigger backfill for a specific data type."""
+@@ -138,7 +144,8 @@ def trigger_backfill_for_type(user_id: str, data_type: str) -> dict[str, Any]:
+                 # Retry "min start time" errors with a shorter date range before giving up
+                 if status_code == 400 and "min start time" in error.lower():
+                     fallback_days = 14 if data_type in ACTIVITY_API_TYPES else 31
+-                    start_time_fallback = end_time - timedelta(days=fallback_days)
++                    # Never before the window start: on a reconnect that is the end of what Garmin already sent
++                    start_time_fallback = max(start_time, end_time - timedelta(days=fallback_days))
+                     log_structured(
+                         logger,
+                         "info",
+@@ -164,6 +171,7 @@ def trigger_backfill_for_type(user_id: str, data_type: str) -> dict[str, Any]:
+                         status_code = retry_result.get("failed_status_codes", {}).get(data_type)
+                     else:
+                         # Retry succeeded — skip the failure handling below
++                        _record_accepted_window(user_id, trace_id, start_time_fallback, end_time)
+                         if data_type in retry_result.get("duplicate", []):
+                             mark_type_success(user_id, data_type)
+                             celery_app.send_task(
+@@ -217,6 +225,9 @@ def trigger_backfill_for_type(user_id: str, data_type: str) -> dict[str, Any]:
+                 celery_app.send_task(CeleryTask.GARMIN_TRIGGER_NEXT_PENDING_TYPE, args=[user_id], countdown=delay)
+                 return {"status": "failed", "error": error}
+ 
++            # A 409 duplicate also means Garmin holds this range as requested.
++            _record_accepted_window(user_id, trace_id, start_time, end_time)
++
+             if data_type in result.get("duplicate", []):
+                 log_structured(
+                     logger,
+diff --git a/backend/app/repositories/data_type_coverage_repository.py b/backend/app/repositories/data_type_coverage_repository.py
+index e65bec3ad1..105b565d2f 100644
+--- a/backend/app/repositories/data_type_coverage_repository.py
++++ b/backend/app/repositories/data_type_coverage_repository.py
+@@ -314,6 +314,12 @@ def list_for_user(
+             stmt = stmt.where(DataTypeCoverage.data_type.in_(list(data_types)))
+         return list(db_session.execute(stmt).scalars().all())
+ 
++    def exists_for_provider(self, db_session: DbSession, user_id: UUID, provider: str) -> bool:
++        stmt = select(DataTypeCoverage.user_id).where(
++            DataTypeCoverage.user_id == user_id, DataTypeCoverage.provider == provider
++        )
++        return db_session.execute(stmt.limit(1)).first() is not None
++
+     def get(
+         self, db_session: DbSession, user_id: UUID, provider: str, data_type: str, kind: DataTypeKind
+     ) -> DataTypeCoverage | None:
+diff --git a/backend/app/repositories/sync_run_repository.py b/backend/app/repositories/sync_run_repository.py
+index b783530261..82fa023c6e 100644
+--- a/backend/app/repositories/sync_run_repository.py
++++ b/backend/app/repositories/sync_run_repository.py
+@@ -7,7 +7,7 @@
+ 
+ from app.database import DbSession
+ from app.models import SyncRun, SyncRunDataType
+-from app.schemas.sync_status import DataTypeOutcome, SyncRunWrite, SyncScope, SyncStatus
++from app.schemas.sync_status import DataTypeOutcome, SyncRunWrite, SyncScope, SyncSource, SyncStatus
+ 
+ 
+ def _overlaps(
+@@ -182,6 +182,23 @@ def get_with_data_types(self, db_session: DbSession, run_key: str) -> SyncRun |
+         stmt = select(SyncRun).where(SyncRun.run_key == run_key).options(selectinload(SyncRun.data_types))
+         return db_session.execute(stmt).scalar_one_or_none()
+ 
++    def record_window(self, db_session: DbSession, run_key: str, window_start: datetime, window_end: datetime) -> None:
++        stmt = (
++            update(SyncRun)
++            .where(SyncRun.run_key == run_key, SyncRun.window_end.is_(None))
++            .values(window_start=window_start, window_end=window_end)
++        )
++        db_session.execute(stmt)
++        db_session.commit()
++
++    def last_window_end(
++        self, db_session: DbSession, user_id: UUID, provider: str, source: SyncSource
++    ) -> datetime | None:
++        stmt = select(func.max(SyncRun.window_end)).where(
++            SyncRun.user_id == user_id, SyncRun.provider == provider, SyncRun.source == source
++        )
++        return db_session.execute(stmt).scalar()
++
+     def list_for_user(
+         self,
+         db_session: DbSession,
+diff --git a/backend/app/services/providers/garmin/backfill_state/window_state.py b/backend/app/services/providers/garmin/backfill_state/window_state.py
+index 379d106071..aa86dded48 100644
+--- a/backend/app/services/providers/garmin/backfill_state/window_state.py
++++ b/backend/app/services/providers/garmin/backfill_state/window_state.py
+@@ -19,14 +19,25 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def init_window_state(user_id: str | UUID, total_windows: int = BACKFILL_WINDOW_COUNT) -> None:
+-    """Initialise multi-window backfill state in Redis."""
++def init_window_state(
++    user_id: str | UUID, total_windows: int = BACKFILL_WINDOW_COUNT, start: datetime | None = None
++) -> None:
++    """Initialise multi-window backfill state in Redis. ``start`` floors every window's start."""
+     uid = str(user_id)
+     anchor = datetime.now(timezone.utc).isoformat()
+     get_redis_client().setex(_get_key(uid, "window", "current"), REDIS_TTL, "0")
+     get_redis_client().setex(_get_key(uid, "window", "total"), REDIS_TTL, str(total_windows))
+     get_redis_client().setex(_get_key(uid, "window", "anchor_ts"), REDIS_TTL, anchor)
+     get_redis_client().setex(_get_key(uid, "window", "completed_count"), REDIS_TTL, "0")
++    if start is None:
++        get_redis_client().delete(_get_key(uid, "window", "start_ts"))
++    else:
++        get_redis_client().setex(_get_key(uid, "window", "start_ts"), REDIS_TTL, start.isoformat())
++
++
++def _floored(user_id: str | UUID, start_time: datetime) -> datetime:
++    val = get_redis_client().get(_get_key(str(user_id), "window", "start_ts"))
++    return max(start_time, datetime.fromisoformat(val)) if val else start_time  # ty:ignore[invalid-argument-type]
+ 
+ 
+ def get_current_window(user_id: str | UUID) -> int:
+@@ -60,7 +71,7 @@ def get_window_date_range(user_id: str | UUID) -> tuple[datetime, datetime]:
+     chunk = BACKFILL_CHUNK_DAYS
+     end_time = anchor - timedelta(days=window * chunk)
+     start_time = anchor - timedelta(days=(window + 1) * chunk)
+-    return start_time, end_time
++    return _floored(user_id, start_time), end_time
+ 
+ 
+ def get_window_date_range_for_index(user_id: str | UUID, window_idx: int) -> tuple[datetime, datetime]:
+@@ -69,7 +80,7 @@ def get_window_date_range_for_index(user_id: str | UUID, window_idx: int) -> tup
+     chunk = BACKFILL_CHUNK_DAYS
+     end_time = anchor - timedelta(days=window_idx * chunk)
+     start_time = anchor - timedelta(days=(window_idx + 1) * chunk)
+-    return start_time, end_time
++    return _floored(user_id, start_time), end_time
+ 
+ 
+ def get_completed_window_count(user_id: str | UUID) -> int:
+diff --git a/backend/app/services/sync_status_service.py b/backend/app/services/sync_status_service.py
+index 44686c0820..aedb9c7fa9 100644
+--- a/backend/app/services/sync_status_service.py
++++ b/backend/app/services/sync_status_service.py
+@@ -345,6 +345,29 @@ def list_stored_runs(
+     return [SyncRunRecord.model_validate(run) for run in runs]
+ 
+ 
++def record_requested_window(run_key: str, window_start: datetime, window_end: datetime) -> None:
++    """Store the window a provider accepted a backfill request for, best effort like try_persist_run."""
++    if not settings.sync_run_tracking_enabled:
++        return
++    try:
++        with SessionLocal() as db:
++            sync_run_repository.record_window(db, run_key, window_start, window_end)
++    except Exception as exc:
++        log_structured(
++            logger,
++            "warning",
++            "Failed to record requested window",
++            action="sync_run_window_failed",
++            run_id=run_key,
++            error=str(exc),
++        )
++
++
++def last_backfill_requested_until(db: DbSession, user_id: UUID, provider: str) -> datetime | None:
++    """End of the latest window the provider accepted a backfill request for."""
++    return sync_run_repository.last_window_end(db, user_id, provider, SyncSource.BACKFILL)
++
++
+ def get_stored_run(db: DbSession, run_key: str) -> SyncRunDetail | None:
+     """One stored run with its per-data-type breakdown, or None when unknown."""
+     run = sync_run_repository.get_with_data_types(db, run_key)
+diff --git a/backend/app/services/user_connection_service.py b/backend/app/services/user_connection_service.py
+index 28134a1f77..2854057368 100644
+--- a/backend/app/services/user_connection_service.py
++++ b/backend/app/services/user_connection_service.py
+@@ -1,10 +1,12 @@
+-from datetime import datetime
++from datetime import datetime, timedelta, timezone
+ from logging import Logger, getLogger
+ from uuid import UUID
+ 
++from app.config import settings
+ from app.database import DbSession
+ from app.models import UserConnection
+ from app.repositories.data_source_repository import DataSourceRepository
++from app.repositories.data_type_coverage_repository import data_type_coverage_repository
+ from app.repositories.user_connection_repository import UserConnectionRepository
+ from app.schemas.enums import ProviderName, SdkConnectionOutcome
+ from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
+@@ -163,16 +165,42 @@ def purge_provider_data(
+         return deleted
+ 
+     @handle_exceptions
+-    def stamp_last_synced_at(self, db_session: DbSession, user_id: UUID, provider: str) -> None:
++    def stamp_last_synced_at(self, db_session: DbSession, user_id: UUID, provider: str) -> datetime | None:
+         """Stamp last_synced_at=now on the user's connection for the given provider.
+ 
+         Used after OAuth completion so the first periodic sync uses the connection
+         timestamp as its live-sync cursor and won't attempt to pull all historical data.
+-        No-op if the connection does not exist.
++        No-op if the connection does not exist. Returns the value it replaced.
+         """
+         connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
+-        if connection:
+-            self.crud.update_last_synced_at(db_session, connection)
++        if not connection:
++            return None
++        previous = connection.last_synced_at
++        self.crud.update_last_synced_at(db_session, connection)
++        return previous
++
++    def reconnect_gap_start(
++        self, db_session: DbSession, user_id: UUID, provider: str, last_synced_at: datetime | None
++    ) -> datetime | None:
++        """Where the gap a reconnect has to backfill starts, or None when the full window is needed.
++
++        Without held data (first connect, purged, or the first backfill never wrote) it is the full window.
++        """
++        if last_synced_at is None or not data_type_coverage_repository.exists_for_provider(
++            db_session, user_id, provider
++        ):
++            return None
++        return last_synced_at
++
++    def historical_start_on_connect(
++        self, db_session: DbSession, user_id: UUID, provider: str, last_synced_at: datetime | None, days: int
++    ) -> datetime:
++        """Start of the on-connect pull: the gap since the last sync on a reconnect, else `days` back."""
++        full_window = datetime.now(timezone.utc) - timedelta(days=days)
++        gap_start = self.reconnect_gap_start(db_session, user_id, provider, last_synced_at)
++        if gap_start is None:
++            return full_window
++        return max(gap_start - (settings.pull_sync_lookback or timedelta()), full_window)
+ 
+     def deregister_from_provider(
+         self, db_session: DbSession, user_id: UUID, provider: str, oauth: BaseOAuthTemplate
+diff --git a/backend/tests/providers/garmin/test_garmin_backfill.py b/backend/tests/providers/garmin/test_garmin_backfill.py
+index b587b802d8..0fcedaeb6d 100644
+--- a/backend/tests/providers/garmin/test_garmin_backfill.py
++++ b/backend/tests/providers/garmin/test_garmin_backfill.py
+@@ -2,9 +2,11 @@
+ 
+ from datetime import datetime, timedelta, timezone
+ from unittest.mock import MagicMock, patch
++from uuid import uuid4
+ 
+ from fastapi import HTTPException
+ 
++from app.integrations.celery.tasks.garmin.backfill_task import start_full_backfill
+ from app.integrations.celery.tasks.garmin.backfill_trigger import trigger_backfill_for_type
+ from app.services.providers.garmin.backfill_config import (
+     ALL_DATA_TYPES,
+@@ -18,6 +20,11 @@
+     REQUEST_DELAY_SECONDS,
+     SUMMARY_DAYS,
+ )
++from app.services.providers.garmin.backfill_state import (
++    get_window_date_range,
++    get_window_date_range_for_index,
++    init_window_state,
++)
+ from app.services.providers.garmin.handlers.backfill import GarminBackfillService
+ 
+ 
+@@ -303,8 +310,9 @@ class TestBackfillTaskStopChain:
+     def _run_task(
+         self,
+         *,
+-        side_effect: Exception | None = None,
++        side_effect: Exception | list[dict] | None = None,
+         return_value: dict | None = None,
++        window: tuple[datetime, datetime] | None = None,
+     ) -> dict:
+         """Run trigger_backfill_for_type with a mocked backfill service.
+ 
+@@ -330,10 +338,7 @@ def _run_task(
+             patch(f"{self.TASK_MODULE}.get_current_window", return_value=0),
+             patch(
+                 f"{self.TASK_MODULE}.get_window_date_range",
+-                return_value=(
+-                    datetime.now(timezone.utc) - timedelta(days=30),
+-                    datetime.now(timezone.utc),
+-                ),
++                return_value=window or (datetime.now(timezone.utc) - timedelta(days=30), datetime.now(timezone.utc)),
+             ),
+             patch(f"{self.TASK_MODULE}.get_trace_id", return_value="test-trace"),
+             patch(f"{self.TASK_MODULE}.set_type_trace_id", return_value="test-type-trace"),
+@@ -347,6 +352,8 @@ def _run_task(
+             patch(f"{self.TASK_MODULE}.celery_app") as mock_celery,
+             patch(f"{self.TASK_MODULE}.get_redis_client", return_value=mock_redis),
+             patch(f"{self.TASK_MODULE}.UserConnectionRepository") as mock_conn_repo_cls,
++            patch(f"{self.TASK_MODULE}.record_requested_window") as mock_record_window,
++            patch(f"{self.TASK_MODULE}.check_triggered_timeout"),
+         ):
+             # Setup DB session context manager
+             mock_db = MagicMock()
+@@ -360,13 +367,15 @@ def _run_task(
+                 GarminBackfillService,
+                 "trigger_backfill",
+                 **backfill_patch_kwargs,
+-            ):
++            ) as mock_trigger:
+                 result = trigger_backfill_for_type(self.USER_ID, "sleeps")
+ 
+             return {
+                 "result": result,
++                "mock_trigger": mock_trigger,
+                 "mock_mark_failed": shared_mark_failed,
+                 "mock_send_task": mock_celery.send_task,
++                "mock_record_window": mock_record_window,
+             }
+ 
+     def _run_task_with_status(self, status_code: int, detail: str) -> dict:
+@@ -375,6 +384,21 @@ def _run_task_with_status(self, status_code: int, detail: str) -> dict:
+             side_effect=HTTPException(status_code=status_code, detail=detail),
+         )
+ 
++    def test_accepted_request_records_the_window(self) -> None:
++        ctx = self._run_task(return_value={"triggered": ["sleeps"], "duplicate": [], "failed": {}})
++
++        assert ctx["result"]["status"] == "triggered"
++        run_id = ctx["mock_record_window"].call_args.args[0]
++        assert run_id == f"garmin_backfill_{self.USER_ID}_test-trace"
++
++    def test_rejected_request_records_no_window(self) -> None:
++        ctx = self._run_task(
++            return_value={"triggered": [], "duplicate": [], "failed": {"sleeps": "boom"}, "failed_status_codes": {}}
++        )
++
++        assert ctx["result"]["status"] == "failed"
++        ctx["mock_record_window"].assert_not_called()
++
+     def test_412_stops_chain_and_fails_pending_types(self) -> None:
+         """412 should stop the chain and mark all pending types as failed."""
+         ctx = self._run_task_with_status(412, "Access denied for consumer required HISTORICAL_DATA_EXPORT")
+@@ -461,6 +485,22 @@ def test_400_min_start_time_stops_chain_via_result(self) -> None:
+ 
+         ctx["mock_send_task"].assert_not_called()
+ 
++    def test_shorter_range_retry_stays_inside_a_reconnect_gap(self) -> None:
++        """Before the gap Garmin already sent the data; asking again only earns a 409."""
++        now = datetime.now(timezone.utc)
++        gap_start = now - timedelta(days=3)
++        min_start_error = {
++            "triggered": [],
++            "failed": {"sleeps": "before min start time"},
++            "duplicate": [],
++            "failed_status_codes": {"sleeps": 400},
++        }
++        accepted = {"triggered": ["sleeps"], "failed": {}, "duplicate": []}
++
++        ctx = self._run_task(side_effect=[min_start_error, accepted], window=(gap_start, now))
++
++        assert ctx["mock_trigger"].call_args_list[1].kwargs["start_time"] == gap_start
++
+     def test_500_does_not_stop_chain(self) -> None:
+         """500 should NOT stop the chain — next type should still be triggered."""
+         ctx = self._run_task_with_status(500, "internal server error")
+@@ -474,3 +514,75 @@ def test_500_does_not_stop_chain(self) -> None:
+ 
+         # Should trigger next type
+         ctx["mock_send_task"].assert_called_once()
++
++
++class TestReconnectGapBackfill:
++    """A reconnect requests only the gap, never a range Garmin was already asked for."""
++
++    TASK_MODULE = "app.integrations.celery.tasks.garmin.backfill_task"
++
++    def test_start_floors_the_window(self) -> None:
++        user_id = str(uuid4())
++        start = datetime.now(timezone.utc) - timedelta(days=3)
++
++        init_window_state(user_id, start=start)
++
++        assert get_window_date_range(user_id)[0] == start
++        assert get_window_date_range_for_index(user_id, 0)[0] == start
++
++    def test_full_backfill_clears_a_previous_floor(self) -> None:
++        user_id = str(uuid4())
++        init_window_state(user_id, start=datetime.now(timezone.utc) - timedelta(days=3))
++
++        init_window_state(user_id)
++
++        start, end = get_window_date_range(user_id)
++        assert end - start == timedelta(days=BACKFILL_CHUNK_DAYS)
++
++    def _start(self, since: datetime, requested_at: datetime | None) -> tuple[dict, MagicMock]:
++        connection = MagicMock(scope=None, provider_user_id=None)
++        with (
++            patch(f"{self.TASK_MODULE}.SessionLocal"),
++            patch(f"{self.TASK_MODULE}.UserConnectionRepository") as repo_cls,
++            patch(f"{self.TASK_MODULE}.last_backfill_requested_until", return_value=requested_at),
++            patch(f"{self.TASK_MODULE}.acquire_backfill_lock", return_value=True),
++            patch(f"{self.TASK_MODULE}.get_current_window", return_value=0),
++            patch(f"{self.TASK_MODULE}.init_window_state") as init,
++            patch(f"{self.TASK_MODULE}.emit_sync_started"),
++            patch(f"{self.TASK_MODULE}.trigger_backfill_for_type"),
++        ):
++            repo_cls.return_value.get_by_user_and_provider.return_value = connection
++            result = start_full_backfill(str(uuid4()), since.isoformat())
++        return result, init
++
++    def test_gap_starts_after_the_last_requested_backfill(self) -> None:
++        now = datetime.now(timezone.utc)
++        requested_at = now - timedelta(days=2)
++
++        result, init = self._start(since=now - timedelta(days=5), requested_at=requested_at)
++
++        assert result["status"] == "started"
++        assert init.call_args.kwargs["start"] == requested_at + timedelta(seconds=1)
++
++    def test_gap_starts_at_last_sync_when_later(self) -> None:
++        now = datetime.now(timezone.utc)
++        since = now - timedelta(days=1)
++
++        _, init = self._start(since=since, requested_at=now - timedelta(days=2))
++
++        assert init.call_args.kwargs["start"] == since
++
++    def test_naive_since_is_read_as_utc(self) -> None:
++        since = datetime.now(timezone.utc) - timedelta(days=1)
++
++        _, init = self._start(since=since.replace(tzinfo=None), requested_at=since - timedelta(days=1))
++
++        assert init.call_args.kwargs["start"] == since
++
++    def test_nothing_left_to_request_skips(self) -> None:
++        now = datetime.now(timezone.utc)
++
++        result, init = self._start(since=now - timedelta(days=5), requested_at=now + timedelta(minutes=1))
++
++        assert result["status"] == "skipped"
++        init.assert_not_called()
+diff --git a/backend/tests/services/test_sync_run_persistence.py b/backend/tests/services/test_sync_run_persistence.py
+index c0f4518a8f..766e129b80 100644
+--- a/backend/tests/services/test_sync_run_persistence.py
++++ b/backend/tests/services/test_sync_run_persistence.py
+@@ -27,7 +27,13 @@
+     SyncStatus,
+     SyncStatusEvent,
+ )
+-from app.services.sync_status_service import list_stored_runs, try_persist_run, try_record_data_types
++from app.services.sync_status_service import (
++    last_backfill_requested_until,
++    list_stored_runs,
++    record_requested_window,
++    try_persist_run,
++    try_record_data_types,
++)
+ from tests.factories import UserFactory
+ 
+ 
+@@ -393,6 +399,28 @@ def test_provider_filter(self, mock_session_local: MagicMock, db: Session) -> No
+ 
+         assert [r.run_key for r in runs] == ["pull_garmin"]
+ 
++    @patch("app.services.sync_status_service.SessionLocal")
++    def test_backfill_requested_until_counts_only_accepted_windows(
++        self, mock_session_local: MagicMock, db: Session
++    ) -> None:
++        """A run that opened but never had a request accepted must not hide its range."""
++        mock_session_local.return_value.__enter__.return_value = db
++        user = UserFactory()
++        now = datetime.now(timezone.utc)
++        backfill = {"provider": "garmin", "source": SyncSource.BACKFILL}
++        for run_id, extra in [
++            ("accepted", backfill),
++            ("rejected", backfill),
++            ("pull", {"provider": "garmin"}),
++            ("oura", {"provider": "oura", "source": SyncSource.BACKFILL}),
++        ]:
++            try_persist_run(_event(user.id, run_id=run_id, **extra))
++        record_requested_window("accepted", now - timedelta(days=9), now - timedelta(days=2))
++        record_requested_window("pull", now - timedelta(days=1), now)
++        record_requested_window("oura", now - timedelta(days=1), now)
++
++        assert last_backfill_requested_until(db, user.id, "garmin") == now - timedelta(days=2)
++
+     @patch("app.services.sync_status_service.SessionLocal")
+     def test_covered_range_matches_the_window_not_the_run_time(
+         self, mock_session_local: MagicMock, db: Session
+diff --git a/backend/tests/services/test_user_connection_service.py b/backend/tests/services/test_user_connection_service.py
+index 08cda017a2..dde3379398 100644
+--- a/backend/tests/services/test_user_connection_service.py
++++ b/backend/tests/services/test_user_connection_service.py
+@@ -10,12 +10,15 @@
+ 
+ from datetime import datetime, timedelta, timezone
+ from unittest.mock import MagicMock, patch
+-from uuid import uuid4
++from uuid import UUID, uuid4
+ 
+ from sqlalchemy.orm import Session
+ 
++from app.repositories.data_type_coverage_repository import data_type_coverage_repository
+ from app.schemas.auth import ConnectionStatus
++from app.schemas.data_type_coverage import CoverageSpan
+ from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
++from app.schemas.sync_status import DataTypeKind
+ from app.services.user_connection_service import user_connection_service
+ from tests.factories import UserConnectionFactory, UserFactory
+ 
+@@ -552,3 +555,60 @@ def test_expired_token_without_refresh_token_is_left_for_the_disconnect_to_revok
+         oauth.deregister_user.assert_not_called()
+         db.refresh(connection)
+         assert connection.status == ConnectionStatus.ACTIVE
++
++
++class TestHistoricalStartOnConnect:
++    """On reconnect only the gap since the last sync is backfilled."""
++
++    def _hold_data(self, user_id: UUID, provider: str, db: Session) -> None:
++        now = datetime.now(timezone.utc)
++        data_type_coverage_repository.record(
++            db, [CoverageSpan(user_id, provider, "heart_rate", DataTypeKind.SERIES, now - timedelta(days=60), now)]
++        )
++
++    def test_stamp_returns_replaced_value(self, db: Session) -> None:
++        last = datetime.now(timezone.utc) - timedelta(days=5)
++        connection = UserConnectionFactory(provider="oura", last_synced_at=last)
++
++        previous = user_connection_service.stamp_last_synced_at(db, connection.user_id, "oura")
++
++        assert previous == last
++        assert connection.last_synced_at > last
++
++    def test_reconnect_with_held_data_starts_at_last_sync(self, db: Session) -> None:
++        user = UserFactory()
++        self._hold_data(user.id, "oura", db)
++        last = datetime.now(timezone.utc) - timedelta(days=5)
++
++        with patch("app.services.user_connection_service.settings.pull_sync_lookback", timedelta(days=1)):
++            start = user_connection_service.historical_start_on_connect(db, user.id, "oura", last, days=90)
++
++        assert start == last - timedelta(days=1)
++
++    def test_gap_longer_than_window_is_clamped(self, db: Session) -> None:
++        user = UserFactory()
++        self._hold_data(user.id, "oura", db)
++        last = datetime.now(timezone.utc) - timedelta(days=200)
++
++        before = datetime.now(timezone.utc)
++        start = user_connection_service.historical_start_on_connect(db, user.id, "oura", last, days=90)
++
++        assert before - timedelta(days=90) <= start <= datetime.now(timezone.utc) - timedelta(days=90)
++
++    def test_no_held_data_uses_full_window(self, db: Session) -> None:
++        user = UserFactory()
++        self._hold_data(user.id, "whoop", db)
++        last = datetime.now(timezone.utc) - timedelta(days=5)
++
++        before = datetime.now(timezone.utc)
++        start = user_connection_service.historical_start_on_connect(db, user.id, "oura", last, days=90)
++
++        assert before - timedelta(days=90) <= start <= datetime.now(timezone.utc) - timedelta(days=90)
++
++    def test_first_connect_uses_full_window(self, db: Session) -> None:
++        user = UserFactory()
++
++        before = datetime.now(timezone.utc)
++        start = user_connection_service.historical_start_on_connect(db, user.id, "oura", None, days=90)
++
++        assert before - timedelta(days=90) <= start <= datetime.now(timezone.utc) - timedelta(days=90)

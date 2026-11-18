@@ -1,0 +1,168 @@
+diff --git a/engine/src/androidTest/java/com/google/android/fhir/db/impl/DatabaseImplTest.kt b/engine/src/androidTest/java/com/google/android/fhir/db/impl/DatabaseImplTest.kt
+index da3caad8af..ee0aede8c9 100644
+--- a/engine/src/androidTest/java/com/google/android/fhir/db/impl/DatabaseImplTest.kt
++++ b/engine/src/androidTest/java/com/google/android/fhir/db/impl/DatabaseImplTest.kt
+@@ -29,6 +29,7 @@ import com.google.android.fhir.SearchParamName
+ import com.google.android.fhir.SearchResult
+ import com.google.android.fhir.db.Database
+ import com.google.android.fhir.db.ResourceNotFoundException
++import com.google.android.fhir.db.impl.dao.LocalChangeDao
+ import com.google.android.fhir.logicalId
+ import com.google.android.fhir.search.LOCAL_LAST_UPDATED_PARAM
+ import com.google.android.fhir.search.Operation
+@@ -86,6 +87,7 @@ import org.hl7.fhir.r4.model.ResourceType
+ import org.hl7.fhir.r4.model.RiskAssessment
+ import org.hl7.fhir.r4.model.SearchParameter
+ import org.hl7.fhir.r4.model.StringType
++import org.hl7.fhir.r4.model.Task
+ import org.json.JSONArray
+ import org.json.JSONObject
+ import org.junit.After
+@@ -5003,6 +5005,32 @@ class DatabaseImplTest {
+         .inOrder()
+     }
+ 
++  // https://github.com/google/android-fhir/issues/2559
++  @Test
++  fun getLocalChangeResourceReferences_shouldSafelyReturnReferencesAboveSQLiteInOpLimit() =
++    runBlocking {
++      val patientsCount = LocalChangeDao.SQLITE_LIMIT_MAX_VARIABLE_NUMBER * 7
++      val locallyCreatedPatients =
++        (1..patientsCount).map {
++          Patient().apply {
++            id = "local-patient-id$it"
++            name = listOf(HumanName().setFamily("Family").setGiven(listOf(StringType("$it"))))
++          }
++        }
++      database.insert(*locallyCreatedPatients.toTypedArray())
++      val locallyCreatedPatientTasks =
++        locallyCreatedPatients.mapIndexed { index, patient ->
++          Task().apply {
++            `for` = Reference("Patient/${patient.logicalId}")
++            id = "local-observation-$index"
++          }
++        }
++      database.insert(*locallyCreatedPatientTasks.toTypedArray())
++      val localChangeIds = database.getAllLocalChanges().flatMap { it.token.ids }
++      val localChangeResourceReferences = database.getLocalChangeResourceReferences(localChangeIds)
++      assertThat(localChangeResourceReferences.size).isEqualTo(locallyCreatedPatients.size)
++    }
++
+   private companion object {
+     const val mockEpochTimeStamp = 1628516301000
+     const val TEST_PATIENT_1_ID = "test_patient_1"
+diff --git a/engine/src/androidTest/java/com/google/android/fhir/db/impl/dao/LocalChangeDaoTest.kt b/engine/src/androidTest/java/com/google/android/fhir/db/impl/dao/LocalChangeDaoTest.kt
+index cba9a5f211..d99c71d21d 100644
+--- a/engine/src/androidTest/java/com/google/android/fhir/db/impl/dao/LocalChangeDaoTest.kt
++++ b/engine/src/androidTest/java/com/google/android/fhir/db/impl/dao/LocalChangeDaoTest.kt
+@@ -38,6 +38,7 @@ import org.hl7.fhir.r4.model.Enumerations
+ import org.hl7.fhir.r4.model.Observation
+ import org.hl7.fhir.r4.model.Patient
+ import org.hl7.fhir.r4.model.Reference
++import org.hl7.fhir.r4.model.Task
+ import org.junit.After
+ import org.junit.Before
+ import org.junit.Test
+@@ -358,6 +359,39 @@ class LocalChangeDaoTest {
+       .isEqualTo(practitionerReference)
+   }
+ 
++  // https://github.com/google/android-fhir/issues/2559
++  @Test
++  fun updateResourceIdAndReferences_shouldSafelyUpdateLocalChangesReferencesAboveSQLiteInOpLimit() =
++    runBlocking {
++      val localPatientId = "local-patient-id"
++      val patientResourceUuid = UUID.randomUUID()
++      val localPatient = Patient().apply { id = localPatientId }
++      val patientCreationTime = Instant.now()
++      localChangeDao.addInsert(localPatient, patientResourceUuid, patientCreationTime)
++
++      val countAboveLimit = LocalChangeDao.SQLITE_LIMIT_MAX_VARIABLE_NUMBER * 10
++      (1..countAboveLimit).forEach {
++        val taskResourceUuid = UUID.randomUUID()
++        val task =
++          Task().apply {
++            id = "local-task-$it"
++            `for` = Reference("Patient/$localPatientId")
++          }
++        val taskCreationTime = Instant.now()
++        localChangeDao.addInsert(task, taskResourceUuid, taskCreationTime)
++      }
++
++      val updatedPatientId = "synced-patient-id"
++      val updatedLocalPatient = localPatient.copy().apply { id = updatedPatientId }
++      val updatedReferences =
++        localChangeDao.updateResourceIdAndReferences(
++          patientResourceUuid,
++          oldResource = localPatient,
++          updatedResource = updatedLocalPatient,
++        )
++      assertThat(updatedReferences.size).isEqualTo(countAboveLimit)
++    }
++
+   @Test
+   fun getReferencesForLocalChanges_should_return_all_changes(): Unit = runBlocking {
+     listOf(
+diff --git a/engine/src/main/java/com/google/android/fhir/db/impl/DatabaseImpl.kt b/engine/src/main/java/com/google/android/fhir/db/impl/DatabaseImpl.kt
+index 0e652d9f4c..7bf364f4e9 100644
+--- a/engine/src/main/java/com/google/android/fhir/db/impl/DatabaseImpl.kt
++++ b/engine/src/main/java/com/google/android/fhir/db/impl/DatabaseImpl.kt
+@@ -31,6 +31,7 @@ import com.google.android.fhir.db.ResourceNotFoundException
+ import com.google.android.fhir.db.ResourceWithUUID
+ import com.google.android.fhir.db.impl.DatabaseImpl.Companion.UNENCRYPTED_DATABASE_NAME
+ import com.google.android.fhir.db.impl.dao.ForwardIncludeSearchResult
++import com.google.android.fhir.db.impl.dao.LocalChangeDao.Companion.SQLITE_LIMIT_MAX_VARIABLE_NUMBER
+ import com.google.android.fhir.db.impl.dao.ReverseIncludeSearchResult
+ import com.google.android.fhir.db.impl.entities.ResourceEntity
+ import com.google.android.fhir.index.ResourceIndexer
+@@ -407,12 +408,14 @@ internal class DatabaseImpl(
+   override suspend fun getLocalChangeResourceReferences(
+     localChangeIds: List<Long>,
+   ): List<LocalChangeResourceReference> {
+-    return localChangeDao.getReferencesForLocalChanges(localChangeIds).map {
+-      LocalChangeResourceReference(
+-        it.localChangeId,
+-        it.resourceReferenceValue,
+-        it.resourceReferencePath,
+-      )
++    return localChangeIds.chunked(SQLITE_LIMIT_MAX_VARIABLE_NUMBER).flatMap { chunk ->
++      localChangeDao.getReferencesForLocalChanges(chunk).map {
++        LocalChangeResourceReference(
++          it.localChangeId,
++          it.resourceReferenceValue,
++          it.resourceReferencePath,
++        )
++      }
+     }
+   }
+ 
+diff --git a/engine/src/main/java/com/google/android/fhir/db/impl/dao/LocalChangeDao.kt b/engine/src/main/java/com/google/android/fhir/db/impl/dao/LocalChangeDao.kt
+index 13f0b9d560..a078f80b65 100644
+--- a/engine/src/main/java/com/google/android/fhir/db/impl/dao/LocalChangeDao.kt
++++ b/engine/src/main/java/com/google/android/fhir/db/impl/dao/LocalChangeDao.kt
+@@ -412,7 +412,10 @@ internal abstract class LocalChangeDao {
+     val updatedReferenceValue = "${updatedResource.resourceType.name}/${updatedResource.logicalId}"
+     val referringLocalChangeIds =
+       getLocalChangeReferencesWithValue(oldReferenceValue).map { it.localChangeId }.distinct()
+-    val referringLocalChanges = getLocalChanges(referringLocalChangeIds)
++    val referringLocalChanges =
++      referringLocalChangeIds.chunked(SQLITE_LIMIT_MAX_VARIABLE_NUMBER).flatMap {
++        getLocalChanges(it)
++      }
+ 
+     referringLocalChanges.forEach { existingLocalChangeEntity ->
+       val updatedLocalChangeEntity =
+@@ -498,6 +501,13 @@ internal abstract class LocalChangeDao {
+ 
+   companion object {
+     const val DEFAULT_ID_VALUE = 0L
++
++    /**
++     * Represents SQLite limit on the size of parameters that can be passed in an IN(..) query See
++     * https://issuetracker.google.com/issues/192284727 See https://www.sqlite.org/limits.html See
++     * https://github.com/google/android-fhir/issues/2559
++     */
++    const val SQLITE_LIMIT_MAX_VARIABLE_NUMBER = 999
+   }
+ }
+ 

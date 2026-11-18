@@ -1,0 +1,554 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5db15bfa..bd23a567 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,23 @@
+ 
+ ### Fixed
+ 
++- **A counting question can be asked of `view="stats"`, and its count is
++  right.** "How many days last week did I get under an hour of deep sleep"
++  is a band plus a count, and the tool returned the whole series; a local 2B
++  answered `30.75`, a duration. `query_health_indicators` takes `value_min` /
++  `value_max`, and stats rows now carry `days` (distinct local days) and,
++  when a band is given, `count_in_range` (readings in it) and
++  `days_in_range` (days with at least one). The band is compared on the
++  basis the row's min/max/avg use, so it is in the unit the row reports, and
++  a series whose readings share no unit gets no count. A series stored in
++  pieces (steps as increments, sleep as segments) gets no count either: a
++  piece is not a day's value, and three 4,000-step readings counted no day
++  above 10,000. A bound that is not a finite number, or a `value_min` above
++  `value_max`, is refused; a band on a view that does not count is said, not
++  silently dropped. `HealthQuery.stats` takes the band as optional keyword
++  arguments, passed only when given. How to tell:
++  `pytest mirobody/tests/test_value_range_filter.py`.
++
+ - **An empty window says it is empty, not that the record lacks the
+   indicator.** When a named window held none of the readings a selection
+   matched, `query_health_indicators` fell back to the catalogue under "no
+diff --git a/mirobody/agent/tools/_render.py b/mirobody/agent/tools/_render.py
+index 1ea63ad1..ff94bbbc 100644
+--- a/mirobody/agent/tools/_render.py
++++ b/mirobody/agent/tools/_render.py
+@@ -47,8 +47,9 @@
+     "trend": ("indicator", "n", "first_date", "last_date", "first_third_mean", "last_third_mean",
+               "delta", "delta_pct", "slope_per_day", "direction", "shape", "min", "max", "unit", "system", "code",
+               "source_days", "total_days", "missing_numeric_days", "mixed_units", "reason"),
+-    "stats": ("indicator", "count", "min", "max", "avg", "median", "stddev", "sum", "first", "first_date",
+-              "last", "last_date", "change", "unit", "mixed_units", "system", "code"),
++    "stats": ("indicator", "count", "count_in_range", "days", "days_in_range", "min", "max", "avg", "median",
++              "stddev", "sum", "first", "first_date", "last", "last_date", "change", "unit", "mixed_units",
++              "system", "code"),
+     "latest": ("indicator", "name", "date", "time", "value", "unit", "ref", "flag", "system", "code", "file"),
+ }
+ 
+diff --git a/mirobody/agent/tools/health_indicators_service.py b/mirobody/agent/tools/health_indicators_service.py
+index c3bc367f..d000f457 100644
+--- a/mirobody/agent/tools/health_indicators_service.py
++++ b/mirobody/agent/tools/health_indicators_service.py
+@@ -50,7 +50,7 @@
+ from datetime import date, datetime, timedelta
+ from typing import Any
+ 
+-from mirobody.kernel import query, series, tools
++from mirobody.kernel import metrics, query, series, tools
+ from mirobody.kernel.ops import is_driver_exception
+ from ._authz import refused
+ from ._base import CITATION_SESSION, RecordTool
+@@ -250,7 +250,11 @@ async def _dispatch(
+             daily = await awaited(hq.buckets(subject_id, sel, window, resolution="day", limit=400))
+             return query.trend_rows(daily)
+         if method == "stats":
+-            return await awaited(hq.stats(subject_id, sel, window))
++            if not request.banded:
++                return await awaited(hq.stats(subject_id, sel, window))
++            rows = await awaited(hq.stats(subject_id, sel, window, value_min=request.value_min,
++                                          value_max=request.value_max))
++            return [_unbanded(r) if _in_pieces(r) else r for r in rows]
+         if method == "latest":
+             return await awaited(hq.latest(subject_id, sel, window))
+         raise ValueError(f"no leaf for method {method!r}")
+@@ -377,6 +381,12 @@ def _envelope_for(
+             f"view={request.view} was not applied: with no keywords or indicators the answer is this catalogue; "
+             f"call again with indicators copied from it and view={request.view}"
+         )
++    if method == "stats" and request.banded:
++        assumptions.extend(_band_notes(request, rows))
++    elif request.band_unapplied and method != "catalog":
++        assumptions.append(
++            f"value_min/value_max were not applied: view={request.view} returns readings as they are; "
++            "view=stats counts them (count_in_range, days_in_range)")
+     if method == "buckets" and request.view in ("day", "week", "month"):
+         assumptions.append(_DAY_VALUE_NOTE)
+     if semantics == query.SEMANTICS_DATE_PADDED:
+@@ -469,6 +479,53 @@ def _raw_cut_note(rows: Sequence[Mapping[str, Any]], cap: int) -> str:
+             f"Older data {_NOT_MISSING}. For it, call again with {' or with '.join(ways)}.")
+ 
+ 
++def _pieces_codes() -> frozenset[str]:
++    """The catalogue identities whose every row stores a day in pieces:
++    increments (steps), segments (sleep stages) or entries (a meal's
++    protein). A code also carried by a daily figure (93831-6 is both a
++    night's deep-sleep total and its segments) is not one of them."""
++    shapes: dict[str, set[str]] = {}
++    for m in metrics.ROWS:
++        key = m.loinc if m.loinc and m.confidence == metrics.CONFIDENT else m.name
++        shapes.setdefault(key, set()).add(m.state_class)
++    pieces = {metrics.STATE_CUMULATIVE, metrics.STATE_INTERVAL, metrics.STATE_SESSION}
++    return frozenset(key for key, found in shapes.items() if found <= pieces)
++
++
++_PIECES = _pieces_codes()
++
++
++def _in_pieces(row: Mapping[str, Any]) -> bool:
++    return str(row.get("code") or "") in _PIECES
++
++
++def _unbanded(row: Mapping[str, Any]) -> dict[str, Any]:
++    """A band compares each stored reading, and a piece is not a day's
++    value: 12,000 steps stored as three 4,000-step increments counted no day
++    above 10,000. No count is given rather than a wrong one."""
++    return {**row, "count_in_range": None, "days_in_range": None}
++
++
++def _band_notes(request: query.QueryRequest, rows: Sequence[Mapping[str, Any]]) -> list[str]:
++    """What a band counted, in which unit, and which rows it could not count."""
++    lo, hi = request.value_min, request.value_max
++    band = (f"between {lo:.15g} and {hi:.15g}" if lo is not None and hi is not None
++            else f"at or above {lo:.15g}" if lo is not None else f"at or below {hi:.15g}")
++    notes = [(f"count_in_range is the readings and days_in_range the days with at least one reading {band}, "
++              "in each row's unit; count and days are the whole window")]
++    pieces = sorted({str(r.get("indicator") or "") for r in rows if _in_pieces(r)} - {""})
++    if pieces:
++        notes.append("no band was counted for " + ", ".join(pieces) + ": each reading is a piece of a day "
++                     "(an increment or a segment), not the day's value; ask the daily series instead, "
++                     "such as dailySteps for steps")
++    unitless = sorted({str(r.get("indicator") or "") for r in rows
++                       if r.get("mixed_units") and r.get("count_in_range") is None and not _in_pieces(r)} - {""})
++    if unitless:
++        notes.append("no band was counted for " + ", ".join(unitless) + ": its readings share no unit to "
++                     "compare the band in")
++    return notes
++
++
+ def _outside_note(catalog: Sequence[Mapping[str, Any]], rows: Sequence[Mapping[str, Any]],
+                   window: query.Window) -> str:
+     """One note naming each answered series that has readings before or after
+diff --git a/mirobody/collect/query.py b/mirobody/collect/query.py
+index 63252c60..744900a4 100644
+--- a/mirobody/collect/query.py
++++ b/mirobody/collect/query.py
+@@ -128,6 +128,19 @@
+     f" WHEN {_COMMON_CANONICAL} THEN STDDEV_SAMP(value_canonical) END"
+ )
+ 
++#: A reading inside `:vmin`..`:vmax`, either end open, compared on the basis
++#: the row's min/max/avg use, so the band is in the unit the row reports.
++#: Compared on printed values, 80 umol/L counted and 0.9 mg/dL did not, the
++#: same creatinine, in a row that reported both in mol/L. NULL when no band
++#: was asked for, or when the readings share no unit to compare in.
++_IN_BAND = ("(CAST(:vmin AS DOUBLE PRECISION) IS NULL OR {v} >= CAST(:vmin AS DOUBLE PRECISION))"
++            " AND (CAST(:vmax AS DOUBLE PRECISION) IS NULL OR {v} <= CAST(:vmax AS DOUBLE PRECISION))")
++_STAT_BAND = (
++    "CASE WHEN CAST(:vmin AS DOUBLE PRECISION) IS NULL AND CAST(:vmax AS DOUBLE PRECISION) IS NULL THEN NULL"
++    " WHEN COUNT(DISTINCT unit_ucum) <= 1 THEN {agg} FILTER (WHERE " + _IN_BAND.format(v="value_num") + ")"
++    " WHEN " + _COMMON_CANONICAL + " THEN {agg} FILTER (WHERE " + _IN_BAND.format(v="value_canonical") + ") END"
++)
++
+ # Propagate the evidence status of the rows actually used by each result:
+ # an out-of-window or unelected reading must not taint an unrelated answer.
+ _UNVERIFIED_ROW = f"o.modality = '{MODALITY_UNVERIFIED}' AS unverified"
+@@ -509,7 +522,8 @@ async def buckets(
+             rows = await self._day_buckets(subject_id, names, window, resolution, limit)
+         return [_bucket_row(r) for r in rows]
+ 
+-    async def stats(self, subject_id: str, sel: query.Selection, window: query.Window) -> list[dict]:
++    async def stats(self, subject_id: str, sel: query.Selection, window: query.Window, *,
++                    value_min: float | None = None, value_max: float | None = None) -> list[dict]:
+         """count/min/max/avg/median/stddev/sum/first/last/change over the WHOLE
+         window, in SQL, over `_STATS_CTE`: a day with an elected authority
+         counts once, as that value; any other day counts every reading.
+@@ -534,7 +548,8 @@ async def stats(self, subject_id: str, sel: query.Selection, window: query.Windo
+         names = await self._resolve(subject_id, sel, window)
+         if not names:
+             return []
+-        params: dict[str, Any] = {"uid": str(subject_id), "names": names, "reported": REPORTED_KINDS}
++        params: dict[str, Any] = {"uid": str(subject_id), "names": names, "reported": REPORTED_KINDS,
++                                  "vmin": value_min, "vmax": value_max}
+         where = _window_clause(params, window)
+         source = _STATS_CTE.format(where=where)
+         rows = await execute_query(
+@@ -544,6 +559,9 @@ async def stats(self, subject_id: str, sel: query.Selection, window: query.Windo
+                    {_LATEST_IDENTITY},
+                    COUNT(*) AS count,
+                    COUNT(value_num) AS numeric_count,
++                   {_STAT_BAND.format(agg="COUNT(*)")} AS count_in_range,
++                   COUNT(DISTINCT local_date) AS days,
++                   {_STAT_BAND.format(agg="COUNT(DISTINCT local_date)")} AS days_in_range,
+                    {_STAT_VALUE.format(agg="MIN")} AS min,
+                    {_STAT_VALUE.format(agg="MAX")} AS max,
+                    {_STAT_AVG} AS avg,
+@@ -928,11 +946,23 @@ def _bucket_row(r: dict) -> dict:
+     }
+ 
+ 
++def _count(value: Any) -> int | None:
++    return None if value is None else int(value)
++
++
+ def _stats_row(r: dict) -> dict:
+     out = {
+         **_identity(r),
+         "count": int(r.get("count") or 0),
+         "numeric_count": int(r.get("numeric_count") or 0),
++        # A day count answers "how many days" exactly, which `count` does not:
++        # a heart-rate series has many readings a day, and 392 of PHIA's 4,000
++        # objective questions ask how many days something happened.
++        "days": int(r.get("days") or 0),
++        # None without a band, so a table without one does not carry a band
++        # count that is only the whole count again.
++        "count_in_range": _count(r.get("count_in_range")),
++        "days_in_range": _count(r.get("days_in_range")),
+         "min": _number(r.get("min")),
+         "max": _number(r.get("max")),
+         "avg": _number(r.get("avg")),
+diff --git a/mirobody/kernel/query.py b/mirobody/kernel/query.py
+index 6665fb95..c32a9154 100644
+--- a/mirobody/kernel/query.py
++++ b/mirobody/kernel/query.py
+@@ -145,6 +145,14 @@ def kind(self) -> str:
+         return "catalog"
+ 
+ 
++def _as_float(value: object) -> float | None:
++    """A numeric argument as a float; None when absent. `validate_request`
++    refuses a bound that is not a finite number, so this sees only those."""
++    if value in (None, ""):
++        return None
++    return float(value)  # type: ignore[arg-type]
++
++
+ def normalize_list_arg(value: object) -> tuple[str, ...]:
+     """Whatever the model sent for a list parameter → clean names. Seen in
+     the wild: a JSON-stringified list, a list of JSON strings, a comma-joined
+@@ -568,6 +576,20 @@ def trend_rows(daily: Sequence[Mapping[str, object]]) -> list[dict[str, object]]
+             "description": "First local date, inclusive (YYYY-MM-DD, the person's time zone). Omit both dates for the whole record.",
+         },
+         "end": {"type": "string", "pattern": r"^\d{4}-\d{2}-\d{2}$", "description": "Last local date, inclusive."},
++        "value_min": {
++            "type": "number",
++            "description": "With view=stats: count the readings at or above this value. The reply "
++                           "keeps count and days for the whole window and adds count_in_range "
++                           "(readings in the band) and days_in_range (days with at least one reading "
++                           "in it), so 'how many days above 120 bpm' is days_in_range. The bound is "
++                           "in the unit the stats row reports: call stats once without it to read "
++                           "that unit (sleep durations are in ms). Other views ignore it.",
++        },
++        "value_max": {
++            "type": "number",
++            "description": "With view=stats: count the readings at or below this value; combine "
++                           "with value_min for a band.",
++        },
+         "view": {
+             "type": "string",
+             "enum": list(VIEWS),
+@@ -599,6 +621,12 @@ class QueryRequest:
+     start: str = ""
+     end: str = ""
+     view: str = "raw"
++    #: A value band, in the unit the stats row reports. "how many days above
++    #: X" is a counting question the tool could not express: it returned the
++    #: whole series and left the filtering to the model, which a small model
++    #: does not do (PHIA's objective set, 2026-10-28).
++    value_min: float | None = None
++    value_max: float | None = None
+ 
+     @property
+     def method(self) -> str:
+@@ -612,6 +640,17 @@ def view_unapplied(self) -> bool:
+         the caller should say the view waits for the names it lists."""
+         return self.selection.kind == "catalog" and self.view != "raw"
+ 
++    @property
++    def banded(self) -> bool:
++        return self.value_min is not None or self.value_max is not None
++
++    @property
++    def band_unapplied(self) -> bool:
++        """A band was given to a view that does not count: answered as
++        asked, and said, as `view_unapplied` is, rather than refused into a
++        retry loop."""
++        return self.banded and self.method != "stats"
++
+ 
+ @dataclass(frozen=True)
+ class Rejection:
+@@ -659,10 +698,32 @@ def reject_dates(args: Mapping[str, object]) -> list[Rejection]:
+     return out
+ 
+ 
++def reject_bounds(args: Mapping[str, object]) -> list[Rejection]:
++    """``value_min``/``value_max`` that are not a finite number. Ignored, a
++    bad bound counted every reading as in the band, a confident wrong answer;
++    NaN compared false and counted none."""
++    out = []
++    for p in ("value_min", "value_max"):
++        v = args.get(p)
++        if v in (None, ""):
++            continue
++        try:
++            number = float(v)  # type: ignore[arg-type]
++        except (TypeError, ValueError):
++            out.append(Rejection(p, "must be a number"))
++            continue
++        if isinstance(v, bool) or not math.isfinite(number):
++            out.append(Rejection(p, "must be a finite number"))
++    if not out and all(args.get(p) not in (None, "") for p in ("value_min", "value_max")):
++        if float(args["value_min"]) > float(args["value_max"]):  # type: ignore[arg-type]
++            out.append(Rejection("value_min", "is above value_max"))
++    return out
++
++
+ def validate_request(args: Mapping[str, object]) -> tuple[Rejection, ...]:
+     """Everything wrong with the raw arguments, in a stable order. Empty
+     means :func:`parse_request` will succeed. Checks the enums, the selection
+-    rule and the dates.
++    rule, the dates and the value band.
+ 
+     A view with no selection is not refused: it is a catalogue call
+     (:attr:`QueryRequest.view_unapplied`). Refused, MiniCPM5-2B opened with
+@@ -676,6 +737,7 @@ def validate_request(args: Mapping[str, object]) -> tuple[Rejection, ...]:
+     if len(selectors) > 1:
+         out.append(Rejection("keywords+indicators", "give keywords or indicators — not both"))
+     out.extend(reject_dates(args))
++    out.extend(reject_bounds(args))
+     return tuple(out)
+ 
+ 
+@@ -694,6 +756,8 @@ def parse_request(args: Mapping[str, object]) -> QueryRequest:
+         start=str(args.get("start") or ""),
+         end=str(args.get("end") or ""),
+         view=str(args.get("view") or "raw"),
++        value_min=_as_float(args.get("value_min")),
++        value_max=_as_float(args.get("value_max")),
+     )
+ 
+ 
+@@ -717,7 +781,8 @@ def on_read(self, subject_id: str) -> None: ...
+     def catalog(self, subject_id: str, window: Window | None) -> Rows: ...
+     def readings(self, subject_id: str, sel: Selection, window: Window, *, limit: int) -> Rows: ...
+     def buckets(self, subject_id: str, sel: Selection, window: Window, *, resolution: str, limit: int) -> Rows: ...
+-    def stats(self, subject_id: str, sel: Selection, window: Window) -> Rows: ...
++    def stats(self, subject_id: str, sel: Selection, window: Window, *,
++              value_min: float | None = None, value_max: float | None = None) -> Rows: ...
+     def latest(self, subject_id: str, sel: Selection, window: Window) -> Rows: ...
+ 
+ 
+@@ -743,6 +808,7 @@ def latest(self, subject_id: str, sel: Selection, window: Window) -> Rows: ...
+     "parse_bound",
+     "parse_request",
+     "rank_catalog",
++    "reject_bounds",
+     "reject_dates",
+     "reject_unknown",
+     "resolve_window",
+diff --git a/mirobody/tests/test_postgres_regressions.py b/mirobody/tests/test_postgres_regressions.py
+index 8ec5ca26..0de9b73b 100644
+--- a/mirobody/tests/test_postgres_regressions.py
++++ b/mirobody/tests/test_postgres_regressions.py
+@@ -629,6 +629,60 @@ async def test_trend_citation_members_use_the_actual_capped_input_span(database)
+     assert len(resolved["readings"]) == citations.MEMBERS_SHOWN
+ 
+ 
++async def test_a_value_band_counts_readings_and_days_on_the_rows_own_basis(database):
++    """The band is compared as min/max/avg are: printed values for one unit,
++    canonical values for a shared canonical unit, nothing otherwise.
++    Compared on printed values, 80 umol/L counted and 0.9 mg/dL (79.56
++    umol/L, the same creatinine) did not, in a row reported in mol/L."""
++    from mirobody.collect import observations
++    from mirobody.collect.query import PostgresHealthQuery
++    from mirobody.kernel import query
++
++    def at(day, hour=8):
++        return datetime(2026, 1, day, hour, tzinfo=UTC)
++
++    drafts = [observations.Draft(name_text=name, value_text=value, unit_text=unit, observed_start=when)
++              for name, value, unit, when in (
++                  ("ALT", "20", "U/L", at(1)), ("ALT", "45", "U/L", at(1, 20)), ("ALT", "50", "U/L", at(2)),
++                  ("ALT", "10", "U/L", at(3)),
++                  ("Creatinine", "80", "umol/L", at(1)), ("Creatinine", "0.9", "mg/dL", at(2)),
++                  ("Albumin", "40", "g/L", at(1)), ("Albumin", "600", "umol/L", at(2)))]
++    await observations.ingest("1", drafts, observations.Provenance("lab-report", "file", "th_files:synthetic-band"),
++                              user_tz="UTC")
++    store, window = PostgresHealthQuery(), query.Window(0, 0, "UTC")
++
++    [alt] = await store.stats("1", query.Selection(indicators=("ALT",)), window, value_min=40)
++    assert (alt["count"], alt["days"], alt["count_in_range"], alt["days_in_range"]) == (4, 3, 2, 2)
++    [plain] = await store.stats("1", query.Selection(indicators=("ALT",)), window)
++    assert plain["count_in_range"] is None and plain["days_in_range"] is None
++
++    creatinine = query.Selection(indicators=("2160-0",))
++    [both] = await store.stats("1", creatinine, window, value_min=79e-6)
++    assert both["unit"] == "mol/L" and both["count_in_range"] == 2
++    [neither] = await store.stats("1", creatinine, window, value_min=50)
++    assert neither["count_in_range"] == 0
++
++    [albumin] = await store.stats("1", query.Selection(indicators=("1751-7",)), window, value_min=1)
++    assert albumin["mixed_units"] and albumin["count_in_range"] is None
++
++
++async def test_a_value_band_is_not_counted_over_steps_stored_as_increments(database):
++    from mirobody.agent.tools.health_indicators_service import HealthIndicatorsService
++    from mirobody.collect import observations
++    from mirobody.collect.query import PostgresHealthQuery
++
++    drafts = [observations.Draft(name_text="steps", value_text="4000", unit_text="{#}",
++                                 observed_start=datetime(2026, 1, 1, hour, tzinfo=UTC)) for hour in (8, 12, 18)]
++    await observations.ingest("1", drafts, observations.Provenance("device-sensed", "device", "synthetic-steps",
++                                                                   vendor="synthetic-research"), user_tz="UTC")
++    envelope = await HealthIndicatorsService(PostgresHealthQuery(), outside_note=False).envelope(
++        {"user_id": "1"}, indicators=["steps"], view="stats", value_min=10000)
++    [row] = envelope.data
++    assert row["code"] == "55423-8"
++    assert row["count_in_range"] is None and row["days_in_range"] is None
++    assert any(a.startswith("no band was counted for") for a in envelope.assumptions)
++
++
+ async def test_an_empty_window_names_the_readings_the_record_holds_elsewhere(database):
+     """A window holding none of a series' readings is zero there, not a
+     record without the series; the whole-record stats say where it is."""
+diff --git a/mirobody/tests/test_value_range_filter.py b/mirobody/tests/test_value_range_filter.py
+index 615812b3..4091dc52 100644
+--- a/mirobody/tests/test_value_range_filter.py
++++ b/mirobody/tests/test_value_range_filter.py
+@@ -1,3 +1,129 @@
++"""A counting question has to be expressible, and its count has to be right.
++
++"How many days did I sleep less than an hour of deep sleep" is a band plus a
++count. The tool returned the whole series and left both to the model; asked
++that PHIA question, a local 2B answered 30.75, a duration, not a number of
++days. `value_min` / `value_max` with `view="stats"` answer it with
++`count_in_range` and `days_in_range`. The band is compared on the basis the
++row's min/max/avg use, refused when it is not a finite number, said when a
++view does not count, and withheld for a series stored in pieces. The SQL is
++exercised by the Postgres suite (`test_postgres_regressions.py`).
++"""
++
++from __future__ import annotations
++
++from unittest.mock import Mock
++
++import pytest
++
++from mirobody.kernel import query
++
++
++def test_a_band_parses_into_the_request():
++    request = query.parse_request(
++        {"indicators": ["dailyDeepSleep"], "view": "stats", "value_min": 1000, "value_max": 5000})
++    assert (request.value_min, request.value_max) == (1000.0, 5000.0)
++    assert request.banded and not request.band_unapplied
++
++
++def test_one_sided_bounds_are_allowed_and_absent_stays_absent():
++    lower = query.parse_request({"indicators": ["dailyDeepSleep"], "value_min": "900"})
++    assert lower.value_min == 900.0 and lower.value_max is None
++    upper = query.parse_request({"indicators": ["dailyDeepSleep"], "value_max": 6})
++    assert upper.value_max == 6.0 and upper.value_min is None
++    bare = query.parse_request({"indicators": ["dailyDeepSleep"]})
++    assert bare.value_min is None and bare.value_max is None and not bare.banded
++
++
++@pytest.mark.parametrize("bad", ["abc", "nan", "inf", float("nan"), True])
++def test_a_bound_that_is_not_a_finite_number_is_refused(bad):
++    """Ignored, a bad bound counted every reading as in the band."""
++    problems = query.validate_request({"indicators": ["dailyDeepSleep"], "view": "stats", "value_min": bad})
++    assert [p.parameter for p in problems] == ["value_min"]
++
++
++def test_a_band_upside_down_is_refused():
++    problems = query.validate_request({"indicators": ["dailyDeepSleep"], "view": "stats",
++                                       "value_min": 10, "value_max": 5})
++    assert [p.parameter for p in problems] == ["value_min"]
++
++
++def test_the_schema_says_what_each_count_means():
++    properties = query.TOOL_SCHEMA["properties"]
++    assert properties["value_min"]["type"] == properties["value_max"]["type"] == "number"
++    text = properties["value_min"]["description"]
++    assert "days_in_range" in text and "count_in_range" in text and "view=stats" in text
++
++
++def _stats_row(**over):
++    row = {"indicator": "Deep sleep duration", "code": "93831-6", "count": 7, "numeric_count": 7, "days": 7,
++           "count_in_range": 4, "days_in_range": 4, "min": 1_800_000.0, "max": 5_400_000.0,
++           "avg": 3_600_000.0, "unit": "ms"}
++    row.update(over)
++    return row
++
++
++def test_the_band_counts_reach_the_model_only_when_a_band_was_asked():
++    """The stats table is a fixed column list, and a column it does not
++    list never reaches the model; without a band the counts are None, and a
++    None cell is not rendered."""
++    from mirobody.agent.tools import _render
++    from mirobody.kernel import tools
++
++    def text(row):
++        return _render.render_compact(tools.Envelope(tools.STATUS_OK, data=[row],
++                                                     meta=tools.Meta(view="stats", row_count=1)))
++
++    banded = text(_stats_row())
++    assert "days=7" in banded and "count_in_range=4" in banded and "days_in_range=4" in banded
++    plain = text(_stats_row(count_in_range=None, days_in_range=None))
++    assert "days=7" in plain and "in_range" not in plain
++
++
++def _service(rows):
++    pytest.importorskip("dotenv")
++    from mirobody.agent.tools.health_indicators_service import HealthIndicatorsService
++
++    hq = Mock()
++    hq.tz.return_value = "UTC"
++    hq.on_read.return_value = None
++    hq.stats.return_value = rows
++    hq.buckets.return_value = rows
++    return hq, HealthIndicatorsService(hq, outside_note=False)
++
++
++async def test_a_band_is_passed_to_the_store_and_said_in_the_answer():
++    hq, service = _service([_stats_row()])
++    envelope = await service.envelope({"user_id": "1"}, indicators=["dailyDeepSleep"], view="stats",
++                                      value_max=3_600_000)
++    assert hq.stats.call_args.kwargs == {"value_min": None, "value_max": 3_600_000.0}
++    assert any("at or below 3600000," in a and "days_in_range" in a for a in envelope.assumptions)
++
++
++async def test_no_band_leaves_the_store_call_as_it_was():
++    """A store written before the band existed still answers stats."""
++    hq, service = _service([_stats_row(count_in_range=None, days_in_range=None)])
++    await service.envelope({"user_id": "1"}, indicators=["dailyDeepSleep"], view="stats")
++    assert hq.stats.call_args.kwargs == {}
++
++
++async def test_a_series_stored_in_pieces_gets_no_band_count():
++    steps = _stats_row(indicator="Steps", code="55423-8", unit="{#}", count_in_range=0, days_in_range=0)
++    _, service = _service([steps])
++    envelope = await service.envelope({"user_id": "1"}, indicators=["steps"], view="stats", value_min=10000)
++    [row] = envelope.data
++    assert row["count_in_range"] is None and row["days_in_range"] is None
++    assert any("no band was counted for Steps" in a and "dailySteps" in a for a in envelope.assumptions)
++
++
++async def test_a_band_on_a_view_that_does_not_count_is_said_not_dropped():
++    day = {"indicator": "Deep sleep duration", "series": "s", "period": "2026-01-02", "avg": 1.0, "n": 1,
++           "unit": "ms", "total": 1}
++    _, service = _service([day])
++    envelope = await service.envelope({"user_id": "1"}, indicators=["dailyDeepSleep"], view="day", value_min=5)
++    assert any(a.startswith("value_min/value_max were not applied: view=day") for a in envelope.assumptions)
++
++
+ 
+ 
+ def test_stats_publishes_a_median_and_a_spread():

@@ -1,0 +1,17 @@
+# Issue
+
+**Title:** Generate a bounded no-PHI diagnostic and recovery bundle
+
+## Description
+
+.
+
+Adds `openmed/service/diagnostics.py`, a bounded collector that writes a deterministic, value-free diagnostic and recovery bundle, plus `openmed service diagnose --out <file>` and `openmed service verify-bundle <file>` (`openmed/cli/service_diagnostics.py`). Thirteen typed collectors (runtime, capabilities, configuration, health, readiness, operational events, jobs, Journey store, model registry, model activation, audit continuity, backup, disk) reuse `core/capabilities.py`, `core/config_provenance.py`, a new value-free `core/doctor.value_free_health_checks()`, the service setting parsers, the Journey migrations, `registry_slots.pointer_targets`, `audit_chain.AuditChain.verify` and a new `PrometheusMetricsRegistry.diagnostic_snapshot()`. Each collector runs in its own worker under section and total time budgets and reads sources only through a budget handle that enforces file count, per-file bytes, total bytes, directory depth, directory entries, list items and bundle size; SQLite stores open read-only (`immutable` unless WAL sidecars already exist) with a progress handler that interrupts at the deadline. Output carries only controlled codes, counts, versions, hour-rounded `generated_at`, and domain-separated digests; a shape-level value-safety contract is applied after collection and again by the offline verifier, which checks per-entry, header, recovery and manifest-root digests and reports stable codes for missing, added, reordered and modified entries. Recovery guidance maps reason codes and findings to inspect, retry, restore, quarantine and escalate actions linked to the new `docs/recovery/diagnostic-bundle.md` (added to the nav and the publication registry).
+
+Not covered: backup metadata and model-activation journals have no source on master yet (#5452, #5066), so those categories take a caller-registered provider with a fixed field allowlist and otherwise report `provider_not_registered` (backup) or environment-derived activation evidence. Readiness, operational events and residency need a running app passed through `DiagnosticContext(app=...)`; the CLI runs out of process and reports `not_in_process` for them. Digests are unkeyed integrity checks, not signatures.
+
+Validation: `pytest tests/unit/service/test_diagnostics.py tests/unit/cli/test_service_diagnostics_cli.py` (76 passed, repeated 3 times), `pytest tests/unit -k "docs or publication or mkdocs"` (153 passed, 15 skipped), `ruff check .` and `ruff format --check .` (clean), `python scripts/security/check_effect_paths.py --check` (effect_paths_verified), `mypy` (no issues), `pytest tests/ -m "not slow and not fuzz" --ignore=tests/unit/training/synthetic/test_dicom_overlays.py` (27969 passed, 270 skipped; the ignored module needs `pydicom`, which the shared venv lacks). The strict MkDocs build was left to CI because `mkdocs` is not installed locally.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `f8969c5b0f1a`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

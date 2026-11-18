@@ -1,0 +1,146 @@
+diff --git a/backend/app/constants/devices_map/device_types.py b/backend/app/constants/devices_map/device_types.py
+index 1524cd377f..ff214079e3 100644
+--- a/backend/app/constants/devices_map/device_types.py
++++ b/backend/app/constants/devices_map/device_types.py
+@@ -217,8 +217,12 @@ def infer_device_type(
+     device_model: str | None,
+     original_source_name: str | None = None,
+     reported_type: DeviceType | None = None,
++    source_app_id: str | None = None,
+ ) -> DeviceType:
+     """Resolve device type: single-device provider, then the reported type, then inference."""
++    # The iOS SDK derives both from the relaying iPhone/Watch, so only the source name is left
++    if is_host_model(source_app_id, device_model):
++        device_model, reported_type = None, None
+     device_type = _resolve_device_type(provider, device_model, original_source_name, reported_type)
+     if device_type == DeviceType.OTHER:
+         log_structured(
+diff --git a/backend/app/repositories/data_source_repository.py b/backend/app/repositories/data_source_repository.py
+index 8d4b37e15e..1872e91d33 100644
+--- a/backend/app/repositories/data_source_repository.py
++++ b/backend/app/repositories/data_source_repository.py
+@@ -344,7 +344,11 @@ def _new_row(
+     ) -> DataSource:
+         user_id, device_model, source, device_id, source_app_id = identity
+         device_type = infer_device_type(
+-            provider, device_model, details.original_source_name or source, details.reported_type
++            provider,
++            device_model=device_model,
++            original_source_name=details.original_source_name or source,
++            reported_type=details.reported_type,
++            source_app_id=source_app_id,
+         )
+         return self.model(
+             id=uuid4(),
+@@ -387,9 +391,8 @@ def _apply_updates(
+             updates["source"] = source
+         # Keyed rows learn their model later (Polar sleep before the exercise, a writer's first model);
+         # a relaying host's code is replaced by the producing device's model
+-        replaces_host = is_host_model(existing.source_app_id, existing.device_model) and not is_host_model(
+-            source_app_id, device_model
+-        )
++        host_row = is_host_model(existing.source_app_id, existing.device_model)
++        replaces_host = host_row and not is_host_model(source_app_id, device_model)
+         if device_model and (existing.device_model is None or replaces_host):
+             updates["device_model"] = device_model
+         model_replaced = "device_model" in updates
+@@ -404,12 +407,13 @@ def _apply_updates(
+             updates["original_source_name"] = original_source_name
+         resolved = infer_device_type(
+             provider,
+-            effective_model,
+-            original_source_name or existing.original_source_name or existing.source,
+-            reported_type,
++            device_model=effective_model,
++            original_source_name=original_source_name or existing.original_source_name or existing.source,
++            reported_type=reported_type,
++            source_app_id=source_app_id or existing.source_app_id,
+         )
+-        # The stored type came from the host code, so it is replaced along with the model
+-        if model_replaced and replaces_host:
++        # The stored type came from the host code, so it is always recomputed
++        if host_row:
+             device_type = resolved.value if resolved != DeviceType.UNKNOWN else None
+         else:
+             device_type = self.next_device_type(provider, existing.device_type, resolved)
+diff --git a/backend/scripts/data_migrations/backfill_device_types.py b/backend/scripts/data_migrations/backfill_device_types.py
+index 93f90a2fe6..22db296794 100644
+--- a/backend/scripts/data_migrations/backfill_device_types.py
++++ b/backend/scripts/data_migrations/backfill_device_types.py
+@@ -5,6 +5,7 @@
+ rows are recomputed outright, which also corrects types the old keywords got wrong (e.g. Garmin
+ Index BPM stored as scale); SDK-provider rows only upgrade NULL/``other`` to a concrete type.
+ iPad rows stored as phone move to tablet: that phone came from the same productType, not the SDK.
++Third-party iOS writers keyed by a relaying iPhone/Watch code are recomputed from their source name.
+ Later mapping changes reach existing rows on their next sync, so this only needs to run once.
+ 
+ Idempotent: a second run finds nothing to change. Safe to run on every startup until removed.
+@@ -19,7 +20,7 @@
+ 
+ from sqlalchemy.orm import Session
+ 
+-from app.constants.devices_map import infer_device_type
++from app.constants.devices_map import infer_device_type, is_host_model
+ from app.database import SessionLocal
+ from app.models import DataSource
+ from app.repositories.data_source_repository import DataSourceRepository
+@@ -37,7 +38,12 @@ def backfill_device_types(db: Session, *, dry_run: bool) -> Counter[str]:
+             provider = ProviderName(ds.provider)
+         except ValueError:
+             continue
+-        resolved = infer_device_type(provider, ds.device_model, ds.original_source_name or ds.source)
++        resolved = infer_device_type(
++            provider,
++            device_model=ds.device_model,
++            original_source_name=ds.original_source_name or ds.source,
++            source_app_id=ds.source_app_id,
++        )
+         # Google formFactor isn't stored, so recomputing here would undo it; live sync recomputes Google rows
+         if provider == ProviderName.GOOGLE_HEALTH and ds.device_type not in (None, DeviceType.OTHER):
+             continue
+@@ -48,6 +54,8 @@ def backfill_device_types(db: Session, *, dry_run: bool) -> Counter[str]:
+             and (ds.device_model or "").startswith("iPad")
+         ):
+             new_type = DeviceType.TABLET.value
++        if is_host_model(ds.source_app_id, ds.device_model):
++            new_type = resolved.value if resolved != DeviceType.UNKNOWN else None
+         if new_type == ds.device_type:
+             continue
+         changes[f"{provider.value}: {ds.device_type} -> {new_type}"] += 1
+diff --git a/backend/tests/constants/test_device_types.py b/backend/tests/constants/test_device_types.py
+index a8f6157deb..0a09d3945d 100644
+--- a/backend/tests/constants/test_device_types.py
++++ b/backend/tests/constants/test_device_types.py
+@@ -130,6 +130,11 @@ def test_specific_inference_overrides_reported_other(self) -> None:
+         )
+         assert infer_device_type(ProviderName.SAMSUNG, "unlisted-model", None, DeviceType.OTHER) == DeviceType.OTHER
+ 
++    def test_relaying_host_is_ignored_for_third_party_writer(self) -> None:
++        oura = infer_device_type(ProviderName.APPLE, "iPhone16,1", "Oura", DeviceType.PHONE, "com.ouraring.oura")
++        strava = infer_device_type(ProviderName.APPLE, "iPhone16,1", "Strava", DeviceType.PHONE, "com.strava.run")
++        assert (oura, strava) == (DeviceType.RING, DeviceType.UNKNOWN)
++
+     def test_unknown_sdk_type_falls_back_to_inference(self) -> None:
+         assert infer_device_type(ProviderName.HEALTH_CONNECT, "Pixel 8", None, DeviceType.UNKNOWN) == DeviceType.PHONE
+ 
+diff --git a/backend/tests/scripts/test_backfill_device_types.py b/backend/tests/scripts/test_backfill_device_types.py
+index 42afe9171d..f51a0e2826 100644
+--- a/backend/tests/scripts/test_backfill_device_types.py
++++ b/backend/tests/scripts/test_backfill_device_types.py
+@@ -78,3 +78,16 @@ def test_moves_ipad_phone_rows_to_tablet(self, db: Session) -> None:
+ 
+         assert ipad.device_type == "tablet"
+         assert iphone.device_type == "phone"
++
++    def test_recomputes_third_party_rows_keyed_by_host(self, db: Session) -> None:
++        oura = DataSourceFactory(
++            provider=ProviderName.APPLE,
++            device_model="iPhone16,1",
++            source="Oura",
++            source_app_id="com.ouraring.oura",
++            device_type="phone",
++        )
++
++        backfill_device_types(db, dry_run=False)
++
++        assert oura.device_type == "ring"

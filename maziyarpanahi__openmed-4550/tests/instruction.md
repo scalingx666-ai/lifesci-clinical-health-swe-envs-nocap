@@ -1,0 +1,19 @@
+# Issue
+
+**Title:** Gate OpenMedKit Swift, Android and JavaScript dependency licenses offline
+
+## Description
+
+.
+
+Adds `scripts/licenses/kit_inventory.py`, an offline, standard-library-only gate for the OpenMedKit dependency manifests. It parses the root and nested `Package.swift`, the committed `Package.resolved` files, `android/settings.gradle.kts` (which leads it to every included module's build file and to `gradle/libs.versions.toml`), the `js/*` npm lockfiles with their `package.json`, the Tauri `Cargo.lock` with its `Cargo.toml`, and the Flutter `pubspec.yaml`, podspecs and Android `build.gradle`. Each package is looked up in the new reviewed SPDX table `docs/security/kit-license-inventory.md`, classified with the shared `scripts/licenses/inventory.py` allow and deny classes, and labelled runtime or development. The gate fails closed on unreviewed, unknown, copyleft, source-available or proprietary entries. Failure lines name only the manifest, ecosystem and package, and reports carry no license text, versions, URLs or local paths.
+
+ML Kit is reviewed as `LicenseRef-Proprietary-Google-ML-Kit-Terms` (restricted). It passes only through the scoped exception `mlkit-optional-ocr`, keyed by artifact coordinate and limited to `android/openmedkit-mlkit/build.gradle.kts` (#4451), the scan demo, and the current core `android/openmedkit/build.gradle.kts` path as a transitional entry. Every use is printed. `argmax-oss-swift` (WhisperKit, #4428) is reviewed as MIT at 1.1.1. Development-only dependencies may also carry `EPL-1.0`, `EPL-2.0` or `LicenseRef-Public-Domain` (JUnit 4, `org.json`). Transitive lock entries that are marked development-only (npm `dev`, Cargo crates reachable only through dev or build tables) are counted, not reviewed. The shared classifier now accepts `WITH LLVM-exception` and `WITH Swift-exception`, and treats `MIT-0` and `Unicode-3.0` as permissive. `MIT WITH MIT`-style misuse still fails. CI runs the gate in the `repo-policy` job right after the Python license policy step. A unit test fails if a committed kit manifest is not read by the gate.
+
+Not covered: Android transitive dependencies (including ML Kit's own Play services artifacts) are not visible until Gradle lockfiles are committed (#3951). Rows are per package, not per version. The git-ignored `swift/OpenMedKit/Package.resolved` and `pubspec.lock` are not read; their parsers are tested with synthetic fixtures.
+
+Validation: `.venv/bin/python -m pytest tests/unit/licenses tests/unit/release/test_license_policy.py tests/unit/test_docs_publication.py -q` (106 passed, 2 skipped), `python scripts/licenses/kit_inventory.py` (passed: 521 reviewed occurrences, 475 runtime and 46 development, 2 ML Kit scoped exceptions, 252 development-only lock entries counted), the same gate with `--root` on a checkout of #4451 (passed, one exception at `android/openmedkit-mlkit/build.gradle.kts`), `.venv/bin/python -m pytest tests/unit -k "docs or publication or mkdocs" --ignore=tests/unit/training/synthetic/test_dicom_overlays.py` (152 passed, 14 skipped), `ruff check .` and `ruff format --check .` (clean), `python scripts/security/check_effect_paths.py --check` (verified), `mypy` (clean), `.venv/bin/python -m pytest tests/ -q -m "not slow and not fuzz" --ignore=tests/unit/training/synthetic/test_dicom_overlays.py` (27013 passed, 224 skipped; the ignored module needs `pydicom`, which the local venv lacks). The strict MkDocs build was left to CI because `mkdocs` is not installed locally.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `b7c0322f1b17`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

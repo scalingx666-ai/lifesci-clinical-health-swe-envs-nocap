@@ -1,0 +1,211 @@
+diff --git a/grails-app/i18n/messages.properties b/grails-app/i18n/messages.properties
+index 621a16c576e..2e1924ec94e 100644
+--- a/grails-app/i18n/messages.properties
++++ b/grails-app/i18n/messages.properties
+@@ -4313,6 +4313,7 @@ react.stockTransfer.column.dateCreated.label=Date created
+ # Putaway Task
+ react.putawayTask.rerunStrategy.label=Rerun Strategy
+ react.putawayTask.rerunStrategy.confirm.label=Are you sure you want to rerun the putaway strategy? The current task will be replaced with new strategy results.
++react.putawayTask.rerunStrategy.confirmInProgress.label=Are you sure you want to rerun the putaway strategy? The destination will be reassigned, but the putaway container will not change.
+ react.putawayTask.rerunStrategy.success.label=Putaway strategy has been rerun successfully
+ 
+ # Replenishment
+diff --git a/grails-app/services/org/pih/warehouse/inboundSortation/InboundSortationService.groovy b/grails-app/services/org/pih/warehouse/inboundSortation/InboundSortationService.groovy
+index 43d220d4450..46c3de6f73e 100644
+--- a/grails-app/services/org/pih/warehouse/inboundSortation/InboundSortationService.groovy
++++ b/grails-app/services/org/pih/warehouse/inboundSortation/InboundSortationService.groovy
+@@ -5,10 +5,12 @@ import org.pih.warehouse.api.Putaway
+ import org.pih.warehouse.api.PutawayItem
+ import org.pih.warehouse.api.PutawayStatus
+ import org.pih.warehouse.api.PutawayTaskStatus
++import org.pih.warehouse.auth.AuthService
+ import org.pih.warehouse.core.ActivityCode
+ import org.pih.warehouse.core.Comment
+ import org.pih.warehouse.core.CommentType
+ import org.pih.warehouse.core.User
++import org.pih.warehouse.core.UserService
+ import org.pih.warehouse.order.Order
+ import org.pih.warehouse.order.OrderItem
+ import org.pih.warehouse.putaway.PutawayTask
+@@ -23,6 +25,7 @@ class InboundSortationService {
+     def orderIdentifierService
+     def putawayService
+     def messageSource
++    UserService userService
+     PutawayStrategyService putawayStrategyService
+ 
+     void createPutawayOrdersFromReceipt(Receipt receipt) {
+@@ -51,12 +54,18 @@ class InboundSortationService {
+     }
+ 
+     void rerunPutawayStrategy(PutawayTask task) {
+-        // 1. Validate PENDING only
+-        if (task.status != PutawayTaskStatus.PENDING) {
+-            throw new IllegalStateException("Can only rerun strategy on PENDING putaway tasks")
++        // 1. Validate PENDING or IN_PROGRESS only
++        if (task.status != PutawayTaskStatus.PENDING && task.status != PutawayTaskStatus.IN_PROGRESS) {
++            throw new IllegalStateException("Can only rerun strategy on PENDING or IN_PROGRESS putaway tasks")
+         }
+ 
+-        // 2. Build PutawayContext from existing task
++        // 2. Rerunning the strategy for an in-progress task (i.e. one already scanned into a
++        //    putaway container) is a superuser-only action since it can move the item's destination.
++        if (task.status == PutawayTaskStatus.IN_PROGRESS && !userService.isSuperuser(AuthService.currentUser)) {
++            throw new IllegalStateException("Only a superuser can rerun the putaway strategy for an in-progress putaway task")
++        }
++
++        // 3. Build PutawayContext from existing task
+         PutawayContext context = new PutawayContext(
+                 facility: task.facility,
+                 product: task.product,
+@@ -72,14 +81,18 @@ class InboundSortationService {
+                 deliveryTypeCode: task.deliveryTypeCode,
+         )
+ 
+-        // 3. Execute strategy chain
++        // 4. Execute strategy chain
+         List<PutawayResult> results = putawayStrategyService.execute(context)
+         PutawayResult result = results?.find { it.quantity > 0 }
+ 
+-        // 4. Update existing order item with new strategy results
++        // 5. Update existing order item with new strategy results. For an in-progress task the
++        //    item has already been physically scanned into a container, so only the destination
++        //    is reassigned -- the container it's already sitting in must not change.
+         OrderItem orderItem = OrderItem.get(task.putawayOrderItem.id)
+         orderItem.destinationBinLocation = result?.destination
+-        orderItem.containerLocation = result?.container
++        if (task.status == PutawayTaskStatus.PENDING) {
++            orderItem.containerLocation = result?.container
++        }
+         orderItem.description = result?.comment
+         orderItem.save(failOnError: true)
+     }
+diff --git a/grails-app/views/putaway/_putawayTasks.gsp b/grails-app/views/putaway/_putawayTasks.gsp
+index 095f720692b..414354b2d98 100644
+--- a/grails-app/views/putaway/_putawayTasks.gsp
++++ b/grails-app/views/putaway/_putawayTasks.gsp
+@@ -62,6 +62,22 @@
+                                     </a>
+                                 </div>
+                             </g:if>
++                            <g:elseif test="${task.status == PutawayTaskStatus.IN_PROGRESS}">
++                                <%-- Rerunning strategy for an in-progress task reassigns the destination only
++                                     (the container it's already been scanned into does not change), so it's
++                                     restricted to superusers. --%>
++                                <g:isSuperuser>
++                                    <div class="action-menu-item">
++                                        <a href="javascript:void(0)"
++                                           class="btn-rerun-strategy"
++                                           data-task-id="${task.id}"
++                                           data-facility-id="${orderInstance?.destination?.id}">
++                                            <img src="${resource(dir: 'images/icons/silk', file: 'arrow_refresh.png')}" />
++                                            &nbsp;<warehouse:message code="react.putawayTask.rerunStrategy.label" default="Rerun Strategy"/>
++                                        </a>
++                                    </div>
++                                </g:isSuperuser>
++                            </g:elseif>
+                         </div>
+                     </span>
+                 </td>
+diff --git a/src/js/components/putaway-task/list/PutawayTaskListTable.jsx b/src/js/components/putaway-task/list/PutawayTaskListTable.jsx
+index 8ce49663919..752ba38d623 100644
+--- a/src/js/components/putaway-task/list/PutawayTaskListTable.jsx
++++ b/src/js/components/putaway-task/list/PutawayTaskListTable.jsx
+@@ -2,6 +2,7 @@ import React, { useMemo } from 'react';
+ 
+ import PropTypes from 'prop-types';
+ import { RiInformationLine, RiRefreshLine } from 'react-icons/ri';
++import { connect } from 'react-redux';
+ 
+ import DataTable, { TableCell } from 'components/DataTable';
+ import DateCell from 'components/DataTable/DateCell';
+@@ -22,7 +23,7 @@ const STATUS_VARIANT_MAP = {
+   CANCELED: 'danger',
+ };
+ 
+-const PutawayTaskListTable = ({ filterParams }) => {
++const PutawayTaskListTable = ({ filterParams, highestRole }) => {
+   const {
+     onFetchHandler,
+     rerunHandler,
+@@ -45,7 +46,17 @@ const PutawayTaskListTable = ({ filterParams }) => {
+       defaultLabel: 'Rerun Strategy',
+       leftIcon: <RiRefreshLine />,
+       statuses: ['PENDING'],
+-      onClick: (id) => rerunHandler(id),
++      onClick: (id) => rerunHandler(id, row.status),
++    },
++    {
++      label: 'react.putawayTask.rerunStrategy.label',
++      defaultLabel: 'Rerun Strategy',
++      leftIcon: <RiRefreshLine />,
++      statuses: ['IN_PROGRESS'],
++      // Rerunning the strategy on an in-progress task can move its destination, so it's
++      // restricted to superusers. The container it was already scanned into is unaffected.
++      minimumRequiredRole: 'Superuser',
++      onClick: (id) => rerunHandler(id, row.status),
+     },
+   ];
+ 
+@@ -60,7 +71,7 @@ const PutawayTaskListTable = ({ filterParams }) => {
+         <ContextMenu
+           positions={['right']}
+           dropdownClasses="action-dropdown-offset"
+-          actions={findActions(getActions(row.original), row, {})}
++          actions={findActions(getActions(row.original), row, { highestRole })}
+           id={row.original.id}
+         />
+       ),
+@@ -156,7 +167,7 @@ const PutawayTaskListTable = ({ filterParams }) => {
+       className: 'd-flex align-items-center',
+       Cell: (row) => <DateCell {...row} />,
+     },
+-  ], [rerunHandler]);
++  ], [rerunHandler, highestRole]);
+ 
+   return (
+     <div className="list-page-list-section">
+@@ -183,8 +194,13 @@ const PutawayTaskListTable = ({ filterParams }) => {
+   );
+ };
+ 
+-export default PutawayTaskListTable;
++const mapStateToProps = (state) => ({
++  highestRole: state.session.highestRole,
++});
++
++export default connect(mapStateToProps)(PutawayTaskListTable);
+ 
+ PutawayTaskListTable.propTypes = {
+   filterParams: PropTypes.shape({}).isRequired,
++  highestRole: PropTypes.string.isRequired,
+ };
+diff --git a/src/js/hooks/list-pages/putaway-task/usePutawayTaskListTableData.jsx b/src/js/hooks/list-pages/putaway-task/usePutawayTaskListTableData.jsx
+index 3c85aff5847..c93465d88ec 100644
+--- a/src/js/hooks/list-pages/putaway-task/usePutawayTaskListTableData.jsx
++++ b/src/js/hooks/list-pages/putaway-task/usePutawayTaskListTableData.jsx
+@@ -75,13 +75,19 @@ const usePutawayTaskListTableData = (filterParams) => {
+     }
+   };
+ 
+-  const rerunHandler = (id) => {
+-    confirmAlert({
+-      title: translate('react.default.areYouSure.label', 'Are you sure?'),
+-      message: translate(
++  const rerunHandler = (id, status) => {
++    const confirmMessage = status === 'IN_PROGRESS'
++      ? translate(
++        'react.putawayTask.rerunStrategy.confirmInProgress.label',
++        'Are you sure you want to rerun the putaway strategy? The destination will be reassigned, but the putaway container will not change.',
++      )
++      : translate(
+         'react.putawayTask.rerunStrategy.confirm.label',
+         'Are you sure you want to rerun the putaway strategy? The current task will be replaced with new strategy results.',
+-      ),
++      );
++    confirmAlert({
++      title: translate('react.default.areYouSure.label', 'Are you sure?'),
++      message: confirmMessage,
+       buttons: [
+         {
+           label: translate('react.default.yes.label', 'Yes'),

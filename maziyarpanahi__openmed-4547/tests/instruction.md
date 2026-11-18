@@ -1,0 +1,17 @@
+# Issue
+
+**Title:** Run browser inference in cancellable workers with bounded queues
+
+## Description
+
+.
+
+This adds a typed inference-worker facade to the `openmed` web package as new modules under `js/openmedkit-web/src/worker/`. `protocol.ts` defines versioned host/worker messages with request ids and plan epochs, value-free `InferenceWorkerError` codes, lossless UTF-16 input transfer, and transferable typed-array token columns that carry labels, scores, indices and offsets but no token text. `createInferenceWorkerClient()` (`client.ts`) gives a bounded host queue that rejects overflow with `queue_full`, `AbortSignal` cancellation that reaches the worker (a cancelled request holds its slot until the worker acknowledges it, and late results are dropped), model-generation ownership for `client.pipeline()` handles, invalidation on GPU device loss or worker failure, and `recover()`, which forces `localOnly: true` and re-verifies model ref, digest and backend before reuse. `serveInferenceWorker()` (`server.ts`) runs a bounded sequential queue inside the worker, aborts the pipeline's `context.signal`, never posts results for cancelled or superseded work, releases the runtime when `deviceLost` settles, and reports only controlled codes. Hashing and redaction stay on the host because `client.pipeline()` plugs into the existing `extractPii()`/`deidentify()`, so `index.ts` only gains re-exports and `model-loader.ts`/`ort-web-loader.ts` are untouched; the package README documents the behaviour.
+
+Not covered: no run in a real browser `Worker` and no real WebGPU device loss. Device loss goes through the `deviceLost` promise seam, and the tests use a fake worker, the real server behind a `MessageChannel` (real structured clone and transfer), and a real `node:worker_threads` worker. A real-browser check belongs in the browser ORT lane (#3940).
+
+Validation: `npm test` in `js/openmedkit-web` (tsup build, `tsc --noEmit`, 48/48 node tests including the 14 new ones in `tests/web/test_inference_worker.spec.ts`; these cover queue limits, queued and in-flight cancellation, late-result suppression, generation supersession, device-loss recovery verification, worker crash isolation and restart, teardown, sentinel checks on errors, worker messages, stats, console and storage APIs, and direct-vs-worker span parity on six synthetic vectors in `tests/web/fixtures/inference_worker_parity_vectors.json` plus the existing Python golden), package sources type-checked with the browser extension's stricter flags (pass), `pytest tests/web/test_npm_deidentify.py` (slow npm bridge, pass), `ruff check .` and `ruff format --check .` (clean), `scripts/security/check_effect_paths.py --check` (verified), `mypy` (clean), `pytest tests/ -q -m "not slow and not fuzz" --ignore=tests/unit/training/synthetic/test_dicom_overlays.py` (26986 passed, 224 skipped, 298 deselected; the ignored module fails to collect in the shared venv because `pydicom` is missing, which also happens on master).
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `b7c0322f1b17`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

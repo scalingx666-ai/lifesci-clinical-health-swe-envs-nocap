@@ -1,0 +1,1158 @@
+diff --git a/backend/app/integrations/rollup_queue.py b/backend/app/integrations/rollup_queue.py
+index 8208da0efa..a3ca96264e 100644
+--- a/backend/app/integrations/rollup_queue.py
++++ b/backend/app/integrations/rollup_queue.py
+@@ -1,9 +1,11 @@
+ """Days whose samples or events changed, waiting for the nightly rollup."""
+ 
+-from collections.abc import Iterable
++from collections import defaultdict
++from collections.abc import Callable, Iterable
++from concurrent.futures import ThreadPoolExecutor
+ from datetime import date
+ from logging import getLogger
+-from typing import cast
++from typing import Any, cast
+ from uuid import UUID
+ 
+ from sqlalchemy import event as sa_event
+@@ -20,6 +22,12 @@
+ # Days a run has taken but not finished: a worker killed mid-run leaves them here, the next run puts them back.
+ IN_PROGRESS_KEY = "series_rollup:in_progress"
+ 
++# Per source, its days queued or in progress, scored by the day: what a read asks to learn which of its days the
++# rollup has not caught up with. The global queue is one set for every user, which a read could only range over.
++SOURCE_DAYS_KEY = "series_rollup:source_days:{source_id}"
++# The sources holding a SOURCE_DAYS_KEY, so dropping the queue can drop theirs too.
++QUEUED_SOURCES_KEY = "series_rollup:queued_sources"
++
+ # Per source, the first local day an unfinished retention run has not deleted yet. Until the run finishes and
+ # archival_settings.deleted_before moves, this is what freezes the days already gone.
+ DELETED_BEFORE_KEY = "series_rollup:deleted_before"
+@@ -45,6 +53,36 @@
+ logger = getLogger(__name__)
+ 
+ 
++# A day is finished for its source only once no write queued it again meanwhile: a write landing while the run
++# rolled the day up has put it back on the global queue, and the source must keep it until the next run.
++_FINISH = """
++for i = 1, #ARGV do
++    local member = ARGV[i]
++    redis.call('SREM', KEYS[2], member)
++    if not redis.call('ZSCORE', KEYS[1], member) then
++        local split = string.find(member, ':', 1, true)
++        local source_key = KEYS[3] .. string.sub(member, 1, split - 1)
++        redis.call('ZREM', source_key, string.sub(member, split + 1))
++        if redis.call('ZCARD', source_key) == 0 then
++            redis.call('SREM', KEYS[4], string.sub(member, 1, split - 1))
++        end
++    end
++end
++"""
++_SOURCE_DAYS_PREFIX = SOURCE_DAYS_KEY.removesuffix("{source_id}")
++
++# Reading the queued sources and deleting their keys in one step, so a write in between leaves no orphan index.
++_CLEAR = """
++for _, source_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do redis.call('DEL', KEYS[5] .. source_id) end
++redis.call('DEL', KEYS[1], KEYS[2], KEYS[3], KEYS[4])
++"""
++
++# A read waits this long for the queue before it goes on with the rows as the rollup left them.
++QUEUED_DAYS_TIMEOUT_SECONDS = 0.05
++# Shared by every request of the process: each asks once and briefly, so a few threads never make a queue.
++_queue_reads = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rollup-queue-read")
++
++
+ def take_lock() -> str | None:
+     """The token that releases the lock, or None while another rollup holds it."""
+     return redis_lock.acquire(LOCK_KEY, _LOCK_TTL_SECONDS)
+@@ -63,7 +101,10 @@ def mark_dirty_days(db_session: DbSession, days: Iterable[tuple[UUID, date]]) ->
+     @sa_event.listens_for(db_session, "after_commit", once=True)
+     def _queue(_session: DbSession) -> None:
+         try:
+-            get_redis_client().zadd(DIRTY_DAYS_KEY, _scored(members))
++            pipe = get_redis_client().pipeline()
++            pipe.zadd(DIRTY_DAYS_KEY, _scored(members))
++            _index_by_source(pipe, members)
++            pipe.execute()
+         except Exception as exc:
+             # The day stays rolled up as it was; the next write to it, or the backfill, queues it again.
+             log_and_capture_error(exc, logger, "Failed to queue days for the rollup", extra={"days": len(members)})
+@@ -78,7 +119,9 @@ def pop_dirty_days(count: int) -> list[tuple[UUID, date]]:
+ def finish_dirty_days(days: Iterable[tuple[UUID, date]]) -> None:
+     """The run is done with these days: rolled up, or dropped for good."""
+     if members := _members(days):
+-        get_redis_client().srem(IN_PROGRESS_KEY, *members)
++        get_redis_client().eval(
++            _FINISH, 4, DIRTY_DAYS_KEY, IN_PROGRESS_KEY, _SOURCE_DAYS_PREFIX, QUEUED_SOURCES_KEY, *members
++        )
+ 
+ 
+ def requeue_dirty_days(days: Iterable[tuple[UUID, date]]) -> None:
+@@ -87,6 +130,8 @@ def requeue_dirty_days(days: Iterable[tuple[UUID, date]]) -> None:
+         pipe = get_redis_client().pipeline()
+         pipe.zadd(DIRTY_DAYS_KEY, _scored(members))
+         pipe.srem(IN_PROGRESS_KEY, *members)
++        # Already indexed when queued; again so days queued before the index existed join it.
++        _index_by_source(pipe, members)
+         pipe.execute()
+ 
+ 
+@@ -99,6 +144,7 @@ def recover_dirty_days() -> int:
+     pipe = client.pipeline()
+     pipe.zadd(DIRTY_DAYS_KEY, _scored(members))
+     pipe.delete(IN_PROGRESS_KEY)
++    _index_by_source(pipe, members)
+     pipe.execute()
+     return len(members)
+ 
+@@ -120,7 +166,9 @@ def roll_up_soon() -> None:
+ 
+ def clear_dirty_days() -> None:
+     """Drop the queue, while the rollup is off."""
+-    get_redis_client().delete(DIRTY_DAYS_KEY, IN_PROGRESS_KEY, RECONCILE_DAYS_KEY)
++    get_redis_client().eval(
++        _CLEAR, 5, DIRTY_DAYS_KEY, IN_PROGRESS_KEY, RECONCILE_DAYS_KEY, QUEUED_SOURCES_KEY, _SOURCE_DAYS_PREFIX
++    )
+ 
+ 
+ def queue_reconcile_days(days: Iterable[tuple[UUID, date]]) -> None:
+@@ -136,6 +184,64 @@ def pop_reconcile_days(count: int) -> list[tuple[UUID, date]]:
+     return [(UUID(user_id), date.fromisoformat(day)) for user_id, day in (m.split(":", 1) for m, _ in members)]
+ 
+ 
++class QueuedDays:
++    """The days of some sources the rollup has not caught up with: queued, or taken by a run not finished yet.
++    Their day rows, if any, are older than their samples."""
++
++    def __init__(self, days: dict[UUID, set[date]] | None = None, deleted_before: dict[UUID, date] | None = None):
++        self.days = days or {}
++        # Per source, the first day an unfinished retention run has not deleted: the days before it hold no samples.
++        self.deleted_before = deleted_before or {}
++
++    def of(self, source_id: UUID, frozen_before: date | None = None) -> set[date]:
++        """The source's queued days that still hold their samples."""
++        floor = max((day for day in (frozen_before, self.deleted_before.get(source_id)) if day), default=None)
++        days = self.days.get(source_id, set())
++        return {day for day in days if day >= floor} if floor else days
++
++    def __bool__(self) -> bool:
++        return any(self.days.values())
++
++
++def queued_days(source_ids: Iterable[UUID], first_day: date, last_day: date) -> QueuedDays:
++    """The sources' days from ``first_day`` to ``last_day`` the rollup has not caught up with: one round trip,
++    a range of a small set per source, whatever the size of the queue."""
++    source_ids = list(source_ids)
++    if not source_ids:
++        return QueuedDays()
++    pipe = get_redis_client().pipeline(transaction=False)
++    for source_id in source_ids:
++        pipe.zrangebyscore(SOURCE_DAYS_KEY.format(source_id=source_id), first_day.toordinal(), last_day.toordinal())
++    pipe.hmget(DELETED_BEFORE_KEY, [str(source_id) for source_id in source_ids])
++    *ranges, deleted = pipe.execute()
++    days = {
++        source_id: {date.fromisoformat(day) for day in members}
++        for source_id, members in zip(source_ids, ranges, strict=True)
++        if members
++    }
++    deleted_before = {
++        source_id: date.fromisoformat(day) for source_id, day in zip(source_ids, deleted, strict=True) if day
++    }
++    return QueuedDays(days, deleted_before)
++
++
++def queued_days_soon(source_ids: Iterable[UUID], first_day: date, last_day: date) -> Callable[[], QueuedDays]:
++    """Start :func:`queued_days` on a worker thread, so the caller's database query runs meanwhile; call the
++    result for the answer. A queue that fails or is slow answers nothing queued: the rows stand as they are."""
++    future = _queue_reads.submit(queued_days, list(source_ids), first_day, last_day)
++
++    def result() -> QueuedDays:
++        try:
++            return future.result(timeout=QUEUED_DAYS_TIMEOUT_SECONDS)
++        except Exception:
++            # Expected under a slow Redis and harmless, so no Sentry event per read.
++            future.cancel()
++            logger.warning("Could not read the rollup queue; day rows are read as they are", exc_info=True)
++            return QueuedDays()
++
++    return result
++
++
+ def source_deleted_before(source_id: UUID) -> date | None:
+     """The first local day of the source retention has not deleted yet, in a run that did not finish."""
+     day = cast(str | None, get_redis_client().hget(DELETED_BEFORE_KEY, str(source_id)))
+@@ -151,6 +257,17 @@ def clear_sources_deleted_before() -> None:
+     get_redis_client().delete(DELETED_BEFORE_KEY)
+ 
+ 
++def _index_by_source(pipe: Any, members: Iterable[str]) -> None:
++    by_source: dict[str, dict[str, int]] = defaultdict(dict)
++    for member in members:
++        source_id, day = member.rsplit(":", 1)
++        by_source[source_id][day] = date.fromisoformat(day).toordinal()
++    for source_id, days in by_source.items():
++        pipe.zadd(SOURCE_DAYS_KEY.format(source_id=source_id), days)
++    if by_source:
++        pipe.sadd(QUEUED_SOURCES_KEY, *by_source)
++
++
+ def _members(days: Iterable[tuple[UUID, date]]) -> list[str]:
+     return [f"{source_id}:{day.isoformat()}" for source_id, day in days]
+ 
+diff --git a/backend/app/repositories/data_point_series_repository.py b/backend/app/repositories/data_point_series_repository.py
+index b98d9340b7..9b3b482817 100644
+--- a/backend/app/repositories/data_point_series_repository.py
++++ b/backend/app/repositories/data_point_series_repository.py
+@@ -1,8 +1,8 @@
+-from collections.abc import Iterable
++from collections.abc import Collection, Iterable
+ from datetime import date, datetime, timedelta, timezone
+ from decimal import Decimal
+ from logging import getLogger
+-from typing import LiteralString, NamedTuple, overload
++from typing import Any, LiteralString, NamedTuple, overload
+ from typing import cast as typing_cast
+ from uuid import UUID
+ 
+@@ -767,9 +767,13 @@ def winning_source_by_series_type(
+         types: list[SeriesType],
+         user_id: UUID,
+         ranking: SourceRanking,
++        sample_sources: Collection[UUID] | None = None,
+     ) -> dict[int, UUID]:
+         """Best-ranked data source per series type, among those holding data in the window.
+ 
++        Day, week and month reads look for day rows; of ``sample_sources`` also for samples, as the read counts
++        their days from samples where the rollup has not written rows (yet).
++
+         Decided on source metadata plus one existence probe per (source, series type), so the
+         cost tracks the number of devices a user owns rather than the number of samples. The
+         winner is resolved per series type, so a watch with heart rate but no GPS keeps the
+@@ -781,52 +785,32 @@ def winning_source_by_series_type(
+             return {}
+ 
+         start, end = params.start_datetime, params.end_datetime
+-        candidates = values(
+-            column("type_id", Integer),
+-            column("source_id", PGUUID(as_uuid=True)),
+-            name="candidates",
+-        ).data([(type_id, source.id) for type_id in type_ids for source in ranked])
++        pairs = [(type_id, source.id) for type_id in type_ids for source in ranked]
+         if params.resolution in PERIOD_RESOLUTIONS:
+             # Day, week and month reads come from the day rows, so that is where a source must hold
+             # something: retention may have deleted its samples while its day rows stay, and a source
+             # with only a provider day value (a Whoop cycle's steps) has exactly what these return.
+-            source, series, at = (
+-                SeriesAggregate.data_source_id,
+-                SeriesAggregate.series_type_definition_id,
+-                SeriesAggregate.period_start,
+-            )
+             # The same local days the read then returns: the UTC reach alone would crown a source on a row
+             # just past the range, and the read would come back empty.
+             available = [SeriesAggregate.period_kind == PeriodKind.DAY]
++            at = SeriesAggregate.period_start
+             if start is not None:
+                 available.extend([at >= start - OFFSET_REACH, start.date() <= LOCAL_DAY])
+             if end is not None:
+                 available.extend([at < end + OFFSET_REACH, (end - timedelta(microseconds=1)).date() >= LOCAL_DAY])
++            probe = (SeriesAggregate.data_source_id, SeriesAggregate.series_type_definition_id, at, available)
+         else:
+-            source, series, at = self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+-            available = [at >= start] if start is not None else []
+-            if end is not None:
+-                available.append(at < end)
+-            if params.resolution is not Resolution.RAW:
+-                # Bucketed reads drop daily totals, so a source holding only those has nothing to
+-                # offer here and must not outrank one with real intraday samples.
+-                available.append(self.model.is_daily_total.isnot(True))
+-        probe = (
+-            select(literal_column("1"))
+-            .where(source == candidates.c.source_id, series == candidates.c.type_id, *available)
+-            # Ordering on the index's trailing column lets the planner stop at the first match
+-            # instead of costing this as a full scan once a non-indexed filter is present.
+-            .order_by(at)
+-            .limit(1)
+-            .lateral("probe")
+-        )
+-        populated = db_session.execute(
+-            select(candidates.c.type_id, candidates.c.source_id).select_from(candidates.join(probe, true()))
+-        ).all()
++            probe = self._sample_probe(start, end, intraday_only=params.resolution is not Resolution.RAW)
++        # Each (series, source) pair with the probe that found it: a tie is broken by counting with that probe.
++        found = dict.fromkeys(self._populated(db_session, pairs, *probe), probe)
++        if params.resolution in PERIOD_RESOLUTIONS and sample_sources:
++            sample_probe = self._sample_probe(start, end, intraday_only=True, local_days=True)
++            unfound = [pair for pair in pairs if pair[1] in sample_sources and pair not in found]
++            found |= dict.fromkeys(self._populated(db_session, unfound, *sample_probe), sample_probe)
+ 
+         rank_of = {s.id: ranking.rank(s.provider, s.device_type) for s in ranked}
+         by_type: dict[int, list[UUID]] = {}
+-        for type_id, source_id in populated:
++        for type_id, source_id in found:
+             by_type.setdefault(type_id, []).append(source_id)
+         winners: dict[int, UUID] = {}
+         for type_id, source_ids in by_type.items():
+@@ -836,21 +820,74 @@ def winning_source_by_series_type(
+                 winners[type_id] = tied[0]
+                 continue
+             # A tie goes to the source holding the most here (capped), so one stray entry never hides a real device.
+-            tied_sources = values(column("source_id", PGUUID(as_uuid=True)), name="tied").data([(s,) for s in tied])
+-            held = (
+-                select(literal_column("1").label("one"))
+-                .where(source == tied_sources.c.source_id, series == type_id, *available)
+-                .limit(_TIE_COUNT_CAP)
+-                .lateral("held")
+-            )
+-            counts = db_session.execute(
+-                select(tied_sources.c.source_id, func.count())
+-                .select_from(tied_sources.join(held, true()))
+-                .group_by(tied_sources.c.source_id)
+-            ).all()
++            counts = []
++            for tie_probe in {id(found[(type_id, s)]): found[(type_id, s)] for s in tied}.values():
++                source, series, _, available = tie_probe
++                members = [s for s in tied if found[(type_id, s)] is tie_probe]
++                tied_sources = values(column("source_id", PGUUID(as_uuid=True)), name="tied").data(
++                    [(s,) for s in members]
++                )
++                held = (
++                    select(literal_column("1").label("one"))
++                    .where(source == tied_sources.c.source_id, series == type_id, *available)
++                    .limit(_TIE_COUNT_CAP)
++                    .lateral("held")
++                )
++                counts += db_session.execute(
++                    select(tied_sources.c.source_id, func.count())
++                    .select_from(tied_sources.join(held, true()))
++                    .group_by(tied_sources.c.source_id)
++                ).all()
+             winners[type_id] = min(counts, key=lambda row: (-row[1], str(row[0])))[0]
+         return winners
+ 
++    def _sample_probe(
++        self, start: datetime | None, end: datetime | None, intraday_only: bool, local_days: bool = False
++    ) -> tuple:
++        """The source, series and instant columns of samples, and the conditions a sample in the window meets;
++        with ``local_days``, a sample of the window's local days, as day reads count them."""
++        at = self.model.recorded_at
++        reach = OFFSET_REACH if local_days else timedelta(0)
++        day = cast(func.timezone("UTC", at) + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval), Date)
++        available = [at >= start - reach] if start is not None else []
++        if end is not None:
++            available.append(at < end + reach)
++        if local_days and start is not None:
++            available.append(day >= start.date())
++        if local_days and end is not None:
++            available.append(day <= (end - timedelta(microseconds=1)).date())
++        if intraday_only:
++            # Bucketed and sample-counted day reads drop daily totals, so a source holding only those has
++            # nothing to offer there and must not outrank one with real intraday samples.
++            available.append(self.model.is_daily_total.isnot(True))
++        return self.model.data_source_id, self.model.series_type_definition_id, at, available
++
++    @staticmethod
++    def _populated(
++        db_session: DbSession, pairs: list[tuple[int, UUID]], source: Any, series: Any, at: Any, available: list
++    ) -> set[tuple[int, UUID]]:
++        """The (series type, source) pairs holding a row that meets ``available``: one index probe each."""
++        if not pairs:
++            return set()
++        candidates = values(
++            column("type_id", Integer),
++            column("source_id", PGUUID(as_uuid=True)),
++            name="candidates",
++        ).data(pairs)
++        probe = (
++            select(literal_column("1"))
++            .where(source == candidates.c.source_id, series == candidates.c.type_id, *available)
++            # Ordering on the index's trailing column lets the planner stop at the first match
++            # instead of costing this as a full scan once a non-indexed filter is present.
++            .order_by(at)
++            .limit(1)
++            .lateral("probe")
++        )
++        rows = db_session.execute(
++            select(candidates.c.type_id, candidates.c.source_id).select_from(candidates.join(probe, true()))
++        )
++        return {(row.type_id, row.source_id) for row in rows}
++
+     def _ranked_sources(
+         self,
+         db_session: DbSession,
+diff --git a/backend/app/repositories/series_aggregate_repository.py b/backend/app/repositories/series_aggregate_repository.py
+index 11e73a29f9..456efe3bd6 100644
+--- a/backend/app/repositories/series_aggregate_repository.py
++++ b/backend/app/repositories/series_aggregate_repository.py
+@@ -1,9 +1,9 @@
+ from collections import defaultdict
+-from collections.abc import Iterable
++from collections.abc import Callable, Iterable
+ from dataclasses import dataclass
+ from datetime import date, datetime, timedelta, timezone
+ from decimal import Decimal
+-from typing import cast
++from typing import Any, cast
+ from uuid import UUID
+ 
+ from sqlalchemy import Date, Interval, func, text, tuple_
+@@ -11,7 +11,9 @@
+ from sqlalchemy.orm import Query
+ 
+ from app.database import DbSession
++from app.integrations import rollup_queue
+ from app.models import DataSource, SeriesAggregate
++from app.models.archival_setting import ArchivalSetting
+ from app.models.series_type_definition import SeriesTypeDefinition
+ from app.repositories.local_day import OFFSET_REACH, sample_day_sql, utc_midnight
+ from app.repositories.repositories import (
+@@ -81,6 +83,19 @@
+     ) d
+ """)
+ 
++# The same, for only the local days in :days: those the rollup has not caught up with.
++_SAMPLE_DAYS_OF = text(f"""
++    SELECT c.source_id AS data_source_id, c.type_id AS series_type_definition_id, d.*
++    FROM unnest(CAST(:type_ids AS integer[]), CAST(:source_ids AS uuid[])) AS c(type_id, source_id)
++    CROSS JOIN LATERAL (
++        SELECT {sample_day_sql("s")} AS day, sum(s.value) AS sum, avg(s.value) AS avg, min(s.value) AS min,
++            max(s.value) AS max, count(*) AS count, (array_agg(s.value ORDER BY s.recorded_at DESC))[1] AS last,
++            min(s.zone_offset) AS zone_offset
++        {_SAMPLES_OF_PAIR} AND {sample_day_sql("s")} = ANY(:days)
++        GROUP BY 1
++    ) d
++""")
++
+ # Per (series, data source) pair, the local day of its first (or last) sample in the range.
+ _SAMPLE_EDGES = {
+     latest: text(f"""
+@@ -113,6 +128,25 @@ class SampleDay:
+     computed_by: ComputedBy = ComputedBy.OPEN_WEARABLES
+ 
+ 
++# Per data source, its local days whose day rows are older than their samples, as the rollup has not caught up.
++StaleDays = dict[UUID, set[date]]
++
++
++def _sample_day(sample: Any) -> SampleDay:
++    return SampleDay(
++        data_source_id=sample.data_source_id,
++        series_type_definition_id=sample.series_type_definition_id,
++        period_start=CalendarPeriod.of_date(sample.day, sample.zone_offset).start,
++        sum=sample.sum,
++        avg=sample.avg,
++        min=sample.min,
++        max=sample.max,
++        count=sample.count,
++        last=sample.last,
++        zone_offset=sample.zone_offset,
++    )
++
++
+ def _pair_params(pairs: list[tuple[int, UUID]], first_day: date, last_day: date) -> dict:
+     return {
+         "type_ids": [type_id for type_id, _ in pairs],
+@@ -165,34 +199,80 @@ def day_rows_or_samples(
+         from_samples: bool,
+         params: TimeSeriesQueryParams | None = None,
+         source_by_type: dict[int, UUID] | None = None,
++        stale: StaleDays | None = None,
+     ) -> list[tuple[SeriesAggregate | SampleDay, date]]:
+         """The user's day rows; with ``from_samples`` also every (data source, series, day) no row holds, counted
+-        from its samples, as the readers were before the rollup."""
++        from its samples, as the readers were before the rollup. Without it, the days the rollup has not caught
++        up with yet (``stale``, else asked of its queue while the rows are read) are counted from their samples.
++        """
+         params = params or TimeSeriesQueryParams()
++        pairs = self._pairs(db_session, user_id, params, types, source_by_type)
++        pending = None
++        if not from_samples and stale is None:
++            pending = self.stale_days_soon(db_session, {source_id for _, source_id in pairs}, first_day, last_day)
+         rows: list[tuple[SeriesAggregate | SampleDay, date]] = list(
+             self.get_day_rows(db_session, user_id, params, types, first_day, last_day, source_by_type)
+         )
+-        if not from_samples:
++        if pending is not None:
++            stale = pending()
++        if from_samples:
++            held = {(row.data_source_id, row.series_type_definition_id, day) for row, day in rows}
++            for sample in db_session.execute(_SAMPLE_DAYS, _pair_params(pairs, first_day, last_day)) if pairs else ():
++                if (sample.data_source_id, sample.series_type_definition_id, sample.day) not in held:
++                    rows.append((_sample_day(sample), sample.day))
++        elif stale := {
++            source_id: in_range
++            for source_id, days in (stale or {}).items()
++            if (in_range := {day for day in days if first_day <= day <= last_day})
++        }:
++            rows = self._recount_stale(db_session, rows, pairs, stale)
++        return sorted(rows, key=lambda pair: pair[1])
++
++    def stale_days_soon(
++        self, db_session: DbSession, source_ids: Iterable[UUID], first_day: date, last_day: date
++    ) -> Callable[[], StaleDays]:
++        """Ask the rollup queue which of the sources' days it has not caught up with, on a worker thread so the
++        caller's next query runs meanwhile; call the result for the answer. Days whose samples retention deleted
++        are left out: their rows are all they have."""
++        pending = rollup_queue.queued_days_soon(source_ids, first_day, last_day)
++
++        def result() -> StaleDays:
++            queued = pending()
++            if not queued:
++                return {}
++            frozen_before = db_session.query(ArchivalSetting.deleted_before).filter(ArchivalSetting.id == 1).scalar()
++            return {source_id: days for source_id in queued.days if (days := queued.of(source_id, frozen_before))}
++
++        return result
++
++    @staticmethod
++    def _recount_stale(
++        db_session: DbSession,
++        rows: list[tuple[SeriesAggregate | SampleDay, date]],
++        pairs: list[tuple[int, UUID]],
++        stale: StaleDays,
++    ) -> list[tuple[SeriesAggregate | SampleDay, date]]:
++        """``rows`` with our rows of the stale days counted again from their samples; a provider's row stays."""
++        pairs = [(type_id, source_id) for type_id, source_id in pairs if stale.get(source_id)]
++        if not pairs:
+             return rows
+-        held = {(row.data_source_id, row.series_type_definition_id, day) for row, day in rows}
+-        pairs = self._pairs(db_session, user_id, params, types, source_by_type)
+-        for sample in db_session.execute(_SAMPLE_DAYS, _pair_params(pairs, first_day, last_day)) if pairs else ():
+-            if (sample.data_source_id, sample.series_type_definition_id, sample.day) in held:
++        days = sorted(set().union(*(stale[source_id] for _, source_id in pairs)))
++        counted = {
++            (sample.data_source_id, sample.series_type_definition_id, sample.day): _sample_day(sample)
++            for sample in db_session.execute(_SAMPLE_DAYS_OF, {**_pair_params(pairs, days[0], days[-1]), "days": days})
++            if sample.day in stale[sample.data_source_id]
++        }
++        kept: list[tuple[SeriesAggregate | SampleDay, date]] = []
++        for row, day in rows:
++            key = (row.data_source_id, row.series_type_definition_id, day)
++            if row.computed_by == ComputedBy.PROVIDER:
++                counted.pop(key, None)
++            elif key in counted:
++                # Replaced by the count below; a series with no samples that day keeps its row, as the rollup does.
+                 continue
+-            day = SampleDay(
+-                data_source_id=sample.data_source_id,
+-                series_type_definition_id=sample.series_type_definition_id,
+-                period_start=CalendarPeriod.of_date(sample.day, sample.zone_offset).start,
+-                sum=sample.sum,
+-                avg=sample.avg,
+-                min=sample.min,
+-                max=sample.max,
+-                count=sample.count,
+-                last=sample.last,
+-                zone_offset=sample.zone_offset,
+-            )
+-            rows.append((day, sample.day))
+-        return sorted(rows, key=lambda pair: pair[1])
++            kept.append((row, day))
++        kept.extend((sample_day, key[2]) for key, sample_day in counted.items())
++        return kept
+ 
+     def sample_edge_day(
+         self,
+diff --git a/backend/app/services/timeseries_service.py b/backend/app/services/timeseries_service.py
+index a1ddadda8a..218ffa3b12 100644
+--- a/backend/app/services/timeseries_service.py
++++ b/backend/app/services/timeseries_service.py
+@@ -17,7 +17,7 @@
+ from app.repositories import ArchivalSettingRepository, DataPointSeriesRepository
+ from app.repositories.data_point_series_repository import AggregatedSample, WriteCounts
+ from app.repositories.repositories import SourceRanking
+-from app.repositories.series_aggregate_repository import SampleDay, SeriesAggregateRepository
++from app.repositories.series_aggregate_repository import SampleDay, SeriesAggregateRepository, StaleDays
+ from app.repositories.series_reconcile_repository import RECONCILED_SERIES, SeriesReconcileRepository
+ from app.schemas.enums import (
+     BUCKET_SIZES,
+@@ -368,10 +368,11 @@ def _winning_sources(
+         user_id: UUID,
+         types: list[SeriesType],
+         params: TimeSeriesQueryParams,
++        sample_sources: set[UUID] | None = None,
+     ) -> dict[int, UUID]:
+         """Resolve one data source per series type, using the ranking sleep and summaries use."""
+         ranking = priority_service.get_source_ranking(db_session)
+-        return self.crud.winning_source_by_series_type(db_session, params, types, user_id, ranking)
++        return self.crud.winning_source_by_series_type(db_session, params, types, user_id, ranking, sample_sources)
+ 
+     def _aggregated_timeseries(
+         self,
+@@ -425,23 +426,31 @@ def _period_timeseries(
+         user_id: UUID,
+         types: list[SeriesType],
+         params: TimeSeriesQueryParams,
+-        source_by_type: dict[int, UUID] | None = None,
+-        ranking: SourceRanking | None = None,
+-        reconcile: bool = False,
++        source_selection: SourceSelection = SourceSelection.ALL,
+     ) -> PaginatedResponse[TimeSeriesSample]:
+         """Day, week and month values from series_aggregate, the provider's day before ours.
+ 
+         Weeks start on Monday and months on the 1st, by the local day; a week or month is built from
+         its days within the requested range. Pages hold ``limit`` periods; the cursor is a period's
+-        first day. With ``ranking``, each day keeps only its best-ranked source, and a week or month is
+-        built from those days whichever source each came from. With ``reconcile`` too, a merged series' day two
++        first day. With per_period, each day keeps only its best-ranked source, and a week or month is
++        built from those days whichever source each came from. With reconcile too, a merged series' day two
+         sources hold is their merged value instead (see :meth:`_reconciled_days`).
++
++        Until the rollup is on and caught up with the history, a day no row holds is counted from its samples.
++        After that, only the days the rollup has not caught up with yet are: the rollup queue names them, asked
++        while the first query runs.
+         """
+         kind = PERIOD_RESOLUTIONS[params.resolution]
++        per_range = source_selection is SourceSelection.PER_RANGE
++        reconcile = source_selection is SourceSelection.RECONCILE
++        ranked = source_selection in (SourceSelection.PER_PERIOD, SourceSelection.RECONCILE)
++        ranking = priority_service.get_source_ranking(db_session) if ranked else None
+         first_day = max(params.start_datetime.date(), _NO_START) if params.start_datetime else _NO_START
+         last_day = (
+             min((params.end_datetime - timedelta(microseconds=1)).date(), _NO_END) if params.end_datetime else _NO_END
+         )
++        # The whole range, whatever page: priority must pick the same source on every page.
++        range_days = (first_day, last_day)
+         backward = False
+         if params.cursor:
+             cursor_period, direction = decode_date_cursor(params.cursor)
+@@ -456,19 +465,34 @@ def _period_timeseries(
+         # so a sparse range is not paged through empty and a page never scans the whole range.
+         repo = self.series_aggregate_repo
+         from_samples = days_from_samples(db_session)
++        source_ids: set[UUID] = set()
++        if per_range or not from_samples:
++            source_ids = {source_id for _, source_id in repo._pairs(db_session, user_id, params, types, None)}
++        # Asked on a worker thread while the next query runs; answered empty when every day is read from samples.
++        pending_stale = repo.stale_days_soon(db_session, source_ids, *range_days) if not from_samples else dict
++        source_by_type = None
++        if per_range:
++            # Priority picks among the sources holding something on these days, samples counted where they are read.
++            stale = pending_stale()
++            pending_stale = lambda: stale  # noqa: E731
++            sample_sources = source_ids if from_samples else set(stale)
++            source_by_type = self._winning_sources(db_session, user_id, types, params, sample_sources)
+ 
+         def edge_day(first: date, last: date, latest: bool, starts: Any = None) -> date | None:
+-            """The outermost day holding a row, or with ``from_samples`` a sample."""
++            """The outermost day holding a row, or with ``from_samples`` a sample, or one the rollup is behind on."""
+             days = [repo.edge_day(db_session, user_id, params, types, first, last, source_by_type, latest, starts)]
+             if from_samples:
+                 days.append(
+                     repo.sample_edge_day(db_session, user_id, params, types, first, last, source_by_type, latest)
+                 )
++            read_sources = set(source_by_type.values()) if source_by_type is not None else set(stale)
++            days.extend(day for source_id in read_sources for day in stale.get(source_id, ()) if first <= day <= last)
+             days = [day for day in days if day is not None]
+             return (max(days) if latest else min(days)) if days else None
+ 
+         edges = repo.edge_rows(db_session, user_id, params, types, first_day, last_day, source_by_type, backward)
+-        if not edges and not from_samples:
++        stale = pending_stale()
++        if not edges and not from_samples and not stale:
+             return _page(data=[], params=params, has_more=False, next_cursor=None, previous_cursor=None)
+         # A period is up to two rows (the provider's and ours) a day for every series of every source holding
+         # data here; with all of them asked for, a page of `limit` periods could be hundreds of thousands of rows.
+@@ -490,7 +514,7 @@ def edge_day(first: date, last: date, latest: bool, starts: Any = None) -> date
+                 min(last_day, _shift(_period_of(first_day, kind), kind, limit + 1) - timedelta(days=1)),
+             )
+         device_rows = repo.day_rows_or_samples(
+-            db_session, user_id, types, *window, from_samples, params, source_by_type
++            db_session, user_id, types, *window, from_samples, params, source_by_type, stale=stale
+         )
+         sources = self.crud._sources_by_id(db_session, {row.data_source_id for row, _ in device_rows})
+         rows: Sequence[tuple[_DayRow, date]] = device_rows
+@@ -499,7 +523,9 @@ def edge_day(first: date, last: date, latest: bool, starts: Any = None) -> date
+             held = sorted({_period_of(day, kind) for _, day in device_rows})
+             shown_periods = set(held[-limit:] if backward else held[:limit])
+             shown = {day for _, day in device_rows if _period_of(day, kind) in shown_periods}
+-            rows = self._reconciled_days(db_session, user_id, types, device_rows, sources, ranking, from_samples, shown)
++            rows = self._reconciled_days(
++                db_session, user_id, types, device_rows, sources, ranking, from_samples, stale, shown
++            )
+         elif ranking is not None:
+             rows = _best_per_day(device_rows, sources, ranking)
+ 
+@@ -561,11 +587,13 @@ def _reconciled_days(
+         sources: dict[UUID, DataSource],
+         ranking: SourceRanking,
+         from_samples: bool,
++        stale: StaleDays,
+         shown: set[date] | None = None,
+     ) -> Sequence[tuple[_DayRow, date]]:
+         """The devices' day rows of a page, with each RECONCILED_SERIES day of ``shown`` two of them hold replaced by
+-        its merged value: the stored one, else merged now (at most RECONCILE_ON_THE_FLY_MAX_DAYS days, queued to be
+-        stored with reconcile on). A day whose best-ranked source holds no samples keeps that source's row."""
++        its merged value: the stored one unless a source has newer samples (``stale``), else merged now (at most
++        RECONCILE_ON_THE_FLY_MAX_DAYS days, queued to be stored with reconcile on). A day whose best-ranked source
++        holds no samples keeps that source's row."""
+         if not rows:
+             return rows
+         merged_series = RECONCILED_SERIES & set(types) if types else RECONCILED_SERIES
+@@ -575,15 +603,19 @@ def _reconciled_days(
+         reconcile_repo = SeriesReconcileRepository()
+         first_day, last_day = min(day for _, day in rows), max(day for _, day in rows)
+         reconciled = reconcile_repo.reconciled_source(db_session, user_id)
+-        stored = (
+-            reconcile_repo.day_rows(db_session, reconciled.id, sorted(merged_type_ids), first_day, last_day)
+-            if reconciled
+-            else {}
+-        )
+-
+         sources_of: dict[tuple[int, date], set[UUID]] = defaultdict(set)
+         for row, day in rows:
+             sources_of[(row.series_type_definition_id, day)].add(row.data_source_id)
++        # A stored merge is out of date only when a source of that series and day has newer samples queued.
++        stored = {
++            key: row
++            for key, row in (
++                reconcile_repo.day_rows(db_session, reconciled.id, sorted(merged_type_ids), first_day, last_day)
++                if reconciled
++                else {}
++            ).items()
++            if not any(key[1] in stale.get(source_id, ()) for source_id in sources_of.get(key, ()))
++        }
+         # Retention has deleted these days' samples: nothing is left to merge, the best source's day stands.
+         frozen_before = ArchivalSettingRepository().deleted_before(db_session)
+         candidates = {
+@@ -656,14 +688,14 @@ def get_timeseries(
+                     "end_datetime": _clamp(params.end_datetime, _NO_START, _NO_END),
+                 }
+             )
++        if params.resolution in PERIOD_RESOLUTIONS:
++            return self._period_timeseries(db_session, user_id, types, params, source_selection)
+         source_by_type = None
+         if source_selection is SourceSelection.PER_RANGE:
+             source_by_type = self._winning_sources(db_session, user_id, types, params)
+-        ranked = source_selection in (SourceSelection.PER_PERIOD, SourceSelection.RECONCILE)
+-        ranking = priority_service.get_source_ranking(db_session) if ranked else None
+-        if params.resolution in PERIOD_RESOLUTIONS:
+-            reconcile = source_selection is SourceSelection.RECONCILE
+-            return self._period_timeseries(db_session, user_id, types, params, source_by_type, ranking, reconcile)
++        ranking = (
++            priority_service.get_source_ranking(db_session) if source_selection is SourceSelection.PER_PERIOD else None
++        )
+         if params.resolution is not Resolution.RAW:
+             return self._aggregated_timeseries(db_session, user_id, types, params, source_by_type, ranking)
+ 
+diff --git a/backend/tests/repositories/test_aggregate_repository.py b/backend/tests/repositories/test_aggregate_repository.py
+index 04c8e1cf7d..f18fb6ea8c 100644
+--- a/backend/tests/repositories/test_aggregate_repository.py
++++ b/backend/tests/repositories/test_aggregate_repository.py
+@@ -15,7 +15,12 @@
+     DELETED_BEFORE_KEY,
+     DIRTY_DAYS_KEY,
+     IN_PROGRESS_KEY,
++    QUEUED_SOURCES_KEY,
++    clear_dirty_days,
++    finish_dirty_days,
++    mark_source_deleted_before,
+     pop_dirty_days,
++    queued_days,
+     recover_dirty_days,
+     requeue_dirty_days,
+ )
+@@ -447,6 +452,72 @@ def test_a_run_takes_the_newest_days_first(self) -> None:
+         assert sorted(day for _, day in pop_dirty_days(10)) == [DAY, DAY + timedelta(days=3)]
+ 
+ 
++class TestQueuedDaysOfASource:
++    """What a read asks: which of its sources' days the rollup has not caught up with."""
++
++    def test_a_committed_write_names_its_day_for_its_source(self, db: Session) -> None:
++        user = UserFactory()
++        sample = TimeSeriesSampleCreate(
++            id=uuid4(),
++            user_id=user.id,
++            source="garmin",
++            recorded_at=datetime(2099, 1, 1, 12, tzinfo=timezone.utc),
++            value=Decimal("70"),
++            series_type=SeriesType.heart_rate,
++        )
++        DataPointSeriesRepository(SeriesSample).bulk_create(db, [sample])
++        db.commit()
++        source_id = db.query(SeriesSample).one().data_source_id
++
++        assert queued_days([source_id], date(2099, 1, 1), date(2099, 1, 1)).days == {source_id: {date(2099, 1, 1)}}
++
++    def test_only_the_days_in_range_of_the_asked_sources(self) -> None:
++        mine, other = uuid4(), uuid4()
++        requeue_dirty_days([(mine, DAY), (mine, DAY + timedelta(days=5)), (other, DAY)])
++
++        assert queued_days([mine], DAY, DAY + timedelta(days=1)).days == {mine: {DAY}}
++
++    def test_a_day_a_run_took_stays_named_until_it_finishes(self) -> None:
++        source = uuid4()
++        requeue_dirty_days([(source, DAY)])
++        taken = pop_dirty_days(10)
++        assert queued_days([source], DAY, DAY).days == {source: {DAY}}
++
++        finish_dirty_days(taken)
++
++        assert (queued_days([source], DAY, DAY).days, get_redis_client().scard(QUEUED_SOURCES_KEY)) == ({}, 0)
++
++    def test_a_day_written_again_during_its_run_stays_named(self) -> None:
++        source = uuid4()
++        requeue_dirty_days([(source, DAY)])
++        taken = pop_dirty_days(10)
++        requeue_dirty_days([(source, DAY)])  # a write landing while the run rolls the day up
++
++        finish_dirty_days(taken)
++
++        assert queued_days([source], DAY, DAY).days == {source: {DAY}}
++
++    def test_dropping_the_queue_drops_every_source_days(self) -> None:
++        source = uuid4()
++        requeue_dirty_days([(source, DAY)])
++
++        clear_dirty_days()
++
++        assert queued_days([source], DAY, DAY).days == {}
++
++    def test_days_retention_emptied_are_not_stale(self) -> None:
++        source = uuid4()
++        requeue_dirty_days([(source, DAY), (source, DAY + timedelta(days=2))])
++        mark_source_deleted_before(source, DAY + timedelta(days=1))
++
++        queued = queued_days([source], DAY, DAY + timedelta(days=2))
++
++        assert (queued.of(source), queued.of(source, frozen_before=DAY + timedelta(days=3))) == (
++            {DAY + timedelta(days=2)},
++            set(),
++        )
++
++
+ class TestDirtyDaysSurviveAKill:
+     def test_days_a_dead_run_took_come_back_on_the_next_run(self, db: Session) -> None:
+         source_id = uuid4()
+diff --git a/backend/tests/services/test_reconcile.py b/backend/tests/services/test_reconcile.py
+index c4091e016b..e58ee4c67f 100644
+--- a/backend/tests/services/test_reconcile.py
++++ b/backend/tests/services/test_reconcile.py
+@@ -95,6 +95,28 @@ def test_a_day_two_devices_hold_is_their_merged_value(self, db: Session, devices
+ 
+         assert _read(db, watch, DAY, DAY) == [(DAY, 180, None)]
+ 
++    def test_a_stored_merge_stays_while_only_another_series_source_is_queued(
++        self, db: Session, devices: tuple, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        watch, phone = devices
++        _walk(watch, phone, DAY)
++        for source in devices:
++            SeriesRollupRepository().roll_up(db, source.id, [DAY])
++        SeriesReconcileRepository().reconcile(db, watch.user_id, [DAY], priority_service.get_source_ranking(db))
++        scale = DataSourceFactory(user=db.get(User, watch.user_id), provider=ProviderName.WITHINGS, source="withings")
++        requeue_dirty_days([(scale.id, DAY)])
++        db.merge(ArchivalSetting(id=1, rollup_enabled=True, delete_after_days=None))
++        DataMigrationRepository().mark_completed(db, "aggregate_backfill:rollup_all")
++        db.flush()
++        monkeypatch.setattr(rollup_queue, "QUEUED_DAYS_TIMEOUT_SECONDS", 5)
++
++        def no_merging(*_args: object) -> None:
++            raise AssertionError("merged on the fly")
++
++        monkeypatch.setattr(SeriesReconcileRepository, "merge", no_merging)
++
++        assert _read(db, watch, DAY, DAY) == [(DAY, 180, None)]
++
+     def test_a_day_whose_best_source_holds_only_a_day_value_is_that_value(self, db: Session, devices: tuple) -> None:
+         """Oura sends steps only as its day total; ranked first, it is not outvoted by a merge of worse devices."""
+         watch, phone = devices
+@@ -218,6 +240,20 @@ def test_a_refused_page_does_not_claim_days_it_could_not_queue(
+ 
+         assert refused.value.detail["queued"] is False
+ 
++    def test_a_stored_merged_day_whose_samples_changed_since_is_merged_again(self, db: Session, devices: tuple) -> None:
++        watch, phone = devices
++        _walk(watch, phone, DAY)
++        for source in devices:
++            SeriesRollupRepository().roll_up(db, source.id, [DAY])
++        SeriesReconcileRepository().reconcile(db, watch.user_id, [DAY], priority_service.get_source_ranking(db))
++        db.merge(ArchivalSetting(id=1, rollup_enabled=True, delete_after_days=None))
++        DataMigrationRepository().mark_completed(db, "aggregate_backfill:rollup_all")
++        db.flush()
++        _steps(phone, DAY, 15, 20)  # walked on with the watch off; the rollup has not caught up yet
++        requeue_dirty_days([(phone.id, DAY)])
++
++        assert _read(db, watch, DAY, DAY) == [(DAY, 200, None)]
++
+     def test_with_reconcile_off_nothing_is_queued(self, db: Session, devices: tuple) -> None:
+         watch, phone = devices
+         _walk(watch, phone, DAY)
+diff --git a/backend/tests/services/test_summaries_service.py b/backend/tests/services/test_summaries_service.py
+index 0296d616af..55ec48b566 100644
+--- a/backend/tests/services/test_summaries_service.py
++++ b/backend/tests/services/test_summaries_service.py
+@@ -11,6 +11,8 @@
+ from fastapi import HTTPException
+ from sqlalchemy.orm import Session
+ 
++from app.integrations import rollup_queue
++from app.integrations.rollup_queue import requeue_dirty_days
+ from app.models import DataSource, EventRecordAggregate, ProviderPriority
+ from app.models.archival_setting import ArchivalSetting
+ from app.repositories import AggregateRepository, EventRecordRepository, ProviderPriorityRepository
+@@ -856,6 +858,25 @@ def test_once_the_rollup_reached_the_history_the_samples_are_not_read(
+ 
+         assert self._day(db, service, user) == []
+ 
++    def test_a_queued_day_is_counted_from_its_samples_not_its_old_row(
++        self, db: Session, service: SummariesService, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Samples newer than the last rollup run: the summary follows them, as the day reads do."""
++        user = UserFactory()
++        ds = self._apple_steps(user, [1000, 250])
++        roll_up_everything(db)
++        _rollup_reached_the_history(db)
++        DataPointSeriesFactory(
++            data_source=ds,
++            series_type=SeriesTypeDefinitionFactory.get_or_create_steps(),
++            value=500,
++            recorded_at=_dt("2026-01-01T12:00:00+00:00"),
++        )
++        requeue_dirty_days([(ds.id, date(2026, 1, 1))])
++        monkeypatch.setattr(rollup_queue, "QUEUED_DAYS_TIMEOUT_SECONDS", 5)
++
++        assert [day.steps for day in self._day(db, service, user)] == [1750]
++
+     def test_includes_days_with_only_a_workout(self, db: Session, service: SummariesService) -> None:
+         user = UserFactory()
+         ds = DataSourceFactory(user=user, provider=ProviderName.STRAVA, source="strava")
+diff --git a/backend/tests/services/test_time_series_service.py b/backend/tests/services/test_time_series_service.py
+index 4278f00993..27d5311e83 100644
+--- a/backend/tests/services/test_time_series_service.py
++++ b/backend/tests/services/test_time_series_service.py
+@@ -17,13 +17,16 @@
+ import pytest
+ from sqlalchemy.orm import Session
+ 
+-from app.models import DataSource, SeriesAggregate
++from app.integrations import rollup_queue
++from app.integrations.rollup_queue import finish_dirty_days, pop_dirty_days, requeue_dirty_days
++from app.models import DataSource, ProviderPriority, SeriesAggregate
+ from app.models.archival_setting import ArchivalSetting
+-from app.repositories import AggregateRepository
++from app.repositories import AggregateRepository, ProviderPriorityRepository
+ from app.repositories.data_migration_repository import DataMigrationRepository
+ from app.schemas.enums import (
+     ComputedBy,
+     PeriodKind,
++    ProviderName,
+     Resolution,
+     SeriesType,
+     SourceSelection,
+@@ -780,9 +783,11 @@ def test_priority_skips_a_source_holding_only_daily_totals(self, db: Session) ->
+         assert [(s.value, s.source.provider) for s in result.data] == [(30, "whoop")]
+ 
+     def test_priority_on_days_takes_the_source_holding_day_rows(self, db: Session) -> None:
+-        """Day reads come from the day rows: a source with only a provider day value must win there, and
+-        a higher-ranked one whose samples are not rolled up (or were deleted by retention) has nothing."""
++        """With the rollup on and caught up, day reads come from the day rows: a source with only a provider day
++        value must win there, and a higher-ranked one whose samples have no rows and are not queued has nothing."""
+         # Arrange - the watch outranks the band but has samples only; the band sent its day's total
++        db.merge(ArchivalSetting(id=1, rollup_enabled=True, delete_after_days=None))
++        DataMigrationRepository().mark_completed(db, "aggregate_backfill:rollup_all")
+         user = UserFactory()
+         watch = DataSourceFactory(user=user, provider="garmin", source="garmin", device_type="watch")
+         band = DataSourceFactory(user=user, provider="whoop", source="whoop", device_type="band")
+@@ -1245,3 +1250,200 @@ def test_samples_carry_their_window(self, db: Session) -> None:
+         )
+ 
+         assert (raw.data[0].window_seconds, hourly.data[0].window_seconds) == (900, 3600)
++
++
++class TestDayReadsBehindTheRollup:
++    """With the rollup on and caught up, day reads take the rows, except where the rollup queue says a day's
++    samples changed since: those days are counted from the samples, so a read is never staler than its data."""
++
++    _DAY = date(2024, 3, 2)
++
++    @pytest.fixture(autouse=True)
++    def _rollup_caught_up(self, db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
++        # The logic under test, not how fast the test Redis answers.
++        monkeypatch.setattr(rollup_queue, "QUEUED_DAYS_TIMEOUT_SECONDS", 5)
++        db.merge(ArchivalSetting(id=1, rollup_enabled=True, delete_after_days=None))
++        DataMigrationRepository().mark_completed(db, "aggregate_backfill:rollup_all")
++        db.flush()
++
++    def _row(self, db: Session, source: DataSource, day: date, computed_by: ComputedBy, steps: int) -> None:
++        period = CalendarPeriod.of_date(day, "+00:00")
++        AggregateRepository(SeriesAggregate).upsert(
++            db,
++            [
++                {
++                    "data_source_id": source.id,
++                    "series_type_definition_id": get_series_type_id(SeriesType.steps),
++                    "period_kind": PeriodKind.DAY,
++                    "period_start": period.start,
++                    "period_end": period.end,
++                    "zone_offset": period.zone_offset,
++                    "computed_by": computed_by,
++                    "count": 1,
++                    "sum": Decimal(steps),
++                }
++            ],
++        )
++
++    def _steps(self, source: DataSource, day: date, *values: int) -> None:
++        for hour, value in enumerate(values, start=8):
++            DataPointSeriesFactory(
++                mapping=source,
++                series_type=SeriesTypeDefinitionFactory.get_or_create_steps(),
++                recorded_at=datetime.combine(day, datetime.min.time(), timezone.utc) + timedelta(hours=hour),
++                value=value,
++            )
++
++    def _read(self, db: Session, source: DataSource, **kwargs: object) -> list[tuple[date, float]]:
++        params = TimeSeriesQueryParams(
++            start_datetime=datetime(2024, 3, 1, tzinfo=timezone.utc),
++            end_datetime=datetime(2024, 3, 4, tzinfo=timezone.utc),
++            resolution=Resolution.ONE_DAY,
++        )
++        result = timeseries_service.get_timeseries(db, source.user_id, [SeriesType.steps], params, **kwargs)
++        return [(s.timestamp.date(), float(s.value)) for s in result.data]
++
++    def test_a_queued_day_is_counted_from_its_samples_not_its_old_row(self, db: Session) -> None:
++        source = DataSourceFactory()
++        self._row(db, source, self._DAY, ComputedBy.OPEN_WEARABLES, 1000)
++        self._steps(source, self._DAY, 1000, 500)
++        requeue_dirty_days([(source.id, self._DAY)])
++
++        assert self._read(db, source) == [(self._DAY, 1500)]
++
++    def test_a_queued_day_without_samples_keeps_its_row(self, db: Session) -> None:
++        """The rollup leaves such a row alone (an archived day), so a read must not drop it either."""
++        source = DataSourceFactory()
++        self._row(db, source, self._DAY, ComputedBy.OPEN_WEARABLES, 900)
++        requeue_dirty_days([(source.id, self._DAY)])
++
++        assert self._read(db, source) == [(self._DAY, 900)]
++
++    def test_per_range_ignores_a_queued_sample_past_the_last_local_day(self, db: Session) -> None:
++        """23:30 UTC on the last day is the next local day at +02:00: the read returns nothing from it."""
++        user = UserFactory()
++        watch = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
++        phone = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="apple")
++        priorities = ProviderPriorityRepository(ProviderPriority)
++        priorities.upsert(db, ProviderName.GARMIN, 1)
++        priorities.upsert(db, ProviderName.APPLE, 2)
++        DataPointSeriesFactory(
++            mapping=watch,
++            series_type=SeriesTypeDefinitionFactory.get_or_create_steps(),
++            recorded_at=datetime(2024, 3, 3, 23, 30, tzinfo=timezone.utc),
++            zone_offset="+02:00",
++            value=400,
++        )
++        requeue_dirty_days([(watch.id, date(2024, 3, 3))])
++        self._row(db, phone, self._DAY, ComputedBy.OPEN_WEARABLES, 700)
++
++        assert self._read(db, phone, source_selection=SourceSelection.PER_RANGE) == [(self._DAY, 700)]
++
++    def test_a_day_no_longer_queued_reads_its_row(self, db: Session) -> None:
++        source = DataSourceFactory()
++        self._row(db, source, self._DAY, ComputedBy.OPEN_WEARABLES, 1000)
++        self._steps(source, self._DAY, 1000, 500)
++        requeue_dirty_days([(source.id, self._DAY)])
++        finish_dirty_days(pop_dirty_days(10))
++
++        assert self._read(db, source) == [(self._DAY, 1000)]
++
++    def test_a_queued_day_without_a_row_yet_is_read(self, db: Session) -> None:
++        source = DataSourceFactory()
++        self._row(db, source, date(2024, 3, 1), ComputedBy.OPEN_WEARABLES, 700)
++        self._steps(source, date(2024, 3, 3), 300)
++        requeue_dirty_days([(source.id, date(2024, 3, 3))])
++
++        assert self._read(db, source) == [(date(2024, 3, 1), 700), (date(2024, 3, 3), 300)]
++
++    def test_a_providers_row_stays_on_a_queued_day(self, db: Session) -> None:
++        source = DataSourceFactory()
++        self._row(db, source, self._DAY, ComputedBy.PROVIDER, 8432)
++        self._steps(source, self._DAY, 1000)
++        requeue_dirty_days([(source.id, self._DAY)])
++
++        assert self._read(db, source) == [(self._DAY, 8432)]
++
++    def test_a_queued_day_retention_emptied_keeps_its_row(self, db: Session) -> None:
++        """A late sample on a deleted day queues it; that one sample is not the day."""
++        source = DataSourceFactory()
++        db.merge(ArchivalSetting(id=1, rollup_enabled=True, delete_after_days=30, deleted_before=date(2024, 3, 3)))
++        self._row(db, source, self._DAY, ComputedBy.OPEN_WEARABLES, 9000)
++        self._steps(source, self._DAY, 12)
++        requeue_dirty_days([(source.id, self._DAY)])
++
++        assert self._read(db, source) == [(self._DAY, 9000)]
++
++    def test_an_unreachable_queue_leaves_the_rows_as_they_are(
++        self, db: Session, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        source = DataSourceFactory()
++        self._row(db, source, self._DAY, ComputedBy.OPEN_WEARABLES, 1000)
++        self._steps(source, self._DAY, 1000, 500)
++        requeue_dirty_days([(source.id, self._DAY)])
++
++        def unreachable(*_args: object) -> None:
++            raise ConnectionError("redis is down")
++
++        monkeypatch.setattr(rollup_queue, "queued_days", unreachable)
++
++        assert self._read(db, source) == [(self._DAY, 1000)]
++
++    def test_priority_picks_a_source_only_its_queued_samples_hold(self, db: Session) -> None:
++        user = UserFactory()
++        watch = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
++        ring = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura")
++        priorities = ProviderPriorityRepository(ProviderPriority)
++        priorities.upsert(db, ProviderName.GARMIN, 1)
++        priorities.upsert(db, ProviderName.OURA, 2)
++        self._row(db, ring, self._DAY, ComputedBy.PROVIDER, 8000)
++        self._steps(watch, self._DAY, 4000, 4100)
++        requeue_dirty_days([(watch.id, self._DAY)])
++
++        assert self._read(db, watch, source_selection=SourceSelection.PER_RANGE) == [(self._DAY, 8100)]
++
++
++class TestPriorityDayReadsBeforeTheRollup:
++    def test_priority_picks_a_source_whose_days_are_only_in_its_samples(self, db: Session) -> None:
++        """Rollup off: the day read counts the samples, so priority must look at them too, not only at rows."""
++        user = UserFactory()
++        watch = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
++        ring = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura")
++        priorities = ProviderPriorityRepository(ProviderPriority)
++        priorities.upsert(db, ProviderName.GARMIN, 1)
++        priorities.upsert(db, ProviderName.OURA, 2)
++        day = date(2024, 3, 2)
++        period = CalendarPeriod.of_date(day, "+00:00")
++        AggregateRepository(SeriesAggregate).upsert(
++            db,
++            [
++                {
++                    "data_source_id": ring.id,
++                    "series_type_definition_id": get_series_type_id(SeriesType.steps),
++                    "period_kind": PeriodKind.DAY,
++                    "period_start": period.start,
++                    "period_end": period.end,
++                    "zone_offset": period.zone_offset,
++                    "computed_by": ComputedBy.PROVIDER,
++                    "count": 1,
++                    "sum": Decimal(8000),
++                }
++            ],
++        )
++        DataPointSeriesFactory(
++            mapping=watch,
++            series_type=SeriesTypeDefinitionFactory.get_or_create_steps(),
++            recorded_at=datetime(2024, 3, 2, 9, tzinfo=timezone.utc),
++            value=4000,
++        )
++        params = TimeSeriesQueryParams(
++            start_datetime=datetime(2024, 3, 1, tzinfo=timezone.utc),
++            end_datetime=datetime(2024, 3, 4, tzinfo=timezone.utc),
++            resolution=Resolution.ONE_DAY,
++        )
++
++        result = timeseries_service.get_timeseries(
++            db, user.id, [SeriesType.steps], params, source_selection=SourceSelection.PER_RANGE
++        )
++
++        assert [(s.timestamp.date(), float(s.value), s.source.provider) for s in result.data] == [(day, 4000, "garmin")]

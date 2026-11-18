@@ -1,0 +1,843 @@
+diff --git a/backend/app/api/routes/v1/sdk_token.py b/backend/app/api/routes/v1/sdk_token.py
+index 26bb71fdf9..2175cee2e1 100644
+--- a/backend/app/api/routes/v1/sdk_token.py
++++ b/backend/app/api/routes/v1/sdk_token.py
+@@ -5,8 +5,8 @@
+ 
+ from app.config import settings
+ from app.database import DbSession
+-from app.schemas.auth import SDKTokenRequest, TokenResponse
+-from app.services import application_service, create_sdk_user_token, refresh_token_service
++from app.schemas.auth import SDKTokenOrigin, SDKTokenRequest, TokenResponse
++from app.services import application_service, refresh_token_service
+ from app.utils.auth import DeveloperOptionalDep
+ 
+ router = APIRouter()
+@@ -44,17 +44,18 @@ def create_user_token(
+         401: If app credentials are invalid or admin auth is missing
+         400: If neither app credentials nor admin auth is provided
+     """
+-    app_id: str
+-
+     # Method 1: App credentials provided
+     if payload and payload.app_id and payload.app_secret:
+         application = application_service.validate_credentials(db, payload.app_id, payload.app_secret)
+-        app_id = application.app_id
++        access_token, refresh_token = refresh_token_service.issue_sdk_tokens(
++            db, user_id, SDKTokenOrigin.APPLICATION, application=application
++        )
+     # Method 2: Admin authentication (developer token)
+     elif developer:
+-        # Use developer ID as app_id for admin-generated tokens (enables audit trail)
+-        # Format: "admin:{developer_id}" to distinguish from app-generated tokens
+-        app_id = f"admin:{developer.id}"
++        # The issuing developer is recorded for the audit trail
++        access_token, refresh_token = refresh_token_service.issue_sdk_tokens(
++            db, user_id, SDKTokenOrigin.ADMIN, issued_by_developer_id=developer.id
++        )
+     else:
+         # Neither method provided
+         raise HTTPException(
+@@ -62,14 +63,6 @@ def create_user_token(
+             detail="Either app credentials (app_id, app_secret) or admin authentication (Bearer token) is required",
+         )
+ 
+-    # Generate user-scoped SDK token
+-    access_token = create_sdk_user_token(
+-        app_id=app_id,
+-        user_id=str(user_id),
+-    )
+-
+-    refresh_token = refresh_token_service.create_sdk_refresh_token(db, user_id, app_id)
+-
+     return TokenResponse(
+         access_token=access_token,
+         token_type="bearer",
+diff --git a/backend/app/database.py b/backend/app/database.py
+index 3378203d55..04caf0883f 100644
+--- a/backend/app/database.py
++++ b/backend/app/database.py
+@@ -22,7 +22,7 @@
+ )
+ 
+ from app.config import settings
+-from app.schemas.auth import ConnectionStatus, LiveSyncMode, TokenType
++from app.schemas.auth import ConnectionStatus, LiveSyncMode, SDKTokenOrigin, TokenType
+ from app.schemas.enums import AggregationMethod, DataGranularity, HealthScoreCategory, ProviderName
+ from app.schemas.model_crud.user_management import InvitationStatus
+ from app.schemas.sync_status import SyncScope, SyncSource, SyncStatus
+@@ -75,6 +75,7 @@ def __repr__(self) -> str:
+         ProviderName: String(50),
+         HealthScoreCategory: String(32),
+         TokenType: String(64),
++        SDKTokenOrigin: String(32),
+         AggregationMethod: String(32),
+         SyncSource: String(32),
+         SyncScope: String(32),
+diff --git a/backend/app/mappings.py b/backend/app/mappings.py
+index 83ca08bb60..7bdfd59c65 100644
+--- a/backend/app/mappings.py
++++ b/backend/app/mappings.py
+@@ -41,6 +41,7 @@
+ 
+ # Custom foreign keys
+ FKDeveloper = Annotated[UUID, mapped_column(ForeignKey("developer.id", ondelete="SET NULL"))]
++FKApplication = Annotated[UUID, mapped_column(ForeignKey("application.id", ondelete="CASCADE"))]
+ FKUser = Annotated[UUID, mapped_column(ForeignKey("user.id", ondelete="CASCADE"))]
+ FKEventRecord = Annotated[
+     UUID,
+diff --git a/backend/app/models/refresh_token.py b/backend/app/models/refresh_token.py
+index 34e067c7c3..e9bbd74bcc 100644
+--- a/backend/app/models/refresh_token.py
++++ b/backend/app/models/refresh_token.py
+@@ -1,10 +1,12 @@
+ from datetime import datetime
+ 
+-from sqlalchemy.orm import Mapped
++from sqlalchemy import CheckConstraint
++from sqlalchemy.orm import Mapped, relationship
+ 
+ from app.database import BaseDbModel
+-from app.mappings import FKDeveloper, FKUser, Indexed, PrimaryKey, str_64
+-from app.schemas.auth import TokenType
++from app.mappings import FKApplication, FKDeveloper, FKUser, Indexed, ManyToOne, PrimaryKey, str_64
++from app.models import Application
++from app.schemas.auth import SDKTokenOrigin, TokenType
+ 
+ 
+ class RefreshToken(BaseDbModel):
+@@ -15,16 +17,35 @@ class RefreshToken(BaseDbModel):
+     """
+ 
+     __tablename__ = "refresh_token"
++    __table_args__ = (
++        # SDK tokens from an application point at it; admin/invite tokens point at the issuing
++        # developer instead (NULL once that developer is deleted). Developer tokens have no origin.
++        CheckConstraint(
++            "(token_type = 'sdk' AND ("
++            "(origin = 'application' AND application_id IS NOT NULL AND issued_by_developer_id IS NULL)"
++            " OR (origin IN ('admin', 'invite') AND application_id IS NULL)))"
++            " OR (token_type = 'developer' AND origin IS NULL"
++            " AND application_id IS NULL AND issued_by_developer_id IS NULL)",
++            name="ck_refresh_token_origin",
++        ),
++    )
+ 
+     id: Mapped[PrimaryKey[str_64]]  # rt-{32 hex chars}
+     token_type: Mapped[TokenType]
+ 
+     # For SDK tokens
+     user_id: Mapped[Indexed[FKUser] | None]
+-    app_id: Mapped[str_64 | None]
++    origin: Mapped[SDKTokenOrigin | None]
++    application_id: Mapped[Indexed[FKApplication] | None]
++    issued_by_developer_id: Mapped[FKDeveloper | None]
+ 
+     # For Developer tokens
+     developer_id: Mapped[Indexed[FKDeveloper] | None]
+ 
+     last_used_at: Mapped[datetime | None]
+     revoked_at: Mapped[datetime | None]
++
++    application: Mapped[ManyToOne["Application"] | None] = relationship(
++        "Application",
++        foreign_keys="[RefreshToken.application_id]",
++    )
+diff --git a/backend/app/schemas/auth/__init__.py b/backend/app/schemas/auth/__init__.py
+index 1b9acc6df5..09815ce9f7 100644
+--- a/backend/app/schemas/auth/__init__.py
++++ b/backend/app/schemas/auth/__init__.py
+@@ -14,6 +14,7 @@
+ from .token import (
+     PasswordChangePrompt,
+     RefreshTokenRequest,
++    SDKTokenOrigin,
+     TokenResponse,
+     TokenType,
+ )
+@@ -25,6 +26,7 @@
+     # Token
+     "PasswordChangePrompt",
+     "RefreshTokenRequest",
++    "SDKTokenOrigin",
+     "TokenResponse",
+     "TokenType",
+     # Connection status
+diff --git a/backend/app/schemas/auth/token.py b/backend/app/schemas/auth/token.py
+index ecbafdd121..c5158c4207 100644
+--- a/backend/app/schemas/auth/token.py
++++ b/backend/app/schemas/auth/token.py
+@@ -10,6 +10,14 @@ class TokenType(StrEnum):
+     DEVELOPER = "developer"
+ 
+ 
++class SDKTokenOrigin(StrEnum):
++    """How an SDK refresh token was issued."""
++
++    APPLICATION = "application"  # app_id + app_secret
++    ADMIN = "admin"  # developer Bearer token
++    INVITE = "invite"  # redeemed invitation code
++
++
+ class PasswordChangePrompt(StrEnum):
+     """How the portal should ask a developer who signed in with the default password to change it."""
+ 
+diff --git a/backend/app/services/refresh_token_service.py b/backend/app/services/refresh_token_service.py
+index 7a9dfc3fc0..4fa8024839 100644
+--- a/backend/app/services/refresh_token_service.py
++++ b/backend/app/services/refresh_token_service.py
+@@ -7,11 +7,12 @@
+ 
+ from app.config import settings
+ from app.database import DbSession
+-from app.models import RefreshToken
++from app.models import Application, RefreshToken
+ from app.repositories.refresh_token_repository import refresh_token_repository
+-from app.schemas.auth import TokenResponse, TokenType
++from app.schemas.auth import SDKTokenOrigin, TokenResponse, TokenType
+ from app.services.sdk_token_service import create_sdk_user_token
+ from app.utils.security import create_access_token
++from app.utils.structured_logging import log_structured
+ 
+ 
+ class RefreshTokenService:
+@@ -26,13 +27,67 @@ def _generate_refresh_token_id() -> str:
+         """Generate an opaque refresh token ID with rt- prefix."""
+         return f"rt-{secrets.token_hex(16)}"
+ 
+-    def create_sdk_refresh_token(self, db_session: DbSession, user_id: UUID, app_id: str) -> str:
++    @staticmethod
++    def _sdk_app_id_claim(
++        origin: SDKTokenOrigin,
++        application: Application | None,
++        issued_by_developer_id: UUID | None,
++    ) -> str:
++        """Build the app_id claim of an SDK access token from where the token came from."""
++        if origin == SDKTokenOrigin.APPLICATION:
++            return application.app_id  # ty:ignore[unresolved-attribute]
++        # The issuing developer may have been deleted since; keep the origin prefix alone then
++        return f"{origin}:{issued_by_developer_id}" if issued_by_developer_id else str(origin)
++
++    def issue_sdk_tokens(
++        self,
++        db_session: DbSession,
++        user_id: UUID,
++        origin: SDKTokenOrigin,
++        application: Application | None = None,
++        issued_by_developer_id: UUID | None = None,
++    ) -> tuple[str, str]:
++        """Issue an SDK access token and a matching refresh token.
++
++        Args:
++            db_session: Database session
++            user_id: The OpenWearables User ID
++            origin: How the token is being issued
++            application: The application that requested the token (APPLICATION origin)
++            issued_by_developer_id: The developer who issued the token (ADMIN / INVITE origin)
++
++        Returns:
++            Tuple of (access_token, refresh_token)
++        """
++        access_token = create_sdk_user_token(
++            app_id=self._sdk_app_id_claim(origin, application, issued_by_developer_id),
++            user_id=str(user_id),
++        )
++        refresh_token = self.create_sdk_refresh_token(
++            db_session,
++            user_id=user_id,
++            origin=origin,
++            application_id=application.id if application else None,
++            issued_by_developer_id=issued_by_developer_id,
++        )
++        return access_token, refresh_token
++
++    def create_sdk_refresh_token(
++        self,
++        db_session: DbSession,
++        user_id: UUID,
++        origin: SDKTokenOrigin,
++        application_id: UUID | None = None,
++        issued_by_developer_id: UUID | None = None,
++    ) -> str:
+         """Create a refresh token for an SDK token.
+ 
+         Args:
+             db_session: Database session
+             user_id: The OpenWearables User ID
+-            app_id: The application ID that created the token
++            origin: How the token was issued
++            application_id: The application that requested the token (APPLICATION origin)
++            issued_by_developer_id: The developer who issued the token (ADMIN / INVITE origin)
+ 
+         Returns:
+             The refresh token string (rt-{hex})
+@@ -42,14 +97,23 @@ def create_sdk_refresh_token(self, db_session: DbSession, user_id: UUID, app_id:
+             id=token_id,
+             token_type=TokenType.SDK,
+             user_id=user_id,
+-            app_id=app_id,
++            origin=origin,
++            application_id=application_id,
++            issued_by_developer_id=issued_by_developer_id,
+             developer_id=None,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+             revoked_at=None,
+         )
+         self.repo.create(db_session, token)
+-        self.logger.debug(f"Created SDK refresh token for user {user_id}, app {app_id}")
++        log_structured(
++            self.logger,
++            "debug",
++            "Created SDK refresh token",
++            action="sdk_refresh_token_created",
++            user_id=str(user_id),
++            origin=str(origin),
++        )
+         return token_id
+ 
+     def create_developer_refresh_token(self, db_session: DbSession, developer_id: UUID) -> str:
+@@ -67,7 +131,6 @@ def create_developer_refresh_token(self, db_session: DbSession, developer_id: UU
+             id=token_id,
+             token_type=TokenType.DEVELOPER,
+             user_id=None,
+-            app_id=None,
+             developer_id=developer_id,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+@@ -106,14 +169,12 @@ def refresh_token(self, db_session: DbSession, refresh_token_str: str) -> TokenR
+ 
+         # Generate new access token and refresh token based on token type
+         if token.token_type == TokenType.SDK:
+-            access_token = create_sdk_user_token(
+-                app_id=token.app_id,  # ty:ignore[invalid-argument-type]
+-                user_id=str(token.user_id),
+-            )
+-            new_refresh_token = self.create_sdk_refresh_token(
++            access_token, new_refresh_token = self.issue_sdk_tokens(
+                 db_session,
+                 user_id=token.user_id,  # ty:ignore[invalid-argument-type]
+-                app_id=token.app_id,  # ty:ignore[invalid-argument-type]
++                origin=token.origin,  # ty:ignore[invalid-argument-type]
++                application=token.application,
++                issued_by_developer_id=token.issued_by_developer_id,
+             )
+             self.logger.debug(f"Refreshed SDK token for user {token.user_id} (rotated)")
+         elif token.token_type == TokenType.DEVELOPER:
+diff --git a/backend/app/services/user_invitation_code_service.py b/backend/app/services/user_invitation_code_service.py
+index 8760be0ef8..b05b921efe 100644
+--- a/backend/app/services/user_invitation_code_service.py
++++ b/backend/app/services/user_invitation_code_service.py
+@@ -9,13 +9,13 @@
+ from app.database import DbSession
+ from app.models.user_invitation_code import UserInvitationCode
+ from app.repositories.user_invitation_code_repository import UserInvitationCodeRepository
++from app.schemas.auth import SDKTokenOrigin
+ from app.schemas.model_crud.credentials import (
+     InvitationCodeRedeemResponse,
+     UserInvitationCodeCreate,
+     UserInvitationCodeRead,
+ )
+ from app.services.refresh_token_service import refresh_token_service
+-from app.services.sdk_token_service import create_sdk_user_token
+ from app.services.user_service import user_service
+ 
+ CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+@@ -65,17 +65,11 @@ def redeem(self, db_session: DbSession, code: str) -> InvitationCodeRedeemRespon
+ 
+         self.crud.mark_redeemed(db_session, invitation_code)
+ 
+-        app_id = f"invite:{invitation_code.created_by_id}"
+-
+-        access_token = create_sdk_user_token(
+-            app_id=app_id,
+-            user_id=str(invitation_code.user_id),
+-        )
+-
+-        refresh_token = refresh_token_service.create_sdk_refresh_token(
++        access_token, refresh_token = refresh_token_service.issue_sdk_tokens(
+             db_session,
+             user_id=invitation_code.user_id,
+-            app_id=app_id,
++            origin=SDKTokenOrigin.INVITE,
++            issued_by_developer_id=invitation_code.created_by_id,
+         )
+ 
+         return InvitationCodeRedeemResponse(
+diff --git a/backend/migrations/versions/2026_10_12_1200-c4e1a7b93d20_refresh_token_origin.py b/backend/migrations/versions/2026_10_12_1200-c4e1a7b93d20_refresh_token_origin.py
+new file mode 100644
+index 0000000000..ad68a64c64
+--- /dev/null
++++ b/backend/migrations/versions/2026_10_12_1200-c4e1a7b93d20_refresh_token_origin.py
+@@ -0,0 +1,113 @@
++"""refresh_token_origin
++
++Replace refresh_token.app_id, which mixed application app_ids with "admin:{developer_id}" and
++"invite:{developer_id}" strings, with an explicit origin plus real foreign keys to application
++and developer.
++
++SDK refresh tokens whose application no longer exists are deleted: they were never cut off when
++the application was removed, and from now on deleting an application cascades to its tokens.
++
++Revision ID: c4e1a7b93d20
++Revises: 4b9d28928ca1
++
++"""
++
++from typing import Sequence, Union
++
++import sqlalchemy as sa
++from alembic import op
++
++# revision identifiers, used by Alembic.
++revision: str = "c4e1a7b93d20"
++down_revision: Union[str, None] = "4b9d28928ca1"
++branch_labels: Union[str, Sequence[str], None] = None
++depends_on: Union[str, Sequence[str], None] = None
++
++ORIGIN_CHECK = (
++    "(token_type = 'sdk' AND ("
++    "(origin = 'application' AND application_id IS NOT NULL AND issued_by_developer_id IS NULL)"
++    " OR (origin IN ('admin', 'invite') AND application_id IS NULL)))"
++    " OR (token_type = 'developer' AND origin IS NULL"
++    " AND application_id IS NULL AND issued_by_developer_id IS NULL)"
++)
++
++
++def upgrade() -> None:
++    op.add_column("refresh_token", sa.Column("origin", sa.String(length=32), nullable=True))
++    op.add_column("refresh_token", sa.Column("application_id", sa.UUID(), nullable=True))
++    op.add_column("refresh_token", sa.Column("issued_by_developer_id", sa.UUID(), nullable=True))
++
++    op.execute(
++        """
++        UPDATE refresh_token rt
++        SET origin = 'application', application_id = a.id
++        FROM application a
++        WHERE rt.token_type = 'sdk' AND rt.app_id = a.app_id
++        """
++    )
++    # admin:/invite: tokens keep working even if the issuing developer is gone (issuer becomes NULL)
++    op.execute(
++        """
++        UPDATE refresh_token
++        SET origin = split_part(app_id, ':', 1)
++        WHERE token_type = 'sdk' AND origin IS NULL AND split_part(app_id, ':', 1) IN ('admin', 'invite')
++        """
++    )
++    op.execute(
++        """
++        UPDATE refresh_token rt
++        SET issued_by_developer_id = d.id
++        FROM developer d
++        WHERE rt.origin IN ('admin', 'invite') AND d.id::text = split_part(rt.app_id, ':', 2)
++        """
++    )
++    # Anything left points at an application that was deleted
++    op.execute("DELETE FROM refresh_token WHERE token_type = 'sdk' AND origin IS NULL")
++
++    op.drop_column("refresh_token", "app_id")
++    op.create_foreign_key(
++        "refresh_token_application_id_fkey",
++        "refresh_token",
++        "application",
++        ["application_id"],
++        ["id"],
++        ondelete="CASCADE",
++    )
++    op.create_foreign_key(
++        "refresh_token_issued_by_developer_id_fkey",
++        "refresh_token",
++        "developer",
++        ["issued_by_developer_id"],
++        ["id"],
++        ondelete="SET NULL",
++    )
++    op.create_index(op.f("ix_refresh_token_application_id"), "refresh_token", ["application_id"], unique=False)
++    op.create_check_constraint("ck_refresh_token_origin", "refresh_token", ORIGIN_CHECK)
++
++
++def downgrade() -> None:
++    op.drop_constraint("ck_refresh_token_origin", "refresh_token", type_="check")
++    op.drop_index(op.f("ix_refresh_token_application_id"), table_name="refresh_token")
++    op.drop_constraint("refresh_token_issued_by_developer_id_fkey", "refresh_token", type_="foreignkey")
++    op.drop_constraint("refresh_token_application_id_fkey", "refresh_token", type_="foreignkey")
++    op.add_column("refresh_token", sa.Column("app_id", sa.String(length=64), nullable=True))
++
++    op.execute(
++        """
++        UPDATE refresh_token rt
++        SET app_id = a.app_id
++        FROM application a
++        WHERE rt.origin = 'application' AND rt.application_id = a.id
++        """
++    )
++    op.execute(
++        """
++        UPDATE refresh_token
++        SET app_id = origin || ':' || coalesce(issued_by_developer_id::text, '')
++        WHERE origin IN ('admin', 'invite')
++        """
++    )
++
++    op.drop_column("refresh_token", "issued_by_developer_id")
++    op.drop_column("refresh_token", "application_id")
++    op.drop_column("refresh_token", "origin")
+diff --git a/backend/tests/api/v1/test_token.py b/backend/tests/api/v1/test_token.py
+index 497d41c19d..c497cd2ca3 100644
+--- a/backend/tests/api/v1/test_token.py
++++ b/backend/tests/api/v1/test_token.py
+@@ -6,13 +6,17 @@
+ - DELETE /api/v1/token/refresh - revoke refresh token
+ """
+ 
++import pytest
+ from jose import jwt
+ from sqlalchemy.orm import Session
+ from starlette.testclient import TestClient
+ 
+ from app.config import settings
++from app.models import RefreshToken
++from app.schemas.auth import SDKTokenOrigin
+ from app.services import refresh_token_service
+ from tests.factories import ApplicationFactory, DeveloperFactory, UserFactory
++from tests.utils import developer_auth_headers
+ 
+ 
+ class TestRefreshToken:
+@@ -22,8 +26,10 @@ def test_refresh_sdk_token_success(self, client: TestClient, db: Session, api_v1
+         """Valid SDK refresh token should return new access token and rotated refresh token."""
+         # Arrange
+         user = UserFactory()
+-        app_id = "test_app_123"
+-        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, app_id)
++        application = ApplicationFactory(developer=DeveloperFactory())
++        refresh_token = refresh_token_service.create_sdk_refresh_token(
++            db, user.id, SDKTokenOrigin.APPLICATION, application_id=application.id
++        )
+ 
+         # Act
+         response = client.post(
+@@ -47,7 +53,57 @@ def test_refresh_sdk_token_success(self, client: TestClient, db: Session, api_v1
+         )
+         assert payload["sub"] == str(user.id)
+         assert payload["scope"] == "sdk"
+-        assert payload["app_id"] == app_id
++        assert payload["app_id"] == application.app_id
++
++    @pytest.mark.parametrize("origin", [SDKTokenOrigin.ADMIN, SDKTokenOrigin.INVITE])
++    def test_refresh_developer_issued_sdk_token_keeps_app_id_claim(
++        self, client: TestClient, db: Session, api_v1_prefix: str, origin: SDKTokenOrigin
++    ) -> None:
++        """Refreshing an admin/invite SDK token should keep the "{origin}:{developer_id}" app_id claim."""
++        # Arrange
++        user = UserFactory()
++        developer = DeveloperFactory()
++        refresh_token = refresh_token_service.create_sdk_refresh_token(
++            db, user.id, origin, issued_by_developer_id=developer.id
++        )
++
++        # Act
++        response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": refresh_token})
++
++        # Assert
++        assert response.status_code == 200
++        payload = jwt.decode(
++            response.json()["access_token"],
++            settings.secret_key,
++            algorithms=[settings.algorithm],
++            options={"verify_exp": False},
++        )
++        assert payload["app_id"] == f"{origin}:{developer.id}"
++        rotated = db.get(RefreshToken, response.json()["refresh_token"])
++        assert rotated.origin == origin
++        assert rotated.issued_by_developer_id == developer.id
++
++    def test_refresh_sdk_token_of_deleted_application_fails(
++        self, client: TestClient, db: Session, api_v1_prefix: str
++    ) -> None:
++        """Deleting an application should cut off the refresh tokens it issued."""
++        # Arrange
++        developer = DeveloperFactory()
++        application = ApplicationFactory(developer=developer)
++        refresh_token = refresh_token_service.create_sdk_refresh_token(
++            db, UserFactory().id, SDKTokenOrigin.APPLICATION, application_id=application.id
++        )
++        delete_response = client.delete(
++            f"{api_v1_prefix}/applications/{application.app_id}",
++            headers=developer_auth_headers(developer.id),
++        )
++        assert delete_response.status_code == 204
++
++        # Act
++        response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": refresh_token})
++
++        # Assert
++        assert response.status_code == 401
+ 
+     def test_refresh_developer_token_success(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
+         """Valid developer refresh token should return new access token and rotated refresh token."""
+@@ -95,7 +151,7 @@ def test_refresh_revoked_token(self, client: TestClient, db: Session, api_v1_pre
+         """Revoked refresh token should return 401."""
+         # Arrange
+         user = UserFactory()
+-        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
++        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
+         refresh_token_service.revoke_token(db, refresh_token)
+ 
+         # Act
+@@ -125,7 +181,7 @@ def test_refresh_token_rotation_invalidates_old_token(
+         """Old refresh token should be invalid after rotation."""
+         # Arrange
+         user = UserFactory()
+-        old_refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
++        old_refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
+ 
+         # Act - refresh once to rotate
+         response = client.post(
+@@ -157,7 +213,7 @@ def test_revoke_token_success(self, client: TestClient, db: Session, api_v1_pref
+         """Valid refresh token should be revoked successfully."""
+         # Arrange
+         user = UserFactory()
+-        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
++        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
+ 
+         # Act
+         response = client.post(
+@@ -190,7 +246,7 @@ def test_revoke_already_revoked_token(self, client: TestClient, db: Session, api
+         """Already revoked token should return 404."""
+         # Arrange
+         user = UserFactory()
+-        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
++        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
+         refresh_token_service.revoke_token(db, refresh_token)
+ 
+         # Act
+@@ -257,8 +313,6 @@ def test_sdk_token_returns_refresh_token_for_app_credentials(
+     def test_admin_sdk_token_returns_refresh_token(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
+         """Admin-generated SDK token should return refresh token."""
+         # Arrange
+-        from tests.utils import developer_auth_headers
+-
+         developer = DeveloperFactory()
+         user = UserFactory()  # Create user
+         headers = developer_auth_headers(developer.id)
+diff --git a/backend/tests/repositories/test_refresh_token_repository.py b/backend/tests/repositories/test_refresh_token_repository.py
+index b7414ff2c9..6eba0d5cd2 100644
+--- a/backend/tests/repositories/test_refresh_token_repository.py
++++ b/backend/tests/repositories/test_refresh_token_repository.py
+@@ -8,7 +8,7 @@
+ 
+ from app.models import RefreshToken
+ from app.repositories.refresh_token_repository import refresh_token_repository
+-from app.schemas.auth import TokenType
++from app.schemas.auth import SDKTokenOrigin, TokenType
+ from tests.factories import DeveloperFactory, UserFactory
+ 
+ 
+@@ -23,7 +23,7 @@ def test_create_token(self, db: Session) -> None:
+             id="rt-test123456789012345678901234",
+             token_type=TokenType.SDK,
+             user_id=user.id,
+-            app_id="test_app",
++            origin=SDKTokenOrigin.ADMIN,
+             developer_id=None,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+@@ -46,7 +46,7 @@ def test_get_valid_token(self, db: Session) -> None:
+             id="rt-validtoken123456789012345678",
+             token_type=TokenType.SDK,
+             user_id=user.id,
+-            app_id="test_app",
++            origin=SDKTokenOrigin.ADMIN,
+             developer_id=None,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+@@ -70,7 +70,7 @@ def test_get_valid_token_returns_none_for_revoked(self, db: Session) -> None:
+             id="rt-revokedtoken12345678901234567",
+             token_type=TokenType.SDK,
+             user_id=user.id,
+-            app_id="test_app",
++            origin=SDKTokenOrigin.ADMIN,
+             developer_id=None,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+@@ -93,7 +93,7 @@ def test_get_by_user_id(self, db: Session) -> None:
+             id="rt-user1token1234567890123456789",
+             token_type=TokenType.SDK,
+             user_id=user.id,
+-            app_id="app1",
++            origin=SDKTokenOrigin.ADMIN,
+             developer_id=None,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+@@ -103,7 +103,7 @@ def test_get_by_user_id(self, db: Session) -> None:
+             id="rt-user1token2345678901234567890",
+             token_type=TokenType.SDK,
+             user_id=user.id,
+-            app_id="app2",
++            origin=SDKTokenOrigin.ADMIN,
+             developer_id=None,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+@@ -127,7 +127,6 @@ def test_get_by_developer_id(self, db: Session) -> None:
+             id="rt-dev1token12345678901234567890",
+             token_type=TokenType.DEVELOPER,
+             user_id=None,
+-            app_id=None,
+             developer_id=developer.id,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+@@ -151,7 +150,7 @@ def test_revoke_token(self, db: Session) -> None:
+             id="rt-torevoke123456789012345678901",
+             token_type=TokenType.SDK,
+             user_id=user.id,
+-            app_id="test_app",
++            origin=SDKTokenOrigin.ADMIN,
+             developer_id=None,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+@@ -175,7 +174,7 @@ def test_revoke_all_for_user(self, db: Session) -> None:
+             id="rt-revokeall123456789012345678901",
+             token_type=TokenType.SDK,
+             user_id=user.id,
+-            app_id="app1",
++            origin=SDKTokenOrigin.ADMIN,
+             developer_id=None,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+@@ -185,7 +184,7 @@ def test_revoke_all_for_user(self, db: Session) -> None:
+             id="rt-revokeall234567890123456789012",
+             token_type=TokenType.SDK,
+             user_id=user.id,
+-            app_id="app2",
++            origin=SDKTokenOrigin.ADMIN,
+             developer_id=None,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+@@ -213,7 +212,6 @@ def test_revoke_all_for_developer(self, db: Session) -> None:
+             id="rt-revokedev123456789012345678901",
+             token_type=TokenType.DEVELOPER,
+             user_id=None,
+-            app_id=None,
+             developer_id=developer.id,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+@@ -238,7 +236,7 @@ def test_update_last_used(self, db: Session) -> None:
+             id="rt-updateused12345678901234567890",
+             token_type=TokenType.SDK,
+             user_id=user.id,
+-            app_id="test_app",
++            origin=SDKTokenOrigin.ADMIN,
+             developer_id=None,
+             created_at=datetime.now(timezone.utc),
+             last_used_at=None,
+diff --git a/backend/tests/services/test_refresh_token_service.py b/backend/tests/services/test_refresh_token_service.py
+index 5c87a27f70..e407126fdd 100644
+--- a/backend/tests/services/test_refresh_token_service.py
++++ b/backend/tests/services/test_refresh_token_service.py
+@@ -7,9 +7,9 @@
+ from sqlalchemy.orm import Session
+ 
+ from app.models import RefreshToken
+-from app.schemas.auth import TokenType
++from app.schemas.auth import SDKTokenOrigin, TokenType
+ from app.services.refresh_token_service import refresh_token_service
+-from tests.factories import DeveloperFactory, UserFactory
++from tests.factories import ApplicationFactory, DeveloperFactory, UserFactory
+ 
+ 
+ class TestCreateSDKRefreshToken:
+@@ -19,10 +19,9 @@ def test_create_sdk_refresh_token_format(self, db: Session) -> None:
+         """SDK refresh token should have rt- prefix and be 35 characters total."""
+         # Arrange
+         user = UserFactory()
+-        app_id = "test_app_123"
+ 
+         # Act
+-        token = refresh_token_service.create_sdk_refresh_token(db, user.id, app_id)
++        token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
+ 
+         # Assert
+         assert token.startswith("rt-")
+@@ -32,17 +31,21 @@ def test_create_sdk_refresh_token_stored_in_db(self, db: Session) -> None:
+         """SDK refresh token should be stored in database with correct metadata."""
+         # Arrange
+         user = UserFactory()
+-        app_id = "test_app_123"
++        application = ApplicationFactory(developer=DeveloperFactory())
+ 
+         # Act
+-        token = refresh_token_service.create_sdk_refresh_token(db, user.id, app_id)
++        token = refresh_token_service.create_sdk_refresh_token(
++            db, user.id, SDKTokenOrigin.APPLICATION, application_id=application.id
++        )
+ 
+         # Assert
+         db_token = db.query(RefreshToken).filter(RefreshToken.id == token).first()
+         assert db_token is not None
+         assert db_token.token_type == TokenType.SDK
+         assert db_token.user_id == user.id
+-        assert db_token.app_id == app_id
++        assert db_token.origin == SDKTokenOrigin.APPLICATION
++        assert db_token.application_id == application.id
++        assert db_token.issued_by_developer_id is None
+         assert db_token.developer_id is None
+         assert db_token.revoked_at is None
+ 
+@@ -76,7 +79,8 @@ def test_create_developer_refresh_token_stored_in_db(self, db: Session) -> None:
+         assert db_token.token_type == TokenType.DEVELOPER
+         assert db_token.developer_id == developer.id
+         assert db_token.user_id is None
+-        assert db_token.app_id is None
++        assert db_token.origin is None
++        assert db_token.application_id is None
+         assert db_token.revoked_at is None
+ 
+ 
+@@ -87,8 +91,7 @@ def test_refresh_sdk_token_success(self, db: Session) -> None:
+         """Refreshing SDK token should return new access token and rotated refresh token."""
+         # Arrange
+         user = UserFactory()
+-        app_id = "test_app_123"
+-        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, app_id)
++        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
+ 
+         # Act
+         result = refresh_token_service.refresh_token(db, refresh_token)
+@@ -132,7 +135,7 @@ def test_refresh_revoked_token_raises_401(self, db: Session) -> None:
+         """Refreshing revoked token should raise 401."""
+         # Arrange
+         user = UserFactory()
+-        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
++        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
+         refresh_token_service.revoke_token(db, refresh_token)
+ 
+         # Act & Assert
+@@ -145,7 +148,7 @@ def test_refresh_revokes_old_token(self, db: Session) -> None:
+         """Refreshing token should revoke the old token (rotation)."""
+         # Arrange
+         user = UserFactory()
+-        old_refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
++        old_refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
+ 
+         # Verify not revoked initially
+         db_token = db.query(RefreshToken).filter(RefreshToken.id == old_refresh_token).first()
+@@ -172,7 +175,7 @@ def test_revoke_token_success(self, db: Session) -> None:
+         """Revoking token should set revoked_at timestamp."""
+         # Arrange
+         user = UserFactory()
+-        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
++        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
+ 
+         # Act
+         result = refresh_token_service.revoke_token(db, refresh_token)
+@@ -198,7 +201,7 @@ def test_revoke_already_revoked_token_raises_404(self, db: Session) -> None:
+         """Revoking already revoked token should raise 404."""
+         # Arrange
+         user = UserFactory()
+-        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
++        refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
+         refresh_token_service.revoke_token(db, refresh_token)
+ 
+         # Act & Assert

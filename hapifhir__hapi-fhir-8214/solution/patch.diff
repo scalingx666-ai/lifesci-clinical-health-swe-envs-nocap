@@ -1,0 +1,99 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8214-fix-trigger-subscription-partition-isolation.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8214-fix-trigger-subscription-partition-isolation.yaml
+new file mode 100644
+index 000000000000..0471d41078b1
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8214-fix-trigger-subscription-partition-isolation.yaml
+@@ -0,0 +1,5 @@
++---
++type: fix
++issue: 8214
++title: "Previously, executing the `$trigger-subscription` operation on a partitioned server would read the requested
++resources across all partitions. It is now scoped to the triggering job's partition."
+diff --git a/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/triggering/SubscriptionTriggeringSvcImpl.java b/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/triggering/SubscriptionTriggeringSvcImpl.java
+index 625ebc5ea688..1fe2297fcbc6 100644
+--- a/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/triggering/SubscriptionTriggeringSvcImpl.java
++++ b/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/triggering/SubscriptionTriggeringSvcImpl.java
+@@ -50,6 +50,7 @@
+ import ca.uhn.fhir.rest.server.exceptions.InvalidRequestException;
+ import ca.uhn.fhir.rest.server.exceptions.PreconditionFailedException;
+ import ca.uhn.fhir.rest.server.exceptions.ResourceGoneException;
++import ca.uhn.fhir.rest.server.exceptions.ResourceNotFoundException;
+ import ca.uhn.fhir.util.ParametersUtil;
+ import ca.uhn.fhir.util.StopWatch;
+ import ca.uhn.fhir.util.UrlUtil;
+@@ -542,7 +543,19 @@ private void submitResource(
+ 			String theSubscriptionId, RequestPartitionId theRequestPartitionId, String theResourceIdToTrigger) {
+ 		org.hl7.fhir.r4.model.IdType resourceId = new org.hl7.fhir.r4.model.IdType(theResourceIdToTrigger);
+ 		IFhirResourceDao dao = myDaoRegistry.getResourceDao(resourceId.getResourceType());
+-		IBaseResource resourceToTrigger = dao.read(resourceId, SystemRequestDetails.forAllPartitions());
++		SystemRequestDetails requestDetails = SystemRequestDetails.forRequestPartitionId(theRequestPartitionId);
++		IBaseResource resourceToTrigger;
++		try {
++			resourceToTrigger = dao.read(resourceId, requestDetails);
++		} catch (ResourceNotFoundException e) {
++			// if requested resource cannot be resolved - skip it
++			ourLog.warn(
++					"Resource {} cannot be found and will not be submitted for subscription {} on partition {}",
++					resourceId.getIdPart(),
++					theSubscriptionId,
++					theRequestPartitionId);
++			return;
++		}
+ 
+ 		submitResource(theSubscriptionId, theRequestPartitionId, resourceToTrigger);
+ 	}
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/partition/PartitionedSubscriptionTriggeringR4Test.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/partition/PartitionedSubscriptionTriggeringR4Test.java
+index 81e4b0957f58..42e6e850f7c7 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/partition/PartitionedSubscriptionTriggeringR4Test.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/partition/PartitionedSubscriptionTriggeringR4Test.java
+@@ -8,7 +8,6 @@
+ import ca.uhn.fhir.jpa.api.dao.IFhirResourceDao;
+ import ca.uhn.fhir.jpa.api.model.DaoMethodOutcome;
+ import ca.uhn.fhir.jpa.api.model.ExpungeOptions;
+-import ca.uhn.fhir.jpa.dao.r4.BasePartitioningR4Test;
+ import ca.uhn.fhir.jpa.entity.PartitionEntity;
+ import ca.uhn.fhir.jpa.model.config.PartitionSettings;
+ import ca.uhn.fhir.jpa.model.config.SubscriptionSettings;
+@@ -327,6 +326,42 @@ public void testManualTriggeredSubscriptionInPartition() throws Exception {
+ 		assertThat(responseValue).contains("Subscription triggering job submitted as JOB ID");
+ 	}
+ 
++	@Test
++	public void testManualTriggeredSubscriptionByResourceIdDoesNotCrossPartitions() throws Exception {
++		String payload = "application/fhir+json";
++		String code = "1000000050";
++		String criteria1 = "Observation?code=SNOMED-CT|" + code + "&_format=xml";
++
++		// create resource in partition 1
++		myPartitionInterceptor.setRequestPartitionId(REQ_PART_1);
++		IIdType observation1 = myDaoRegistry.getResourceDao("Observation")
++			.create(buildBaseObservation(code, "SNOMED-CT"), mySrd).getId().toUnqualifiedVersionless();
++
++		// create resource in partition 2
++		myPartitionInterceptor.setRequestPartitionId(REQ_PART_2);
++		IIdType observation2 = myDaoRegistry.getResourceDao("Observation")
++			.create(buildBaseObservation(code, "SNOMED-CT"), mySrd).getId().toUnqualifiedVersionless();
++
++		// create subscription in partition 1, no cross-partition
++		myPartitionInterceptor.setRequestPartitionId(REQ_PART_1);
++		IIdType subscriptionId = myDaoRegistry.getResourceDao("Subscription")
++			.create(newSubscription(criteria1, payload), mySrd).getId();
++		waitForActivatedSubscriptionCount(1);
++
++		// trigger for both resources from the partition-1 job context
++		ArrayList<IPrimitiveType<String>> resourceIdList = new ArrayList<>();
++		resourceIdList.add(new StringDt(observation1.getValue()));
++		resourceIdList.add(new StringDt(observation2.getValue()));
++		Parameters resultParameters = (Parameters) mySubscriptionTriggeringSvc.triggerSubscription(resourceIdList, null, subscriptionId, mySrd);
++		mySubscriptionTriggeringSvc.runDeliveryPass();
++		waitForQueueToDrain();
++
++		// only the partition-1 resource should be delivered
++		assertEquals(1, BaseSubscriptionsR4Test.ourObservationProvider.getCountUpdate());
++		String responseValue = resultParameters.getParameter().get(0).getValue().primitiveValue();
++		assertThat(responseValue).contains("Subscription triggering job submitted as JOB ID");
++	}
++
+ 	@Interceptor
+ 	public static class MyReadWriteInterceptor {
+ 		private RequestPartitionId myReadPartitionId;

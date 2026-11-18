@@ -1,0 +1,781 @@
+diff --git a/engine/src/androidTest/java/com/google/android/fhir/db/impl/DatabaseImplTest.kt b/engine/src/androidTest/java/com/google/android/fhir/db/impl/DatabaseImplTest.kt
+index 16446abfdd..705b3c8a58 100644
+--- a/engine/src/androidTest/java/com/google/android/fhir/db/impl/DatabaseImplTest.kt
++++ b/engine/src/androidTest/java/com/google/android/fhir/db/impl/DatabaseImplTest.kt
+@@ -40,9 +40,9 @@ import com.google.android.fhir.search.getQuery
+ import com.google.android.fhir.search.has
+ import com.google.android.fhir.search.include
+ import com.google.android.fhir.search.revInclude
+-import com.google.android.fhir.sync.upload.LocalChangesFetchMode
+ import com.google.android.fhir.sync.upload.ResourceUploadResponseMapping
+ import com.google.android.fhir.sync.upload.UploadRequestResult
++import com.google.android.fhir.sync.upload.UploadStrategy.AllChangesSquashedBundlePut
+ import com.google.android.fhir.testing.assertJsonArrayEqualsIgnoringOrder
+ import com.google.android.fhir.testing.assertResourceEquals
+ import com.google.android.fhir.testing.readFromFile
+@@ -552,7 +552,7 @@ class DatabaseImplTest {
+     // Delete the patient created in setup as we only want to upload the patient in this test
+     database.deleteUpdates(listOf(TEST_PATIENT_1))
+     services.fhirEngine
+-      .syncUpload(LocalChangesFetchMode.AllChanges) {
++      .syncUpload(AllChangesSquashedBundlePut) {
+         it
+           .first { it.resourceId == "remote-patient-3" }
+           .let {
+diff --git a/engine/src/androidTest/java/com/google/android/fhir/sync/upload/HttpPostResourceConsolidatorTest.kt b/engine/src/androidTest/java/com/google/android/fhir/sync/upload/HttpPostResourceConsolidatorTest.kt
+new file mode 100644
+index 0000000000..67b1bb258c
+--- /dev/null
++++ b/engine/src/androidTest/java/com/google/android/fhir/sync/upload/HttpPostResourceConsolidatorTest.kt
+@@ -0,0 +1,231 @@
++/*
++ * Copyright 2024 Google LLC
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.google.android.fhir.sync.upload
++
++import android.content.Context
++import androidx.test.core.app.ApplicationProvider
++import androidx.test.ext.junit.runners.AndroidJUnit4
++import ca.uhn.fhir.context.FhirContext
++import com.google.android.fhir.FhirServices
++import com.google.android.fhir.db.Database
++import com.google.android.fhir.db.ResourceNotFoundException
++import com.google.android.fhir.logicalId
++import com.google.common.truth.Truth.assertThat
++import kotlinx.coroutines.runBlocking
++import org.hl7.fhir.r4.model.DomainResource
++import org.hl7.fhir.r4.model.InstantType
++import org.hl7.fhir.r4.model.Observation
++import org.hl7.fhir.r4.model.ResourceType
++import org.junit.After
++import org.junit.Assert.assertThrows
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.junit.runners.Parameterized
++
++@RunWith(AndroidJUnit4::class)
++class HttpPostResourceConsolidatorTest {
++  @JvmField @Parameterized.Parameter(0) var encrypted: Boolean = false
++
++  private val context: Context = ApplicationProvider.getApplicationContext()
++  private lateinit var database: Database
++  private lateinit var resourceConsolidator: ResourceConsolidator
++
++  @Before
++  fun setupDatabase() = runBlocking {
++    database =
++      FhirServices.builder(context)
++        .inMemory()
++        .apply {
++          if (encrypted) enableEncryptionIfSupported()
++          setSearchParameters(null)
++        }
++        .build()
++        .database
++    resourceConsolidator = HttpPostResourceConsolidator(database)
++  }
++
++  @After
++  fun closeDatabase() {
++    database.close()
++  }
++
++  @Test
++  fun consolidate_shouldUpdateResourceId() = runBlocking {
++    val patientJsonString =
++      """
++        {
++          "resourceType": "Patient",
++          "id": "patient1"
++        }
++            """
++        .trimIndent()
++    val patient =
++      FhirContext.forR4Cached().newJsonParser().parseResource(patientJsonString) as DomainResource
++    database.insert(patient)
++    val localChanges = database.getLocalChanges(patient.resourceType, patient.logicalId)
++
++    val postSyncPatientJsonString =
++      """
++      {
++        "resourceType": "Patient",
++        "id": "patient2",
++        "meta": {
++          "versionId": "1"
++        }
++      }
++        """
++        .trimIndent()
++    val postSyncPatient =
++      FhirContext.forR4Cached().newJsonParser().parseResource(postSyncPatientJsonString)
++        as DomainResource
++    postSyncPatient.meta.lastUpdatedElement = InstantType.now()
++    val uploadRequestResult =
++      UploadRequestResult.Success(
++        listOf(ResourceUploadResponseMapping(localChanges, postSyncPatient)),
++      )
++    resourceConsolidator.consolidate(uploadRequestResult)
++
++    assertThat(database.select(ResourceType.Patient, "patient2").logicalId)
++      .isEqualTo(postSyncPatient.logicalId)
++
++    val exception =
++      assertThrows(ResourceNotFoundException::class.java) {
++        runBlocking { database.select(ResourceType.Patient, "patient1") }
++      }
++
++    assertThat(exception.message).isEqualTo("Resource not found with type Patient and id patient1!")
++  }
++
++  @Test
++  fun consolidate_dependentResources_shouldUpdateReferenceValue() = runBlocking {
++    val patientJsonString =
++      """
++        {
++          "resourceType": "Patient",
++          "id": "patient1"
++        }
++            """
++        .trimIndent()
++    val patient =
++      FhirContext.forR4Cached().newJsonParser().parseResource(patientJsonString) as DomainResource
++    val observationJsonString =
++      """
++        {
++          "resourceType": "Observation",
++          "id": "observation1",
++          "subject": {
++            "reference": "Patient/patient1"
++          }
++        }
++            """
++        .trimIndent()
++    val observation =
++      FhirContext.forR4Cached().newJsonParser().parseResource(observationJsonString)
++        as DomainResource
++    database.insert(patient, observation)
++    val postSyncPatientJsonString =
++      """
++      {
++        "resourceType": "Patient",
++        "id": "patient2",
++        "meta": {
++          "versionId": "1"
++        }
++      }
++        """
++        .trimIndent()
++    val postSyncPatient =
++      FhirContext.forR4Cached().newJsonParser().parseResource(postSyncPatientJsonString)
++        as DomainResource
++    postSyncPatient.meta.lastUpdatedElement = InstantType.now()
++    val localChanges = database.getLocalChanges(patient.resourceType, patient.logicalId)
++    val uploadRequestResult =
++      UploadRequestResult.Success(
++        listOf(ResourceUploadResponseMapping(localChanges, postSyncPatient)),
++      )
++
++    resourceConsolidator.consolidate(uploadRequestResult)
++
++    assertThat(
++        (database.select(ResourceType.Observation, "observation1") as Observation)
++          .subject
++          .reference,
++      )
++      .isEqualTo("Patient/patient2")
++  }
++
++  @Test
++  fun consolidate_localChanges_shouldUpdateReferenceValue() = runBlocking {
++    val patientJsonString =
++      """
++        {
++          "resourceType": "Patient",
++          "id": "patient1"
++        }
++            """
++        .trimIndent()
++    val patient =
++      FhirContext.forR4Cached().newJsonParser().parseResource(patientJsonString) as DomainResource
++    val observationJsonString =
++      """
++        {
++          "resourceType": "Observation",
++          "id": "observation1",
++          "subject": {
++            "reference": "Patient/patient1"
++          }
++        }
++            """
++        .trimIndent()
++    val observation =
++      FhirContext.forR4Cached().newJsonParser().parseResource(observationJsonString)
++        as DomainResource
++    database.insert(patient, observation)
++    val postSyncPatientJsonString =
++      """
++      {
++        "resourceType": "Patient",
++        "id": "patient2",
++        "meta": {
++          "versionId": "1"
++        }
++      }
++        """
++        .trimIndent()
++    val postSyncPatient =
++      FhirContext.forR4Cached().newJsonParser().parseResource(postSyncPatientJsonString)
++        as DomainResource
++    postSyncPatient.meta.lastUpdatedElement = InstantType.now()
++    val localChanges = database.getLocalChanges(patient.resourceType, patient.logicalId)
++    val uploadRequestResult =
++      UploadRequestResult.Success(
++        listOf(ResourceUploadResponseMapping(localChanges, postSyncPatient)),
++      )
++
++    resourceConsolidator.consolidate(uploadRequestResult)
++
++    val localChange = database.getLocalChanges(ResourceType.Observation, "observation1").last()
++    assertThat(
++        (FhirContext.forR4Cached().newJsonParser().parseResource(localChange.payload)
++            as Observation)
++          .subject
++          .reference,
++      )
++      .isEqualTo("Patient/patient2")
++  }
++}
+diff --git a/engine/src/main/java/com/google/android/fhir/FhirEngine.kt b/engine/src/main/java/com/google/android/fhir/FhirEngine.kt
+index 45eb630896..fa47d2b21a 100644
+--- a/engine/src/main/java/com/google/android/fhir/FhirEngine.kt
++++ b/engine/src/main/java/com/google/android/fhir/FhirEngine.kt
+@@ -19,9 +19,9 @@ package com.google.android.fhir
+ import com.google.android.fhir.db.ResourceNotFoundException
+ import com.google.android.fhir.search.Search
+ import com.google.android.fhir.sync.ConflictResolver
+-import com.google.android.fhir.sync.upload.LocalChangesFetchMode
+ import com.google.android.fhir.sync.upload.SyncUploadProgress
+ import com.google.android.fhir.sync.upload.UploadRequestResult
++import com.google.android.fhir.sync.upload.UploadStrategy
+ import java.time.OffsetDateTime
+ import kotlinx.coroutines.flow.Flow
+ import org.hl7.fhir.r4.model.Resource
+@@ -130,7 +130,7 @@ interface FhirEngine {
+    */
+   @Deprecated("To be deprecated.")
+   suspend fun syncUpload(
+-    localChangesFetchMode: LocalChangesFetchMode,
++    uploadStrategy: UploadStrategy,
+     upload: (suspend (List<LocalChange>) -> Flow<UploadRequestResult>),
+   ): Flow<SyncUploadProgress>
+ 
+diff --git a/engine/src/main/java/com/google/android/fhir/db/impl/dao/ResourceDao.kt b/engine/src/main/java/com/google/android/fhir/db/impl/dao/ResourceDao.kt
+index 45786270bb..84458cf7a1 100644
+--- a/engine/src/main/java/com/google/android/fhir/db/impl/dao/ResourceDao.kt
++++ b/engine/src/main/java/com/google/android/fhir/db/impl/dao/ResourceDao.kt
+@@ -87,6 +87,7 @@ internal abstract class ResourceDao {
+           resourceId = updatedResource.logicalId,
+           serializedResource = iParser.encodeResourceToString(updatedResource),
+           lastUpdatedRemote = updatedResource.meta.lastUpdated?.toInstant() ?: it.lastUpdatedRemote,
++          versionId = updatedResource.meta.versionId,
+         )
+       updateChanges(entity, updatedResource)
+     }
+diff --git a/engine/src/main/java/com/google/android/fhir/impl/FhirEngineImpl.kt b/engine/src/main/java/com/google/android/fhir/impl/FhirEngineImpl.kt
+index 4645c149bc..0c0b37c1d5 100644
+--- a/engine/src/main/java/com/google/android/fhir/impl/FhirEngineImpl.kt
++++ b/engine/src/main/java/com/google/android/fhir/impl/FhirEngineImpl.kt
+@@ -28,11 +28,11 @@ import com.google.android.fhir.search.count
+ import com.google.android.fhir.search.execute
+ import com.google.android.fhir.sync.ConflictResolver
+ import com.google.android.fhir.sync.Resolved
+-import com.google.android.fhir.sync.upload.DefaultResourceConsolidator
+ import com.google.android.fhir.sync.upload.LocalChangeFetcherFactory
+-import com.google.android.fhir.sync.upload.LocalChangesFetchMode
++import com.google.android.fhir.sync.upload.ResourceConsolidatorFactory
+ import com.google.android.fhir.sync.upload.SyncUploadProgress
+ import com.google.android.fhir.sync.upload.UploadRequestResult
++import com.google.android.fhir.sync.upload.UploadStrategy
+ import java.time.OffsetDateTime
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.firstOrNull
+@@ -132,11 +132,13 @@ internal class FhirEngineImpl(private val database: Database, private val contex
+       .intersect(database.getAllLocalChanges().map { it.resourceId }.toSet())
+ 
+   override suspend fun syncUpload(
+-    localChangesFetchMode: LocalChangesFetchMode,
++    uploadStrategy: UploadStrategy,
+     upload: (suspend (List<LocalChange>) -> Flow<UploadRequestResult>),
+   ): Flow<SyncUploadProgress> = flow {
+-    val resourceConsolidator = DefaultResourceConsolidator(database)
+-    val localChangeFetcher = LocalChangeFetcherFactory.byMode(localChangesFetchMode, database)
++    val resourceConsolidator =
++      ResourceConsolidatorFactory.byHttpVerb(uploadStrategy.requestGeneratorMode, database)
++    val localChangeFetcher =
++      LocalChangeFetcherFactory.byMode(uploadStrategy.localChangesFetchMode, database)
+ 
+     emit(
+       SyncUploadProgress(
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/FhirSyncWorker.kt b/engine/src/main/java/com/google/android/fhir/sync/FhirSyncWorker.kt
+index c5c525b2d1..afb43458be 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/FhirSyncWorker.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/FhirSyncWorker.kt
+@@ -91,16 +91,18 @@ abstract class FhirSyncWorker(appContext: Context, workerParams: WorkerParameter
+       FhirSynchronizer(
+         getFhirEngine(),
+         UploadConfiguration(
+-          Uploader(
+-            dataSource = dataSource,
+-            patchGenerator =
+-              PatchGeneratorFactory.byMode(
+-                getUploadStrategy().patchGeneratorMode,
+-                FhirEngineProvider.getFhirDatabase(applicationContext),
+-              ),
+-            requestGenerator =
+-              UploadRequestGeneratorFactory.byMode(getUploadStrategy().requestGeneratorMode),
+-          ),
++          uploader =
++            Uploader(
++              dataSource = dataSource,
++              patchGenerator =
++                PatchGeneratorFactory.byMode(
++                  getUploadStrategy().patchGeneratorMode,
++                  FhirEngineProvider.getFhirDatabase(applicationContext),
++                ),
++              requestGenerator =
++                UploadRequestGeneratorFactory.byMode(getUploadStrategy().requestGeneratorMode),
++            ),
++          uploadStrategy = getUploadStrategy(),
+         ),
+         DownloadConfiguration(
+           DownloaderImpl(dataSource, getDownloadWorkManager()),
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/FhirSynchronizer.kt b/engine/src/main/java/com/google/android/fhir/sync/FhirSynchronizer.kt
+index 6f5232e311..10ee79f4e6 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/FhirSynchronizer.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/FhirSynchronizer.kt
+@@ -19,7 +19,7 @@ package com.google.android.fhir.sync
+ import com.google.android.fhir.FhirEngine
+ import com.google.android.fhir.sync.download.DownloadState
+ import com.google.android.fhir.sync.download.Downloader
+-import com.google.android.fhir.sync.upload.LocalChangesFetchMode
++import com.google.android.fhir.sync.upload.UploadStrategy
+ import com.google.android.fhir.sync.upload.Uploader
+ import java.time.OffsetDateTime
+ import kotlinx.coroutines.flow.MutableSharedFlow
+@@ -46,6 +46,7 @@ data class ResourceSyncException(val resourceType: ResourceType, val exception:
+ 
+ internal data class UploadConfiguration(
+   val uploader: Uploader,
++  val uploadStrategy: UploadStrategy,
+ )
+ 
+ internal class DownloadConfiguration(
+@@ -131,18 +132,18 @@ internal class FhirSynchronizer(
+ 
+   private suspend fun upload(): SyncResult {
+     val exceptions = mutableListOf<ResourceSyncException>()
+-    val localChangesFetchMode = LocalChangesFetchMode.AllChanges
+-    fhirEngine.syncUpload(localChangesFetchMode, uploadConfiguration.uploader::upload).collect {
+-      progress ->
+-      progress.uploadError?.let { exceptions.add(it) }
+-        ?: setSyncState(
+-          SyncJobStatus.InProgress(
+-            SyncOperation.UPLOAD,
+-            progress.initialTotal,
+-            progress.initialTotal - progress.remaining,
+-          ),
+-        )
+-    }
++    fhirEngine
++      .syncUpload(uploadConfiguration.uploadStrategy, uploadConfiguration.uploader::upload)
++      .collect { progress ->
++        progress.uploadError?.let { exceptions.add(it) }
++          ?: setSyncState(
++            SyncJobStatus.InProgress(
++              SyncOperation.UPLOAD,
++              progress.initialTotal,
++              progress.initialTotal - progress.remaining,
++            ),
++          )
++      }
+ 
+     return if (exceptions.isEmpty()) {
+       SyncResult.Success()
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/ResourceConsolidator.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/ResourceConsolidator.kt
+index 051b2c3257..ea8870b5f5 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/upload/ResourceConsolidator.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/ResourceConsolidator.kt
+@@ -18,9 +18,12 @@ package com.google.android.fhir.sync.upload
+ 
+ import com.google.android.fhir.LocalChangeToken
+ import com.google.android.fhir.db.Database
++import com.google.android.fhir.sync.upload.request.UploadRequestGeneratorMode
+ import org.hl7.fhir.r4.model.Bundle
+ import org.hl7.fhir.r4.model.DomainResource
++import org.hl7.fhir.r4.model.Resource
+ import org.hl7.fhir.r4.model.ResourceType
++import org.hl7.fhir.r4.model.codesystems.HttpVerb
+ 
+ /**
+  * Represents a mechanism to consolidate resources after they are uploaded.
+@@ -88,33 +91,101 @@ internal class DefaultResourceConsolidator(private val database: Database) : Res
+       )
+     }
+   }
++}
+ 
+-  /**
+-   * FHIR uses weak ETag that look something like W/"MTY4NDMyODE2OTg3NDUyNTAwMA", so we need to
+-   * extract version from it. See https://hl7.org/fhir/http.html#Http-Headers.
+-   */
+-  private fun getVersionFromETag(eTag: String) =
+-    // The server should always return a weak etag that starts with W, but if it server returns a
+-    // strong tag, we store it as-is. The http-headers for conditional upload like if-match will
+-    // always add value as a weak tag.
+-    if (eTag.startsWith("W/")) {
+-      eTag.split("\"")[1]
+-    } else {
+-      eTag
++internal class HttpPostResourceConsolidator(private val database: Database) : ResourceConsolidator {
++  override suspend fun consolidate(uploadRequestResult: UploadRequestResult) =
++    when (uploadRequestResult) {
++      is UploadRequestResult.Success -> {
++        database.deleteUpdates(
++          LocalChangeToken(
++            uploadRequestResult.successfulUploadResponseMappings.flatMap {
++              it.localChanges.flatMap { localChange -> localChange.token.ids }
++            },
++          ),
++        )
++        uploadRequestResult.successfulUploadResponseMappings.forEach {
++          when (it) {
++            is BundleComponentUploadResponseMapping -> {
++              // TODO https://github.com/google/android-fhir/issues/2499
++              throw NotImplementedError()
++            }
++            is ResourceUploadResponseMapping -> {
++              val preSyncResourceId = it.localChanges.firstOrNull()?.resourceId
++              preSyncResourceId?.let { preSyncResourceId ->
++                updateResourcePostSync(preSyncResourceId, it.output)
++              }
++            }
++          }
++        }
++      }
++      is UploadRequestResult.Failure -> {
++        /* For now, do nothing (we do not delete the local changes from the database as they were
++        not uploaded successfully. In the future, add consolidation required if upload fails.
++         */
++      }
++    }
++
++  private suspend fun updateResourcePostSync(
++    preSyncResourceId: String,
++    postSyncResource: Resource,
++  ) {
++    if (
++      postSyncResource.hasMeta() &&
++        postSyncResource.meta.hasVersionId() &&
++        postSyncResource.meta.hasLastUpdated()
++    ) {
++      database.updateResourceAndReferences(
++        preSyncResourceId,
++        postSyncResource,
++      )
+     }
++  }
++}
+ 
+-  /**
+-   * May return a Pair of versionId and resource type extracted from the
+-   * [Bundle.BundleEntryResponseComponent.location].
+-   *
+-   * [Bundle.BundleEntryResponseComponent.location] may be:
+-   * 1. absolute path: `<server-path>/<resource-type>/<resource-id>/_history/<version>`
+-   * 2. relative path: `<resource-type>/<resource-id>/_history/<version>`
+-   */
+-  private val Bundle.BundleEntryResponseComponent.resourceIdAndType: Pair<String, ResourceType>?
+-    get() =
+-      location
+-        ?.split("/")
+-        ?.takeIf { it.size > 3 }
+-        ?.let { it[it.size - 3] to ResourceType.fromCode(it[it.size - 4]) }
++/**
++ * FHIR uses weak ETag that look something like W/"MTY4NDMyODE2OTg3NDUyNTAwMA", so we need to
++ * extract version from it. See https://hl7.org/fhir/http.html#Http-Headers.
++ */
++private fun getVersionFromETag(eTag: String) =
++  // The server should always return a weak etag that starts with W, but if it server returns a
++  // strong tag, we store it as-is. The http-headers for conditional upload like if-match will
++  // always add value as a weak tag.
++  if (eTag.startsWith("W/")) {
++    eTag.split("\"")[1]
++  } else {
++    eTag
++  }
++
++/**
++ * May return a Pair of versionId and resource type extracted from the
++ * [Bundle.BundleEntryResponseComponent.location].
++ *
++ * [Bundle.BundleEntryResponseComponent.location] may be:
++ * 1. absolute path: `<server-path>/<resource-type>/<resource-id>/_history/<version>`
++ * 2. relative path: `<resource-type>/<resource-id>/_history/<version>`
++ */
++private val Bundle.BundleEntryResponseComponent.resourceIdAndType: Pair<String, ResourceType>?
++  get() =
++    location
++      ?.split("/")
++      ?.takeIf { it.size > 3 }
++      ?.let { it[it.size - 3] to ResourceType.fromCode(it[it.size - 4]) }
++
++internal object ResourceConsolidatorFactory {
++  fun byHttpVerb(
++    uploadRequestMode: UploadRequestGeneratorMode,
++    database: Database,
++  ): ResourceConsolidator {
++    val httpVerbToUse =
++      when (uploadRequestMode) {
++        is UploadRequestGeneratorMode.UrlRequest -> uploadRequestMode.httpVerbToUseForCreate
++        is UploadRequestGeneratorMode.BundleRequest -> uploadRequestMode.httpVerbToUseForCreate
++      }
++    return if (httpVerbToUse.toString() == HttpVerb.POST.toCode()) {
++      HttpPostResourceConsolidator(database)
++    } else {
++      DefaultResourceConsolidator(database)
++    }
++  }
+ }
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/UploadStrategy.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/UploadStrategy.kt
+index f6bc702d79..a926aac516 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/upload/UploadStrategy.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/UploadStrategy.kt
+@@ -62,13 +62,24 @@ private constructor(
+    * bundled PUT request. This strategy is efficient and minimizes the number of requests sent to
+    * the server, but does not maintain individual change history.
+    */
+-  object AllChangesSquashedBundlePut :
++  data object AllChangesSquashedBundlePut :
+     UploadStrategy(
+       LocalChangesFetchMode.AllChanges,
+       PatchGeneratorMode.PerResource,
+       UploadRequestGeneratorMode.BundleRequest(Bundle.HTTPVerb.PUT, Bundle.HTTPVerb.PATCH),
+     )
+ 
++  /**
++   * Fetches all changes for a single resource, generates a patch for that resource, and creates a
++   * single POST request with the patch.
++   */
++  data object SingleResourcePost :
++    UploadStrategy(
++      LocalChangesFetchMode.PerResource,
++      PatchGeneratorMode.PerResource,
++      UploadRequestGeneratorMode.UrlRequest(HttpVerb.POST, HttpVerb.PATCH),
++    )
++
+   /*
+    * All the [UploadStrategy]s below this line are still in progress and not available as of now. As
+    * and when an [UploadStrategy] is implemented, it should be moved above this comment section and
+@@ -119,17 +130,6 @@ private constructor(
+       UploadRequestGeneratorMode.UrlRequest(HttpVerb.PUT, HttpVerb.PATCH),
+     )
+ 
+-  /**
+-   * Not yet implemented - Fetches all changes for a single resource, generates a patch for that
+-   * resource, and creates a single POST request with the patch.
+-   */
+-  private object SingleResourcePost :
+-    UploadStrategy(
+-      LocalChangesFetchMode.PerResource,
+-      PatchGeneratorMode.PerResource,
+-      UploadRequestGeneratorMode.UrlRequest(HttpVerb.POST, HttpVerb.PATCH),
+-    )
+-
+   /**
+    * Not yet implemented - Fetches all local changes, generates a patch for each individual change,
+    * and creates a single bundle POST request containing all the patches.
+diff --git a/engine/src/main/java/com/google/android/fhir/testing/Utilities.kt b/engine/src/main/java/com/google/android/fhir/testing/Utilities.kt
+index 07c764241a..e6c0441158 100644
+--- a/engine/src/main/java/com/google/android/fhir/testing/Utilities.kt
++++ b/engine/src/main/java/com/google/android/fhir/testing/Utilities.kt
+@@ -31,9 +31,9 @@ import com.google.android.fhir.sync.DownloadWorkManager
+ import com.google.android.fhir.sync.download.BundleDownloadRequest
+ import com.google.android.fhir.sync.download.DownloadRequest
+ import com.google.android.fhir.sync.download.UrlDownloadRequest
+-import com.google.android.fhir.sync.upload.LocalChangesFetchMode
+ import com.google.android.fhir.sync.upload.SyncUploadProgress
+ import com.google.android.fhir.sync.upload.UploadRequestResult
++import com.google.android.fhir.sync.upload.UploadStrategy
+ import com.google.android.fhir.sync.upload.request.BundleUploadRequest
+ import com.google.android.fhir.sync.upload.request.UploadRequest
+ import com.google.android.fhir.sync.upload.request.UrlUploadRequest
+@@ -157,7 +157,7 @@ object TestFhirEngineImpl : FhirEngine {
+   }
+ 
+   override suspend fun syncUpload(
+-    localChangesFetchMode: LocalChangesFetchMode,
++    uploadStrategy: UploadStrategy,
+     upload: suspend (List<LocalChange>) -> Flow<UploadRequestResult>,
+   ): Flow<SyncUploadProgress> = flow {
+     emit(SyncUploadProgress(1, 1))
+diff --git a/engine/src/test/java/com/google/android/fhir/impl/FhirEngineImplTest.kt b/engine/src/test/java/com/google/android/fhir/impl/FhirEngineImplTest.kt
+index 21d440a1ba..48be1a491b 100644
+--- a/engine/src/test/java/com/google/android/fhir/impl/FhirEngineImplTest.kt
++++ b/engine/src/test/java/com/google/android/fhir/impl/FhirEngineImplTest.kt
+@@ -30,10 +30,10 @@ import com.google.android.fhir.search.search
+ import com.google.android.fhir.sync.AcceptLocalConflictResolver
+ import com.google.android.fhir.sync.AcceptRemoteConflictResolver
+ import com.google.android.fhir.sync.ResourceSyncException
+-import com.google.android.fhir.sync.upload.LocalChangesFetchMode
+ import com.google.android.fhir.sync.upload.ResourceUploadResponseMapping
+ import com.google.android.fhir.sync.upload.SyncUploadProgress
+ import com.google.android.fhir.sync.upload.UploadRequestResult
++import com.google.android.fhir.sync.upload.UploadStrategy
+ import com.google.android.fhir.testing.assertResourceEquals
+ import com.google.android.fhir.testing.assertResourceNotEquals
+ import com.google.android.fhir.testing.readFromFile
+@@ -323,7 +323,7 @@ class FhirEngineImplTest {
+     val emittedProgress = mutableListOf<SyncUploadProgress>()
+ 
+     fhirEngine
+-      .syncUpload(LocalChangesFetchMode.AllChanges) {
++      .syncUpload(UploadStrategy.AllChangesSquashedBundlePut) {
+         localChanges.addAll(it)
+         flowOf(
+           UploadRequestResult.Success(
+@@ -356,7 +356,7 @@ class FhirEngineImplTest {
+     val emittedProgress = mutableListOf<SyncUploadProgress>()
+     val uploadError = ResourceSyncException(ResourceType.Patient, FHIRException("Did not work"))
+     fhirEngine
+-      .syncUpload(LocalChangesFetchMode.AllChanges) {
++      .syncUpload(UploadStrategy.AllChangesSquashedBundlePut) {
+         flowOf(
+           UploadRequestResult.Failure(
+             it,
+@@ -763,6 +763,26 @@ class FhirEngineImplTest {
+         .inOrder()
+     }
+ 
++  @Test
++  fun `test local changes are consumed when using POST upload strategy`() = runBlocking {
++    assertThat(services.database.getLocalChangesCount()).isEqualTo(1)
++    fhirEngine
++      .syncUpload(UploadStrategy.SingleResourcePost) {
++        flowOf(
++          UploadRequestResult.Success(
++            listOf(
++              ResourceUploadResponseMapping(
++                it,
++                TEST_PATIENT_1,
++              ),
++            ),
++          ),
++        )
++      }
++      .collect {}
++    assertThat(services.database.getLocalChangesCount()).isEqualTo(0)
++  }
++
+   companion object {
+     private const val TEST_PATIENT_1_ID = "test_patient_1"
+     private var TEST_PATIENT_1 =
+diff --git a/engine/src/test/java/com/google/android/fhir/sync/FhirSynchronizerTest.kt b/engine/src/test/java/com/google/android/fhir/sync/FhirSynchronizerTest.kt
+index 299c3e4342..22c6fb6709 100644
+--- a/engine/src/test/java/com/google/android/fhir/sync/FhirSynchronizerTest.kt
++++ b/engine/src/test/java/com/google/android/fhir/sync/FhirSynchronizerTest.kt
+@@ -19,6 +19,7 @@ package com.google.android.fhir.sync
+ import com.google.android.fhir.sync.download.DownloadState
+ import com.google.android.fhir.sync.download.Downloader
+ import com.google.android.fhir.sync.upload.UploadRequestResult
++import com.google.android.fhir.sync.upload.UploadStrategy
+ import com.google.android.fhir.sync.upload.Uploader
+ import com.google.android.fhir.testing.TestFhirEngineImpl
+ import com.google.common.truth.Truth.assertThat
+@@ -59,7 +60,7 @@ class FhirSynchronizerTest {
+     fhirSynchronizer =
+       FhirSynchronizer(
+         TestFhirEngineImpl,
+-        UploadConfiguration(uploader),
++        UploadConfiguration(uploader, UploadStrategy.AllChangesSquashedBundlePut),
+         DownloadConfiguration(downloader, conflictResolver),
+         fhirDataStore,
+       )
+@@ -158,7 +159,7 @@ class FhirSynchronizerTest {
+       val fhirSynchronizerWithDelayInDownload =
+         FhirSynchronizer(
+           TestFhirEngineImpl,
+-          UploadConfiguration(uploader),
++          UploadConfiguration(uploader, UploadStrategy.AllChangesSquashedBundlePut),
+           DownloadConfiguration(
+             object : Downloader {
+               override suspend fun download(): Flow<DownloadState> {
+diff --git a/engine/src/test/java/com/google/android/fhir/sync/upload/ResourceConsolidatorFactoryTest.kt b/engine/src/test/java/com/google/android/fhir/sync/upload/ResourceConsolidatorFactoryTest.kt
+new file mode 100644
+index 0000000000..10c1fee372
+--- /dev/null
++++ b/engine/src/test/java/com/google/android/fhir/sync/upload/ResourceConsolidatorFactoryTest.kt
+@@ -0,0 +1,50 @@
++/*
++ * Copyright 2024 Google LLC
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.google.android.fhir.sync.upload
++
++import androidx.test.core.app.ApplicationProvider
++import com.google.android.fhir.FhirServices
++import kotlin.test.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++
++@RunWith(RobolectricTestRunner::class)
++class ResourceConsolidatorFactoryTest {
++  private val services =
++    FhirServices.builder(ApplicationProvider.getApplicationContext()).inMemory().build()
++
++  @Test
++  fun `return HttpPostResourceConsolidator instance `() {
++    val httpPostResourceConsolidator =
++      ResourceConsolidatorFactory.byHttpVerb(
++        UploadStrategy.SingleResourcePost.requestGeneratorMode,
++        services.database,
++      )
++    assertTrue(httpPostResourceConsolidator is HttpPostResourceConsolidator)
++  }
++
++  @Test
++  fun `return DefaultResourceConsolidator instance `() {
++    val httpPostResourceConsolidator =
++      ResourceConsolidatorFactory.byHttpVerb(
++        UploadStrategy.AllChangesSquashedBundlePut.requestGeneratorMode,
++        services.database,
++      )
++    assertTrue(httpPostResourceConsolidator is DefaultResourceConsolidator)
++  }
++}

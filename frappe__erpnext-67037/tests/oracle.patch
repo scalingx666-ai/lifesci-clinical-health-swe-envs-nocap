@@ -1,0 +1,217 @@
+diff --git a/erpnext/manufacturing/doctype/job_card/test_job_card.py b/erpnext/manufacturing/doctype/job_card/test_job_card.py
+index a9dc99c46caa..70e0f1cf5993 100644
+--- a/erpnext/manufacturing/doctype/job_card/test_job_card.py
++++ b/erpnext/manufacturing/doctype/job_card/test_job_card.py
+@@ -618,6 +618,35 @@ def test_job_card_excess_material_transfer(self):
+ 		# JC is Completed with excess transfer
+ 		self.assertEqual(job_card.status, "Completed")
+ 
++	def test_transfer_refuses_job_card_item_of_other_job_card(self):
++		self.transfer_material_against = "Job Card"
++		self.source_warehouse = "Stores - _TC"
++		self.generate_required_stock(self.work_order)
++		job_card = frappe.get_last_doc("Job Card", {"work_order": self.work_order.name})
++
++		other_work_order = make_wo_order_test_record(
++			item="_Test FG Item 2",
++			qty=2,
++			transfer_material_against="Job Card",
++			source_warehouse="Stores - _TC",
++		)
++		other_job_card = frappe.get_last_doc("Job Card", {"work_order": other_work_order.name})
++
++		transfer_entry = make_stock_entry_from_jc(job_card.name)
++		transfer_entry.items[0].job_card_item = other_job_card.items[0].name
++		self.assertRaisesRegex(
++			frappe.ValidationError,
++			f"Job Card Item {other_job_card.items[0].name} does not belong to Job Card {job_card.name}",
++			transfer_entry.insert,
++		)
++
++		transfer_entry = make_stock_entry_from_jc(job_card.name)
++		transfer_entry.submit()
++		self.assertEqual(
++			frappe.db.get_value("Job Card Item", job_card.items[0].name, "transferred_qty"),
++			job_card.items[0].required_qty,
++		)
++
+ 	def test_job_card_actions_blocked_until_material_transfer(self):
+ 		"Start and Complete must wait for the transfer when RMs move against Job Card."
+ 		self.transfer_material_against = "Job Card"
+diff --git a/erpnext/stock/doctype/stock_entry/stock_entry.py b/erpnext/stock/doctype/stock_entry/stock_entry.py
+index 5ab83fba4140..e8beffa26c11 100644
+--- a/erpnext/stock/doctype/stock_entry/stock_entry.py
++++ b/erpnext/stock/doctype/stock_entry/stock_entry.py
+@@ -328,6 +328,8 @@ def set_allow_alternative_item(self):
+ 			)
+ 
+ 	def validate(self):
++		self.validate_reference_companies()
++		self.validate_row_reference_parents()
+ 		self.pro_doc = frappe._dict()
+ 		if self.work_order:
+ 			self.pro_doc = frappe.get_doc("Work Order", self.work_order)
+@@ -411,6 +413,67 @@ def validate(self):
+ 		self.validate_raw_materials_exists()
+ 		super().validate_subcontracting_inward()
+ 
++	def validate_reference_companies(self):
++		for doctype, names in self.get_referenced_documents().items():
++			if other_company_document := frappe.get_all(
++				doctype,
++				filters={"name": ("in", list(names)), "company": ("!=", self.company)},
++				pluck="name",
++				limit=1,
++			):
++				frappe.throw(
++					_("{0} {1} does not belong to Company {2}").format(
++						_(doctype), other_company_document[0], self.company
++					)
++				)
++
++	def validate_row_reference_parents(self):
++		for row_field, child_doctype, parent_field in (
++			("pick_list_item", "Pick List Item", "pick_list"),
++			("job_card_item", "Job Card Item", "job_card"),
++		):
++			names = {row.get(row_field) for row in self.items if row.get(row_field)}
++			parent = self.get(parent_field) or ""
++			if names and (
++				other_parent_row := frappe.get_all(
++					child_doctype,
++					filters={"name": ("in", list(names)), "parent": ("!=", parent)},
++					pluck="name",
++					limit=1,
++				)
++			):
++				frappe.throw(
++					_("{0} {1} does not belong to {2} {3}").format(
++						_(child_doctype),
++						other_parent_row[0],
++						_(self.meta.get_label(parent_field)),
++						parent,
++					)
++				)
++
++	def get_referenced_documents(self):
++		references = defaultdict(set)
++		for fieldname in (
++			"work_order",
++			"job_card",
++			"pick_list",
++			"purchase_order",
++			"subcontracting_order",
++			"subcontracting_inward_order",
++			"outgoing_stock_entry",
++			"source_stock_entry",
++		):
++			if name := self.get(fieldname):
++				references[self.meta.get_options(fieldname)].add(name)
++
++		for row in self.get("items"):
++			if row.material_request:
++				references["Material Request"].add(row.material_request)
++			if row.against_stock_entry:
++				references["Stock Entry"].add(row.against_stock_entry)
++
++		return references
++
+ 	def validate_finished_good_serial_batch_for_work_order(self):
+ 		if not (
+ 			self.work_order
+diff --git a/erpnext/stock/doctype/stock_entry/test_stock_entry.py b/erpnext/stock/doctype/stock_entry/test_stock_entry.py
+index bf264bffad6e..81b730433082 100644
+--- a/erpnext/stock/doctype/stock_entry/test_stock_entry.py
++++ b/erpnext/stock/doctype/stock_entry/test_stock_entry.py
+@@ -5342,6 +5342,91 @@ def test_process_loss_qty_derived_from_percentage_when_qty_blank(self):
+ 
+ 		self.assertEqual(se.process_loss_qty, 50)
+ 
++	def test_stock_entry_refuses_work_order_of_other_company(self):
++		from erpnext.manufacturing.doctype.production_plan.test_production_plan import make_bom
++		from erpnext.manufacturing.doctype.work_order.test_work_order import make_wo_order_test_record
++		from erpnext.manufacturing.doctype.work_order.work_order import (
++			make_stock_entry as make_transfer_entry,
++		)
++
++		fg_item = make_item("_Test Gear Box", {"is_stock_item": 1}).name
++		rm_item = make_item("_Test Gear Wheel", {"is_stock_item": 1}).name
++		make_bom(item=fg_item, raw_materials=[rm_item])
++		other_bom = make_bom(item=fg_item, raw_materials=[rm_item], company="_Test Company 1")
++
++		def new_transfer_entry(work_order):
++			entry = frappe.get_doc(
++				make_transfer_entry(work_order.name, "Material Transfer for Manufacture", 1)
++			)
++			entry.company = "_Test Company"
++			for row in entry.items:
++				row.update(
++					{
++						"s_warehouse": "_Test Warehouse - _TC",
++						"t_warehouse": "_Test Warehouse 1 - _TC",
++						"expense_account": None,
++						"cost_center": None,
++					}
++				)
++			return entry
++
++		own_work_order = make_wo_order_test_record(production_item=fg_item, qty=1)
++		new_transfer_entry(own_work_order).insert()
++
++		other_work_order = make_wo_order_test_record(
++			production_item=fg_item, bom_no=other_bom.name, company="_Test Company 1", qty=1
++		)
++		self.assertRaisesRegex(
++			frappe.ValidationError,
++			f"Work Order {other_work_order.name} does not belong to Company _Test Company",
++			new_transfer_entry(other_work_order).insert,
++		)
++
++	def test_stock_entry_refuses_pick_list_row_of_other_pick_list(self):
++		from erpnext.stock.doctype.pick_list.pick_list import create_stock_entry as make_entry_from_pick_list
++
++		item = make_item(properties={"is_stock_item": 1}).name
++
++		def new_pick_list(company, warehouse):
++			make_stock_entry(item=item, to_warehouse=warehouse, qty=5, basic_rate=100)
++			pick_list = frappe.get_doc(
++				{
++					"doctype": "Pick List",
++					"company": company,
++					"purpose": "Material Transfer",
++					"pick_manually": 1,
++					"locations": [{"item_code": item, "warehouse": warehouse, "qty": 5, "picked_qty": 5}],
++				}
++			).insert()
++			pick_list.submit()
++			return pick_list
++
++		own_pick_list = new_pick_list("_Test Company", "_Test Warehouse - _TC")
++		other_pick_list = new_pick_list("_Test Company 1", "_Test Warehouse 2 - _TC1")
++
++		receipt = frappe.get_doc(make_entry_from_pick_list(own_pick_list.as_dict()))
++		receipt.update({"purpose": "Material Receipt", "stock_entry_type": "Material Receipt"})
++		receipt.items[0].update(
++			{
++				"s_warehouse": None,
++				"t_warehouse": "_Test Warehouse - _TC",
++				"basic_rate": 100,
++				"pick_list_item": other_pick_list.locations[0].name,
++			}
++		)
++		self.assertRaisesRegex(
++			frappe.ValidationError,
++			f"Pick List Item {other_pick_list.locations[0].name} does not belong to Pick List {own_pick_list.name}",
++			receipt.insert,
++		)
++
++		transfer = frappe.get_doc(make_entry_from_pick_list(own_pick_list.as_dict()))
++		transfer.items[0].t_warehouse = "_Test Warehouse 1 - _TC"
++		transfer.submit()
++		self.assertEqual(
++			frappe.db.get_value("Pick List Item", own_pick_list.locations[0].name, "transferred_qty"), 5
++		)
++
+ 	def test_get_pending_work_orders(self):
+ 		from erpnext.manufacturing.doctype.work_order.test_work_order import make_wo_order_test_record
+ 

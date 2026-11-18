@@ -1,0 +1,1015 @@
+diff --git a/hapi-fhir-base/src/main/java/ca/uhn/fhir/context/support/IValidationSupport.java b/hapi-fhir-base/src/main/java/ca/uhn/fhir/context/support/IValidationSupport.java
+index 84cbf65ea3d3..b2f68d5cee4a 100644
+--- a/hapi-fhir-base/src/main/java/ca/uhn/fhir/context/support/IValidationSupport.java
++++ b/hapi-fhir-base/src/main/java/ca/uhn/fhir/context/support/IValidationSupport.java
+@@ -1247,6 +1247,10 @@ class CodeValidationResult {
+ 		private List<BaseConceptProperty> myProperties;
+ 		private String myDisplay;
+ 		private String mySourceDetails;
++		/**
++		 * If the code cannot be determined to be valid or not, this will be set false.
++		 */
++		private boolean myIsCodeDeterminable = true;
+ 
+ 		private List<CodeValidationIssue> myIssues;
+ 		private Set<String> myUnknownSystems;
+@@ -1272,6 +1276,21 @@ public CodeValidationResult setSourceDetails(String theSourceDetails) {
+ 			return this;
+ 		}
+ 
++		/**
++		 * Returns true if and only if the code can be determined.
++		 * This is to help distinguish between an invalid code
++		 * and a code that may or may not be valid, but the responding server
++		 * didn't respond as expected.
++		 */
++		public boolean isCodeDeterminable() {
++			return myIsCodeDeterminable;
++		}
++
++		public CodeValidationResult setCodeDeterminable(boolean theCodeDeterminable) {
++			myIsCodeDeterminable = theCodeDeterminable;
++			return this;
++		}
++
+ 		public String getDisplay() {
+ 			return myDisplay;
+ 		}
+@@ -1432,6 +1451,7 @@ public CodeValidationResult copy() {
+ 			if (myUnknownSystems != null) {
+ 				retVal.myUnknownSystems = new LinkedHashSet<>(myUnknownSystems);
+ 			}
++			retVal.setCodeDeterminable(myIsCodeDeterminable);
+ 			return retVal;
+ 		}
+ 
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_2_0/8838-codes-that-cant-be-determined-no-longer-show-as-not-valid.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_2_0/8838-codes-that-cant-be-determined-no-longer-show-as-not-valid.yaml
+new file mode 100644
+index 000000000000..02aebf5e6125
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_2_0/8838-codes-that-cant-be-determined-no-longer-show-as-not-valid.yaml
+@@ -0,0 +1,10 @@
++---
++type: security
++issue: 8838
++title: "When a remote terminology server answered `$validate-code` with HTTP 400 or 404,
++    the code was treated as not in the ValueSet without ever being checked,
++    so `:not-in` authorization rules could grant access they were meant to block.
++    Such codes are now treated as undecided: these rules deny, and in-memory `:in`/`:not-in` matching
++    is unsupported.
++    `$validate-code` and `$validate` output is unchanged.
++"
+diff --git a/hapi-fhir-jpaserver-searchparam/src/main/java/ca/uhn/fhir/jpa/searchparam/matcher/InMemoryResourceMatcher.java b/hapi-fhir-jpaserver-searchparam/src/main/java/ca/uhn/fhir/jpa/searchparam/matcher/InMemoryResourceMatcher.java
+index 1d176063d500..ba2baa8e59e8 100644
+--- a/hapi-fhir-jpaserver-searchparam/src/main/java/ca/uhn/fhir/jpa/searchparam/matcher/InMemoryResourceMatcher.java
++++ b/hapi-fhir-jpaserver-searchparam/src/main/java/ca/uhn/fhir/jpa/searchparam/matcher/InMemoryResourceMatcher.java
+@@ -71,8 +71,10 @@
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.stream.Collectors;
++import java.util.stream.Stream;
+ 
+ import static ca.uhn.fhir.jpa.searchparam.extractor.ResourceIndexedSearchParams.isMatchSearchParam;
++import static org.apache.commons.lang3.ObjectUtils.getIfNull;
+ import static org.apache.commons.lang3.ObjectUtils.isEmpty;
+ import static org.apache.commons.lang3.StringUtils.isBlank;
+ import static org.apache.commons.lang3.StringUtils.isNotBlank;
+@@ -597,15 +599,19 @@ private boolean matchTokenParam(
+ 		if (theQueryParam.getModifier() != null) {
+ 			switch (theQueryParam.getModifier()) {
+ 				case IN:
+-					return theSearchParams.myTokenParams.stream()
+-							.filter(t -> isMatchSearchParam(
+-									myPartitionSettings, theStorageSettings, theResourceName, theParamName, t))
+-							.anyMatch(t -> systemContainsCode(theQueryParam, t));
++					return anyCodeInValueSet(
++							theQueryParam,
++							theSearchParams.myTokenParams.stream().filter(t -> {
++								return isMatchSearchParam(
++										myPartitionSettings, theStorageSettings, theResourceName, theParamName, t);
++							}));
+ 				case NOT_IN:
+-					return theSearchParams.myTokenParams.stream()
+-							.filter(t -> isMatchSearchParam(
+-									myPartitionSettings, theStorageSettings, theResourceName, theParamName, t))
+-							.noneMatch(t -> systemContainsCode(theQueryParam, t));
++					return !anyCodeInValueSet(
++							theQueryParam,
++							theSearchParams.myTokenParams.stream().filter(t -> {
++								return isMatchSearchParam(
++										myPartitionSettings, theStorageSettings, theResourceName, theParamName, t);
++							}));
+ 				case NOT:
+ 					return !theSearchParams.matchParam(
+ 							myPartitionSettings,
+@@ -633,6 +639,30 @@ private boolean matchTokenParam(
+ 		}
+ 	}
+ 
++	/**
++	 * Returns true if at least one of the codes is in the ValueSet.
++	 * The codes are checked until one is found in it.
++	 * If none are found, but a code could not be checked, the answer is "unknown".
++	 *
++	 * @throws MembershipNotDecidedException if no code is in the ValueSet and at least one could not be checked.
++	 */
++	private boolean anyCodeInValueSet(TokenParam theQueryParam, Stream<ResourceIndexedSearchParamToken> theTokens) {
++		MembershipNotDecidedException undecided = null;
++		for (ResourceIndexedSearchParamToken next : (Iterable<ResourceIndexedSearchParamToken>) theTokens::iterator) {
++			try {
++				if (systemContainsCode(theQueryParam, next)) {
++					return true;
++				}
++			} catch (MembershipNotDecidedException e) {
++				undecided = getIfNull(undecided, e);
++			}
++		}
++		if (undecided != null) {
++			throw undecided;
++		}
++		return false;
++	}
++
+ 	private boolean systemContainsCode(TokenParam theQueryParam, ResourceIndexedSearchParamToken theSearchParamToken) {
+ 		IValidationSupport validationSupport = getValidationSupportOrNull();
+ 		if (validationSupport == null) {
+@@ -648,12 +678,22 @@ private boolean systemContainsCode(TokenParam theQueryParam, ResourceIndexedSear
+ 				theSearchParamToken.getValue(),
+ 				null,
+ 				theQueryParam.getValue());
++
++		// no result is likely the result of no existing module
+ 		if (codeValidationResult == null) {
+ 			throw new MembershipNotDecidedException(Msg.code(3070)
+ 					+ "ValueSet membership cannot be checked because no validation support module could validate code "
+ 					+ theSearchParamToken.getSystem() + "#" + theSearchParamToken.getValue() + " in ValueSet "
+ 					+ theQueryParam.getValue());
+ 		}
++		if (!codeValidationResult.isCodeDeterminable()) {
++			throw new MembershipNotDecidedException(Msg.code(3074)
++					+ "ValueSet membership cannot be determined for code "
++					+ theSearchParamToken.getSystem() + "#" + theSearchParamToken.getValue()
++					+ " in ValueSet " + theQueryParam.getValue()
++					+ (isNotBlank(codeValidationResult.getMessage()) ? ": " + codeValidationResult.getMessage() : ""));
++		}
++
+ 		List<String> unknownSystems = new ValueSetCodeSystemFinder(validationSupportContext)
+ 				.findUnknownSystems(codeValidationResult, theQueryParam.getValue(), theSearchParamToken.getSystem());
+ 		if (!unknownSystems.isEmpty()) {
+diff --git a/hapi-fhir-jpaserver-searchparam/src/test/java/ca/uhn/fhir/jpa/searchparam/matcher/InMemoryResourceMatcherR5Test.java b/hapi-fhir-jpaserver-searchparam/src/test/java/ca/uhn/fhir/jpa/searchparam/matcher/InMemoryResourceMatcherR5Test.java
+index 0c761e477c34..082bccc46825 100644
+--- a/hapi-fhir-jpaserver-searchparam/src/test/java/ca/uhn/fhir/jpa/searchparam/matcher/InMemoryResourceMatcherR5Test.java
++++ b/hapi-fhir-jpaserver-searchparam/src/test/java/ca/uhn/fhir/jpa/searchparam/matcher/InMemoryResourceMatcherR5Test.java
+@@ -7,6 +7,7 @@
+ import ca.uhn.fhir.jpa.model.entity.ResourceIndexedSearchParamDate;
+ import ca.uhn.fhir.jpa.model.entity.ResourceIndexedSearchParamToken;
+ import ca.uhn.fhir.jpa.model.entity.ResourceIndexedSearchParamUri;
++import ca.uhn.fhir.jpa.model.entity.ResourceTable;
+ import ca.uhn.fhir.jpa.model.entity.StorageSettings;
+ import ca.uhn.fhir.jpa.searchparam.MatchUrlService;
+ import ca.uhn.fhir.jpa.searchparam.extractor.ResourceIndexedSearchParams;
+@@ -266,6 +267,134 @@ void match_valueSetModifierAndNoValidationResult_isUnsupportedNamingTheValueSet(
+ 		assertThat(result.getUnsupportedReason()).contains(OBSERVATION_CODE_VALUE_SET_URI);
+ 	}
+ 
++	/**
++	 * A validation support module that could not check the code, such as a remote terminology server rejecting
++	 * {@code $validate-code}, has not established membership, so neither :in nor :not-in is answered in memory.
++	 */
++	// Created by Claude Opus 5.5
++	@ParameterizedTest
++	@ValueSource(strings = {":in", ":not-in"})
++	void match_valueSetModifierAndMembershipNotDeterminable_isUnsupported(String theModifier) {
++		IValidationSupport.CodeValidationResult codeValidationResult = new IValidationSupport.CodeValidationResult()
++				.setSeverity(IValidationSupport.IssueSeverity.ERROR)
++				.setMessage("Remote rejected the request")
++				.setCodeDeterminable(false);
++		when(myValidationSupport.validateCode(any(), any(), any(), any(), any(), any())).thenReturn(codeValidationResult);
++
++		InMemoryMatchResult result = myInMemoryResourceMatcher.match(
++				"code" + theModifier + "=" + OBSERVATION_CODE_VALUE_SET_URI, myObservation, mySearchParams, newRequest());
++
++		assertFalse(result.supported());
++		assertFalse(result.matched());
++		assertThat(result.getUnsupportedReason())
++				.endsWith("HAPI-3074: ValueSet membership cannot be determined for code " + OBSERVATION_CODE_SYSTEM
++						+ "#" + OBSERVATION_CODE + " in ValueSet " + OBSERVATION_CODE_VALUE_SET_URI
++						+ ": Remote rejected the request");
++	}
++
++	/**
++	 * As {@link #match_valueSetModifierAndMembershipNotDeterminable_isUnsupported}, for a result carrying no message:
++	 * the reason still names the code and the ValueSet, and ends there.
++	 */
++	// Created by Claude Opus 5.5
++	@ParameterizedTest
++	@ValueSource(strings = {":in", ":not-in"})
++	void match_valueSetModifierAndMembershipNotDeterminableWithoutMessage_isUnsupportedNamingTheCode(
++			String theModifier) {
++		IValidationSupport.CodeValidationResult codeValidationResult = new IValidationSupport.CodeValidationResult()
++				.setSeverity(IValidationSupport.IssueSeverity.ERROR)
++				.setCodeDeterminable(false);
++		when(myValidationSupport.validateCode(any(), any(), any(), any(), any(), any())).thenReturn(codeValidationResult);
++
++		InMemoryMatchResult result = myInMemoryResourceMatcher.match(
++				"code" + theModifier + "=" + OBSERVATION_CODE_VALUE_SET_URI, myObservation, mySearchParams, newRequest());
++
++		assertFalse(result.supported());
++		assertThat(result.getUnsupportedReason())
++				.endsWith("HAPI-3074: ValueSet membership cannot be determined for code " + OBSERVATION_CODE_SYSTEM
++						+ "#" + OBSERVATION_CODE + " in ValueSet " + OBSERVATION_CODE_VALUE_SET_URI);
++	}
++
++	/**
++	 * A code found in the ValueSet decides :in and :not-in whatever the other codes are, so a code whose membership
++	 * could not be decided does not leave the match undecided. Each order of the two codes is a row, so the result
++	 * does not depend on which one the matcher checks first.
++	 */
++	// Created by Claude Opus 5.5
++	@ParameterizedTest
++	@CsvSource({
++		":in,     UNDECIDED, MEMBER,    true",
++		":in,     MEMBER,    UNDECIDED, true",
++		":not-in, UNDECIDED, MEMBER,    false",
++		":not-in, MEMBER,    UNDECIDED, false"
++	})
++	void match_valueSetModifierAndOneCodeUndecidedAndOneInValueSet_isDecidedByTheMember(
++			String theModifier, String theFirstCode, String theSecondCode, boolean theExpectedMatch) {
++		givenMembershipOf("UNDECIDED", newUndecidedResult());
++		givenMembershipOf("MEMBER", new IValidationSupport.CodeValidationResult().setCode("MEMBER"));
++		ResourceIndexedSearchParams searchParams = searchParamsWithCodes(theFirstCode, theSecondCode);
++
++		InMemoryMatchResult result = myInMemoryResourceMatcher.match(
++				"code" + theModifier + "=" + OBSERVATION_CODE_VALUE_SET_URI, myObservation, searchParams, newRequest());
++
++		assertTrue(result.supported());
++		assertEquals(theExpectedMatch, result.matched());
++	}
++
++	/**
++	 * With no code found in the ValueSet, a code whose membership could not be decided leaves :in and :not-in
++	 * undecided, whichever order the codes are in.
++	 */
++	// Created by Claude Opus 5.5
++	@ParameterizedTest
++	@CsvSource({
++		":in,     UNDECIDED,  NON_MEMBER",
++		":in,     NON_MEMBER, UNDECIDED",
++		":not-in, UNDECIDED,  NON_MEMBER",
++		":not-in, NON_MEMBER, UNDECIDED"
++	})
++	void match_valueSetModifierAndOneCodeUndecidedAndOneNotInValueSet_isUnsupported(
++			String theModifier, String theFirstCode, String theSecondCode) {
++		givenMembershipOf("UNDECIDED", newUndecidedResult());
++		givenMembershipOf(
++				"NON_MEMBER",
++				new IValidationSupport.CodeValidationResult()
++						.setSeverity(IValidationSupport.IssueSeverity.ERROR)
++						.setMessage("Unknown code"));
++		ResourceIndexedSearchParams searchParams = searchParamsWithCodes(theFirstCode, theSecondCode);
++
++		InMemoryMatchResult result = myInMemoryResourceMatcher.match(
++				"code" + theModifier + "=" + OBSERVATION_CODE_VALUE_SET_URI, myObservation, searchParams, newRequest());
++
++		assertFalse(result.supported());
++		assertFalse(result.matched());
++		assertThat(result.getUnsupportedReason()).contains("HAPI-3074");
++	}
++
++	private void givenMembershipOf(String theCode, IValidationSupport.CodeValidationResult theResult) {
++		when(myValidationSupport.validateCode(any(), any(), any(), eq(theCode), any(), any())).thenReturn(theResult);
++	}
++
++	private static IValidationSupport.CodeValidationResult newUndecidedResult() {
++		return new IValidationSupport.CodeValidationResult()
++				.setSeverity(IValidationSupport.IssueSeverity.ERROR)
++				.setMessage("Remote rejected the request")
++				.setCodeDeterminable(false);
++	}
++
++	/**
++	 * Search parameters holding a {@code code} token for each of the given codes, from {@link #OBSERVATION_CODE_SYSTEM},
++	 * kept in the given order
++	 */
++	private static ResourceIndexedSearchParams searchParamsWithCodes(String... theCodes) {
++		ResourceIndexedSearchParams retVal = ResourceIndexedSearchParams.withLists(new ResourceTable());
++		for (String next : theCodes) {
++			retVal.myTokenParams.add(new ResourceIndexedSearchParamToken(
++					new PartitionSettings(), "Observation", "code", OBSERVATION_CODE_SYSTEM, next));
++		}
++		return retVal;
++	}
++
+ 	/**
+ 	 * A code reported as not in a ValueSet that uses a CodeSystem the server does not have was only checked against
+ 	 * the codes the ValueSet lists, so neither :in nor :not-in is answered in memory, as for an
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/r4/AuthorizationInterceptorRemoteValueSetFilterR4Test.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/r4/AuthorizationInterceptorRemoteValueSetFilterR4Test.java
+new file mode 100644
+index 000000000000..c9a8ac582e2f
+--- /dev/null
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/r4/AuthorizationInterceptorRemoteValueSetFilterR4Test.java
+@@ -0,0 +1,190 @@
++package ca.uhn.fhir.jpa.provider.r4;
++
++import ca.uhn.fhir.context.FhirContext;
++import ca.uhn.fhir.jpa.config.JpaConfig;
++import ca.uhn.fhir.jpa.provider.BaseResourceProviderR4Test;
++import ca.uhn.fhir.jpa.searchparam.matcher.AuthorizationSearchParamMatcher;
++import ca.uhn.fhir.jpa.searchparam.matcher.SearchParamMatcher;
++import ca.uhn.fhir.rest.api.server.RequestDetails;
++import ca.uhn.fhir.rest.server.exceptions.BaseServerResponseException;
++import ca.uhn.fhir.rest.server.exceptions.ForbiddenOperationException;
++import ca.uhn.fhir.rest.server.interceptor.auth.AuthorizationInterceptor;
++import ca.uhn.fhir.rest.server.interceptor.auth.IAuthRule;
++import ca.uhn.fhir.rest.server.interceptor.auth.IAuthRuleBuilderRuleOpClassifier;
++import ca.uhn.fhir.rest.server.interceptor.auth.IAuthRuleFinished;
++import ca.uhn.fhir.rest.server.interceptor.auth.PolicyEnum;
++import ca.uhn.fhir.rest.server.interceptor.auth.RuleBuilder;
++import ca.uhn.fhir.test.utilities.server.RestfulServerExtension;
++import ca.uhn.fhir.test.utilities.validation.IValidationProviders;
++import ca.uhn.fhir.test.utilities.validation.IValidationProvidersR4;
++import org.hl7.fhir.common.hapi.validation.support.RemoteTerminologyServiceValidationSupport;
++import org.hl7.fhir.common.hapi.validation.support.ValidationSupportChain;
++import org.hl7.fhir.r4.model.CodeSystem;
++import org.hl7.fhir.r4.model.Observation;
++import org.hl7.fhir.r4.model.Parameters;
++import org.hl7.fhir.r4.model.ValueSet;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.extension.RegisterExtension;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.CsvSource;
++import org.junit.jupiter.params.provider.EnumSource;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.beans.factory.annotation.Qualifier;
++
++import java.util.List;
++
++import static ca.uhn.fhir.jpa.model.util.JpaConstants.OPERATION_VALIDATE_CODE;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++/**
++ * {@code AuthorizationInterceptor} rules allowing reads of codes not in a ValueSet the server checks codes against on a
++ * remote terminology server, through {@code withFilter("code:not-in=...")} or {@code withCodeNotInValueSet}. When the
++ * remote rejects {@code $validate-code} with HTTP 400 or 404, the server cannot tell whether the code is in the
++ * ValueSet, so the rule does not let the read through.
++ */
++// Created by Claude Opus 5.5
++class AuthorizationInterceptorRemoteValueSetFilterR4Test extends BaseResourceProviderR4Test {
++	private static final String REMOTE_CS_URL = "http://example.org/cs/restricted";
++	private static final String REMOTE_VS_URL = "http://example.org/vs/restricted";
++	private static final String UNLOADED_CS_URL = "http://example.org/cs/unloaded";
++	private static final String UNLOADED_CODE = "x1";
++	private static final String OBSERVATION_ID = "Observation/unloaded-coded";
++	private static final FhirContext ourCtx = FhirContext.forR4Cached();
++
++	@RegisterExtension
++	static RestfulServerExtension ourRemoteServer = new RestfulServerExtension(ourCtx);
++
++	@Autowired
++	private SearchParamMatcher mySearchParamMatcher;
++
++	@Autowired
++	@Qualifier(JpaConfig.JPA_VALIDATION_SUPPORT_CHAIN)
++	private ValidationSupportChain myValidationSupportChain;
++
++	private RemoteTerminologyServiceValidationSupport myRemoteSvc;
++	private IValidationProviders.MyValidationProvider<CodeSystem> myRemoteCodeSystemProvider;
++	private IValidationProviders.MyValidationProvider<ValueSet> myRemoteValueSetProvider;
++
++	@BeforeEach
++	void beforeRegisterRemoteAndCreateObservation() {
++		myRemoteCodeSystemProvider = new IValidationProvidersR4.MyCodeSystemProviderR4();
++		myRemoteValueSetProvider = new IValidationProvidersR4.MyValueSetProviderR4();
++		myRemoteCodeSystemProvider.setShouldThrowExceptionForResourceNotFound(false);
++		myRemoteValueSetProvider.setShouldThrowExceptionForResourceNotFound(false);
++		ValueSet valueSet = myRemoteValueSetProvider.addTerminologyResource(REMOTE_VS_URL);
++		valueSet.getCompose().addInclude().setSystem(REMOTE_CS_URL).addConcept().setCode("r1");
++		ourRemoteServer.registerProvider(myRemoteCodeSystemProvider);
++		ourRemoteServer.registerProvider(myRemoteValueSetProvider);
++
++		myRemoteSvc = new RemoteTerminologyServiceValidationSupport(
++				ourCtx, "http://localhost:" + ourRemoteServer.getPort());
++		myValidationSupportChain.addValidationSupport(0, myRemoteSvc);
++
++		createObservation(withId("unloaded-coded"), withObservationCode(UNLOADED_CS_URL, UNLOADED_CODE));
++	}
++
++	@AfterEach
++	void afterUnregisterRemoteAndInterceptor() {
++		myInterceptorRegistry.unregisterInterceptorsIf(AuthorizationInterceptor.class::isInstance);
++		myValidationSupportChain.removeValidationSupport(myRemoteSvc);
++		ourRemoteServer.unregisterProvider(myRemoteCodeSystemProvider);
++		ourRemoteServer.unregisterProvider(myRemoteValueSetProvider);
++	}
++
++	@ParameterizedTest
++	@CsvSource({
++		"FILTER,                 404",
++		"FILTER,                 400",
++		"CODE_NOT_IN_VALUE_SET,  404",
++		"CODE_NOT_IN_VALUE_SET,  400"
++	})
++	void read_allowedByNotInAndRemoteRejectsValidateCode_isDenied(NotInRule theRule, int theStatusCode) {
++		registerRules(theRule.build());
++		myRemoteValueSetProvider.addException(
++				OPERATION_VALIDATE_CODE,
++				REMOTE_VS_URL,
++				UNLOADED_CODE,
++				BaseServerResponseException.newInstance(theStatusCode, "Simulated rejection"));
++
++		assertReadIsDenied(OBSERVATION_ID);
++	}
++
++	/**
++	 * Control for {@link #read_allowedByNotInAndRemoteRejectsValidateCode_isDenied}: a remote answer that the code is
++	 * not in the ValueSet lets the read through.
++	 */
++	@ParameterizedTest
++	@EnumSource(NotInRule.class)
++	void read_allowedByNotInAndRemoteAnswersNotAMember_isAllowed(NotInRule theRule) {
++		registerRules(theRule.build());
++		givenRemoteValidateCodeAnswers(false);
++
++		assertReadIsAllowed(OBSERVATION_ID);
++	}
++
++	/**
++	 * Control for {@link #read_allowedByNotInAndRemoteRejectsValidateCode_isDenied}: a remote answer that the code is in
++	 * the ValueSet denies the read.
++	 */
++	@ParameterizedTest
++	@EnumSource(NotInRule.class)
++	void read_allowedByNotInAndRemoteAnswersMember_isDenied(NotInRule theRule) {
++		registerRules(theRule.build());
++		givenRemoteValidateCodeAnswers(true);
++
++		assertReadIsDenied(OBSERVATION_ID);
++	}
++
++	private void givenRemoteValidateCodeAnswers(boolean theResult) {
++		Parameters response = new Parameters().addParameter("result", theResult);
++		if (!theResult) {
++			response.addParameter("message", "Code " + UNLOADED_CODE + " is not in the ValueSet");
++		}
++		myRemoteValueSetProvider.addTerminologyResponse(
++				OPERATION_VALIDATE_CODE, REMOTE_VS_URL, UNLOADED_CODE, response);
++	}
++
++	private void registerRules(List<IAuthRule> theRules) {
++		AuthorizationInterceptor interceptor = new AuthorizationInterceptor(PolicyEnum.DENY) {
++			@Override
++			public List<IAuthRule> buildRuleList(RequestDetails theRequestDetails) {
++				return theRules;
++			}
++		}.setValidationSupport(myValidationSupport);
++		interceptor.setAuthorizationSearchParamMatcher(new AuthorizationSearchParamMatcher(mySearchParamMatcher));
++		myServer.getRestfulServer().registerInterceptor(interceptor);
++	}
++
++	private void assertReadIsAllowed(String theId) {
++		Observation result = myClient.read().resource(Observation.class).withId(theId).execute();
++		assertThat(result.getIdElement().toUnqualifiedVersionless().getValue()).isEqualTo(theId);
++	}
++
++	private void assertReadIsDenied(String theId) {
++		var request = myClient.read().resource(Observation.class).withId(theId);
++		assertThatThrownBy(request::execute).isInstanceOf(ForbiddenOperationException.class);
++	}
++
++	/**
++	 * The two ways to allow reading Observations whose code is not in the remote ValueSet: a {@code withFilter}
++	 * expression, matched by the {@code InMemoryResourceMatcher}, and {@code withCodeNotInValueSet}, matched by the
++	 * rule itself
++	 */
++	private enum NotInRule {
++		FILTER,
++		CODE_NOT_IN_VALUE_SET;
++
++		List<IAuthRule> build() {
++			IAuthRuleBuilderRuleOpClassifier observations =
++					new RuleBuilder().allow().read().resourcesOfType("Observation");
++			IAuthRuleFinished finished =
++					switch (this) {
++						case FILTER -> observations.withFilter("code:not-in=" + REMOTE_VS_URL);
++						case CODE_NOT_IN_VALUE_SET -> observations.withCodeNotInValueSet("code", REMOTE_VS_URL);
++					};
++			return finished.andThen().build();
++		}
++	}
++}
+diff --git a/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/interceptor/auth/SearchParameterAndValueSetRuleImpl.java b/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/interceptor/auth/SearchParameterAndValueSetRuleImpl.java
+index 22f1efe5df15..132e746ec457 100644
+--- a/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/interceptor/auth/SearchParameterAndValueSetRuleImpl.java
++++ b/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/interceptor/auth/SearchParameterAndValueSetRuleImpl.java
+@@ -42,6 +42,7 @@
+ 
+ import java.util.List;
+ import java.util.Set;
++import java.util.function.Supplier;
+ 
+ import static org.apache.commons.lang3.StringUtils.isNotBlank;
+ 
+@@ -49,6 +50,10 @@ class SearchParameterAndValueSetRuleImpl extends RuleImplOp {
+ 
+ 	private String mySearchParameterName;
+ 	private String myValueSetUrl;
++	/**
++	 * Whether this is a {@code withCodeInValueSet} rule.
++	 * false for {@code withCodeNotInValueSet}
++	 */
+ 	private boolean myWantCode;
+ 
+ 	/**
+@@ -142,6 +147,16 @@ boolean isUnrestrictedWithinType() {
+ 		return false;
+ 	}
+ 
++	/**
++	 * A code whose membership could not be decided only forces DENY when the decided codes do not settle the rule.
++	 * <pre>
++	 * Rule           |  Condition                                       | 1 member + 1 undecided                  | 1 non-member + 1 undecided
++	 * allow + in     |  any code in the VS = ALLOW     (OR'd)           | ALLOW (1 being in is enough)            | DENY (the undecided one could be in)
++	 * deny + in      |  any code in the VS = DENY      (OR'd)           | DENY (1 being in is enough)             | DENY (the undecided one could be in)
++	 * allow + not-in |  no codes must be in VS = ALLOW   (AND'd)        | NULL (1 is in, so rule doesn't hold)    | DENY (the undecided one could be in)
++	 * deny + not-in  |  at least 1 code must not be in VS = DENY (OR'd) | DENY (the undecided one could be out)   | DENY (1 being out is enough)
++	 * </pre>
++	 */
+ 	private AuthorizationInterceptor.Verdict applyRuleLogic(
+ 			FhirContext theFhirContext,
+ 			RequestDetails theRequestDetails,
+@@ -160,6 +175,7 @@ private AuthorizationInterceptor.Verdict applyRuleLogic(
+ 		Logger troubleshootingLog = theRuleApplier.getTroubleshootingLog();
+ 		boolean wantCode = myWantCode;
+ 
++		// do code match count
+ 		ISearchParamRegistry searchParamRegistry = null;
+ 		CodeMatchCount codeMatchCount = countMatchingCodesInValueSetForSearchParameter(
+ 				theResource,
+@@ -171,42 +187,90 @@ private AuthorizationInterceptor.Verdict applyRuleLogic(
+ 				troubleshootingLog,
+ 				operationDescription);
+ 
+-		if (codeMatchCount.isAtLeastOneUnableToValidate()) {
+-			troubleshootingLog.warn(
+-					"ValueSet {} could not be validated by terminology service - Assuming DENY", myValueSetUrl);
+-			return new AuthorizationInterceptor.Verdict(PolicyEnum.DENY, this);
+-		}
++		// the overall code count only includes codes whose membership was decided
++		boolean anyIn = codeMatchCount.getMatchingCodeCount() > 0;
++		boolean anyOut = codeMatchCount.getMatchingCodeCount() < codeMatchCount.getOverallCodeCount();
++		boolean anyUndecided = codeMatchCount.isAtLeastOneUnableToValidate();
++		Supplier<AuthorizationInterceptor.Verdict> ruleVerdict = () -> newVerdict(
++				theOperation,
++				theRequestDetails,
++				theInputResource,
++				theInputResourceId,
++				theOutputResource,
++				theRuleApplier);
++
++		AuthorizationInterceptor.Verdict verdict =
++				switch (getMode()) {
++					case ALLOW -> {
++						if (!myWantCode) {
++							// allow + not-in (if NONE are in we ALLOW)
++							if (anyIn) {
++								// some code in VS
++								// rule doesn't apply (null)
++								yield null;
++							} else {
++								// no codes in VS
++								// any undecided -> DENY
++								// else -> ALLOW
++								if (anyUndecided) {
++									yield undecidedDeny(troubleshootingLog);
++								}
++								AuthorizationInterceptor.Verdict allow = ruleVerdict.get();
++								troubleshootingLog.debug("Code was not found in VS - Verdict: {}", allow);
++								yield allow;
++							}
++						} else {
++							// allow + in (if ANY are in we ALLOW)
++							if (anyIn) {
++								// allow
++								yield ruleVerdict.get();
++							} else {
++								// no codes in VS
++								// any undecided -> DENY
++								// else -> rule doesn't apply (null)
++								yield anyUndecided ? undecidedDeny(troubleshootingLog) : null;
++							}
++						}
++					}
++					case DENY -> {
++						if (!myWantCode) {
++							// deny + not-in (if even ONE code is *not* in we DENY)
++							if (anyOut) {
++								// at least 1 code not in VS -> DENY
++								AuthorizationInterceptor.Verdict deny = ruleVerdict.get();
++								troubleshootingLog.debug("Code(s) found that are not in VS - Verdict: {}", deny);
++								yield deny;
++							} else {
++								// no codes not in VS
++								// if there's any undecided -> deny (it could be outside the VS)
++								// otherwise, rule doesn't apply (null)
++								yield anyUndecided ? undecidedDeny(troubleshootingLog) : null;
++							}
++						} else {
++							// deny + in (if ANY code is in we DENY)
++							if (anyIn) {
++								// any code in VS -> DENY
++								yield ruleVerdict.get();
++							} else {
++								// no codes in VS
++								// if any undecided -> DENY (could be in)
++								// otherwise -> rule doesn't apply (null)
++								yield anyUndecided ? undecidedDeny(troubleshootingLog) : null;
++							}
++						}
++					}
++				};
+ 
+-		if (myWantCode && codeMatchCount.getMatchingCodeCount() > 0) {
+-			return newVerdict(
+-					theOperation,
+-					theRequestDetails,
+-					theInputResource,
+-					theInputResourceId,
+-					theOutputResource,
+-					theRuleApplier);
+-		} else if (!myWantCode) {
+-			boolean notFound = getMode() == PolicyEnum.ALLOW && codeMatchCount.getMatchingCodeCount() == 0;
+-			boolean othersFound = getMode() == PolicyEnum.DENY
+-					&& codeMatchCount.getMatchingCodeCount() < codeMatchCount.getOverallCodeCount();
+-			if (notFound || othersFound) {
+-				AuthorizationInterceptor.Verdict verdict = newVerdict(
+-						theOperation,
+-						theRequestDetails,
+-						theInputResource,
+-						theInputResourceId,
+-						theOutputResource,
+-						theRuleApplier);
+-				if (notFound) {
+-					troubleshootingLog.debug("Code was not found in VS - Verdict: {}", verdict);
+-				} else {
+-					troubleshootingLog.debug("Code(s) found that are not in VS - Verdict: {}", verdict);
+-				}
+-				return verdict;
+-			}
+-		}
++		return verdict;
++	}
+ 
+-		return null;
++	/**
++	 * A code whose membership could not be decided might change the verdict, so the rule denies
++	 */
++	private AuthorizationInterceptor.Verdict undecidedDeny(Logger theTroubleshootingLog) {
++		theTroubleshootingLog.warn(
++				"ValueSet {} could not be validated by terminology service - Assuming DENY", myValueSetUrl);
++		return new AuthorizationInterceptor.Verdict(PolicyEnum.DENY, this);
+ 	}
+ 
+ 	/**
+@@ -219,7 +283,7 @@ private AuthorizationInterceptor.Verdict applyRuleLogic(
+ 	 * @param theSearchParameterName The search parameter name being searched for
+ 	 * @param theValueSetUrl         The ValueSet URL to validate against
+ 	 * @param theTroubleshootingLog     A log to use for writing status updates
+-	 * @param theOperationDescription   A description of the operation being peformed (for logging)
++	 * @param theOperationDescription   A description of the operation being performed (for logging)
+ 	 */
+ 	@Nonnull
+ 	static CodeMatchCount countMatchingCodesInValueSetForSearchParameter(
+@@ -267,6 +331,7 @@ static CodeMatchCount countMatchingCodesInValueSetForSearchParameter(
+ 						List<String> unknownSystems = validateCodeResult != null
+ 								? unknownSystemFinder.findUnknownSystems(validateCodeResult, theValueSetUrl, system)
+ 								: List.of();
++
+ 						if (!unknownSystems.isEmpty()) {
+ 							theTroubleshootingLog.debug(
+ 									"Code {}#{} could not be checked against ValueSet[{}] - CodeSystem not loaded: {}",
+@@ -287,6 +352,13 @@ static CodeMatchCount countMatchingCodesInValueSetForSearchParameter(
+ 								if (theReturnOnFirstMatch) {
+ 									return codeMatchCount;
+ 								}
++							} else if (!validateCodeResult.isCodeDeterminable()) {
++								codeMatchCount.addUnableToValidate();
++								theTroubleshootingLog.debug(
++										"Code {}#{} was not able to be determined: {}",
++										system,
++										code,
++										validateCodeResult.getMessage());
+ 							} else {
+ 								codeMatchCount.addNonMatchingCode();
+ 								theTroubleshootingLog.debug(
+diff --git a/hapi-fhir-server/src/test/java/ca/uhn/fhir/rest/server/interceptor/auth/RuleBulkExportImplTest.java b/hapi-fhir-server/src/test/java/ca/uhn/fhir/rest/server/interceptor/auth/RuleBulkExportImplTest.java
+index a0fed1081628..21964851a7da 100644
+--- a/hapi-fhir-server/src/test/java/ca/uhn/fhir/rest/server/interceptor/auth/RuleBulkExportImplTest.java
++++ b/hapi-fhir-server/src/test/java/ca/uhn/fhir/rest/server/interceptor/auth/RuleBulkExportImplTest.java
+@@ -488,7 +488,7 @@ public void testPatientExport_ruleAllowsId_requestsTooManyIds_abstain() {
+ 
+ 		//Then: There are unpermitted patients in the request so this is not permitted.
+ 		assertDeny(verdict);
+-	}  //
++	}
+ 
+ 	@Test
+ 	public void testPatientExport_RuleAllowsAll_RequestId_allows() {
+diff --git a/hapi-fhir-validation/src/main/java/org/hl7/fhir/common/hapi/validation/support/RemoteTerminologyServiceValidationSupport.java b/hapi-fhir-validation/src/main/java/org/hl7/fhir/common/hapi/validation/support/RemoteTerminologyServiceValidationSupport.java
+index f674cdbcc618..a7648452d67c 100644
+--- a/hapi-fhir-validation/src/main/java/org/hl7/fhir/common/hapi/validation/support/RemoteTerminologyServiceValidationSupport.java
++++ b/hapi-fhir-validation/src/main/java/org/hl7/fhir/common/hapi/validation/support/RemoteTerminologyServiceValidationSupport.java
+@@ -830,12 +830,21 @@ protected CodeValidationResult invokeRemoteValidateCode(
+ 			return createCodeValidationResult(output, errorMessageBuilder, theCode, theDisplay);
+ 		} catch (ResourceNotFoundException | InvalidRequestException ex) {
+ 			ourLog.error(ex.getMessage(), ex);
++			CodeValidationIssueCode issueCode;
++
++			if (ex instanceof InvalidRequestException) {
++				issueCode = CodeValidationIssueCode.CODE_INVALID;
++			} else {
++				issueCode = CodeValidationIssueCode.NOT_FOUND;
++			}
+ 			String errorMessage = errorMessageBuilder.buildErrorMessage(ex.getMessage());
+-			CodeValidationIssueCode issueCode = ex instanceof ResourceNotFoundException
+-					? CodeValidationIssueCode.NOT_FOUND
+-					: CodeValidationIssueCode.CODE_INVALID;
+-			return createCodeValidationResult(new CodeValidationIssue(
++
++			CodeValidationResult retval = createCodeValidationResult(new CodeValidationIssue(
+ 					errorMessage, IssueSeverity.ERROR, issueCode, CodeValidationIssueCoding.INVALID_CODE));
++			// this is either a 400 or a 404. either way, we can't determine it
++			retval.setCodeDeterminable(false);
++
++			return retval;
+ 		} catch (BaseServerResponseException ex) {
+ 			if (!isRemoteServerFailure(ex)) {
+ 				throw ex;
+diff --git a/hapi-fhir-validation/src/test/java/ca/uhn/fhir/rest/server/interceptor/auth/SearchParameterAndValueSetRuleImplTest.java b/hapi-fhir-validation/src/test/java/ca/uhn/fhir/rest/server/interceptor/auth/SearchParameterAndValueSetRuleImplTest.java
+index b7552b422eff..adb7b77fd21e 100644
+--- a/hapi-fhir-validation/src/test/java/ca/uhn/fhir/rest/server/interceptor/auth/SearchParameterAndValueSetRuleImplTest.java
++++ b/hapi-fhir-validation/src/test/java/ca/uhn/fhir/rest/server/interceptor/auth/SearchParameterAndValueSetRuleImplTest.java
+@@ -8,8 +8,11 @@
+ import ca.uhn.fhir.rest.api.RestOperationTypeEnum;
+ import ca.uhn.fhir.rest.api.server.RequestDetails;
+ import ca.uhn.fhir.rest.api.server.SystemRequestDetails;
++import ca.uhn.fhir.rest.server.exceptions.BaseServerResponseException;
+ import ca.uhn.fhir.test.utilities.server.RestfulServerExtension;
+ import ca.uhn.fhir.test.utilities.validation.IValidationProvidersR4;
++import ca.uhn.test.util.LogbackTestExtension;
++import ch.qos.logback.classic.Level;
+ import org.hl7.fhir.common.hapi.validation.support.CommonCodeSystemsTerminologyService;
+ import org.hl7.fhir.common.hapi.validation.support.InMemoryTerminologyServerValidationSupport;
+ import org.hl7.fhir.common.hapi.validation.support.PrePopulatedValidationSupport;
+@@ -47,6 +50,13 @@ class SearchParameterAndValueSetRuleImplTest {
+ 	@RegisterExtension
+ 	static RestfulServerExtension ourRemoteTerminologyServer = new RestfulServerExtension(ourCtx);
+ 
++	/**
++	 * The troubleshooting log of the {@code AuthorizationInterceptor}, where a rule says it denied because a code's
++	 * membership could not be decided
++	 */
++	@RegisterExtension
++	final LogbackTestExtension myAuthorizationLog = new LogbackTestExtension(AuthorizationInterceptor.class.getName());
++
+ 	private IValidationProvidersR4.MyValueSetProviderR4 myRemoteValueSets;
+ 
+ 	@BeforeEach
+@@ -175,11 +185,7 @@ void applyRulesAndReturnDecision_remoteValueSetOverCodeSystemTheRemoteDoesNotSup
+ 		response.addParameter(
+ 				IValidationSupport.CodeValidationResult.CAUSED_BY_UNKNOWN_SYSTEM, new CanonicalType(CS_URL));
+ 		myRemoteValueSets.addTerminologyResponse(JpaConstants.OPERATION_VALIDATE_CODE, VS_URL, "red", response);
+-		ValidationSupportChain validationSupport = new ValidationSupportChain(
+-				new RemoteTerminologyServiceValidationSupport(ourCtx, ourRemoteTerminologyServer.getBaseUrl()),
+-				new DefaultProfileValidationSupport(ourCtx),
+-				new CommonCodeSystemsTerminologyService(ourCtx),
+-				new InMemoryTerminologyServerValidationSupport(ourCtx));
++		ValidationSupportChain validationSupport = newRemoteChain();
+ 
+ 		// Test
+ 		AuthorizationInterceptor.Verdict verdict = readObservationCodedRed(theRule, validationSupport);
+@@ -188,6 +194,146 @@ void applyRulesAndReturnDecision_remoteValueSetOverCodeSystemTheRemoteDoesNotSup
+ 		assertThat(verdict.getDecision()).isEqualTo(PolicyEnum.DENY);
+ 	}
+ 
++	/**
++	 * A remote terminology server that rejects {@code $validate-code} with HTTP 400 or 404 has not checked the code,
++	 * so membership cannot be established and every rule shape denies
++	 */
++	// Created by Claude Opus 5.5
++	@ParameterizedTest
++	@CsvSource({
++		"ALLOW_IN,     404",
++		"ALLOW_IN,     400",
++		"ALLOW_NOT_IN, 404",
++		"ALLOW_NOT_IN, 400",
++		"DENY_IN,      404",
++		"DENY_IN,      400",
++		"DENY_NOT_IN,  404",
++		"DENY_NOT_IN,  400"
++	})
++	void applyRulesAndReturnDecision_remoteRejectsValidateCode_denies(CodeRuleEnum theRule, int theStatusCode) {
++		// Setup
++		myRemoteValueSets.addTerminologyResource(VS_URL);
++		myRemoteValueSets.addException(
++				JpaConstants.OPERATION_VALIDATE_CODE,
++				VS_URL,
++				"red",
++				BaseServerResponseException.newInstance(theStatusCode, "Simulated rejection"));
++
++		// Test
++		AuthorizationInterceptor.Verdict verdict = readObservationCodedRed(theRule, newRemoteChain());
++
++		// Verify
++		assertThat(verdict.getDecision()).isEqualTo(PolicyEnum.DENY);
++		// a deny not-in rule would deny a code outside the ValueSet too, so only the log shows which path denied
++		assertThat(isUndecidedDenyLogged()).isTrue();
++	}
++
++	/**
++	 * A code whose membership could not be decided only denies when the other code does not settle the rule, so the
++	 * verdict does not depend on the order of the codings. A code in the ValueSet settles every rule shape but a deny
++	 * not-in rule, whose undecided code might be outside the ValueSet. Allow not-in, which a code in the ValueSet keeps
++	 * from applying, leaves the read to the {@code allowAll()} rule that follows it. Only the deny not-in rule denies
++	 * because of the undecided code, which its log shows.
++	 */
++	// Created by Claude Opus 5.5
++	@ParameterizedTest
++	@CsvSource({
++		"ALLOW_IN,     undecided, red,       ALLOW, false",
++		"ALLOW_IN,     red,       undecided, ALLOW, false",
++		"DENY_IN,      undecided, red,       DENY,  false",
++		"DENY_IN,      red,       undecided, DENY,  false",
++		"ALLOW_NOT_IN, undecided, red,       ALLOW, false",
++		"ALLOW_NOT_IN, red,       undecided, ALLOW, false",
++		"DENY_NOT_IN,  undecided, red,       DENY,  true",
++		"DENY_NOT_IN,  red,       undecided, DENY,  true"
++	})
++	void applyRulesAndReturnDecision_undecidedCodeAndCodeInValueSet_decidesWhateverTheOrder(
++			CodeRuleEnum theRule,
++			String theFirstCode,
++			String theSecondCode,
++			PolicyEnum theExpectedDecision,
++			boolean theExpectedUndecidedDeny) {
++		// Setup
++		givenRemoteDecidesRedInBlueOutAndCannotDecideUndecided();
++
++		// Test
++		AuthorizationInterceptor.Verdict verdict =
++				readObservationCoded(theRule, newRemoteChain(), theFirstCode, theSecondCode);
++
++		// Verify
++		assertThat(verdict.getDecision()).isEqualTo(theExpectedDecision);
++		assertThat(isUndecidedDenyLogged()).isEqualTo(theExpectedUndecidedDeny);
++	}
++
++	/**
++	 * With the other code outside the ValueSet, only a deny not-in rule is settled, by that code, and denies; every
++	 * other rule shape could be changed by the undecided code, so it denies, whatever the order of the codings. The log
++	 * shows which of them denied because of the undecided code.
++	 */
++	// Created by Claude Opus 5.5
++	@ParameterizedTest
++	@CsvSource({
++		"ALLOW_IN,     undecided, blue,      true",
++		"ALLOW_IN,     blue,      undecided, true",
++		"DENY_IN,      undecided, blue,      true",
++		"DENY_IN,      blue,      undecided, true",
++		"ALLOW_NOT_IN, undecided, blue,      true",
++		"ALLOW_NOT_IN, blue,      undecided, true",
++		"DENY_NOT_IN,  undecided, blue,      false",
++		"DENY_NOT_IN,  blue,      undecided, false"
++	})
++	void applyRulesAndReturnDecision_undecidedCodeAndCodeNotInValueSet_deniesWhateverTheOrder(
++			CodeRuleEnum theRule, String theFirstCode, String theSecondCode, boolean theExpectedUndecidedDeny) {
++		// Setup
++		givenRemoteDecidesRedInBlueOutAndCannotDecideUndecided();
++
++		// Test
++		AuthorizationInterceptor.Verdict verdict =
++				readObservationCoded(theRule, newRemoteChain(), theFirstCode, theSecondCode);
++
++		// Verify
++		assertThat(verdict.getDecision()).isEqualTo(PolicyEnum.DENY);
++		assertThat(isUndecidedDenyLogged()).isEqualTo(theExpectedUndecidedDeny);
++	}
++
++	/**
++	 * Whether a rule logged that it denied because a code's membership could not be decided
++	 */
++	private boolean isUndecidedDenyLogged() {
++		return !myAuthorizationLog
++				.getLogEvents(t -> t.getLevel() == Level.WARN
++						&& t.getFormattedMessage().contains("could not be validated by terminology service"))
++				.isEmpty();
++	}
++
++	/**
++	 * The remote server has the ValueSet, answers that {@code red} is in it and {@code blue} is not, and rejects
++	 * {@code $validate-code} for {@code undecided} with HTTP 400
++	 */
++	private void givenRemoteDecidesRedInBlueOutAndCannotDecideUndecided() {
++		myRemoteValueSets.addTerminologyResource(VS_URL);
++		myRemoteValueSets.addTerminologyResponse(
++				JpaConstants.OPERATION_VALIDATE_CODE, VS_URL, "red", new Parameters().addParameter("result", true));
++		myRemoteValueSets.addTerminologyResponse(
++				JpaConstants.OPERATION_VALIDATE_CODE,
++				VS_URL,
++				"blue",
++				new Parameters().addParameter("result", false).addParameter("message", "Unknown code blue"));
++		myRemoteValueSets.addException(
++				JpaConstants.OPERATION_VALIDATE_CODE,
++				VS_URL,
++				"undecided",
++				BaseServerResponseException.newInstance(400, "Simulated rejection"));
++	}
++
++	private static ValidationSupportChain newRemoteChain() {
++		return new ValidationSupportChain(
++				new RemoteTerminologyServiceValidationSupport(ourCtx, ourRemoteTerminologyServer.getBaseUrl()),
++				new DefaultProfileValidationSupport(ourCtx),
++				new CommonCodeSystemsTerminologyService(ourCtx),
++				new InMemoryTerminologyServerValidationSupport(ourCtx));
++	}
++
+ 	/**
+ 	 * With {@code useCurrentVersionForUnknownCodeSystemVersion} on, a code the current version has is checked against
+ 	 * it, so every rule shape decides as for a loaded CodeSystem
+@@ -301,7 +447,7 @@ private static AuthorizationInterceptor.Verdict readObservationCodedRed(
+ 	}
+ 
+ 	private static AuthorizationInterceptor.Verdict readObservationCoded(
+-			CodeRuleEnum theRule, ValidationSupportChain theValidationSupport, String theCode) {
++			CodeRuleEnum theRule, ValidationSupportChain theValidationSupport, String... theCodes) {
+ 		AuthorizationInterceptor interceptor = new AuthorizationInterceptor(PolicyEnum.DENY) {
+ 			@Override
+ 			public List<IAuthRule> buildRuleList(RequestDetails theRequestDetails) {
+@@ -314,7 +460,9 @@ public List<IAuthRule> buildRuleList(RequestDetails theRequestDetails) {
+ 		requestDetails.setResourceName("Observation");
+ 		Observation observation = new Observation();
+ 		observation.setId(new IdType("Observation/10"));
+-		observation.getCode().addCoding().setSystem(CS_URL).setCode(theCode);
++		for (String next : theCodes) {
++			observation.getCode().addCoding().setSystem(CS_URL).setCode(next);
++		}
+ 
+ 		return interceptor.applyRulesAndReturnDecision(
+ 				RestOperationTypeEnum.READ,
+diff --git a/hapi-fhir-validation/src/test/java/org/hl7/fhir/r4/validation/RemoteTerminologyServiceValidationSupportR4Test.java b/hapi-fhir-validation/src/test/java/org/hl7/fhir/r4/validation/RemoteTerminologyServiceValidationSupportR4Test.java
+index 49fe5485eeb7..dcbba0708e8f 100644
+--- a/hapi-fhir-validation/src/test/java/org/hl7/fhir/r4/validation/RemoteTerminologyServiceValidationSupportR4Test.java
++++ b/hapi-fhir-validation/src/test/java/org/hl7/fhir/r4/validation/RemoteTerminologyServiceValidationSupportR4Test.java
+@@ -219,6 +219,52 @@ null, new ConceptValidationOptions(), CODE_SYSTEM, CODE, null, newValueSet(null)
+ 		assertThat(getLoggedErrors()).isEmpty();
+ 	}
+ 
++	/**
++	 * A 400 or 404 from $validate-code means the remote server rejected the request rather than checked the code, so
++	 * the result says the code's membership could not be determined. The issue it carries is unchanged, so
++	 * $validate-code and $validate responses built from it do not change.
++	 */
++	// Created by Claude Opus 5.5
++	@ParameterizedTest
++	@CsvSource({
++		"404, not-found",
++		"400, code-invalid"
++	})
++	void validateCode_remoteRejectsValidateCode_isNotDeterminable(int theStatusCode, String theIssueCode) {
++		myValueSetProvider.myValidateCodeException =
++				BaseServerResponseException.newInstance(theStatusCode, ERROR_MESSAGE);
++
++		CodeValidationResult outcome = mySvc.validateCode(
++				null, new ConceptValidationOptions(), CODE_SYSTEM, CODE, null, VALUE_SET_URL);
++
++		assertThat(outcome).isNotNull();
++		assertThat(outcome.isOk()).isFalse();
++		assertThat(outcome.isCodeDeterminable()).isFalse();
++		assertThat(outcome.getSeverity()).isEqualTo(IssueSeverity.ERROR);
++		assertThat(outcome.getIssues())
++				.singleElement()
++				.satisfies(issue -> assertThat(issue.getType().getCode()).isEqualTo(theIssueCode));
++	}
++
++	/**
++	 * Control for {@link #validateCode_remoteRejectsValidateCode_isNotDeterminable}: an answer that the code is not in
++	 * the ValueSet is a decided result.
++	 */
++	// Created by Claude Opus 5.5
++	@Test
++	void validateCode_remoteAnswersNotAMember_isDeterminable() {
++		myValueSetProvider.myValidateCodeResult = new Parameters()
++				.addParameter("result", false)
++				.addParameter("message", "Unknown code " + CODE);
++
++		CodeValidationResult outcome = mySvc.validateCode(
++				null, new ConceptValidationOptions(), CODE_SYSTEM, CODE, null, VALUE_SET_URL);
++
++		assertThat(outcome).isNotNull();
++		assertThat(outcome.isOk()).isFalse();
++		assertThat(outcome.isCodeDeterminable()).isTrue();
++	}
++
+ 	/**
+ 	 * Through a validation support chain, a remote server that fails leaves the code unchecked, which is reported
+ 	 * as a warning naming the remote server and its error rather than thrown into the caller's own request.

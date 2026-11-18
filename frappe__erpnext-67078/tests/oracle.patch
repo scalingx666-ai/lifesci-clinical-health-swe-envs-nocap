@@ -1,0 +1,169 @@
+diff --git a/erpnext/manufacturing/doctype/production_plan/production_plan.py b/erpnext/manufacturing/doctype/production_plan/production_plan.py
+index f7c52964ba1d..ae9811a76703 100644
+--- a/erpnext/manufacturing/doctype/production_plan/production_plan.py
++++ b/erpnext/manufacturing/doctype/production_plan/production_plan.py
+@@ -45,6 +45,7 @@
+ )
+ from erpnext.stock.get_item_details import get_conversion_factor
+ from erpnext.stock.utils import get_or_make_bin, validate_warehouse_company
++from erpnext.utilities.query import get_user_permission_conditions_qb
+ from erpnext.utilities.transaction_base import validate_uom_is_integer
+ 
+ 
+@@ -2877,6 +2878,9 @@ def sales_order_query(doctype=None, txt=None, searchfield=None, start=None, page
+ 	if txt:
+ 		query = query.where(table.parent.like(f"%{txt}%"))
+ 
++	for condition in get_user_permission_conditions_qb("Sales Order", so_table):
++		query = query.where(condition)
++
+ 	if page_len:
+ 		query = query.limit(page_len)
+ 
+diff --git a/erpnext/manufacturing/doctype/production_plan/test_production_plan.py b/erpnext/manufacturing/doctype/production_plan/test_production_plan.py
+index b68c8d9f9802..cce76722ea69 100644
+--- a/erpnext/manufacturing/doctype/production_plan/test_production_plan.py
++++ b/erpnext/manufacturing/doctype/production_plan/test_production_plan.py
+@@ -5773,6 +5773,81 @@ def test_material_request_status_rollup_without_production_plan_permission(self)
+ 		self.assertGreater(requested_qty, 0)
+ 		self.assertEqual(pln.status, "Material Requested")
+ 
++	def test_sales_order_query_follows_company_user_permission(self):
++		from erpnext.manufacturing.doctype.production_plan.production_plan import sales_order_query
++
++		item = make_item(properties={"is_stock_item": 1}).name
++		sales_order = make_sales_order(item_code=item, qty=5, rate=100).name
++		other_company_planner = create_manufacturing_user("planner-tc1@example.com", "_Test Company 1")
++		same_company_planner = create_manufacturing_user("planner-tc@example.com", "_Test Company")
++
++		self.addCleanup(frappe.set_user, "Administrator")
++		frappe.set_user(other_company_planner)
++		self.assertFalse(sales_order_query(filters={"item_code": item}))
++		self.assertFalse(sales_order_query(filters={"company": "_Test Company", "item_code": item}))
++
++		frappe.set_user(same_company_planner)
++		rows = sales_order_query(filters={"company": "_Test Company", "item_code": item})
++		self.assertEqual([row[0] for row in rows], [sales_order])
++
++	def test_sales_order_query_without_user_permission_lists_all_open_orders(self):
++		from erpnext.manufacturing.doctype.production_plan.production_plan import sales_order_query
++
++		item = make_item(properties={"is_stock_item": 1}).name
++		sales_order = make_sales_order(item_code=item, qty=5, rate=100).name
++		planner = create_manufacturing_user("planner-unrestricted@example.com")
++
++		self.addCleanup(frappe.set_user, "Administrator")
++		frappe.set_user(planner)
++		self.assertEqual([row[0] for row in sales_order_query(filters={"item_code": item})], [sales_order])
++
++	def test_sales_order_query_follows_item_user_permission_on_order_rows(self):
++		from erpnext.manufacturing.doctype.production_plan.production_plan import (
++			get_so_details,
++			sales_order_query,
++		)
++
++		allowed_item = make_item(properties={"is_stock_item": 1}).name
++		other_item = make_item(properties={"is_stock_item": 1}).name
++		allowed_order = make_sales_order(item_code=allowed_item, qty=5, rate=100).name
++		mixed_order = make_sales_order(
++			item_list=[
++				{"item_code": allowed_item, "warehouse": "_Test Warehouse - _TC", "qty": 5, "rate": 100},
++				{"item_code": other_item, "warehouse": "_Test Warehouse - _TC", "qty": 3, "rate": 100},
++			]
++		).name
++		planner = create_manufacturing_user("planner-item@example.com")
++		frappe.get_doc(
++			{"doctype": "User Permission", "user": planner, "allow": "Item", "for_value": allowed_item}
++		).insert(ignore_permissions=True)
++
++		self.addCleanup(frappe.set_user, "Administrator")
++		frappe.set_user(planner)
++		rows = sales_order_query(filters={"item_code": allowed_item})
++		self.assertEqual([row[0] for row in rows], [allowed_order])
++		self.assertEqual(get_so_details(allowed_order).customer, "_Test Customer")
++		self.assertRaises(frappe.PermissionError, get_so_details, mixed_order)
++
++
++def create_manufacturing_user(email, company=None):
++	if not frappe.db.exists("User", email):
++		frappe.get_doc(
++			{
++				"doctype": "User",
++				"email": email,
++				"first_name": email.split("@")[0],
++				"send_welcome_email": 0,
++				"roles": [{"role": "Manufacturing User"}],
++			}
++		).insert(ignore_permissions=True)
++
++	if company and not frappe.db.exists("User Permission", {"user": email, "allow": "Company"}):
++		frappe.get_doc(
++			{"doctype": "User Permission", "user": email, "allow": "Company", "for_value": company}
++		).insert(ignore_permissions=True)
++
++	return email
++
+ 
+ def create_production_plan(**args):
+ 	"""
+diff --git a/erpnext/utilities/query.py b/erpnext/utilities/query.py
+new file mode 100644
+index 000000000000..2afbd0fc2e1f
+--- /dev/null
++++ b/erpnext/utilities/query.py
+@@ -0,0 +1,55 @@
++import frappe
++
++
++def get_user_permission_conditions_qb(doctype, table=None):
++	from frappe.database.query import Engine
++
++	engine = Engine()
++	engine.get_query(doctype)
++	table = table or engine.table
++	return engine.get_user_permission_conditions(doctype, table) + get_child_user_permission_conditions_qb(
++		doctype, table
++	)
++
++
++def get_child_user_permission_conditions_qb(doctype, table):
++	from frappe.permissions import get_user_permissions
++	from pypika.terms import Criterion, ExistsCriterion
++
++	user_permissions = get_user_permissions(frappe.session.user)
++	if not user_permissions:
++		return []
++
++	conditions = []
++	for table_field in frappe.get_meta(doctype).get_table_fields():
++		child = frappe.qb.DocType(table_field.options).as_(f"restricted_{table_field.fieldname}")
++		refused = get_refused_link_conditions(child, table_field.options, doctype, user_permissions)
++		if refused:
++			rows = (
++				frappe.qb.from_(child)
++				.select(child.name)
++				.where(
++					(child.parent == table.name)
++					& (child.parenttype == doctype)
++					& (child.parentfield == table_field.fieldname)
++					& Criterion.any(refused)
++				)
++			)
++			conditions.append(ExistsCriterion(rows).negate())
++	return conditions
++
++
++def get_refused_link_conditions(child, child_doctype, doctype, user_permissions):
++	from frappe.permissions import get_allowed_docs_for_doctype
++	from frappe.query_builder.functions import IfNull
++
++	strict = frappe.get_system_settings("apply_strict_user_permissions")
++	conditions = []
++	for field in frappe.get_meta(child_doctype).get_link_fields():
++		if field.ignore_user_permissions:
++			continue
++		allowed = get_allowed_docs_for_doctype(user_permissions.get(field.options, []), doctype)
++		if allowed:
++			value = IfNull(child[field.fieldname], "")
++			conditions.append(value.notin(allowed) if strict else (value != "") & value.notin(allowed))
++	return conditions

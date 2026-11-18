@@ -1,0 +1,262 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 925a0fab..55fb5242 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,18 @@
+ 
+ ### Fixed
+ 
++- **An empty window says it is empty, not that the record lacks the
++  indicator.** When a named window held none of the readings a selection
++  matched, `query_health_indicators` fell back to the catalogue under "no
++  indicator matched those terms" and added "no data for an indicator means it
++  was never recorded". Both are false for a series the record holds outside
++  the window, and a local 2B answering PHIA's objective set concluded exactly
++  that in 11% of its failures. The tool now reads the selection's
++  whole-record statistics before falling back: when it matched, the answer
++  is zero rows with "0 readings between <start> and <end>" and each
++  indicator's count and first and last dates; only a selection that matches
++  nothing falls back. How to tell: `pytest mirobody/tests/test_absence_semantics.py`.
++
+ - **Oura's and WHOOP's nightly sleep totals are filed as the night's
+   figures.** Deep, light and REM sleep, awake time, latency and the sleeping
+   heart and breathing rates are totals over a whole sleep, and the decoders
+diff --git a/mirobody/agent/tools/health_indicators_service.py b/mirobody/agent/tools/health_indicators_service.py
+index 7bf1b9e3..c3bc367f 100644
+--- a/mirobody/agent/tools/health_indicators_service.py
++++ b/mirobody/agent/tools/health_indicators_service.py
+@@ -199,11 +199,22 @@ async def _run(self, caller_id: str, args: Mapping[str, Any]) -> tools.Envelope:
+         method = request.method
+         rows = await self._dispatch(hq, method, subject_id, request, window)
+ 
++        # An empty answer to a named window has two causes: the selection
++        # matched no series, or it matched series with nothing in the window.
++        # Both used to fall back to the catalogue under "no indicator matched
++        # those terms", and asked how many days last week had little deep
++        # sleep, a local 2B answered that the record had no deep sleep while
++        # it held months of it (PHIA's objective set, 11% of its failures).
++        # The whole record's stats tell the two apart.
++        elsewhere: Sequence[Mapping[str, Any]] = ()
++        if not rows and method != "catalog" and (request.start or request.end):
++            elsewhere = await awaited(hq.stats(subject_id, request.selection, query.Window(0, 0, tz)))
++
+         # Nothing matched a selection the caller DID give: answer with what the
+         # person actually has rather than with an empty table. The alternative
+         # costs a model call to learn the names, every time.
+         fell_back = False
+-        if not rows and method != "catalog":
++        if not rows and not elsewhere and method != "catalog":
+             rows = await self._dispatch(hq, "catalog", subject_id, request, window)
+             method, fell_back = "catalog", True
+ 
+@@ -211,10 +222,10 @@ async def _run(self, caller_id: str, args: Mapping[str, Any]) -> tools.Envelope:
+             rows = await _with_rids(CITATION_SESSION.get(), subject_id, method, request, window, rows)
+ 
+         outside = ""
+-        if self._outside_note and method != "catalog" and (request.start or request.end):
++        if self._outside_note and method != "catalog" and rows and (request.start or request.end):
+             outside = _outside_note(await awaited(hq.catalog(subject_id, None)), rows, window)
+         return _envelope_for(method, request, window, rows, fell_back=fell_back, bucket_cap=self._bucket_cap,
+-                             row_cap=self._row_cap, outside=outside)
++                             row_cap=self._row_cap, outside=outside, elsewhere=elsewhere)
+ 
+     async def _dispatch(
+         self, hq: Any, method: str, subject_id: str, request: query.QueryRequest, window: query.Window
+@@ -287,6 +298,7 @@ def _envelope_for(
+     bucket_cap: int = query.BUCKET_CAP,
+     row_cap: int = query.ROW_CAP,
+     outside: str = "",
++    elsewhere: Sequence[Mapping[str, Any]] = (),
+ ) -> tools.Envelope:
+     rows = list(rows)
+     dated = bool(request.start or request.end)
+@@ -322,6 +334,8 @@ def _envelope_for(
+         assumptions.append(window.note)
+     if outside:
+         assumptions.append(outside)
++    if elsewhere:
++        assumptions.append(_elsewhere_note(elsewhere, window))
+     if fell_back:
+         assumptions.append("no indicator matched those terms; this is what this person has on file")
+         # A window outside the record answers nothing, and the model used today's date for a
+@@ -367,7 +381,9 @@ def _envelope_for(
+         assumptions.append(_DAY_VALUE_NOTE)
+     if semantics == query.SEMANTICS_DATE_PADDED:
+         assumptions.append("some rows predate the stored local day; their window is padded a day each way")
+-    assumptions.append(_ABSENCE_NOTE)
++    if not elsewhere:
++        # "never recorded" is false of a series the record holds elsewhere.
++        assumptions.append(_ABSENCE_NOTE)
+     if any(r.get("rid") for r in rows):
+         assumptions.append(RID_NOTE)
+     unverified = sorted({str(r.get("indicator") or r.get("name") or "") for r in rows
+@@ -390,7 +406,7 @@ def _envelope_for(
+         next_steps.append(tools.NEXT_USE_INDICATORS)
+         if truncated:
+             next_steps.append(tools.NEXT_NARROW_WINDOW)
+-    elif not rows:
++    elif not rows and not elsewhere:
+         next_steps.append(tools.NEXT_PICK_FROM_CATALOG)
+     elif truncated:
+         next_steps.extend((tools.NEXT_NARROW_WINDOW, tools.NEXT_VIEW_STATS))
+@@ -464,9 +480,7 @@ def _outside_note(catalog: Sequence[Mapping[str, Any]], rows: Sequence[Mapping[s
+     default span, so the bounds compared are the ones the rows were read
+     from, not the dates the caller wrote."""
+     answered = {str(r.get("series") or "") for r in rows} - {""}
+-    zone = series.zone(window.tz)
+-    first_day = datetime.fromtimestamp(window.start_ms / 1000, zone).date().isoformat()
+-    last_day = datetime.fromtimestamp((window.end_ms - 1) / 1000, zone).date().isoformat()
++    first_day, last_day = _window_days(window)
+     outside = []
+     for entry in catalog:
+         if str(entry.get("series") or "") not in answered:
+@@ -485,6 +499,28 @@ def _outside_note(catalog: Sequence[Mapping[str, Any]], rows: Sequence[Mapping[s
+             + "; call again with a wider start or end to include them")
+ 
+ 
++def _window_days(window: query.Window) -> tuple[str, str]:
++    """The first and last local day a resolved window covers. With one end
++    named the other is the default span, so these are the days the rows were
++    read from, not the dates the caller wrote."""
++    zone = series.zone(window.tz)
++    first_day = datetime.fromtimestamp(window.start_ms / 1000, zone).date().isoformat()
++    last_day = datetime.fromtimestamp((window.end_ms - 1) / 1000, zone).date().isoformat()
++    return first_day, last_day
++
++
++def _elsewhere_note(stats: Sequence[Mapping[str, Any]], window: query.Window) -> str:
++    """The answer to a window that holds none of the readings the selection
++    matched: zero, and where the readings are, so "none last week" is not
++    read as "none ever"."""
++    first_day, last_day = _window_days(window)
++    held = "; ".join(f"{r.get('indicator')} has {r.get('count')} from {r.get('first_date')} to {r.get('last_date')}"
++                     for r in stats)
++    return (f"0 readings between {first_day} and {last_day}. The record does hold these indicators, all outside "
++            f"this window: {held}. The answer for this window is that it has none; to read them, call again "
++            "with dates inside those spans")
++
++
+ def _day_before(stamp: str) -> str:
+     """The day before the local date that starts `stamp`, or "" for none."""
+     try:
+diff --git a/mirobody/tests/test_absence_semantics.py b/mirobody/tests/test_absence_semantics.py
+new file mode 100644
+index 00000000..8e13ce16
+--- /dev/null
++++ b/mirobody/tests/test_absence_semantics.py
+@@ -0,0 +1,82 @@
++"""A window with no readings has to say so, and say which cause it is.
++
++An empty answer to a named window has two causes: the selection matched no
++series, or it matched series with nothing in the window. Both fell back to the
++catalogue under "no indicator matched those terms", and a local 2B answering
++PHIA's objective set concluded the record lacked a metric it held (11% of its
++failures). These drive the tool's real entry point, `envelope()`: the
++envelope builder alone never sees an empty non-catalogue result, because the
++fallback runs first.
++"""
++
++from __future__ import annotations
++
++from datetime import UTC, datetime
++from unittest.mock import Mock
++
++import pytest
++
++# The engine tests also run on a minimal install that has no optional chat
++# dependencies; the tool module imports them, so skip rather than fail there.
++pytest.importorskip("dotenv")
++
++from mirobody.agent.tools.health_indicators_service import HealthIndicatorsService
++from mirobody.kernel import tools
++
++NOW = datetime(2026, 10, 14, tzinfo=UTC)
++HELD = {"indicator": "Deep sleep duration", "series": "loinc:deep sleep", "count": 30,
++        "first_date": "2026-03-01", "last_date": "2026-03-30"}
++CATALOG = [{"indicator": "Deep sleep duration", "series": "loinc:deep sleep", "first_date": "2026-03-01",
++            "last_date": "2026-03-30", "total": 1}]
++
++
++def _store(*, buckets=(), whole_record=(), catalog=CATALOG):
++    hq = Mock()
++    hq.tz.return_value = "UTC"
++    hq.on_read.return_value = None
++    hq.buckets.return_value = list(buckets)
++    hq.stats.return_value = list(whole_record)
++    hq.catalog.return_value = list(catalog)
++    return hq
++
++
++async def _ask(hq, **args):
++    return await HealthIndicatorsService(hq, now=lambda: NOW, outside_note=False).envelope(
++        {"user_id": "1"}, indicators=["dailyDeepSleep"], view="day", **args)
++
++
++async def test_a_series_held_outside_the_window_is_zero_here_not_missing():
++    hq = _store(whole_record=[HELD])
++    envelope = await _ask(hq, start="2026-10-01", end="2026-10-07")
++    note = next(a for a in envelope.assumptions if a.startswith("0 readings"))
++    assert "2026-10-01 and 2026-10-07" in note
++    assert "Deep sleep duration has 30 from 2026-03-01 to 2026-03-30" in note
++    assert not any("no indicator matched" in a for a in envelope.assumptions)
++    assert not any("never recorded" in a for a in envelope.assumptions)
++    assert tools.NEXT_PICK_FROM_CATALOG not in envelope.next_steps
++    assert envelope.meta.row_count == 0
++    hq.catalog.assert_not_called()
++
++
++async def test_a_selection_that_matches_nothing_still_falls_back_to_the_catalogue():
++    hq = _store(whole_record=[])
++    envelope = await _ask(hq, start="2026-10-01", end="2026-10-07")
++    assert any("no indicator matched" in a for a in envelope.assumptions)
++    assert not any(a.startswith("0 readings") for a in envelope.assumptions)
++    assert envelope.meta.row_count == len(CATALOG)
++
++
++async def test_an_undated_empty_answer_needs_no_second_look():
++    hq = _store()
++    envelope = await _ask(hq)
++    hq.stats.assert_not_called()
++    assert any("no indicator matched" in a for a in envelope.assumptions)
++
++
++async def test_a_window_with_readings_makes_no_zero_claim():
++    day = {"indicator": "Deep sleep duration", "series": "loinc:deep sleep", "period": "2026-10-02",
++           "avg": 3_000_000.0, "n": 1, "unit": "ms", "total": 1}
++    hq = _store(buckets=[day], whole_record=[HELD])
++    envelope = await _ask(hq, start="2026-10-01", end="2026-10-07")
++    hq.stats.assert_not_called()
++    assert not any(a.startswith("0 readings") for a in envelope.assumptions)
+diff --git a/mirobody/tests/test_postgres_regressions.py b/mirobody/tests/test_postgres_regressions.py
+index ca688fa9..8ec5ca26 100644
+--- a/mirobody/tests/test_postgres_regressions.py
++++ b/mirobody/tests/test_postgres_regressions.py
+@@ -627,3 +627,28 @@ async def test_trend_citation_members_use_the_actual_capped_input_span(database)
+     assert resolved["from"] == resolved["first_day"] == (first + timedelta(days=1)).date().isoformat()
+     assert resolved["to"] == resolved["last_day"] == (first + timedelta(days=400)).date().isoformat()
+     assert len(resolved["readings"]) == citations.MEMBERS_SHOWN
++
++
++async def test_an_empty_window_names_the_readings_the_record_holds_elsewhere(database):
++    """A window holding none of a series' readings is zero there, not a
++    record without the series; the whole-record stats say where it is."""
++    from mirobody.agent.tools.health_indicators_service import HealthIndicatorsService
++    from mirobody.collect import observations
++    from mirobody.collect.query import PostgresHealthQuery
++
++    drafts = [observations.Draft(name_text="ALT", value_text=str(20 + day), unit_text="U/L",
++                                 observed_start=datetime(2026, 3, day, 8, tzinfo=UTC)) for day in (2, 9, 16)]
++    await observations.ingest("1", drafts, observations.Provenance("lab-report", "file", "th_files:synthetic-elsewhere"),
++                              user_tz="UTC")
++    service = HealthIndicatorsService(PostgresHealthQuery(), outside_note=False)
++    envelope = await service.envelope({"user_id": "1"}, indicators=["ALT"], start="2026-10-01", end="2026-10-07",
++                                      view="day")
++    assert envelope.meta.row_count == 0
++    note = next(a for a in envelope.assumptions if a.startswith("0 readings"))
++    assert "between 2026-10-01 and 2026-10-07" in note
++    assert "has 3 from 2026-03-02 to 2026-03-16" in note
++    assert not any("no indicator matched" in a for a in envelope.assumptions)
++
++    missing = await service.envelope({"user_id": "1"}, indicators=["Ferritin"], start="2026-10-01",
++                                     end="2026-10-07", view="day")
++    assert any("no indicator matched" in a for a in missing.assumptions)

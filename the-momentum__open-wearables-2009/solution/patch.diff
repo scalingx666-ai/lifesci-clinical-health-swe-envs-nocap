@@ -1,0 +1,471 @@
+diff --git a/frontend/e2e/auth.e2e.ts b/frontend/e2e/auth.e2e.ts
+index 46cb415e4c..219d3caa8c 100644
+--- a/frontend/e2e/auth.e2e.ts
++++ b/frontend/e2e/auth.e2e.ts
+@@ -51,3 +51,31 @@ test('sends an already signed-in visitor away from the sign-in page', async ({ p
+ 	await page.goto('/login');
+ 	await expect(page).toHaveURL('/dashboard');
+ });
++
++// A session from another stack, or from before its SECRET_KEY rotated.
++test('sends a session the API no longer accepts back to sign in', async ({
++	page,
++	context,
++	request
++}) => {
++	await signIn(page);
++	await request.post('http://localhost:8787/__forget-tokens/all');
++
++	await page.goto('/login');
++	await expect(page).toHaveURL('/login');
++	await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible();
++	const cookie = (await context.cookies()).find((c) => c.name === 'ow_session');
++	expect(cookie, 'the dead session should be cleared').toBeUndefined();
++});
++
++test('renews a refused access token while its refresh token still works', async ({
++	page,
++	request
++}) => {
++	await signIn(page);
++	await request.post('http://localhost:8787/__forget-tokens/access');
++
++	await page.goto('/users');
++	await expect(page).toHaveURL('/users');
++	await expect(page.getByRole('navigation', { name: 'Main' })).toBeVisible();
++});
+diff --git a/frontend/e2e/mock-api.ts b/frontend/e2e/mock-api.ts
+index 7512f6f8f1..78ec40be55 100644
+--- a/frontend/e2e/mock-api.ts
++++ b/frontend/e2e/mock-api.ts
+@@ -107,6 +107,12 @@ const PORT = Number(process.env.MOCK_API_PORT ?? 8787);
+ let issued = 0;
+ const validAccessTokens = new Set<string>();
+ const validRefreshTokens = new Set<string>();
++// Backend GET routes without auth: a stale bearer token there is ignored, not refused.
++const PUBLIC_PATHS = new Set([
++	'/api/v1/oauth/providers',
++	'/api/v1/meta/coverage',
++	'/api/v1/webhooks/event-types'
++]);
+ 
+ function issueTokens() {
+ 	issued += 1;
+@@ -147,6 +153,25 @@ const server = Bun.serve({
+ 			return new Response(null, { status: 204 });
+ 		}
+ 
++		// The portal pointed at another stack, or its SECRET_KEY rotated: tokens it
++		// holds stop working. `access` keeps the refresh tokens, so renewing still works.
++		const forgetMatch = pathname.match(/^\/__forget-tokens\/(access|all)$/);
++		if (forgetMatch) {
++			validAccessTokens.clear();
++			if (forgetMatch[1] === 'all') validRefreshTokens.clear();
++			return new Response(null, { status: 204 });
++		}
++
++		// As the backend does: a bearer token it did not issue is refused, except on public routes.
++		const bearer = request.headers.get('authorization')?.replace('Bearer ', '');
++		if (
++			bearer !== undefined &&
++			!(request.method === 'GET' && PUBLIC_PATHS.has(pathname)) &&
++			!validAccessTokens.has(bearer)
++		) {
++			return json({ detail: 'Could not validate credentials' }, 401);
++		}
++
+ 		if (pathname === '/__empty-aggregates') {
+ 			EMPTY_AGGREGATES = true;
+ 			return new Response(null, { status: 204 });
+diff --git a/frontend/src/lib/server/api.ts b/frontend/src/lib/server/api.ts
+index 1f8aa5e7f3..e50b77ebad 100644
+--- a/frontend/src/lib/server/api.ts
++++ b/frontend/src/lib/server/api.ts
+@@ -1,5 +1,6 @@
+ import { env as privateEnv } from '$env/dynamic/private';
+ import { env as publicEnv } from '$env/dynamic/public';
++import { getRequestEvent } from '$app/server';
+ 
+ const DEFAULT_API_URL = 'http://localhost:8000';
+ 
+@@ -62,6 +63,30 @@ async function raiseFor(response: Response): Promise<never> {
+ 	throw new ApiError(response.status, detail ?? response.statusText);
+ }
+ 
++/** A refused session token is renewed and retried once; a session that cannot renew redirects to sign-in. */
++async function authorized(
++	path: string,
++	init: Omit<RequestInit, 'headers'> & { headers?: Record<string, string> },
++	accessToken: string | null | undefined
++): Promise<Response> {
++	const send = (token: string | null | undefined) =>
++		fetch(apiUrl(path), {
++			...init,
++			headers: { ...init.headers, ...(token ? { Authorization: `Bearer ${token}` } : {}) }
++		});
++
++	const response = await send(accessToken);
++	if (response.status !== 401 || !accessToken) return response;
++
++	const auth = getRequestEvent().locals.auth;
++	const renewed = await auth.rejected(accessToken);
++	if (!renewed) return response;
++
++	const retried = await send(renewed);
++	if (retried.status === 401) await auth.rejected(renewed);
++	return retried;
++}
++
+ /** OAuth2 password flow: form-encoded, and the field is `username`. */
+ export async function login(email: string, password: string): Promise<TokenResponse> {
+ 	const response = await fetch(apiUrl(API.login), {
+@@ -100,9 +125,7 @@ export async function revokeToken(refreshToken: string): Promise<void> {
+ 
+ /** The token is optional: a few endpoints, and the pairing page, have no session. */
+ export async function apiGet<T>(path: string, accessToken?: string): Promise<T> {
+-	const response = await fetch(apiUrl(path), {
+-		headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {}
+-	});
++	const response = await authorized(path, {}, accessToken);
+ 
+ 	if (!response.ok) await raiseFor(response);
+ 	return response.json();
+@@ -114,14 +137,15 @@ async function apiWrite<T>(
+ 	accessToken: string | null,
+ 	body?: unknown
+ ): Promise<T> {
+-	const response = await fetch(apiUrl(path), {
+-		method,
+-		headers: {
+-			...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+-			...(body === undefined ? {} : { 'Content-Type': 'application/json' })
++	const response = await authorized(
++		path,
++		{
++			method,
++			headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
++			body: body === undefined ? undefined : JSON.stringify(body)
+ 		},
+-		body: body === undefined ? undefined : JSON.stringify(body)
+-	});
++		accessToken
++	);
+ 
+ 	if (!response.ok) await raiseFor(response);
+ 	return response.status === 204 ? (undefined as T) : response.json();
+diff --git a/frontend/src/lib/server/auth.ts b/frontend/src/lib/server/auth.ts
+index 1c4425a82c..4f622b0230 100644
+--- a/frontend/src/lib/server/auth.ts
++++ b/frontend/src/lib/server/auth.ts
+@@ -1,20 +1,48 @@
+-import type { Cookies } from '@sveltejs/kit';
+-import { readSession, validAccessToken, type Session } from './session';
++import { redirect, type Cookies } from '@sveltejs/kit';
++import { resolve } from '$app/paths';
++import { clearSession, readSession, renewSession, validAccessToken, type Session } from './session';
+ 
+ export type AuthContext = {
+ 	session(): Session | null;
+ 	accessToken(): Promise<string | null>;
++	/** The renewed token, null for a token this session never held, or a redirect to sign-in. */
++	rejected(token: string): Promise<string | null>;
+ };
+ 
+ /** The layout guard and the page load both ask for a token; only the first may refresh it. */
+ export function createAuthContext(cookies: Cookies): AuthContext {
+ 	let token: Promise<string | null> | undefined;
++	// One renewal per request: a page's parallel calls all fail with the same token.
++	let renewal: { from: string; to: Promise<string> } | undefined;
++
++	async function signedOut(): Promise<never> {
++		// A cookie left behind would send /login straight back to the dashboard.
++		clearSession(cookies);
++		redirect(303, resolve('/login'));
++	}
+ 
+ 	return {
+ 		session: () => readSession(cookies),
+ 		accessToken: () => {
+ 			const session = readSession(cookies);
+ 			return (token ??= session ? validAccessToken(cookies, session) : Promise.resolve(null));
++		},
++		rejected: async (refused) => {
++			if (renewal) {
++				if (refused === renewal.from) return renewal.to;
++				// The renewed token was refused too, so another refresh would not help.
++				if (refused === (await renewal.to)) return signedOut();
++				return null;
++			}
++
++			// A token the session does not hold - a sign-in still in progress, say.
++			const session = readSession(cookies);
++			if (session?.accessToken !== refused) return null;
++
++			const to = renewSession(cookies, session).then((renewed) => renewed ?? signedOut());
++			renewal = { from: refused, to };
++			token = to;
++			return to;
+ 		}
+ 	};
+ }
+diff --git a/frontend/src/lib/server/form.ts b/frontend/src/lib/server/form.ts
+index 8086ad696e..330c42d909 100644
+--- a/frontend/src/lib/server/form.ts
++++ b/frontend/src/lib/server/form.ts
+@@ -1,7 +1,9 @@
+-import { fail } from '@sveltejs/kit';
++import { fail, isRedirect } from '@sveltejs/kit';
+ import { ApiError } from './api';
+ 
++/** A lapsed session is not a form error: its redirect to sign-in is rethrown. */
+ export function describe(error: unknown): string {
++	if (isRedirect(error)) throw error;
+ 	if (!(error instanceof ApiError)) return 'Something went wrong. Try again.';
+ 	if (error.status === 409) return 'A user with that email already exists.';
+ 	if (error.status === 404) return 'That user no longer exists.';
+diff --git a/frontend/src/lib/server/optional.ts b/frontend/src/lib/server/optional.ts
+index d3fc574183..dfa81efaf8 100644
+--- a/frontend/src/lib/server/optional.ts
++++ b/frontend/src/lib/server/optional.ts
+@@ -1,8 +1,12 @@
++import { isRedirect } from '@sveltejs/kit';
++
+ /** A request whose failure costs one part of a page, not the page. */
+ export async function optional<T>(work: Promise<T>, fallback: T): Promise<T> {
+ 	try {
+ 		return await work;
+-	} catch {
++	} catch (error) {
++		// A lapsed session costs the whole page: it goes back to sign-in.
++		if (isRedirect(error)) throw error;
+ 		return fallback;
+ 	}
+ }
+diff --git a/frontend/src/lib/server/server.spec.ts b/frontend/src/lib/server/server.spec.ts
+index 20ee48f94f..8a41bf20ad 100644
+--- a/frontend/src/lib/server/server.spec.ts
++++ b/frontend/src/lib/server/server.spec.ts
+@@ -1,16 +1,32 @@
+-import { afterEach, describe, expect, it, vi } from 'vitest';
+-import { refreshTokens, type Developer, type TokenResponse } from './api';
++import { isRedirect, type Cookies } from '@sveltejs/kit';
++import { getRequestEvent } from '$app/server';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import {
++	ApiError,
++	apiGet,
++	apiPost,
++	refreshTokens,
++	type Developer,
++	type TokenResponse
++} from './api';
++import { createAuthContext, type AuthContext } from './auth';
+ import { forgetAll, keep, recall } from './cache';
+ import {
+ 	decodeSession,
+ 	encodeSession,
+ 	needsRefresh,
+ 	rotate,
++	SESSION_COOKIE,
+ 	sessionFromTokens,
+ 	type Session
+ } from './session';
+ 
+-vi.mock('./api', () => ({ refreshTokens: vi.fn(), revokeToken: vi.fn() }));
++vi.mock('$app/server', () => ({ getRequestEvent: vi.fn() }));
++vi.mock('./api', async (original) => ({
++	...(await original<typeof import('./api')>()),
++	refreshTokens: vi.fn(),
++	revokeToken: vi.fn()
++}));
+ 
+ const DEVELOPER: Developer = {
+ 	id: 'dev-1',
+@@ -118,6 +134,126 @@ describe('rotate', () => {
+ 	});
+ });
+ 
++/** Like SvelteKit's jar, a cookie set during a request is what the next get reads. */
++function jar(stored: Session): Cookies {
++	const values = new Map([[SESSION_COOKIE, encodeSession(stored)]]);
++	return {
++		get: (name: string) => values.get(name),
++		set: (name: string, value: string) => void values.set(name, value),
++		delete: (name: string) => void values.delete(name)
++	} as unknown as Cookies;
++}
++
++const redirectOf = (work: Promise<unknown>) =>
++	work.then(
++		() => null,
++		(thrown: unknown) => (isRedirect(thrown) ? thrown.location : thrown)
++	);
++
++describe('a token the API refuses', () => {
++	afterEach(() => vi.mocked(refreshTokens).mockReset());
++
++	// Refresh tokens differ per test: rotate() remembers a success for 30s.
++	it('is renewed once for all the parallel calls of a request', async () => {
++		vi.mocked(refreshTokens).mockResolvedValue(tokens({ access_token: 'renewed' }));
++		const cookies = jar(session({ refreshToken: 'rt-parallel' }));
++		const auth = createAuthContext(cookies);
++
++		const answers = await Promise.all([auth.rejected('access'), auth.rejected('access')]);
++
++		expect(answers).toEqual(['renewed', 'renewed']);
++		expect(refreshTokens).toHaveBeenCalledTimes(1);
++		expect(decodeSession(cookies.get(SESSION_COOKIE))?.accessToken).toBe('renewed');
++		await expect(auth.accessToken()).resolves.toBe('renewed');
++	});
++
++	it('is not renewed when the session never held it, as during sign-in', async () => {
++		const auth = createAuthContext(jar(session()));
++
++		await expect(auth.rejected('from-a-sign-in')).resolves.toBeNull();
++		expect(refreshTokens).not.toHaveBeenCalled();
++	});
++
++	it('ends the session when the refresh is refused too', async () => {
++		vi.mocked(refreshTokens).mockRejectedValue(
++			new ApiError(401, 'Invalid or revoked refresh token')
++		);
++		const cookies = jar(session({ refreshToken: 'rt-refused' }));
++
++		await expect(redirectOf(createAuthContext(cookies).rejected('access'))).resolves.toBe('/login');
++		expect(cookies.get(SESSION_COOKIE)).toBeUndefined();
++	});
++
++	it('keeps the session when the refresh fails on an outage', async () => {
++		vi.mocked(refreshTokens).mockRejectedValue(new ApiError(503, 'Service Unavailable'));
++		const cookies = jar(session({ refreshToken: 'rt-outage' }));
++
++		await expect(createAuthContext(cookies).rejected('access')).rejects.toMatchObject({
++			status: 503
++		});
++		expect(cookies.get(SESSION_COOKIE)).toBeDefined();
++	});
++
++	it('ends the session when the renewed token is refused as well', async () => {
++		vi.mocked(refreshTokens).mockResolvedValue(tokens({ access_token: 'renewed' }));
++		const cookies = jar(session({ refreshToken: 'rt-twice' }));
++		const auth = createAuthContext(cookies);
++		await auth.rejected('access');
++
++		await expect(redirectOf(auth.rejected('renewed'))).resolves.toBe('/login');
++		expect(refreshTokens).toHaveBeenCalledTimes(1);
++		expect(cookies.get(SESSION_COOKIE)).toBeUndefined();
++	});
++});
++
++describe('API calls with a refused token', () => {
++	const rejected = vi.fn<AuthContext['rejected']>();
++	const fetchMock = vi.fn<typeof fetch>();
++	const reply = (status: number) => new Response('{}', { status });
++	const sent = (call: number) => fetchMock.mock.calls[call][1];
++
++	beforeEach(() => {
++		vi.stubGlobal('fetch', fetchMock);
++		vi.mocked(getRequestEvent).mockReturnValue({
++			locals: { auth: { rejected } }
++		} as unknown as ReturnType<typeof getRequestEvent>);
++	});
++
++	afterEach(() => {
++		vi.unstubAllGlobals();
++		fetchMock.mockReset();
++		rejected.mockReset();
++	});
++
++	it('are sent again, body and all, with the renewed token', async () => {
++		fetchMock.mockResolvedValueOnce(reply(401)).mockResolvedValueOnce(reply(200));
++		rejected.mockResolvedValue('renewed');
++
++		await apiPost('/api/v1/users', 'access', { email: 'a@example.com' });
++
++		expect(sent(1)?.headers).toMatchObject({ Authorization: 'Bearer renewed' });
++		expect(sent(1)?.body).toBe(sent(0)?.body);
++	});
++
++	it('fail as before when the token was not the session’s', async () => {
++		fetchMock.mockResolvedValue(reply(401));
++		rejected.mockResolvedValue(null);
++
++		await expect(apiGet('/api/v1/auth/me', 'from-a-sign-in')).rejects.toMatchObject({
++			status: 401
++		});
++		expect(fetchMock).toHaveBeenCalledTimes(1);
++	});
++
++	it('hand a refused retry back to the session, which ends it', async () => {
++		fetchMock.mockResolvedValue(reply(401));
++		rejected.mockResolvedValueOnce('renewed').mockRejectedValueOnce(new Error('signed out'));
++
++		await expect(apiGet('/api/v1/users', 'access')).rejects.toThrow('signed out');
++		expect(rejected).toHaveBeenLastCalledWith('renewed');
++	});
++});
++
+ describe('cache', () => {
+ 	afterEach(() => forgetAll());
+ 
+diff --git a/frontend/src/lib/server/session.ts b/frontend/src/lib/server/session.ts
+index b48abb9dfd..915bebf5a5 100644
+--- a/frontend/src/lib/server/session.ts
++++ b/frontend/src/lib/server/session.ts
+@@ -1,5 +1,6 @@
+ import type { Cookies } from '@sveltejs/kit';
+ import {
++	ApiError,
+ 	refreshTokens,
+ 	revokeToken,
+ 	type Developer,
+@@ -69,7 +70,7 @@ function store(cookies: Cookies, session: Session): void {
+ 	});
+ }
+ 
+-const clear = (cookies: Cookies) => cookies.delete(SESSION_COOKIE, { path: '/' });
++export const clearSession = (cookies: Cookies) => cookies.delete(SESSION_COOKIE, { path: '/' });
+ 
+ export function createSession(cookies: Cookies, tokens: TokenResponse, developer: Developer): void {
+ 	store(cookies, sessionFromTokens(tokens, developer));
+@@ -111,8 +112,19 @@ export function rotate(refreshToken: string): Promise<TokenResponse> {
+  * should treat the user as signed out.
+  */
+ export async function validAccessToken(cookies: Cookies, session: Session): Promise<string | null> {
+-	if (!needsRefresh(session)) return session.accessToken;
+-	if (!session.refreshToken) return null;
++	return needsRefresh(session) ? renewSession(cookies, session) : session.accessToken;
++}
++
++/**
++ * Refreshes whether or not it is due: the API can refuse a token that has not
++ * expired, after a secret rotates or on another stack's database. Null, with
++ * the session cleared, once the API refuses the refresh; an outage is rethrown.
++ */
++export async function renewSession(cookies: Cookies, session: Session): Promise<string | null> {
++	if (!session.refreshToken) {
++		clearSession(cookies);
++		return null;
++	}
+ 
+ 	try {
+ 		const renewed = sessionFromTokens(await rotate(session.refreshToken), session.developer);
+@@ -120,14 +132,15 @@ export async function validAccessToken(cookies: Cookies, session: Session): Prom
+ 		if (session.passwordChange) renewed.passwordChange = session.passwordChange;
+ 		store(cookies, renewed);
+ 		return renewed.accessToken;
+-	} catch {
+-		clear(cookies);
++	} catch (error) {
++		if (!(error instanceof ApiError && error.status < 500)) throw error;
++		clearSession(cookies);
+ 		return null;
+ 	}
+ }
+ 
+ export async function destroySession(cookies: Cookies): Promise<void> {
+ 	const existing = readSession(cookies);
+-	clear(cookies);
++	clearSession(cookies);
+ 	if (existing?.refreshToken) await revokeToken(existing.refreshToken);
+ }

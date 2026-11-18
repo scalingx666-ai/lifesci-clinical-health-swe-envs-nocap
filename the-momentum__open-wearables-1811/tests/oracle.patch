@@ -1,0 +1,333 @@
+diff --git a/backend/app/api/routes/v1/sdk_logs.py b/backend/app/api/routes/v1/sdk_logs.py
+index b00a89d346..f270865f9e 100644
+--- a/backend/app/api/routes/v1/sdk_logs.py
++++ b/backend/app/api/routes/v1/sdk_logs.py
+@@ -3,7 +3,7 @@
+ from typing import Any
+ from uuid import UUID
+ 
+-from fastapi import APIRouter, HTTPException, status
++from fastapi import APIRouter, HTTPException, Request, status
+ 
+ from app.constants.series_types.sdk import get_series_type_from_metric_type
+ from app.schemas.providers.mobile_sdk import SDKLogEventType, SDKLogRequest
+@@ -18,6 +18,7 @@
+ from app.services.raw_payload_storage import store_raw_payload
+ from app.services.sync_status_service import emit_sync_started, try_record_data_types
+ from app.utils.auth import SDKAuthDep
++from app.utils.sdk_request_metadata import sdk_request_metadata
+ from app.utils.structured_logging import log_structured
+ 
+ router = APIRouter()
+@@ -115,6 +116,7 @@ def submit_sdk_logs(
+     user_id: UUID,
+     body: SDKLogRequest,
+     auth: SDKAuthDep,
++    request: Request,
+ ) -> UploadDataResponse:
+     """Accept SDK diagnostic log events and store to raw S3 storage.
+ 
+@@ -141,7 +143,7 @@ def submit_sdk_logs(
+         provider=provider,
+         event_count=len(body.events),
+         event_types=event_types,
+-        sdk_version=body.sdkVersion,
++        **sdk_request_metadata(request.headers, body.sdkVersion),
+         **_event_fields(body),
+     )
+ 
+diff --git a/backend/app/api/routes/v1/sdk_sync.py b/backend/app/api/routes/v1/sdk_sync.py
+index 2c77bcfb74..a6c789d9ae 100644
+--- a/backend/app/api/routes/v1/sdk_sync.py
++++ b/backend/app/api/routes/v1/sdk_sync.py
+@@ -2,7 +2,7 @@
+ import uuid
+ from logging import getLogger
+ 
+-from fastapi import APIRouter, HTTPException, status
++from fastapi import APIRouter, HTTPException, Request, status
+ 
+ from app.config import settings
+ from app.constants.sdk_providers import normalize_sdk_provider, sdk_providers
+@@ -12,6 +12,7 @@
+ from app.services.raw_payload_storage import put_payload_to_s3, store_raw_payload
+ from app.utils.api_utils import inline_schema_defs
+ from app.utils.auth import SDKAuthDep
++from app.utils.sdk_request_metadata import sdk_request_metadata
+ from app.utils.sentry_helpers import log_and_capture_error
+ from app.utils.structured_logging import log_structured
+ 
+@@ -34,6 +35,7 @@ def sync_sdk_data(
+     user_id: str,
+     body: dict,
+     auth: SDKAuthDep,
++    request: Request,
+ ) -> UploadDataResponse:
+     """Import health data from SDK provider asynchronously via Celery.
+ 
+@@ -110,6 +112,7 @@ def sync_sdk_data(
+         workouts_count=workouts_count,
+         sleep_count=sleep_count,
+         total_items=records_count + workouts_count + sleep_count,
++        **sdk_request_metadata(request.headers, body.get("sdkVersion")),
+     )
+ 
+     content_str = json.dumps(body)
+diff --git a/backend/app/middlewares.py b/backend/app/middlewares.py
+index b1cf20c426..347d6d5930 100644
+--- a/backend/app/middlewares.py
++++ b/backend/app/middlewares.py
+@@ -15,6 +15,7 @@
+ from app.config import settings
+ from app.services.endpoint_usage import caller_type, endpoint_usage, route_key
+ from app.utils.config_utils import AccessLogLevel
++from app.utils.sdk_request_metadata import sdk_request_metadata
+ from app.utils.structured_logging import log_structured
+ 
+ logger = logging.getLogger("app.access")
+@@ -105,6 +106,7 @@ def emit(
+                 attributes["request_bytes"] = int(content_length)
+             except ValueError:
+                 attributes["request_bytes"] = content_length
++        attributes |= sdk_request_metadata(request.headers)
+         if response_body is not None:
+             attributes["response_body"] = response_body
+         if status >= 400:
+diff --git a/backend/app/utils/sdk_request_metadata.py b/backend/app/utils/sdk_request_metadata.py
+new file mode 100644
+index 0000000000..72abb9e2a9
+--- /dev/null
++++ b/backend/app/utils/sdk_request_metadata.py
+@@ -0,0 +1,35 @@
++"""Attribution headers sent by the mobile SDKs.
++
++Unlike the body, headers are readable even when the request body is truncated.
++"""
++
++from collections.abc import Mapping
++from typing import Any
++
++_SDK_HEADERS = {
++    "x-open-wearables-sdk-version": "sdk_version",
++    "x-open-wearables-sdk-platform": "sdk_platform",
++    "x-request-id": "request_id",
++    "x-open-wearables-outbox-item": "outbox_item_id",
++    "user-agent": "user_agent",
++}
++
++_MAX_VALUE_LENGTH = 256
++
++
++def _sanitize(value: str) -> str:
++    # Control characters would let a client forge log lines in the text log format.
++    cleaned = "".join(char for char in value if char.isprintable()).strip()
++    return cleaned[:_MAX_VALUE_LENGTH]
++
++
++def sdk_request_metadata(headers: Mapping[str, str], body_sdk_version: object = None) -> dict[str, Any]:
++    fields: dict[str, Any] = {}
++    # Older SDK versions send the version only in the body.
++    if isinstance(body_sdk_version, str) and (cleaned := _sanitize(body_sdk_version)):
++        fields["sdk_version"] = cleaned
++    for header, field in _SDK_HEADERS.items():
++        value = headers.get(header)
++        if value and (cleaned := _sanitize(value)):
++            fields[field] = cleaned
++    return fields
+diff --git a/backend/tests/api/v1/test_sdk_logs.py b/backend/tests/api/v1/test_sdk_logs.py
+index 6b5c68ffff..a996a64faa 100644
+--- a/backend/tests/api/v1/test_sdk_logs.py
++++ b/backend/tests/api/v1/test_sdk_logs.py
+@@ -154,6 +154,39 @@ def test_android_data_types_accepted(self, mock_store: MagicMock, client: TestCl
+         )
+         assert response.status_code == 202
+ 
++    @patch("app.api.routes.v1.sdk_logs.log_structured")
++    @patch("app.api.routes.v1.sdk_logs.store_raw_payload")
++    def test_attribution_headers_are_logged(
++        self, mock_store: MagicMock, mock_log: MagicMock, client: TestClient, db: Session
++    ) -> None:
++        api_key = ApiKeyFactory()
++        response = client.post(
++            _url(),
++            headers={
++                "X-Open-Wearables-API-Key": api_key.plain_key,
++                "X-Open-Wearables-SDK-Version": "1.3.0",
++                "X-Open-Wearables-SDK-Platform": "ios",
++                "X-Request-Id": "req-1",
++            },
++            json=_payload(DEVICE_STATE_EVENT),
++        )
++        assert response.status_code == 202
++        attributes = mock_log.call_args.kwargs
++        assert attributes["sdk_version"] == "1.3.0"
++        assert attributes["sdk_platform"] == "ios"
++        assert attributes["request_id"] == "req-1"
++
++    @patch("app.api.routes.v1.sdk_logs.log_structured")
++    @patch("app.api.routes.v1.sdk_logs.store_raw_payload")
++    def test_body_version_logged_without_headers(
++        self, mock_store: MagicMock, mock_log: MagicMock, client: TestClient, db: Session
++    ) -> None:
++        api_key = ApiKeyFactory()
++        client.post(_url(), headers={"X-Open-Wearables-API-Key": api_key.plain_key}, json=_payload(DEVICE_STATE_EVENT))
++        attributes = mock_log.call_args.kwargs
++        assert attributes["sdk_version"] == "1.2.0"
++        assert "sdk_platform" not in attributes
++
+ 
+ class TestSDKLogsEventFields:
+     """The flattened fields are what makes per-type outcomes queryable in the logs."""
+diff --git a/backend/tests/api/v1/test_sdk_sync_logging.py b/backend/tests/api/v1/test_sdk_sync_logging.py
+new file mode 100644
+index 0000000000..2f4dd80530
+--- /dev/null
++++ b/backend/tests/api/v1/test_sdk_sync_logging.py
+@@ -0,0 +1,66 @@
++"""Tests for the attribution fields on the SDK sync batch log line."""
++
++from collections.abc import Generator
++from unittest.mock import MagicMock, patch
++
++import pytest
++from starlette.testclient import TestClient
++
++from app.config import settings
++from tests.factories import ApiKeyFactory
++
++_USER_ID = "123e4567-e89b-12d3-a456-426614174000"
++_BODY = {
++    "provider": "apple",
++    "sdkVersion": "1.0.0",
++    "syncTimestamp": "2021-01-01T00:00:00Z",
++    "data": {"records": [], "workouts": [], "sleep": []},
++}
++
++
++@pytest.fixture
++def mock_log() -> Generator[MagicMock, None, None]:
++    with (
++        patch("app.api.routes.v1.sdk_sync.process_sdk_upload"),
++        patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
++        patch.object(settings, "sdk_payload_s3_offload", False),
++        patch("app.api.routes.v1.sdk_sync.log_structured") as mock,
++    ):
++        yield mock
++
++
++def _batch_received(mock_log: MagicMock) -> dict:
++    return next(call.kwargs for call in mock_log.call_args_list if call.kwargs["action"] == "apple_sdk_batch_received")
++
++
++class TestSDKSyncAttribution:
++    def test_attribution_headers_are_logged(self, client: TestClient, api_v1_prefix: str, mock_log: MagicMock) -> None:
++        response = client.post(
++            f"{api_v1_prefix}/sdk/users/{_USER_ID}/sync/",
++            headers={
++                "X-Open-Wearables-API-Key": ApiKeyFactory().plain_key,
++                "X-Open-Wearables-SDK-Version": "0.15.0",
++                "X-Open-Wearables-SDK-Platform": "ios",
++                "X-Request-Id": "req-1",
++                "User-Agent": "OpenWearablesHealthSDK/0.15.0 (iOS 18.1.0; iPhone15,2)",
++            },
++            json=_BODY,
++        )
++
++        assert response.status_code == 202
++        attributes = _batch_received(mock_log)
++        assert attributes["sdk_version"] == "0.15.0"
++        assert attributes["sdk_platform"] == "ios"
++        assert attributes["request_id"] == "req-1"
++        assert attributes["user_agent"] == "OpenWearablesHealthSDK/0.15.0 (iOS 18.1.0; iPhone15,2)"
++
++    def test_body_version_is_the_fallback(self, client: TestClient, api_v1_prefix: str, mock_log: MagicMock) -> None:
++        client.post(
++            f"{api_v1_prefix}/sdk/users/{_USER_ID}/sync/",
++            headers={"X-Open-Wearables-API-Key": ApiKeyFactory().plain_key},
++            json=_BODY,
++        )
++
++        attributes = _batch_received(mock_log)
++        assert attributes["sdk_version"] == "1.0.0"
++        assert "sdk_platform" not in attributes
+diff --git a/backend/tests/utils_tests/test_access_log.py b/backend/tests/utils_tests/test_access_log.py
+index cd97d105eb..6a335b8b49 100644
+--- a/backend/tests/utils_tests/test_access_log.py
++++ b/backend/tests/utils_tests/test_access_log.py
+@@ -106,3 +106,31 @@ def test_secret_query_values_are_redacted(self, key: str) -> None:
+         assert "s3cret" not in path
+         assert f"{key}=REDACTED" in path
+         assert "appli=1" in path
++
++    def test_sdk_attribution_headers_are_logged(self) -> None:
++        client = _build_client(AccessLogLevel.ALL)
++        with patch("app.middlewares.log_structured") as mock:
++            client.get(
++                "/ok",
++                headers={
++                    "X-Open-Wearables-SDK-Version": "0.15.0",
++                    "X-Open-Wearables-SDK-Platform": "ios",
++                    "X-Request-Id": "req-1",
++                    "X-Open-Wearables-Outbox-Item": "combined_item_abc",
++                    "User-Agent": "OpenWearablesHealthSDK/0.15.0 (iOS 18.1.0; iPhone15,2)",
++                },
++            )
++        attributes = mock.call_args_list[0].kwargs
++        assert attributes["sdk_version"] == "0.15.0"
++        assert attributes["sdk_platform"] == "ios"
++        assert attributes["request_id"] == "req-1"
++        assert attributes["outbox_item_id"] == "combined_item_abc"
++        assert attributes["user_agent"] == "OpenWearablesHealthSDK/0.15.0 (iOS 18.1.0; iPhone15,2)"
++
++    def test_absent_sdk_headers_add_no_fields(self) -> None:
++        client = _build_client(AccessLogLevel.ALL)
++        with patch("app.middlewares.log_structured") as mock:
++            client.get("/ok", headers={"User-Agent": ""})
++        attributes = mock.call_args_list[0].kwargs
++        for key in ("sdk_version", "sdk_platform", "request_id", "outbox_item_id", "user_agent"):
++            assert key not in attributes
+diff --git a/backend/tests/utils_tests/test_sdk_request_metadata.py b/backend/tests/utils_tests/test_sdk_request_metadata.py
+new file mode 100644
+index 0000000000..130878c183
+--- /dev/null
++++ b/backend/tests/utils_tests/test_sdk_request_metadata.py
+@@ -0,0 +1,39 @@
++"""Tests for reading SDK attribution headers into log fields."""
++
++from starlette.datastructures import Headers
++
++from app.utils.sdk_request_metadata import sdk_request_metadata
++
++
++class TestSDKRequestMetadata:
++    def test_header_names_are_case_insensitive(self) -> None:
++        headers = Headers({"x-open-wearables-sdk-version": "0.15.0", "X-REQUEST-ID": "req-1"})
++
++        assert sdk_request_metadata(headers) == {"sdk_version": "0.15.0", "request_id": "req-1"}
++
++    def test_control_characters_are_stripped(self) -> None:
++        fields = sdk_request_metadata({"user-agent": "Agent/1.0\n\tfake=line\r"})
++
++        assert fields["user_agent"] == "Agent/1.0fake=line"
++
++    def test_long_values_are_truncated(self) -> None:
++        fields = sdk_request_metadata({"user-agent": "x" * 1000})
++
++        assert len(fields["user_agent"]) == 256
++
++    def test_blank_values_are_dropped(self) -> None:
++        assert sdk_request_metadata({"x-request-id": "  ", "x-open-wearables-sdk-platform": "\n"}) == {}
++
++    def test_header_version_wins_over_body(self) -> None:
++        fields = sdk_request_metadata({"x-open-wearables-sdk-version": "0.15.0"}, body_sdk_version="0.14.0")
++
++        assert fields["sdk_version"] == "0.15.0"
++
++    def test_body_version_is_sanitized(self) -> None:
++        fields = sdk_request_metadata({}, body_sdk_version="1.0.0\nfake=line" + "x" * 1000)
++
++        assert "\n" not in fields["sdk_version"]
++        assert len(fields["sdk_version"]) == 256
++
++    def test_non_string_body_version_is_ignored(self) -> None:
++        assert sdk_request_metadata({}, body_sdk_version={"nested": "1.0.0"}) == {}

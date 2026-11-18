@@ -1,0 +1,727 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_14_0/8320-retry-chunk-later-swallowed.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_14_0/8320-retry-chunk-later-swallowed.yaml
+new file mode 100644
+index 000000000000..d6b4c0312c02
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_14_0/8320-retry-chunk-later-swallowed.yaml
+@@ -0,0 +1,10 @@
++---
++type: fix
++issue: 8320
++title: "Previously, when a bulk-modify batch job such as `$reindex` needed to defer a work chunk (for example,
++  because terminology storage for a `CodeSystem` was still pending), the chunk failed instead and the job could
++  end in a `FAILED` state with `HAPI-2790`. The chunk is now deferred and retried later.
++  `RetryChunkLaterException`, `JobExecutionFailedException` and `ReductionStepFailureException` now implement
++  the new marker interface `IBatch2FrameworkException`. Custom batch2 job steps that catch broad exception types
++  such as `Exception` or `Throwable` must rethrow any exception implementing this interface so the framework can
++  act on it."
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/docs/server_jpa_batch/introduction.md b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/docs/server_jpa_batch/introduction.md
+index 29668afc1905..6d0ec6eadea7 100644
+--- a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/docs/server_jpa_batch/introduction.md
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/docs/server_jpa_batch/introduction.md
+@@ -53,6 +53,16 @@ When a notification message arrives, the handler does the following:
+ 1. If the step fails, the work chunk status is changed from `IN_PROGRESS` to either `ERRORED` or `FAILED`, depending on the severity of the error.
+ 1. If the step is a reduction step, the job routes to a reducer service (and the heartbeat is updated).
+ 
++### Exceptions Thrown by Job Steps
++
++A job step tells the batch2 framework how to handle its work chunk or job by throwing one of the following exceptions. Each of them implements the marker interface `ca.uhn.fhir.batch2.api.IBatch2FrameworkException`:
++
++- `RetryChunkLaterException`: the work chunk is moved to `POLL_WAITING` and is tried again after the requested delay.
++- `JobExecutionFailedException`: the work chunk is moved to `FAILED` immediately, without being retried.
++- `ReductionStepFailureException`: thrown by a reduction step to move the job to `FAILED`, optionally with a report.
++
++Code that runs in a job step, or below it, and catches a broad exception type such as `Exception`, `RuntimeException` or `Throwable`, must rethrow any exception that implements `IBatch2FrameworkException` unchanged. Swallowing one of these exceptions, or wrapping it in a different exception, hides it from the framework, so the work chunk or job is not handled the way the step intended. For example, if a `RetryChunkLaterException` is swallowed, the work chunk is not deferred and polled again later.
++
+ ### First Step
+ 
+ The first step in a job definition is executed with just the job parameters.
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/reindex/ReindexV3ModifyResourcesStepTest.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/reindex/ReindexV3ModifyResourcesStepTest.java
+index 51c3992a712e..353d95da8fd0 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/reindex/ReindexV3ModifyResourcesStepTest.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/reindex/ReindexV3ModifyResourcesStepTest.java
+@@ -2,6 +2,7 @@
+ 
+ import ca.uhn.fhir.batch2.api.IJobDataSink;
+ import ca.uhn.fhir.batch2.api.IJobStepExecutionServices;
++import ca.uhn.fhir.batch2.api.RetryChunkLaterException;
+ import ca.uhn.fhir.batch2.api.RunOutcome;
+ import ca.uhn.fhir.batch2.api.StepExecutionDetails;
+ import ca.uhn.fhir.batch2.jobs.bulkmodify.framework.common.BulkModifyResourcesChunkOutcomeJson;
+@@ -16,6 +17,7 @@
+ import ca.uhn.fhir.jpa.model.entity.ResourceTable;
+ import ca.uhn.fhir.jpa.test.BaseJpaR4Test;
+ import org.hl7.fhir.instance.model.api.IIdType;
++import org.hl7.fhir.r4.model.CodeSystem;
+ import org.hl7.fhir.r4.model.Enumerations;
+ import org.hl7.fhir.r4.model.IdType;
+ import org.hl7.fhir.r4.model.Patient;
+@@ -28,10 +30,12 @@
+ import org.springframework.beans.factory.annotation.Autowired;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
+ 
+ @SuppressWarnings("removal")
+ public class ReindexV3ModifyResourcesStepTest extends BaseJpaR4Test {
+@@ -306,5 +310,44 @@ public void testReindex_OneResourceReindexFailedButOthersSucceeded() {
+ 		});
+ 	}
+ 
++	/**
++	 * The HAPI-2830 guard runs before the step opens its database transaction. When terminology storage
++	 * still has pending work for a CodeSystem, the whole chunk must be deferred with a
++	 * {@link RetryChunkLaterException}, and must not be recorded as a failure against the chunk's resources.
++	 */
++	@Test
++	public void testReindex_CodeSystemWithPendingTerminologyStorage_DefersChunkAndEmitsNoOutcome() {
++		// Setup
++		CodeSystem codeSystem = new CodeSystem();
++		codeSystem.setUrl("http://example.com/cs-pending-terminology-storage");
++		codeSystem.setStatus(Enumerations.PublicationStatus.ACTIVE);
++		codeSystem.setContent(CodeSystem.CodeSystemContentMode.NOTPRESENT);
++		Long codeSystemPid = myCodeSystemDao.create(codeSystem, mySrd).getId().getIdPartAsLong();
++
++		TypedPidAndVersionListWorkChunkJson data = new TypedPidAndVersionListWorkChunkJson();
++		data.addTypedPidWithNullPartitionForUnitTest("CodeSystem", codeSystemPid);
++
++		JobInstance instance = new JobInstance();
++		instance.setInstanceId("index-id");
++		StepExecutionDetails<ReindexJobParameters, TypedPidAndVersionListWorkChunkJson> stepExecutionDetails = new StepExecutionDetails<>(
++			new ReindexJobParameters(),
++			data,
++			instance,
++			new WorkChunk().setId("chunk-id"),
++			myJobStepExecutionServices
++		);
++
++		// Pausing deferred processing makes the terminology storage queue report pending work
++		myTerminologyDeferredStorageSvc.setProcessDeferred(false);
++		try {
++			// Execute and verify
++			assertThatThrownBy(() -> myReindexStepV1.run(stepExecutionDetails, myDataSink))
++				.isInstanceOf(RetryChunkLaterException.class)
++				.hasMessageContaining("HAPI-2830");
++			verifyNoInteractions(myDataSink);
++		} finally {
++			myTerminologyDeferredStorageSvc.setProcessDeferred(true);
++		}
++	}
+ 
+ }
+diff --git a/hapi-fhir-storage-batch2-jobs/src/main/java/ca/uhn/fhir/batch2/jobs/bulkmodify/framework/base/BaseBulkModifyResourcesStep.java b/hapi-fhir-storage-batch2-jobs/src/main/java/ca/uhn/fhir/batch2/jobs/bulkmodify/framework/base/BaseBulkModifyResourcesStep.java
+index 2b257258bcf8..57126e67480a 100644
+--- a/hapi-fhir-storage-batch2-jobs/src/main/java/ca/uhn/fhir/batch2/jobs/bulkmodify/framework/base/BaseBulkModifyResourcesStep.java
++++ b/hapi-fhir-storage-batch2-jobs/src/main/java/ca/uhn/fhir/batch2/jobs/bulkmodify/framework/base/BaseBulkModifyResourcesStep.java
+@@ -19,9 +19,11 @@
+  */
+ package ca.uhn.fhir.batch2.jobs.bulkmodify.framework.base;
+ 
++import ca.uhn.fhir.batch2.api.IBatch2FrameworkException;
+ import ca.uhn.fhir.batch2.api.IJobDataSink;
+ import ca.uhn.fhir.batch2.api.IJobStepWorker;
+ import ca.uhn.fhir.batch2.api.JobExecutionFailedException;
++import ca.uhn.fhir.batch2.api.RetryChunkLaterException;
+ import ca.uhn.fhir.batch2.api.RunOutcome;
+ import ca.uhn.fhir.batch2.api.StepExecutionDetails;
+ import ca.uhn.fhir.batch2.jobs.bulkmodify.framework.common.BulkModifyResourcesChunkOutcomeJson;
+@@ -93,6 +95,22 @@ public BaseBulkModifyResourcesStep() {
+ 		super();
+ 	}
+ 
++	/**
++	 * Modifies the resources in the work chunk, first in a single transaction and then, for any that failed,
++	 * one resource at a time in separate transactions, so that a failure on one resource doesn't block the
++	 * others. Failures of individual resources are recorded in the emitted outcome rather than thrown.
++	 * <p>
++	 * The following are not recorded as per-resource failures. They propagate out of this method so that the
++	 * batch2 framework can act on them, for example by deferring the work chunk in response to a
++	 * {@link RetryChunkLaterException}:
++	 * </p>
++	 * <ul>
++	 *    <li>Any exception thrown by {@link #processPidsOutsideTransaction}</li>
++	 *    <li>Any {@link IBatch2FrameworkException} thrown by {@link #processPidsInTransaction}</li>
++	 * </ul>
++	 *
++	 * @throws RetryChunkLaterException If a subclass hook asked for the work chunk to be polled again later
++	 */
+ 	@Nonnull
+ 	@Override
+ 	public RunOutcome run(
+@@ -183,11 +201,12 @@ private void processPids(
+ 		HapiTransactionService.noTransactionAllowed();
+ 
+ 		final TransactionDetails transactionDetails = new TransactionDetails();
+-		try {
+ 
+-			processPidsOutsideTransaction(
+-					theStepExecutionDetails, theJobParameters, theState, thePids, transactionDetails, theDataSink);
++		// Must stay outside the try below - see processPidsOutsideTransaction javadoc
++		processPidsOutsideTransaction(
++				theStepExecutionDetails, theJobParameters, theState, thePids, transactionDetails, theDataSink);
+ 
++		try {
+ 			myTransactionService
+ 					.withSystemRequestOnPartition(theRequestPartitionId)
+ 					.withTransactionDetails(transactionDetails)
+@@ -198,9 +217,10 @@ private void processPids(
+ 			// Storage transaction succeeded
+ 			theState.movePendingToSaved();
+ 
+-		} catch (JobExecutionFailedException e) {
+-			throw e;
+ 		} catch (Throwable e) {
++			if (e instanceof IBatch2FrameworkException) {
++				throw e;
++			}
+ 			String failureMessage = e.toString();
+ 			ourLog.warn("Failure occurred during bulk modification. Failure: {}", failureMessage);
+ 			for (TypedPidAndVersionJson pid : thePids) {
+@@ -217,6 +237,14 @@ private void processPids(
+ 	 * For each group of PIDs, this method is called outside of any FHIR transaction, prior to
+ 	 * {@link #processPidsInTransaction(StepExecutionDetails, State, List, TransactionDetails, IJobDataSink)}
+ 	 * being called. It can handle any pre-processing that needs to happen outside of a DB transaction.
++	 * <p>
++	 * This method is called outside of the failure handling that converts a failed storage transaction into
++	 * per-resource failures, so any exception thrown here fails the work chunk as a whole rather than being
++	 * attributed to individual resources. In particular, an implementation may throw
++	 * {@link RetryChunkLaterException} to defer the entire work chunk and have it polled again later. Note that
++	 * a deferred chunk is re-run <b>from the beginning</b>, meaning that any PIDs already committed earlier in
++	 * that chunk will be processed a second time, so implementations which defer must tolerate that.
++	 * </p>
+ 	 *
+ 	 * @param theStepExecutionDetails The step execution details for this work chunk
+ 	 * @param theJobParameters      The job parameters for this job instance
+@@ -246,6 +274,12 @@ protected void processPidsOutsideTransaction(
+ 	 * group), you should override {@link BaseBulkModifyResourcesIndividuallyStep} instead of
+ 	 * this class.
+ 	 * </p>
++	 * <p>
++	 * A generic exception thrown here is converted into a per-resource failure for the PIDs in
++	 * {@literal thePids}. An {@link IBatch2FrameworkException} is instead propagated unchanged to the batch2
++	 * framework; throwing {@link RetryChunkLaterException} defers the whole work chunk, with the re-run caveat
++	 * described on {@link #processPidsOutsideTransaction}.
++	 * </p>
+ 	 *
+ 	 * @param theStepExecutionDetails The step execution details for this work chunk
+ 	 * @param theState                The modification state object, which must be updated for all PIDs
+diff --git a/hapi-fhir-storage-batch2-jobs/src/test/java/ca/uhn/fhir/batch2/jobs/bulkmodify/framework/base/BaseBulkModifyResourcesStepTest.java b/hapi-fhir-storage-batch2-jobs/src/test/java/ca/uhn/fhir/batch2/jobs/bulkmodify/framework/base/BaseBulkModifyResourcesStepTest.java
+new file mode 100644
+index 000000000000..40105a594a4b
+--- /dev/null
++++ b/hapi-fhir-storage-batch2-jobs/src/test/java/ca/uhn/fhir/batch2/jobs/bulkmodify/framework/base/BaseBulkModifyResourcesStepTest.java
+@@ -0,0 +1,367 @@
++package ca.uhn.fhir.batch2.jobs.bulkmodify.framework.base;
++
++import ca.uhn.fhir.batch2.api.IBatch2FrameworkException;
++import ca.uhn.fhir.batch2.api.IJobDataSink;
++import ca.uhn.fhir.batch2.api.IJobStepExecutionServices;
++import ca.uhn.fhir.batch2.api.JobExecutionFailedException;
++import ca.uhn.fhir.batch2.api.ReductionStepFailureException;
++import ca.uhn.fhir.batch2.api.RetryChunkLaterException;
++import ca.uhn.fhir.batch2.api.RunOutcome;
++import ca.uhn.fhir.batch2.api.StepExecutionDetails;
++import ca.uhn.fhir.batch2.jobs.bulkmodify.framework.common.BulkModifyResourcesChunkOutcomeJson;
++import ca.uhn.fhir.batch2.jobs.chunk.TypedPidAndVersionJson;
++import ca.uhn.fhir.batch2.jobs.chunk.TypedPidAndVersionListWorkChunkJson;
++import ca.uhn.fhir.batch2.model.JobInstance;
++import ca.uhn.fhir.batch2.model.WorkChunk;
++import ca.uhn.fhir.context.FhirContext;
++import ca.uhn.fhir.i18n.Msg;
++import ca.uhn.fhir.jpa.api.svc.IIdHelperService;
++import ca.uhn.fhir.jpa.dao.tx.HapiTransactionService;
++import ca.uhn.fhir.jpa.dao.tx.IHapiTransactionService;
++import ca.uhn.fhir.rest.api.server.storage.IResourcePersistentId;
++import ca.uhn.fhir.rest.api.server.storage.TransactionDetails;
++import jakarta.annotation.Nullable;
++import org.hl7.fhir.r4.model.IdType;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.extension.ExtendWith;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.MethodSource;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Captor;
++import org.mockito.InjectMocks;
++import org.mockito.Mock;
++import org.mockito.Spy;
++import org.mockito.junit.jupiter.MockitoExtension;
++import org.springframework.transaction.support.SimpleTransactionStatus;
++import org.springframework.transaction.support.TransactionCallback;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
++
++import java.time.Duration;
++import java.util.List;
++import java.util.stream.Stream;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.lenient;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++
++/**
++ * Unit tests for the exception-routing contract of {@link BaseBulkModifyResourcesStep#run(StepExecutionDetails, IJobDataSink)}.
++ * <p>
++ * Note: the hooks below never assert - the production code wraps the in-transaction hook in a
++ * <code>catch (Throwable)</code> which would swallow an {@link AssertionError} and turn a failing test green.
++ * Observations are recorded into fields and asserted after <code>run()</code> returns.
++ * </p>
++ */
++@SuppressWarnings("unused")
++@ExtendWith(MockitoExtension.class)
++// Created by claude-opus-5
++class BaseBulkModifyResourcesStepTest {
++
++	private static final String RESOURCE_TYPE = "Patient";
++	private static final String RESOURCE_ID_VALUE = "Patient/ABC/_history/123";
++	private static final String FALLBACK_ID_VALUE = "Patient/ABC";
++
++	@Spy
++	private IHapiTransactionService myTransactionService = new MyMockTxService();
++
++	@Mock
++	private IIdHelperService<IResourcePersistentId<?>> myIdHelperService;
++
++	@Spy
++	private FhirContext myFhirContext = FhirContext.forR4Cached();
++
++	@Mock
++	private IJobStepExecutionServices myJobStepExecutionServices;
++
++	@Mock
++	private IJobDataSink<BulkModifyResourcesChunkOutcomeJson> mySink;
++
++	@Captor
++	private ArgumentCaptor<BulkModifyResourcesChunkOutcomeJson> myDataCaptor;
++
++	@InjectMocks
++	private MySvc mySvc = new MySvc();
++
++	/**
++	 * Optional action run by {@link MySvc#processPidsOutsideTransaction} - typically throws.
++	 */
++	private IHookAction myOutsideTransactionAction;
++
++	/**
++	 * Optional action run by {@link MySvc#processPidsInTransaction} before the default body - typically throws.
++	 */
++	private IHookAction myInTransactionAction;
++
++	private int myOutsideTransactionInvocationCount;
++	private int myInTransactionInvocationCount;
++	private Boolean myTransactionActiveInOutsideTransactionHook;
++	private Boolean myTransactionActiveInInTransactionHook;
++
++	/**
++	 * A {@link RetryChunkLaterException} raised by the outside-transaction hook is a <b>retry signal</b>, not a
++	 * failure. It must escape <code>run()</code> so that
++	 * <code>StepExecutor</code> can move the work chunk to POLL_WAITING.
++	 */
++	@Test
++	void testRun_preFlightThrowsRetryChunkLater_propagatesToStepExecutor() {
++		// Setup
++		stubIdHelperForUnresolvedPid();
++		myOutsideTransactionAction =
++				(theState, thePids) -> {
++					throw new RetryChunkLaterException(Msg.code(2830), Duration.ofSeconds(10));
++				};
++		StepExecutionDetails<MyParameters, TypedPidAndVersionListWorkChunkJson> details = createDetails();
++
++		// Test & Verify
++		assertThatThrownBy(() -> mySvc.run(details, mySink)).isInstanceOf(RetryChunkLaterException.class);
++
++		verifyNoInteractions(mySink);
++		assertThat(myOutsideTransactionInvocationCount).isEqualTo(1);
++	}
++
++	/**
++	 * A {@link JobExecutionFailedException} raised by the outside-transaction hook is an unrecoverable failure and
++	 * must escape <code>run()</code> unchanged.
++	 */
++	@Test
++	void testRun_preFlightThrowsJobExecutionFailed_stillPropagates() {
++		// Setup
++		myOutsideTransactionAction =
++				(theState, thePids) -> {
++					throw new JobExecutionFailedException("unrecoverable-marker");
++				};
++		StepExecutionDetails<MyParameters, TypedPidAndVersionListWorkChunkJson> details = createDetails();
++
++		// Test & Verify
++		assertThatThrownBy(() -> mySvc.run(details, mySink))
++				.isInstanceOf(JobExecutionFailedException.class)
++				.hasMessageContaining("unrecoverable-marker");
++
++		verifyNoInteractions(mySink);
++		assertThat(myOutsideTransactionInvocationCount).isEqualTo(1);
++	}
++
++	/**
++	 * A framework signal ({@link IBatch2FrameworkException}) raised from inside the transactional body must
++	 * escape <code>run()</code> unchanged - the same instance, not wrapped or recorded as a per-resource
++	 * failure - so that <code>StepExecutor</code> / <code>ReductionStepExecutorServiceImpl</code> can act on it.
++	 */
++	@ParameterizedTest
++	@MethodSource("frameworkExceptions")
++	void testRun_inTransactionThrowsFrameworkException_propagatesUnchanged(RuntimeException theFrameworkException) {
++		// Setup
++		stubIdHelperForUnresolvedPid();
++		myInTransactionAction = (theState, thePids) -> {
++			throw theFrameworkException;
++		};
++		StepExecutionDetails<MyParameters, TypedPidAndVersionListWorkChunkJson> details = createDetails();
++
++		// Test & Verify
++		assertThatThrownBy(() -> mySvc.run(details, mySink)).isSameAs(theFrameworkException);
++
++		verifyNoInteractions(mySink);
++		assertThat(myInTransactionInvocationCount).isEqualTo(1);
++	}
++
++	static Stream<RuntimeException> frameworkExceptions() {
++		return Stream.of(
++				new RetryChunkLaterException(Msg.code(2830), Duration.ofSeconds(10)),
++				new JobExecutionFailedException("unrecoverable-marker"),
++				new ReductionStepFailureException("reduction-marker", new BulkModifyResourcesChunkOutcomeJson()));
++	}
++
++	/**
++	 * A generic failure inside the transaction is a per-resource failure and must be recorded in the emitted
++	 * outcome rather than thrown. If this ever turns red, the set of exceptions rethrown out of
++	 * <code>run()</code> has been over-broadened.
++	 */
++	@Test
++	void testRun_inTransactionThrowsGenericException_recordedAsPerResourceFailure() {
++		// Setup
++		myInTransactionAction = (theState, thePids) -> {
++			for (TypedPidAndVersionJson pid : thePids) {
++				theState.setResourceIdForPid(pid, new IdType(RESOURCE_ID_VALUE));
++			}
++			throw new MyTestFailureException("in-transaction boom");
++		};
++		StepExecutionDetails<MyParameters, TypedPidAndVersionListWorkChunkJson> details = createDetails();
++
++		// Test
++		RunOutcome outcome = mySvc.run(details, mySink);
++
++		// Verify
++		assertThat(outcome.getRecordsProcessed()).isEqualTo(1);
++		verify(mySink, times(1)).accept(myDataCaptor.capture());
++		BulkModifyResourcesChunkOutcomeJson outputData = myDataCaptor.getValue();
++		assertThat(outputData.getFailures()).containsOnlyKeys(RESOURCE_ID_VALUE);
++		assertThat(outputData.getFailures().get(RESOURCE_ID_VALUE)).contains("in-transaction boom");
++		assertThat(outputData.getChangedIds()).isEmpty();
++		assertThat(myOutsideTransactionInvocationCount).isEqualTo(3);
++		assertThat(myInTransactionInvocationCount).isEqualTo(3);
++		assertThat(outputData.getChunkRetryCount()).isEqualTo(2);
++	}
++
++	/**
++	 * A generic failure in the outside-transaction hook is a whole-chunk guard failure, so it must escape
++	 * <code>run()</code> and let <code>StepExecutor</code> mark the chunk retriable ERRORED, rather than
++	 * being mis-attributed to each individual resource.
++	 */
++	@Test
++	void testRun_preFlightThrowsGenericException_propagatesSoChunkCanBeRetried() {
++		// Setup
++		stubIdHelperForUnresolvedPid();
++		myOutsideTransactionAction =
++				(theState, thePids) -> {
++					throw new MyTestFailureException("pre-flight boom");
++				};
++		StepExecutionDetails<MyParameters, TypedPidAndVersionListWorkChunkJson> details = createDetails();
++
++		// Test & Verify
++		assertThatThrownBy(() -> mySvc.run(details, mySink))
++				.isInstanceOf(MyTestFailureException.class)
++				.hasMessageContaining("pre-flight boom");
++
++		verifyNoInteractions(mySink);
++		assertThat(myOutsideTransactionInvocationCount).isEqualTo(1);
++	}
++
++	/**
++	 * Invariant guard - the outside-transaction hook must run exactly once, outside any transaction, before the
++	 * transactional body runs inside one.
++	 */
++	@Test
++	void testRun_happyPath_preFlightRunsOutsideTransactionAndBodyRunsInside() {
++		// Setup
++		StepExecutionDetails<MyParameters, TypedPidAndVersionListWorkChunkJson> details = createDetails();
++
++		// Test
++		RunOutcome outcome = mySvc.run(details, mySink);
++
++		// Verify
++		assertThat(myTransactionActiveInOutsideTransactionHook).isFalse();
++		assertThat(myTransactionActiveInInTransactionHook).isTrue();
++		assertThat(myOutsideTransactionInvocationCount).isEqualTo(1);
++		assertThat(myInTransactionInvocationCount).isEqualTo(1);
++		assertThat(outcome.getRecordsProcessed()).isEqualTo(1);
++
++		verify(mySink, times(1)).accept(myDataCaptor.capture());
++		BulkModifyResourcesChunkOutcomeJson outputData = myDataCaptor.getValue();
++		assertThat(outputData.getUnchangedIds()).containsExactly(RESOURCE_ID_VALUE);
++		assertThat(outputData.getFailures()).isEmpty();
++	}
++
++	private StepExecutionDetails<MyParameters, TypedPidAndVersionListWorkChunkJson> createDetails() {
++		TypedPidAndVersionListWorkChunkJson data = new TypedPidAndVersionListWorkChunkJson();
++		data.addTypedPidWithNullPartitionForUnitTest(RESOURCE_TYPE, 1L, null);
++		return new StepExecutionDetails<>(
++				new MyParameters(),
++				data,
++				new JobInstance(),
++				new WorkChunk().setId("my-chunk-id"),
++				myJobStepExecutionServices);
++	}
++
++	/**
++	 * A PID that fails before its resource has been fetched has no ID in the {@link BaseBulkModifyResourcesStep.State},
++	 * so <code>BaseBulkModifyResourcesStep#toId</code> falls back to the ID helper. An unstubbed mock returns
++	 * null there, which would surface as a {@link NullPointerException} out of
++	 * {@link BulkModifyResourcesChunkOutcomeJson#addFailure} rather than as an assertion failure. The stub is
++	 * {@link org.mockito.Mockito#lenient()} because it is only consumed when a hook failure is recorded in the
++	 * outcome instead of propagating.
++	 */
++	private void stubIdHelperForUnresolvedPid() {
++		lenient()
++				.when(myIdHelperService.translatePidIdToForcedId(any(), any(), any()))
++				.thenReturn(new IdType(FALLBACK_ID_VALUE));
++	}
++
++	@FunctionalInterface
++	private interface IHookAction {
++		void execute(BaseBulkModifyResourcesStep.State theState, List<TypedPidAndVersionJson> thePids);
++	}
++
++	/**
++	 * Marker type so that an incidental {@link NullPointerException} can not satisfy an
++	 * <code>isInstanceOf(...)</code> assertion about a "generic" failure.
++	 */
++	private static class MyTestFailureException extends RuntimeException {
++		private static final long serialVersionUID = 1L;
++
++		MyTestFailureException(String theMessage) {
++			super(theMessage);
++		}
++	}
++
++	private static class MyParameters extends BaseBulkModifyJobParameters {
++		// nothing
++	}
++
++	private static class MyMockTxService extends HapiTransactionService {
++
++		@Nullable
++		@Override
++		public <T> T doExecute(ExecutionBuilder theExecutionBuilder, TransactionCallback<T> theCallback) {
++			boolean initialState = TransactionSynchronizationManager.isActualTransactionActive();
++			try {
++				if (!initialState) {
++					TransactionSynchronizationManager.setActualTransactionActive(true);
++				}
++				return theCallback.doInTransaction(new SimpleTransactionStatus());
++			} finally {
++				if (!initialState) {
++					TransactionSynchronizationManager.setActualTransactionActive(false);
++				}
++			}
++		}
++	}
++
++	/**
++	 * Extends {@link BaseBulkModifyResourcesStep} directly, rather than
++	 * {@link BaseBulkModifyResourcesIndividuallyStep}, so that both hooks can be overridden, as steps such as
++	 * <code>ReindexV3ModifyResourcesStep</code> do.
++	 */
++	private class MySvc extends BaseBulkModifyResourcesStep<MyParameters, Void> {
++
++		@Override
++		protected void processPidsOutsideTransaction(
++				StepExecutionDetails<MyParameters, TypedPidAndVersionListWorkChunkJson> theStepExecutionDetails,
++				MyParameters theJobParameters,
++				State theState,
++				List<TypedPidAndVersionJson> thePids,
++				TransactionDetails theTransactionDetails,
++				IJobDataSink<BulkModifyResourcesChunkOutcomeJson> theDataSink) {
++			myOutsideTransactionInvocationCount++;
++			myTransactionActiveInOutsideTransactionHook = TransactionSynchronizationManager.isActualTransactionActive();
++			if (myOutsideTransactionAction != null) {
++				myOutsideTransactionAction.execute(theState, thePids);
++			}
++		}
++
++		@Override
++		protected void processPidsInTransaction(
++				StepExecutionDetails<MyParameters, TypedPidAndVersionListWorkChunkJson> theStepExecutionDetails,
++				State theState,
++				List<TypedPidAndVersionJson> thePids,
++				TransactionDetails theTransactionDetails,
++				IJobDataSink<BulkModifyResourcesChunkOutcomeJson> theDataSink) {
++			myInTransactionInvocationCount++;
++			myTransactionActiveInInTransactionHook = TransactionSynchronizationManager.isActualTransactionActive();
++			if (myInTransactionAction != null) {
++				myInTransactionAction.execute(theState, thePids);
++			}
++			for (TypedPidAndVersionJson pid : thePids) {
++				theState.setResourceIdForPid(pid, new IdType(RESOURCE_ID_VALUE));
++				theState.moveToState(pid, StateEnum.UNCHANGED);
++			}
++		}
++
++		@Override
++		protected String getJobNameForLogging() {
++			return "TEST-STEP";
++		}
++	}
++}
+diff --git a/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/IBatch2FrameworkException.java b/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/IBatch2FrameworkException.java
+new file mode 100644
+index 000000000000..860b3120b395
+--- /dev/null
++++ b/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/IBatch2FrameworkException.java
+@@ -0,0 +1,37 @@
++/*-
++ * #%L
++ * HAPI FHIR JPA Server - Batch2 Task Processor
++ * %%
++ * Copyright (C) 2014 - 2026 Smile CDR, Inc.
++ * %%
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ * #L%
++ */
++package ca.uhn.fhir.batch2.api;
++
++/**
++ * Marker interface for exceptions that a job step throws to tell the batch2 framework
++ * (<code>StepExecutor</code> / <code>ReductionStepExecutorServiceImpl</code>) how to handle the
++ * current work chunk or job, for example {@link RetryChunkLaterException} to poll the chunk again
++ * later, or {@link JobExecutionFailedException} to fail it without retrying.
++ * <p>
++ * Code running in or below a job step that catches broad exception types (<code>Exception</code>,
++ * <code>RuntimeException</code>, <code>Throwable</code>) must rethrow exceptions implementing this
++ * interface unchanged - wrapping or swallowing them hides the signal from the framework.
++ * </p>
++ * <p>
++ * Implementations must be unchecked, i.e. extend {@link RuntimeException}.
++ * </p>
++ */
++// Created by claude-opus-5-5
++public interface IBatch2FrameworkException {}
+diff --git a/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/JobExecutionFailedException.java b/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/JobExecutionFailedException.java
+index e132a722e393..3d60d4940c4a 100644
+--- a/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/JobExecutionFailedException.java
++++ b/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/JobExecutionFailedException.java
+@@ -30,7 +30,8 @@
+  * you should throw {@link ca.uhn.fhir.rest.server.exceptions.InternalErrorException} instead.
+  * </p>
+  */
+-public class JobExecutionFailedException extends BaseUnrecoverableRuntimeException {
++public class JobExecutionFailedException extends BaseUnrecoverableRuntimeException
++		implements IBatch2FrameworkException {
+ 
+ 	private static final long serialVersionUID = 4871161727526723730L;
+ 
+diff --git a/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/ReductionStepFailureException.java b/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/ReductionStepFailureException.java
+index 5b10f814eab4..6dd94e6ee664 100644
+--- a/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/ReductionStepFailureException.java
++++ b/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/ReductionStepFailureException.java
+@@ -25,7 +25,8 @@
+ /**
+  * This class holds the report produced at the end of a bulk import
+  */
+-public class ReductionStepFailureException extends BaseUnrecoverableRuntimeException {
++public class ReductionStepFailureException extends BaseUnrecoverableRuntimeException
++		implements IBatch2FrameworkException {
+ 
+ 	private final IModelJson myReportMsg;
+ 
+diff --git a/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/RetryChunkLaterException.java b/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/RetryChunkLaterException.java
+index 01a23e3b3ff6..aaa5d389b1b1 100644
+--- a/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/RetryChunkLaterException.java
++++ b/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/api/RetryChunkLaterException.java
+@@ -26,7 +26,7 @@
+  * Exception that is thrown when a polling step needs to be retried at a later
+  * time.
+  */
+-public class RetryChunkLaterException extends RuntimeException {
++public class RetryChunkLaterException extends RuntimeException implements IBatch2FrameworkException {
+ 
+ 	private static final Duration ONE_MINUTE = Duration.of(1, ChronoUnit.MINUTES);
+ 
+diff --git a/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/coordinator/StepExecutor.java b/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/coordinator/StepExecutor.java
+index c66eef127ee3..b9470b7c5857 100644
+--- a/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/coordinator/StepExecutor.java
++++ b/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/coordinator/StepExecutor.java
+@@ -23,6 +23,7 @@
+ import ca.uhn.fhir.batch2.api.IJobStepWorker;
+ import ca.uhn.fhir.batch2.api.JobExecutionFailedException;
+ import ca.uhn.fhir.batch2.api.JobStepFailedException;
++import ca.uhn.fhir.batch2.api.ReductionStepFailureException;
+ import ca.uhn.fhir.batch2.api.RetryChunkLaterException;
+ import ca.uhn.fhir.batch2.api.RunOutcome;
+ import ca.uhn.fhir.batch2.api.StepExecutionDetails;
+@@ -70,7 +71,7 @@ <PT extends IModelJson, IT extends IModelJson, OT extends IModelJson> boolean ex
+ 					ex.getNextPollDuration().get(ChronoUnit.SECONDS));
+ 			myJobPersistence.onWorkChunkPollDelay(theStepExecutionDetails.getChunkId(), nextPollTime);
+ 			return false;
+-		} catch (JobExecutionFailedException e) {
++		} catch (JobExecutionFailedException | ReductionStepFailureException e) {
+ 			ourLog.error(
+ 					"Unrecoverable failure executing job {} step {} chunk {}",
+ 					jobDefinitionId,
+diff --git a/hapi-fhir-storage-batch2/src/test/java/ca/uhn/fhir/batch2/coordinator/WorkChunkProcessorTest.java b/hapi-fhir-storage-batch2/src/test/java/ca/uhn/fhir/batch2/coordinator/WorkChunkProcessorTest.java
+index d22b3632d270..f1de074da7cc 100644
+--- a/hapi-fhir-storage-batch2/src/test/java/ca/uhn/fhir/batch2/coordinator/WorkChunkProcessorTest.java
++++ b/hapi-fhir-storage-batch2/src/test/java/ca/uhn/fhir/batch2/coordinator/WorkChunkProcessorTest.java
+@@ -9,6 +9,7 @@
+ import ca.uhn.fhir.batch2.api.IReductionStepWorker;
+ import ca.uhn.fhir.batch2.api.JobExecutionFailedException;
+ import ca.uhn.fhir.batch2.api.JobStepFailedException;
++import ca.uhn.fhir.batch2.api.ReductionStepFailureException;
+ import ca.uhn.fhir.batch2.api.RunOutcome;
+ import ca.uhn.fhir.batch2.api.StepExecutionDetails;
+ import ca.uhn.fhir.batch2.api.VoidModel;
+@@ -45,6 +46,8 @@
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyList;
+ import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.contains;
++import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.spy;
+@@ -217,6 +220,16 @@ public void doExecute_stepWorkerThrowsJobExecutionException_marksWorkChunkAsFail
+ 			.onWorkChunkFailed(anyString(), anyString());
+ 	}
+ 
++	@Test
++	public void doExecute_stepWorkerThrowsReductionStepFailureException_marksWorkChunkAsFailedWithoutRetry() {
++		runExceptionThrowingTest(new ReductionStepFailureException("Report failure", new VoidModel()));
++
++		verify(myJobPersistence)
++			.onWorkChunkFailed(eq("chunkId"), contains("Report failure"));
++		verify(myJobPersistence, never())
++			.onWorkChunkError(any(WorkChunkErrorEvent.class));
++	}
++
+ 	@Test
+ 	public void doExecution_stepWorkerThrowsRandomException_rethrowsJobStepFailedException() {
+ 		String msg = "failure";

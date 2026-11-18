@@ -1,0 +1,272 @@
+diff --git a/mirobody/agent/chat/model.py b/mirobody/agent/chat/model.py
+index 25e5d9f0..429484ec 100644
+--- a/mirobody/agent/chat/model.py
++++ b/mirobody/agent/chat/model.py
+@@ -52,6 +52,12 @@ def _null_is_absent(cls, data: Any) -> Any:
+     #: What `th_messages.scene` records: which surface the turn came from.
+     scene: str = "web"
+ 
++    #: Eval-only: pins the agent's "now" for this turn to an ISO date (noon
++    #: that day, in `timezone`) or an ISO datetime. Honoured only when the
++    #: server has `EVAL_AS_OF_ENABLED` set (`chat/service.py::chat_handler`);
++    #: a request that carries it otherwise is refused, not silently ignored.
++    as_of: str = ""
++
+ 
+ def has_attachment(file_list: Any) -> bool:
+     """True when this turn really carries a file the agent can reach.
+diff --git a/mirobody/agent/chat/service.py b/mirobody/agent/chat/service.py
+index c4e2e10c..72506d02 100644
+--- a/mirobody/agent/chat/service.py
++++ b/mirobody/agent/chat/service.py
+@@ -389,6 +389,25 @@ async def chat_handler(self, request: Request) -> Response:
+                             for err in errors)
+             return json_response_with_code(-2, f"Invalid field(s): {bad}", request=request)
+ 
++        #-------------------------------------------------
++
++        # `as_of` redates the whole turn for a frozen eval run; an ordinary
++        # deployment must refuse it outright rather than quietly answer from
++        # the real clock as if it had been honoured.
++        if body.as_of:
++            from mirobody.agent.clock import eval_as_of_enabled, parse_as_of
++            from mirobody.utils.config import get_default_timezone
++
++            if not eval_as_of_enabled():
++                return json_response_with_code(
++                    -5, "as_of is not enabled on this server (EVAL_AS_OF_ENABLED is off).",
++                    request=request,
++                )
++            try:
++                parse_as_of(body.as_of, body.timezone or get_default_timezone())
++            except ValueError as e:
++                return json_response_with_code(-2, f"Invalid as_of: {e}", request=request)
++
+         return StreamingResponse(
+             turn.stream(body),
+             headers=sse_headers(),
+diff --git a/mirobody/agent/chat/turn.py b/mirobody/agent/chat/turn.py
+index d48a165c..cd23f7b7 100644
+--- a/mirobody/agent/chat/turn.py
++++ b/mirobody/agent/chat/turn.py
+@@ -23,10 +23,12 @@
+ import logging
+ import uuid
+ 
++from contextlib import nullcontext
+ from typing import Any
+ from collections.abc import AsyncGenerator
+ 
+ from mirobody.agent.checkpointer import thread_for
++from mirobody.agent.clock import as_of, parse_as_of
+ from mirobody.agent.registry import agent_name, new_agent
+ from mirobody.agent.chat.file import process_files_from_storage
+ from mirobody.agent.errors import client_safe_error
+@@ -88,6 +90,11 @@ async def run(params: ChatStreamRequest) -> AsyncGenerator[dict[str, Any], None]
+         params.query_user_id = params.query_user_id or params.user_id
+         params.session_id = params.session_id or str(uuid.uuid4())
+ 
++        # Validated and gated by `chat_handler` already; parsed again here
++        # (cheap, a short string) rather than threaded through as a second
++        # field, so `ChatStreamRequest` keeps carrying only what the client sent.
++        moment = parse_as_of(params.as_of, params.timezone or get_default_timezone()) if params.as_of else None
++
+         may_read, may_write = await _access(params)
+         if not may_read:
+             yield {"type": ERROR, "message": "No permission to chat for this user"}
+@@ -125,8 +132,12 @@ async def run(params: ChatStreamRequest) -> AsyncGenerator[dict[str, Any], None]
+         if saved:
+             spawn(_summarize_once(params.user_id, params.session_id))
+ 
+-        async for block in _pump(_agent_blocks(params, may_write=may_write), params):
+-            yield block
++        # Pins the agent's "now" for this turn, including the background task
++        # `_pump` spawns: `asyncio.create_task` copies the current context, so
++        # setting it before that call is what makes the spawned task see it.
++        with as_of(moment) if moment is not None else nullcontext():
++            async for block in _pump(_agent_blocks(params, may_write=may_write), params):
++                yield block
+ 
+     except Exception as e:
+         logger.error("chat turn failed: error_type=%s", type(e).__name__,
+diff --git a/mirobody/agent/clock.py b/mirobody/agent/clock.py
+new file mode 100644
+index 00000000..a956e409
+--- /dev/null
++++ b/mirobody/agent/clock.py
+@@ -0,0 +1,100 @@
++"""The agent's own "now": the real clock, or an eval-only override.
++
++A frozen eval run plays back old data and asks a question dated after it, so
++the system clock is the wrong answer: a run against data ending 2026-09-01,
++executed on 2026-10-14, asked "the last 30 days" against the real date, found
++nothing and answered "cannot tell" (the bug this module fixes). `as_of` pins
++the request's own "today" instead, carried on a `ContextVar` so one request's
++moment never leaks into another running concurrently.
++
++Gated by `EVAL_AS_OF_ENABLED` (`chat/service.py`): off by default, so an
++ordinary deployment cannot have its answers dated by a client-supplied value.
++Only the agent's OWN reads of "now" go through here: `prompt.turn_note`,
++`prompt.build_system_prompt`, `hitl.parse_date_answer`, and a tool's
++`RecordTool._clock()`. A stored wall-clock fact, such as `th_messages.created_at`
++or a file's `upload_time`, is not routed through this and must not be: that is
++when the row was actually written, eval or not.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Generator
++from contextlib import contextmanager
++from contextvars import ContextVar
++from datetime import date, datetime, time, tzinfo
++
++from mirobody.kernel.series import zone as _zone
++from mirobody.utils import safe_read_cfg
++
++#: The pinned moment for the request running in this task, if any. Set once
++#: per chat turn (`chat/turn.py::run`) and seen by every tool call and prompt
++#: render that turn makes, because `asyncio.create_task` copies the context a
++#: background task starts with.
++_AS_OF: ContextVar[datetime | None] = ContextVar("agent_as_of", default=None)
++
++
++def now(tz: str | tzinfo | None = None) -> datetime:
++    """The agent's current moment, in `tz` (an IANA name, a `UTC±HH:MM`
++    offset, a `tzinfo`, or none for naive local time): the pinned `as_of` for
++    this request if one is set, else the real clock.
++
++    Same shape as `datetime.now(tz)` so every call site this replaces
++    (`datetime.now(zone(timezone))`, `datetime.now(UTC)`, `datetime.now()`)
++    keeps its own timezone handling; only where the moment comes from changes.
++    """
++    zone = tz if tz is None or isinstance(tz, tzinfo) else _zone(tz)
++    pinned = _AS_OF.get()
++    if pinned is not None:
++        return pinned.astimezone(zone) if zone is not None else pinned
++    return datetime.now(zone)
++
++
++@contextmanager
++def as_of(moment: datetime) -> Generator[None, None, None]:
++    """Pin `now()` to `moment` (must be timezone-aware) for this block.
++
++    Resets to whatever the context held before, so nesting and concurrent
++    tasks (each its own copy of the context) cannot see each other's pin.
++    """
++    if moment.tzinfo is None:
++        raise ValueError("as_of moment must be timezone-aware")
++    token = _AS_OF.set(moment)
++    try:
++        yield
++    finally:
++        _AS_OF.reset(token)
++
++
++def parse_as_of(value: str, tz: str | tzinfo) -> datetime:
++    """An `as_of` request field as an aware moment.
++
++    A bare ISO date (`2025-10-18`) becomes noon that day in `tz`: midnight
++    would read as "yesterday evening" the moment a positive UTC offset is
++    involved, and this is a driver picking a day, not a precise instant. An
++    ISO datetime is used as given; naive (no offset) takes `tz`, the same way
++    the date form does. Anything else raises `ValueError`, quoting the input,
++    for the caller to turn into a client-facing rejection.
++    """
++    text = (value or "").strip()
++    if not text:
++        raise ValueError("as_of must not be empty")
++    zone = tz if isinstance(tz, tzinfo) else _zone(tz)
++    try:
++        return datetime.combine(date.fromisoformat(text), time(12, 0), zone)
++    except ValueError:
++        pass
++    try:
++        moment = datetime.fromisoformat(text)
++    except ValueError as e:
++        raise ValueError(f"as_of is not an ISO date or datetime: {text!r}") from e
++    return moment if moment.tzinfo is not None else moment.replace(tzinfo=zone)
++
++
++def eval_as_of_enabled() -> bool:
++    """Whether this server honours a chat request's `as_of` override.
++
++    Read the same way other boolean flags here are (`ENABLE_INDICATOR_EXTRACTION`,
++    `GLOBAL_FILE_CACHE_ENABLED`): `safe_read_cfg` so it works with or without a
++    loaded `Config`, off unless explicitly turned on.
++    """
++    return safe_read_cfg("EVAL_AS_OF_ENABLED", "").strip().upper() in ("TRUE", "1", "YES", "ON")
+diff --git a/mirobody/agent/hitl.py b/mirobody/agent/hitl.py
+index a9411f64..f69b1195 100644
+--- a/mirobody/agent/hitl.py
++++ b/mirobody/agent/hitl.py
+@@ -29,6 +29,7 @@
+ from langchain_core.messages import BaseMessage
+ from langchain_core.tools import tool
+ 
++from mirobody.agent.clock import now as _now
+ from mirobody.kernel.ops import is_driver_exception
+ 
+ from .wire.blocks import INTERRUPT
+@@ -77,7 +78,7 @@ def parse_date_answer(answer: str, today: datetime | None = None) -> tuple[str,
+     unclear, where it used to file under the upload day. A month-day without
+     a year is this year's."""
+     text = (answer or "").strip()
+-    today = today or datetime.now()
++    today = today or _now()
+     m = _YMD.search(text)
+     if m:
+         try:
+diff --git a/mirobody/agent/prompt.py b/mirobody/agent/prompt.py
+index 3c5c826b..a17767c3 100644
+--- a/mirobody/agent/prompt.py
++++ b/mirobody/agent/prompt.py
+@@ -22,12 +22,11 @@
+ import logging
+ import re
+ from collections.abc import Mapping
+-from datetime import datetime
+ from pathlib import PurePosixPath
+ from typing import Any
+ from urllib.parse import urlsplit
+ 
+-from mirobody.kernel.series import zone
++from mirobody.agent.clock import now as _now
+ from mirobody.utils import prompts
+ 
+ logger = logging.getLogger(__name__)
+@@ -108,7 +107,7 @@ def turn_note(timezone: str, question: str) -> str:
+     question. In the system prompt both changed per hour or per question, and
+     the tool definitions after them were read again: 5.2k tokens for
+     MiniCPM5-2B on llama.cpp each time, 47 with this note (2026-10-12)."""
+-    moment = datetime.now(zone(timezone))
++    moment = _now(timezone)
+     template = _TURN_NOTES.get(question_language(question))
+     if template:
+         return template.format(now=moment.strftime("%Y-%m-%d %H:00 %Z (UTC%z)"))
+@@ -143,7 +142,7 @@ async def build_system_prompt(
+     if tools_description:
+         tools_description += "\n\n---\n\n"
+ 
+-    current_time = datetime.now(zone(timezone)).strftime("%A, %B %d, %Y, at %I:00 %p %Z (UTC%z)")
++    current_time = _now(timezone).strftime("%A, %B %d, %Y, at %I:00 %p %Z (UTC%z)")
+ 
+     template = prompts.environment(enable_async=True).from_string(base_prompt)
+     return await template.render_async(
+diff --git a/mirobody/agent/tools/_base.py b/mirobody/agent/tools/_base.py
+index 6fcb6700..810c5cb7 100644
+--- a/mirobody/agent/tools/_base.py
++++ b/mirobody/agent/tools/_base.py
+@@ -16,6 +16,7 @@
+ from datetime import UTC, datetime
+ from typing import Any
+ 
++from mirobody.agent.clock import now as _eval_now
+ from mirobody.kernel import tools
+ from mirobody.kernel.ops import is_driver_exception
+ from ._authz import caller_of, denied
+@@ -64,4 +65,4 @@ async def _run(self, caller_id: str, args: Mapping[str, Any]) -> tools.Envelope:
+         raise NotImplementedError
+ 
+     def _clock(self) -> datetime:
+-        return self._now() if callable(self._now) else datetime.now(UTC)
++        return self._now() if callable(self._now) else _eval_now(UTC)

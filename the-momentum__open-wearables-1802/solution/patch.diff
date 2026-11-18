@@ -1,0 +1,357 @@
+diff --git a/backend/tests/api/v1/test_event_totals.py b/backend/tests/api/v1/test_event_totals.py
+index 3dc3961777..92b4cf9d56 100644
+--- a/backend/tests/api/v1/test_event_totals.py
++++ b/backend/tests/api/v1/test_event_totals.py
+@@ -12,6 +12,7 @@
+ from sqlalchemy.orm import Session
+ 
+ from app.schemas.enums import ProviderName
++from app.services.priority_service import priority_service
+ from tests.factories import (
+     ApiKeyFactory,
+     DataSourceFactory,
+@@ -86,6 +87,37 @@ def test_is_zero_with_nothing_to_add(self, client: TestClient, db: Session) -> N
+             "distance_meters": None,
+         }
+ 
++    def test_per_session_counts_the_same_workouts_as_the_list(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++        strava = DataSourceFactory(user=user, provider=ProviderName.STRAVA, source="strava")
++        apple = DataSourceFactory(user=user, provider=ProviderName.APPLE)
++        start = datetime.now(timezone.utc) - timedelta(days=2)
++        for ds in (strava, apple):
++            workout = EventRecordFactory(
++                mapping=ds,
++                category="workout",
++                type_="cycling",
++                start_datetime=start,
++                end_datetime=start + timedelta(minutes=30),
++                duration_seconds=1800,
++            )
++            WorkoutDetailsFactory(event_record=workout, energy_burned=Decimal("200"), distance=Decimal("10000"))
++        priority_service.update_provider_priority(db, ProviderName.STRAVA, 1)
++        priority_service.update_provider_priority(db, ProviderName.APPLE, 2)
++
++        # Off by default: both copies are added up.
++        assert self._totals(client, user.id)["count"] == 2
++        # On: the Apple copy of the Strava ride is left out, as it is in the list.
++        filtered = self._totals(client, user.id, source_selection="per_session")
++        assert filtered == {
++            "count": 1,
++            "duration_seconds": 1800,
++            "calories_kcal": 200.0,
++            "distance_meters": 10000.0,
++        }
++        listed = _get(client, f"/api/v1/users/{user.id}/events/workouts", limit=100, source_selection="per_session")
++        assert filtered["count"] == len(listed["data"])
++
+ 
+ class TestSleepTotals:
+     """GET /users/{user_id}/events/sleep/totals adds up the sessions the sleep list returns."""
+diff --git a/backend/tests/api/v1/test_events_workouts.py b/backend/tests/api/v1/test_events_workouts.py
+new file mode 100644
+index 0000000000..beacd01e17
+--- /dev/null
++++ b/backend/tests/api/v1/test_events_workouts.py
+@@ -0,0 +1,56 @@
++from datetime import datetime, timedelta, timezone
++from uuid import UUID
++
++from fastapi.testclient import TestClient
++from sqlalchemy.orm import Session
++
++from app.schemas.enums import ProviderName
++from app.services.priority_service import priority_service
++from tests.factories import ApiKeyFactory, DataSourceFactory, EventRecordFactory, UserFactory
++from tests.utils import api_key_headers
++
++
++class TestListWorkoutsPerSession:
++    """GET /users/{user_id}/events/workouts?source_selection=..."""
++
++    def _seed_duplicate_ride(self, db: Session) -> tuple:
++        user = UserFactory()
++        strava = DataSourceFactory(user=user, provider="strava", source="strava")
++        apple = DataSourceFactory(user=user, provider="apple")
++        start = datetime(2026, 4, 10, 8, 0, tzinfo=timezone.utc)
++        kwargs = {
++            "category": "workout",
++            "type_": "cycling",
++            "start_datetime": start,
++            "end_datetime": start + timedelta(minutes=26),
++            "duration_seconds": 26 * 60,
++        }
++        strava_record = EventRecordFactory(mapping=strava, **kwargs)
++        apple_record = EventRecordFactory(mapping=apple, **kwargs)
++        priority_service.update_provider_priority(db, ProviderName.STRAVA, 1)
++        priority_service.update_provider_priority(db, ProviderName.APPLE, 2)
++        return user, strava_record, apple_record
++
++    def _get(self, client: TestClient, user_id: UUID, **extra: str) -> list[str]:
++        api_key = ApiKeyFactory()
++        response = client.get(
++            f"/api/v1/users/{user_id}/events/workouts",
++            headers=api_key_headers(api_key.plain_key),
++            params={"start_date": "2026-04-01T00:00:00Z", "end_date": "2026-04-30T00:00:00Z", **extra},
++        )
++        assert response.status_code == 200
++        return [w["id"] for w in response.json()["data"]]
++
++    def test_returns_every_source_by_default(self, client: TestClient, db: Session) -> None:
++        user, strava_record, apple_record = self._seed_duplicate_ride(db)
++
++        ids = self._get(client, user.id)
++
++        assert set(ids) == {str(strava_record.id), str(apple_record.id)}
++
++    def test_per_session_drops_the_lower_priority_copy(self, client: TestClient, db: Session) -> None:
++        user, strava_record, _ = self._seed_duplicate_ride(db)
++
++        ids = self._get(client, user.id, source_selection="per_session")
++
++        assert ids == [str(strava_record.id)]
+diff --git a/frontend/e2e/fixtures.ts b/frontend/e2e/fixtures.ts
+index 69481272a9..8725e6c712 100644
+--- a/frontend/e2e/fixtures.ts
++++ b/frontend/e2e/fixtures.ts
+@@ -530,10 +530,16 @@ export const makeWorkouts = (query: URLSearchParams) => {
+ 	const start = new Date(query.get('start_date') ?? 0).getTime();
+ 	const end = new Date(query.get('end_date') ?? 0).getTime();
+ 
++	// Suunto is the lowest-ranked source here, so it stands in for the copy a
++	// higher-priority provider already recorded. The real endpoint matches by
++	// overlap in time, which these evenly spaced fixtures never produce.
++	const topSourceOnly = query.get('source_selection') === 'per_session';
++
+ 	const matching = WORKOUTS.filter((workout) => {
+ 		const at = new Date(workout.start_time).getTime();
+ 		if (at < start || at >= end) return false;
+ 		if (provider && workout.source.provider !== provider) return false;
++		if (topSourceOnly && workout.source.provider === 'suunto') return false;
+ 		return !type || workout.type === type;
+ 	});
+ 
+diff --git a/frontend/e2e/workouts.e2e.ts b/frontend/e2e/workouts.e2e.ts
+index ef67644954..248d3ddd6a 100644
+--- a/frontend/e2e/workouts.e2e.ts
++++ b/frontend/e2e/workouts.e2e.ts
+@@ -44,6 +44,27 @@ test('sums the whole period, not the page in front of you', async ({ page }) =>
+ 	await expect(summary.getByText('4', { exact: true })).toBeVisible();
+ });
+ 
++test('hides the copies a higher-priority source already recorded, in the list and the totals', async ({
++	page
++}) => {
++	await page.goto(WORKOUTS);
++	const pager = page.getByRole('navigation', { name: 'Pagination' });
++	const summary = page.locator('[aria-label="Workout totals"]');
++	await expect(pager).toContainText('of 23');
++	await expect(summary.getByText('23', { exact: true })).toBeVisible();
++
++	await page.getByRole('link', { name: 'Hide duplicates' }).click();
++
++	// The backend narrows both, so paging and the figures agree with the cards.
++	await expect(page).toHaveURL(`${WORKOUTS}?top=1`);
++	await expect(pager).toContainText('of 19');
++	await expect(summary.getByText('19', { exact: true })).toBeVisible();
++
++	// And showing them again brings them back.
++	await page.getByRole('link', { name: 'Show duplicates' }).click();
++	await expect(pager).toContainText('of 23');
++});
++
+ test('reads the clock the workout was recorded in, not the reader’s', async ({ page }) => {
+ 	await page.goto(WORKOUTS);
+ 
+diff --git a/frontend/src/lib/server/workouts.ts b/frontend/src/lib/server/workouts.ts
+index e4019e0e79..44c03be6c6 100644
+--- a/frontend/src/lib/server/workouts.ts
++++ b/frontend/src/lib/server/workouts.ts
+@@ -6,6 +6,8 @@ import type { WorkoutPage, WorkoutTotalsResponse } from '$lib/workouts/types';
+ export type WorkoutQuery = {
+ 	period: Period;
+ 	provider?: string;
++	/** Drops a workout a higher-priority source already recorded, by the ranking summaries use. */
++	topSourceOnly?: boolean;
+ 	type?: string;
+ 	cursor?: string;
+ 	limit?: number;
+@@ -14,19 +16,24 @@ export type WorkoutQuery = {
+ /** The filters the list and its totals share, so both count the same workouts. */
+ function filterParams(
+ 	params: URLSearchParams,
+-	{ provider, type }: { provider: string; type: string }
++	{
++		provider,
++		type,
++		topSourceOnly
++	}: Pick<Required<WorkoutQuery>, 'provider' | 'type' | 'topSourceOnly'>
+ ) {
+ 	if (provider) params.set('provider', provider);
+ 	if (type) params.set('type', type);
++	if (topSourceOnly) params.set('source_selection', 'per_session');
+ 	return params;
+ }
+ 
+ export function fetchWorkouts(
+ 	userId: string,
+ 	accessToken: string,
+-	{ period, provider = '', type = '', cursor = '', limit = 10 }: WorkoutQuery
++	{ period, provider = '', type = '', topSourceOnly = false, cursor = '', limit = 10 }: WorkoutQuery
+ ): Promise<WorkoutPage> {
+-	const params = filterParams(eventWindow(period, limit), { provider, type });
++	const params = filterParams(eventWindow(period, limit), { provider, type, topSourceOnly });
+ 	// A card cannot draw zones until it is expanded, but paging again on expand
+ 	// would be worse than carrying them.
+ 	params.set('include', 'zones');
+@@ -39,10 +46,15 @@ export function fetchWorkouts(
+ export function fetchWorkoutTotals(
+ 	userId: string,
+ 	accessToken: string,
+-	{ period, provider = '', type = '' }: Pick<WorkoutQuery, 'period' | 'provider' | 'type'>
++	{
++		period,
++		provider = '',
++		type = '',
++		topSourceOnly = false
++	}: Pick<WorkoutQuery, 'period' | 'provider' | 'type' | 'topSourceOnly'>
+ ): Promise<WorkoutTotalsResponse> {
+ 	return apiGet<WorkoutTotalsResponse>(
+-		`/api/v1/users/${userId}/events/workouts/totals?${filterParams(periodBounds(period), { provider, type })}`,
++		`/api/v1/users/${userId}/events/workouts/totals?${filterParams(periodBounds(period), { provider, type, topSourceOnly })}`,
+ 		accessToken
+ 	);
+ }
+diff --git a/frontend/src/routes/(app)/users/[id]/workouts/+page.server.ts b/frontend/src/routes/(app)/users/[id]/workouts/+page.server.ts
+index 582f6bc0b1..e78186fa3b 100644
+--- a/frontend/src/routes/(app)/users/[id]/workouts/+page.server.ts
++++ b/frontend/src/routes/(app)/users/[id]/workouts/+page.server.ts
+@@ -16,6 +16,7 @@ export const load: PageServerLoad = async ({ params, url, locals }) => {
+ 	const askedProvider = url.searchParams.get('provider') ?? '';
+ 	const askedType = url.searchParams.get('type') ?? '';
+ 	const cursor = url.searchParams.get('cursor') ?? '';
++	const topSourceOnly = url.searchParams.get('top') === '1';
+ 
+ 	// Ten, not the list default of twenty: these cards expand, and twenty of them
+ 	// is a page nobody reaches the end of. The sizes on offer are the shared ones.
+@@ -32,7 +33,14 @@ export const load: PageServerLoad = async ({ params, url, locals }) => {
+ 	]);
+ 
+ 	const query = (provider: string, type: string) =>
+-		fetchWorkouts(params.id, accessToken, { period, provider, type, cursor, limit: pageSize });
++		fetchWorkouts(params.id, accessToken, {
++			period,
++			provider,
++			type,
++			topSourceOnly,
++			cursor,
++			limit: pageSize
++		});
+ 
+ 	// With neither filter asked for there is nothing to check, so the list query
+ 	// travels alongside the option lists instead of queueing behind them.
+@@ -52,6 +60,7 @@ export const load: PageServerLoad = async ({ params, url, locals }) => {
+ 		provider,
+ 		type,
+ 		types,
++		topSourceOnly,
+ 		workouts,
+ 		providers,
+ 		connections,
+diff --git a/frontend/src/routes/(app)/users/[id]/workouts/+page.svelte b/frontend/src/routes/(app)/users/[id]/workouts/+page.svelte
+index 095a665d2d..0c85984c82 100644
+--- a/frontend/src/routes/(app)/users/[id]/workouts/+page.svelte
++++ b/frontend/src/routes/(app)/users/[id]/workouts/+page.svelte
+@@ -9,6 +9,7 @@
+ 	import DeleteEventDialog from '$lib/components/events/DeleteEventDialog.svelte';
+ 	import EmptyState from '$lib/components/ui/EmptyState.svelte';
+ 	import FilterSelect from '$lib/components/ui/FilterSelect.svelte';
++	import Segmented from '$lib/components/ui/Segmented.svelte';
+ 	import WorkoutCard from '$lib/components/workouts/WorkoutCard.svelte';
+ 	import WorkoutSummary from '$lib/components/workouts/WorkoutSummary.svelte';
+ 	import { providerLabel } from '$lib/providers/labels';
+@@ -31,7 +32,9 @@
+ 	]);
+ 
+ 	const workouts = $derived(data.workouts.data);
+-	const filtered = $derived(Boolean(data.provider || data.type || data.period.from));
++	const filtered = $derived(
++		Boolean(data.provider || data.type || data.topSourceOnly || data.period.from)
++	);
+ 
+ 	// One dialog for the page, not one per card, and the subject is separate from
+ 	// openness so closing does not have to null it mid-transition.
+@@ -60,6 +63,20 @@
+ 				/>
+ 			</FilterGroup>
+ 		{/if}
++
++		<!-- One ride often reaches us from two providers. This is the same ranking
++		     the summaries use, applied by the backend so paging and the totals
++		     agree with it; done here it would have thinned each page instead. -->
++		<FilterGroup label="Sources">
++			<Segmented
++				label="Sources"
++				selected={data.topSourceOnly ? 'top' : 'all'}
++				items={[
++					{ value: 'all', label: 'Show duplicates', href: hrefFor({ top: null }) },
++					{ value: 'top', label: 'Hide duplicates', href: hrefFor({ top: '1' }) }
++				]}
++			/>
++		</FilterGroup>
+ 	</FilterBar>
+ 
+ 	<!-- A rule under the controls: the figures answer to them, so they have to
+diff --git a/frontend/src/routes/(app)/users/[id]/workouts/totals/+server.ts b/frontend/src/routes/(app)/users/[id]/workouts/totals/+server.ts
+index 04c81e2390..3b76cba8f9 100644
+--- a/frontend/src/routes/(app)/users/[id]/workouts/totals/+server.ts
++++ b/frontend/src/routes/(app)/users/[id]/workouts/totals/+server.ts
+@@ -10,7 +10,8 @@ export const GET: RequestHandler = async ({ params, url, locals }) => {
+ 	const totals = await fetchWorkoutTotals(params.id, accessToken, {
+ 		period: parsePeriod(url.searchParams),
+ 		provider: url.searchParams.get('provider') ?? '',
+-		type: url.searchParams.get('type') ?? ''
++		type: url.searchParams.get('type') ?? '',
++		topSourceOnly: url.searchParams.get('top') === '1'
+ 	});
+ 	return json(toWorkoutTotals(totals));
+ };
+diff --git a/mcp/app/services/api_client.py b/mcp/app/services/api_client.py
+index 91e093301f..bb5431a400 100644
+--- a/mcp/app/services/api_client.py
++++ b/mcp/app/services/api_client.py
+@@ -137,6 +137,9 @@ async def get_workouts(
+             "start_date": start_date,
+             "end_date": end_date,
+             "limit": limit,
++            # The same workout often arrives from several providers (e.g. Strava and Apple Health);
++            # keep only the highest-priority copy so counts, durations and calories are not doubled.
++            "source_selection": "per_session",
+         }
+         if record_type:
+             params["record_type"] = record_type
+diff --git a/mcp/tests/test_api_client.py b/mcp/tests/test_api_client.py
+index 76851c6213..a2c26bdacd 100644
+--- a/mcp/tests/test_api_client.py
++++ b/mcp/tests/test_api_client.py
+@@ -70,3 +70,20 @@ def test_typed_errors_inherit_from_base() -> None:
+     assert issubclass(AuthenticationError, OpenWearablesError)
+     assert issubclass(NotFoundError, OpenWearablesError)
+     assert issubclass(ConfigurationError, OpenWearablesError)
++
++
++async def test_get_workouts_asks_for_one_copy_per_session(
++    api_client: OpenWearablesClient,
++    httpx_mock: HTTPXMock,
++) -> None:
++    """Workouts are requested per_session so cross-provider copies are not counted twice."""
++    httpx_mock.add_response(
++        method="GET",
++        url=(
++            "https://api.test.com/api/v1/users/user-1/events/workouts"
++            "?start_date=2026-04-01&end_date=2026-04-30&limit=100&source_selection=per_session"
++        ),
++        json={"data": []},
++    )
++
++    await api_client.get_workouts("user-1", "2026-04-01", "2026-04-30")

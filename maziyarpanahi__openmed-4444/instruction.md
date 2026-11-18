@@ -1,0 +1,17 @@
+# Issue
+
+**Title:** Classify breaking GraphQL SDL and protobuf changes in the API compatibility gate
+
+## Description
+
+.
+
+`openmed.service.api_compatibility` now classifies GraphQL and gRPC schema changes against committed baselines, alongside the existing REST/OpenAPI gate. A GraphQL comparator parses the baseline and live Strawberry SDL with `graphql-core`. It flags removed types, fields, arguments, input fields, enum values, union members, interfaces and directives, kind and type changes, relaxed output nullability, tightened input nullability, and newly required arguments or input fields as breaking. Additions are reported as additive, and default or safe nullability changes as compatible. A protobuf comparator compiles `openmed/service/proto/openmed.proto` in-process with `grpcio-tools` to a `FileDescriptorSet` in a temporary directory and reduces it to a `ProtoContract`. It flags removed, renumbered, renamed or retyped fields, cardinality/presence/oneof changes, removed or reused reserved numbers and names, removed enum values, messages, enums, services and RPCs, and changed RPC signatures as breaking. The new baselines are `docs/api/baselines/graphql-schema.graphql` and `docs/api/baselines/openmed-proto-descriptor.json`. Results go into the existing `CompatibilityReport` as per-surface `SurfaceReport`s. Their `CompatibilityIssue`s carry only `type_name`, `member`, `argument` and `field_number`; REST-only reports keep the same JSON shape. The CLI checks all three surfaces. When `graphql-core`, the GraphQL runtime, `grpcio-tools` or `protobuf` is missing, the surface reports `status: skipped` with a controlled reason and exits 3 (accept it deliberately with `--allow-skipped`), so it never passes silently. `--write-baselines` refuses to overwrite a baseline that the current schema breaks unless `--allow-breaking` is given.
+
+Breaking: `python -m openmed.service.api_compatibility` now also gates GraphQL and gRPC by default and can exit 3 for a skipped surface; pass `--rest-only` for the previous REST-only behaviour. The `check_api_compatibility()` / `assert_api_compatibility()` defaults are unchanged (REST only unless `surfaces=` is given).
+
+Validation: `.venv/bin/python -m pytest tests/unit/service/test_api_schema_compatibility.py tests/unit/service/test_api_compatibility.py -q -p no:cacheprovider` (104 passed, including the slow REST live check), `python -m openmed.service.api_compatibility` on this branch (REST, GraphQL and gRPC compatible, exit 0), `ruff check .` and `ruff format --check .` (clean), `python scripts/security/check_effect_paths.py --check` (effect_paths_verified), `mypy` (no issues), `pytest tests/unit -k "docs or publication or mkdocs or graphql or grpc or compatibility"` (341 passed, 14 skipped), `.venv/bin/python -m pytest tests/ -q -m "not slow and not fuzz" -p no:cacheprovider --ignore=tests/unit/training/synthetic/test_dicom_overlays.py` (26260 passed, 222 skipped; the ignored DICOM overlay module fails to collect in the shared venv on master because `pydicom` is not installed there), `python scripts/release/check_repo_policy.py --commits origin/master HEAD` (passed). The strict MkDocs build was left to CI because `mkdocs` is not installed in the local venv.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `43b89234bd50`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

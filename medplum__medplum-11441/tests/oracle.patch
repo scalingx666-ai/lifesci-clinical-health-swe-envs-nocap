@@ -1,0 +1,199 @@
+diff --git a/packages/server/src/config/types.ts b/packages/server/src/config/types.ts
+index 041a94cd6a8..0acf320bbd7 100644
+--- a/packages/server/src/config/types.ts
++++ b/packages/server/src/config/types.ts
+@@ -107,7 +107,10 @@ export interface MedplumServerConfig {
+   defaultMfaRateLimit?: number;
+   /** Number of FHIR interaction rate limit units per minute users can consume by default; overridable by Project settings */
+   defaultFhirQuota?: number;
+-  /** Milliseconds of delay added per quota unit in async context, in lieu of consuming quota units. */
++  /**
++   * @deprecated Ignored. Async work no longer consumes FHIR quota or self-throttles; limit async load with
++   * `workers.bullmq.<workerName>.globalConcurrency` instead.
++   */
+   asyncDelayScaling?: number;
+   /** Optional config for global default for `maxUserWebSocketSubscriptions`; overridable by Project setting: `maxUserWebSocketSubscriptions` */
+   defaultMaxUserWebSocketSubscriptions?: number;
+diff --git a/packages/server/src/config/utils.ts b/packages/server/src/config/utils.ts
+index 106b4b27d09..69d3089260b 100644
+--- a/packages/server/src/config/utils.ts
++++ b/packages/server/src/config/utils.ts
+@@ -60,7 +60,6 @@ export function addDefaults(config: MedplumServerConfig): ServerConfig {
+   config.defaultMfaRateLimit ??= 10;
+   config.defaultFhirQuota ??= 50_000;
+   config.defaultMaxUserWebSocketSubscriptions ??= 20;
+-  config.asyncDelayScaling ??= 5;
+   config.aiRealtimeTranscriptionUrl ??= 'wss://api.openai.com/v1/realtime?intent=transcription';
+ 
+   const ignoredResourceTypes = projectAdminResourceTypes.filter((rt) => config.disableChainedSearch?.includes(rt));
+@@ -138,7 +137,6 @@ type DefaultConfigKeys =
+   | 'defaultFhirQuota'
+   | 'defaultMaxUserWebSocketSubscriptions'
+   | 'aiRealtimeTranscriptionUrl'
+-  | 'asyncDelayScaling'
+   | 'serverScopedSubscriptionsEnabled';
+ 
+ const integerKeys = new Set([
+diff --git a/packages/server/src/fhir/batch.test.ts b/packages/server/src/fhir/batch.test.ts
+index 4bbd5e15fb6..0511fbd438a 100644
+--- a/packages/server/src/fhir/batch.test.ts
++++ b/packages/server/src/fhir/batch.test.ts
+@@ -76,10 +76,6 @@ describe('Batch and Transaction processing', () => {
+   beforeAll(async () => {
+     const config = await loadTestConfig();
+     baseUrl = config.baseUrl;
+-    // Async batches throttle by sleeping `points * asyncDelayScaling` ms per DB op in the async
+-    // authenticated context (see Repository.recordFhirQuota). These tests exercise behavior, not
+-    // throttle timing, so zero the delay to avoid real sleeps that slow the suite down.
+-    config.asyncDelayScaling = 0;
+     await initApp(app, config);
+     const testProject = await createTestProject({
+       withAccessToken: true,
+diff --git a/packages/server/src/fhir/fhirquota.ts b/packages/server/src/fhir/fhirquota.ts
+index 13b2b0bb9a0..612108daa8e 100644
+--- a/packages/server/src/fhir/fhirquota.ts
++++ b/packages/server/src/fhir/fhirquota.ts
+@@ -250,22 +250,10 @@ export class FhirRateLimiter {
+     throw new OperationOutcomeError(outcome);
+   }
+ 
+-  async recordRead(num = 1): Promise<void> {
+-    return this.consume(Math.max(num, 1));
+-  }
+-
+-  async recordHistory(): Promise<void> {
+-    return this.consume(10);
+-  }
+-
+   async recordSearch(num = 1): Promise<void> {
+     return this.consume(20 * Math.max(num, 1));
+   }
+ 
+-  async recordWrite(): Promise<void> {
+-    return this.consume(100);
+-  }
+-
+   get unitsConsumed(): number {
+     return this.delta;
+   }
+diff --git a/packages/server/src/fhir/operations/set-accounts.test.ts b/packages/server/src/fhir/operations/set-accounts.test.ts
+index 52e96aa7c8a..6773c0174d8 100644
+--- a/packages/server/src/fhir/operations/set-accounts.test.ts
++++ b/packages/server/src/fhir/operations/set-accounts.test.ts
+@@ -25,6 +25,7 @@ import { runInAuthenticatedContext } from '../../context';
+ import { createTestProject, initTestAuth, waitForAsyncJob } from '../../test.setup';
+ import type { SetAccountsJobData } from '../../workers/set-accounts';
+ import { execSetAccountsJob, getSetAccountsQueue } from '../../workers/set-accounts';
++import { FhirQuotaCost, FhirRateLimiter } from '../fhirquota';
+ import { setAccountsHandler } from './set-accounts';
+ 
+ const app = express();
+@@ -122,6 +123,7 @@ describe('Patient Set Accounts Operation', () => {
+ 
+   test('Updates target patient and compartment resources', async () => {
+     // Execute the operation adding the organization to the patient's compartment
++    const consumeSpy = vi.spyOn(FhirRateLimiter.prototype, 'consume');
+     const res3 = await request(app)
+       .post(`/fhir/R4/Patient/${patient.id}/$set-accounts`)
+       .set('Authorization', 'Bearer ' + accessToken)
+@@ -143,6 +145,9 @@ describe('Patient Set Accounts Operation', () => {
+         ],
+       });
+     expect(res3).toHaveStatus(200);
++    // Sync propagation charges the user's FHIR quota for each system repo write
++    expect(consumeSpy.mock.calls.filter(([points]) => points === FhirQuotaCost.WRITE)).toHaveLength(3);
++    consumeSpy.mockRestore();
+     const result = res3.body;
+     expect(result.parameter?.[0].name).toBe('resourcesUpdated');
+     expect(result.parameter?.[0].valueInteger).toBe(3); // Observation and DiagnosticReport
+@@ -430,13 +435,20 @@ describe('Patient Set Accounts Operation', () => {
+     const jobData = queue.add.mock.calls[0][1] as SetAccountsJobData;
+     const job = { id: 1, data: jobData } as unknown as Job<SetAccountsJobData>;
+ 
+-    await runInAuthenticatedContext(
+-      { login, membership, project, userConfig: {} as unknown as UserConfiguration },
+-      undefined,
+-      undefined,
+-      { async: true },
+-      () => execSetAccountsJob(job)
+-    );
++    const consumeSpy = vi.spyOn(FhirRateLimiter.prototype, 'consume');
++    try {
++      await runInAuthenticatedContext(
++        { login, membership, project, userConfig: {} as unknown as UserConfiguration },
++        undefined,
++        undefined,
++        { async: true },
++        () => execSetAccountsJob(job)
++      );
++      // Async propagation must not charge the user's FHIR quota
++      expect(consumeSpy).not.toHaveBeenCalled();
++    } finally {
++      consumeSpy.mockRestore();
++    }
+ 
+     await waitForAsyncJob(initRes.headers['content-location'], app, accessToken);
+     const statusRes = await request(app)
+diff --git a/packages/server/src/fhir/operations/set-accounts.ts b/packages/server/src/fhir/operations/set-accounts.ts
+index 652bd74e882..c1da92a71e2 100644
+--- a/packages/server/src/fhir/operations/set-accounts.ts
++++ b/packages/server/src/fhir/operations/set-accounts.ts
+@@ -22,6 +22,7 @@ import { getAuthenticatedContext } from '../../context';
+ import { getAsyncJobTracking } from '../../workers/base';
+ import { addSetAccountsJobData } from '../../workers/set-accounts';
+ import { CancelledError } from '../../workers/utils';
++import { FhirQuotaCost } from '../fhirquota';
+ import type { Repository, SystemRepository } from '../repo';
+ import { makeOperationDefinition } from './definitions';
+ import { searchPatientCompartment } from './patienteverything';
+@@ -167,7 +168,8 @@ export async function setResourceAccounts(
+   if (!userRepo.canPerformInteraction(AccessPolicyInteraction.UPDATE, target)) {
+     throw new OperationOutcomeError(forbidden);
+   }
+-  await getAuthenticatedContext().fhirRateLimiter?.recordWrite();
++  // System repo writes skip quota accounting, so charge the user's repo, which also exempts async jobs
++  await userRepo.recordFhirQuota(FhirQuotaCost.WRITE);
+   await systemRepo.updateResource(target);
+   let count = 1; // Target resource is updated already
+ 
+@@ -196,7 +198,7 @@ export async function setResourceAccounts(
+         // read with system repo to restore hidden fields
+         const resource = await systemRepo.readResource(entry.resource.resourceType, entry.resource.id);
+         if (userRepo.canPerformInteraction(AccessPolicyInteraction.UPDATE, resource)) {
+-          await updateCompartmentResource(systemRepo, resource, additions, removals);
++          await updateCompartmentResource(userRepo, systemRepo, resource, additions, removals);
+           count++;
+         }
+       }
+@@ -216,6 +218,7 @@ export async function setResourceAccounts(
+ }
+ 
+ async function updateCompartmentResource<T extends Resource>(
++  userRepo: Repository,
+   systemRepo: SystemRepository,
+   resource: T,
+   additions: Reference[],
+@@ -240,7 +243,7 @@ async function updateCompartmentResource<T extends Resource>(
+     account: accountList?.[0],
+   };
+   // Use system repo to force update meta.accounts
+-  await getAuthenticatedContext().fhirRateLimiter?.recordWrite();
++  await userRepo.recordFhirQuota(FhirQuotaCost.WRITE);
+   return systemRepo.updateResource(resource);
+ }
+ 
+diff --git a/packages/server/src/workers/batch.test.ts b/packages/server/src/workers/batch.test.ts
+index a1d0440da58..ec05022e0e9 100644
+--- a/packages/server/src/workers/batch.test.ts
++++ b/packages/server/src/workers/batch.test.ts
+@@ -79,10 +79,6 @@ describe('Batch worker', () => {
+ 
+   beforeAll(async () => {
+     config = await loadTestConfig();
+-    // Async batches throttle by sleeping `points * asyncDelayScaling` ms per DB op in the async
+-    // authenticated context (see Repository.recordFhirQuota). These tests exercise behavior, not
+-    // throttle timing, so zero the delay to keep the worker-processor tests fast.
+-    config.asyncDelayScaling = 0;
+     await initAppServices(config);
+ 
+     const project = await createTestProject({ withClient: true, withAccessToken: true, withRepo: true });

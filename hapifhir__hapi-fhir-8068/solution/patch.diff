@@ -1,0 +1,907 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8058-skip-older-search-parameter-overwrite-multi-version.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8058-skip-older-search-parameter-overwrite-multi-version.yaml
+new file mode 100644
+index 000000000000..4ca7b005d03c
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8058-skip-older-search-parameter-overwrite-multi-version.yaml
+@@ -0,0 +1,8 @@
++---
++type: fix
++issue: 8058
++title: "Previously, installing a package whose dependency tree pulls in multiple versions of the same
++package could silently downgrade resources. In `SINGLE_VERSION` mode, all canonical resources were
++affected. In `MULTI_VERSION` mode (the default), `SearchParameter` resources were affected since they
++match by `code` and `base` rather than URL and version. This has been fixed and the
++installer now detects redundant dependencies and skips older versions."
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/docs/server_jpa/packages.md b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/docs/server_jpa/packages.md
+index 5acad6ab049b..d1544e415d27 100644
+--- a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/docs/server_jpa/packages.md
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/docs/server_jpa/packages.md
+@@ -109,6 +109,32 @@ The following version pairs are treated as compatible:
+ * R4 and R4B are treated as compatible with each other (both are considered `R4`-family).
+ * All other version combinations are treated as incompatible and will trigger the cross-version substitution logic described above.
+ 
++# Version Policy
++
++The `versionPolicy` parameter on `PackageInstallationSpec` controls how the installer matches existing resources during installation The default is `MULTI_VERSION`.
++
++| Policy | Resource Matching | Behavior |
++|--------|------------------|----------|
++| `MULTI_VERSION` (default) | Matches by canonical URL **and** version | Multiple versions of the same resource can coexist in the repository. Server-assigned IDs are used. |
++| `SINGLE_VERSION` | Matches by canonical URL only (ignoring version) | Only one version of each resource exists. Installing a new version overwrites the previous one. Client-assigned IDs from the package are used. |
++
++```java
++PackageInstallationSpec spec = new PackageInstallationSpec()
++    .setName("hl7.fhir.us.core")
++    .setVersion("7.0.0")
++    .setInstallMode(PackageInstallationSpec.InstallModeEnum.INSTALL_ONLY)
++    .setVersionPolicy(PackageInstallationSpec.VersionPolicyEnum.SINGLE_VERSION);
++```
++
++## Redundant Dependency Handling
++
++When `fetchDependencies` is enabled, a package's dependency tree may pull in multiple versions of the same transitive dependency. For example, installing `us.nlm.vsac` version `0.19.0` may depend on `hl7.terminology.r4` version `6.2.0`, while a transitive dependency may pull in `hl7.terminology.r4` version `5.4.0`. Without protection, the older version could silently overwrite canonical resources that were already installed by the newer version.
++
++The installer detects redundant dependencies and skips them in both modes:
++
++* **`SINGLE_VERSION` mode**: All canonical resources are affected since they are matched by URL only. The installer tracks the highest version of each dependency package encountered during the installation. If an older or already-installed version of a package is encountered later in the dependency tree, it is treated as redundant and skipped.
++* **`MULTI_VERSION` mode**: Only `SearchParameter` resources are affected since they are matched by `code` and `base` rather than URL and version. Other canonical resources coexist by URL and version and are not at risk. The installer compares package versions at the resource level and treats updates from older packages as redundant. This relies on the `meta.source` field that the installer stamps on each resource. Resources created manually or installed before this stamping was in place are not protected.
++
+ # Using Installed Packages for Validation
+ 
+ Once a package is installed, its conformance resources (StructureDefinitions, ValueSets, CodeSystems, etc.) are stored in the JPA server database and automatically included in the validation support chain. No additional configuration is needed to validate against profiles from installed packages.
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/packages/PackageDependencyRegistry.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/packages/PackageDependencyRegistry.java
+new file mode 100644
+index 000000000000..4f0a75aaa312
+--- /dev/null
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/packages/PackageDependencyRegistry.java
+@@ -0,0 +1,77 @@
++/*-
++ * #%L
++ * HAPI FHIR JPA Server
++ * %%
++ * Copyright (C) 2014 - 2026 Smile CDR, Inc.
++ * %%
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ * #L%
++ */
++package ca.uhn.fhir.jpa.packages;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Objects;
++
++/**
++ * Tracks which dependency packages have been installed during a single package installation
++ * operation. Detects redundant dependencies — exact duplicates and older versions of
++ * already-installed packages — to prevent unnecessary processing and version downgrades.
++ *
++ * @since 8.12.0
++ */
++// Created by Claude Opus 4.6
++class PackageDependencyRegistry {
++	private static final Logger ourLog = LoggerFactory.getLogger(PackageDependencyRegistry.class);
++	private final Map<String, String> myInstalledVersionByPackageName = new HashMap<>();
++
++	void addDependency(String thePackageName, String theVersion) {
++		myInstalledVersionByPackageName.merge(
++				thePackageName, Objects.requireNonNullElse(theVersion, "current"), (existing, incoming) -> {
++					int cmp = PackageVersionComparator.INSTANCE.compare(incoming, existing);
++					return cmp > 0 ? incoming : existing;
++				});
++	}
++
++	boolean isRedundant(String thePackageName, String theVersion, PackageInstallationSpec theInstallationSpec) {
++		String installedVersion = myInstalledVersionByPackageName.get(thePackageName);
++		if (installedVersion == null) {
++			return false;
++		}
++		String version = Objects.requireNonNullElse(theVersion, "current");
++		if (installedVersion.equals(version)) {
++			ourLog.debug(
++					"Package {}#{} has already been installed. Skipping redundant processing.",
++					thePackageName,
++					version);
++			return true;
++		}
++		boolean isSingleVersionMode =
++				theInstallationSpec.getVersionPolicy() == PackageInstallationSpec.VersionPolicyEnum.SINGLE_VERSION;
++		if (isSingleVersionMode) {
++			int cmp = PackageVersionComparator.INSTANCE.compare(version, installedVersion);
++			if (cmp < 0) {
++				ourLog.info(
++						"Skipping installation of {}#{} because a newer version ({}) has already been installed.",
++						thePackageName,
++						version,
++						installedVersion);
++				return true;
++			}
++		}
++		return false;
++	}
++}
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/packages/PackageInstallerSvcImpl.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/packages/PackageInstallerSvcImpl.java
+index 12e8838b6343..92a26facaaf9 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/packages/PackageInstallerSvcImpl.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/packages/PackageInstallerSvcImpl.java
+@@ -61,7 +61,6 @@
+ import ca.uhn.fhir.rest.server.exceptions.ResourceVersionConflictException;
+ import ca.uhn.fhir.rest.server.exceptions.UnprocessableEntityException;
+ import ca.uhn.fhir.util.Batch2JobDefinitionConstants;
+-import ca.uhn.fhir.util.MetaUtil;
+ import ca.uhn.fhir.util.SearchParameterUtil;
+ import ca.uhn.fhir.util.TerserUtil;
+ import ca.uhn.hapi.converters.canonical.VersionCanonicalizer;
+@@ -89,9 +88,7 @@
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Objects;
+ import java.util.Optional;
+-import java.util.Set;
+ import java.util.function.Supplier;
+ 
+ import static ca.uhn.fhir.jpa.packages.PackageInstallationSpec.InstallModeEnum.STORE_AND_INSTALL;
+@@ -107,7 +104,6 @@
+ public class PackageInstallerSvcImpl implements IPackageInstallerSvc {
+ 
+ 	private static final Logger ourLog = LoggerFactory.getLogger(PackageInstallerSvcImpl.class);
+-	private static final String OUR_PIPE_CHARACTER = "|";
+ 
+ 	// Created by Claude Opus 4.6
+ 	enum InstallResultEnum {
+@@ -172,6 +168,7 @@ public String toString() {
+ 	private ITermCodeSystemStorageSvc myTermCodeSystemStorageSvc;
+ 
+ 	private CommonCodeSystemsTerminologyService myCommonCodeSystemsTerminologyService;
++	private PackageVersionStamper myPackageVersionStamper;
+ 
+ 	@Autowired
+ 	private IJobCoordinator myJobCoordinator;
+@@ -189,6 +186,7 @@ public PackageInstallerSvcImpl() {
+ 	@PostConstruct
+ 	public void initialize() {
+ 		myCommonCodeSystemsTerminologyService = new CommonCodeSystemsTerminologyService(myFhirContext);
++		myPackageVersionStamper = new PackageVersionStamper(myFhirContext);
+ 		switch (myFhirContext.getVersion().getVersion()) {
+ 			case R5:
+ 			case R4B:
+@@ -248,7 +246,8 @@ public PackageInstallOutcomeJson install(PackageInstallationSpec theInstallation
+ 				retVal.getMessage().addAll(NpmPackageUtils.getProcessingMessages(npmPackage));
+ 
+ 				if (theInstallationSpec.isFetchDependencies()) {
+-					fetchAndInstallDependencies(npmPackage, theInstallationSpec, retVal, new DependencyRegister());
++					fetchAndInstallDependencies(
++							npmPackage, theInstallationSpec, retVal, new PackageDependencyRegistry());
+ 				}
+ 
+ 				if (theInstallationSpec.getInstallMode() == STORE_AND_INSTALL
+@@ -427,21 +426,18 @@ private void fetchAndInstallDependencies(
+ 			NpmPackage npmPackage,
+ 			PackageInstallationSpec theInstallationSpec,
+ 			PackageInstallOutcomeJson theOutcome,
+-			DependencyRegister theDependencyRegister)
++			PackageDependencyRegistry thePackageDependencyRegistry)
+ 			throws ImplementationGuideInstallationException {
+ 		List<PackageUtils.DependentPackage> dependentPackages =
+ 				PackageUtils.extractDependentPackages(npmPackage, theInstallationSpec, theOutcome);
+ 
+ 		for (PackageUtils.DependentPackage nextPackage : dependentPackages) {
+-			if (theDependencyRegister.containsDependency(nextPackage.name(), nextPackage.version())) {
+-				ourLog.debug(
+-						"Package {}#{} has already been installed. Skipping redundant processing.",
+-						nextPackage.name(),
+-						nextPackage.version());
++			if (thePackageDependencyRegistry.isRedundant(
++					nextPackage.name(), nextPackage.version(), theInstallationSpec)) {
+ 				continue;
+ 			}
+ 
+-			theDependencyRegister.addDependency(nextPackage.name(), nextPackage.version());
++			thePackageDependencyRegistry.addDependency(nextPackage.name(), nextPackage.version());
+ 
+ 			try {
+ 				if (theInstallationSpec.isDryRun()) {
+@@ -466,7 +462,8 @@ private void fetchAndInstallDependencies(
+ 
+ 					// recursive call to install dependencies of a package before
+ 					// installing the package
+-					fetchAndInstallDependencies(dependency, theInstallationSpec, theOutcome, theDependencyRegister);
++					fetchAndInstallDependencies(
++							dependency, theInstallationSpec, theOutcome, thePackageDependencyRegistry);
+ 
+ 					if (theInstallationSpec.getInstallMode()
+ 							== PackageInstallationSpec.InstallModeEnum.STORE_AND_INSTALL) {
+@@ -640,6 +637,12 @@ && isContentNotPresentCodeSystem(existingResource)
+ 			return SKIPPED;
+ 		}
+ 
++		if (existingResource != null
++				&& !allowMultipleVersionsForResource(theResource, theInstallationSpec)
++				&& myPackageVersionStamper.isOlderPackageVersion(theInstallationSpec, existingResource)) {
++			return SKIPPED;
++		}
++
+ 		if (!searchResult.isEmpty()) {
+ 			ourLog.info("Updating existing resource matching {}", resourceQuery);
+ 		}
+@@ -712,7 +715,7 @@ protected InstallResultEnum installResource(
+ 			@Nonnull PackageInstallationSpec thePackageInstallationSpec) {
+ 
+ 		prefixNumericIdIfNeeded(theResource);
+-		setPackageMetaSource(theResource, thePackageInstallationSpec);
++		myPackageVersionStamper.stampPackageSource(theResource, thePackageInstallationSpec);
+ 
+ 		if (theExistingResource == null) {
+ 			boolean created = createNewResource(theDao, theResource, thePackageInstallationSpec);
+@@ -799,8 +802,6 @@ private boolean updateExistingResource(
+ 
+ 	private boolean updateExistingNonSearchParameter(
+ 			IFhirResourceDao theDao, IBaseResource theResource, IBaseResource theExistingResource) {
+-		// An existing resource is found,
+-		// update this resource and force-use the old ID
+ 		ourLog.debug(
+ 				"Existing resource {} will be overridden with installed resource {}",
+ 				theExistingResource.getIdElement(),
+@@ -857,21 +858,12 @@ private boolean isContentNotPresentCodeSystem(IBaseResource theResource) {
+ 
+ 	private boolean allowMultipleVersionsForResource(
+ 			IBaseResource theResource, PackageInstallationSpec thePackageInstallationSpec) {
+-		// For Search parameters don't allow multi version
+ 		if (isSearchParameter(theResource)) {
+ 			return false;
+ 		}
+ 		return thePackageInstallationSpec.getVersionPolicy() == PackageInstallationSpec.VersionPolicyEnum.MULTI_VERSION;
+ 	}
+ 
+-	private void setPackageMetaSource(IBaseResource theResource, PackageInstallationSpec thePackageInstallationSpec) {
+-		if (thePackageInstallationSpec != null) {
+-			String metaSourceUrl =
+-					thePackageInstallationSpec.getName() + OUR_PIPE_CHARACTER + thePackageInstallationSpec.getVersion();
+-			MetaUtil.setSource(myFhirContext, theResource, metaSourceUrl);
+-		}
+-	}
+-
+ 	private void prefixNumericIdIfNeeded(IBaseResource theResource) {
+ 		IIdType id = theResource.getIdElement();
+ 		if (!id.isEmpty() && id.isIdPartValidLong()) {
+@@ -1211,26 +1203,4 @@ private String extractStringValueOrEmpty(
+ 	private boolean hasValue(IBaseResource theResource, String theElementName) {
+ 		return TerserUtil.hasValues(myFhirContext, theResource, theElementName);
+ 	}
+-
+-	@VisibleForTesting
+-	void setFhirContextForUnitTest(FhirContext theCtx) {
+-		myFhirContext = theCtx;
+-	}
+-
+-	private static class DependencyRegister {
+-		private final Set<String> dependencies = new HashSet<>();
+-
+-		public void addDependency(String thePackageName, String theVersion) {
+-			dependencies.add(buildKey(thePackageName, theVersion));
+-		}
+-
+-		public boolean containsDependency(String thePackageName, String theVersion) {
+-			return dependencies.contains(buildKey(thePackageName, theVersion));
+-		}
+-
+-		@Nonnull
+-		private static String buildKey(String thePackageName, String theVersion) {
+-			return thePackageName + "#" + Objects.requireNonNullElse(theVersion, "current");
+-		}
+-	}
+ }
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/packages/PackageVersionStamper.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/packages/PackageVersionStamper.java
+new file mode 100644
+index 000000000000..aa19ea2854b6
+--- /dev/null
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/packages/PackageVersionStamper.java
+@@ -0,0 +1,111 @@
++/*-
++ * #%L
++ * HAPI FHIR JPA Server
++ * %%
++ * Copyright (C) 2014 - 2026 Smile CDR, Inc.
++ * %%
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ * #L%
++ */
++package ca.uhn.fhir.jpa.packages;
++
++import ca.uhn.fhir.context.FhirContext;
++import ca.uhn.fhir.util.MetaUtil;
++import ca.uhn.fhir.util.UrlUtil;
++import org.hl7.fhir.instance.model.api.IBaseResource;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.Optional;
++
++/**
++ * Handles reading and writing the package source stamp ({@code packageName|packageVersion})
++ * on the {@code meta.source} field of installed resources. Also provides version comparison
++ * to detect when an incoming package version is older than the version already installed.
++ *
++ * @since 8.12.0
++ */
++// Created by Claude Opus 4.6
++class PackageVersionStamper {
++	private static final Logger ourLog = LoggerFactory.getLogger(PackageVersionStamper.class);
++	private static final String OUR_PIPE_CHARACTER = "|";
++
++	private final FhirContext myFhirContext;
++
++	PackageVersionStamper(FhirContext theFhirContext) {
++		myFhirContext = theFhirContext;
++	}
++
++	/**
++	 * Stamps the resource's {@code meta.source} with {@code packageName|packageVersion}
++	 * from the given installation spec.
++	 */
++	void stampPackageSource(IBaseResource theResource, PackageInstallationSpec theSpec) {
++		if (theSpec != null) {
++			String metaSourceUrl = theSpec.getName() + OUR_PIPE_CHARACTER + theSpec.getVersion();
++			MetaUtil.setSource(myFhirContext, theResource, metaSourceUrl);
++		}
++	}
++
++	/**
++	 * Parses the {@code meta.source} field of a resource to extract the package name and version.
++	 *
++	 * @return the parsed parts, or empty if the source is not in {@code name|version} format
++	 */
++	Optional<UrlUtil.CanonicalUrlParts> parsePackageSource(IBaseResource theResource) {
++		String source = MetaUtil.getSource(myFhirContext, theResource);
++		String sourceUri = MetaUtil.extractSourceUriOrEmpty(source);
++		if (sourceUri.isEmpty()) {
++			return Optional.empty();
++		}
++		UrlUtil.CanonicalUrlParts parts = UrlUtil.parseCanonicalUrl(sourceUri);
++		if (parts.versionId().isEmpty()) {
++			return Optional.empty();
++		}
++		return Optional.of(parts);
++	}
++
++	/**
++	 * Returns {@code true} if the incoming package version is older than the version
++	 * stamped on the existing resource's {@code meta.source}. Returns {@code false}
++	 * if the existing resource has no package source stamp or belongs to a different package.
++	 */
++	boolean isOlderPackageVersion(PackageInstallationSpec theIncomingSpec, IBaseResource theExistingResource) {
++		Optional<UrlUtil.CanonicalUrlParts> existingPackage = parsePackageSource(theExistingResource);
++		if (existingPackage.isEmpty()) {
++			return false;
++		}
++		String existingPackageName = existingPackage.get().url();
++		String existingPackageVersion = existingPackage.get().versionId().get();
++
++		String incomingName = theIncomingSpec.getName();
++		String incomingVersion = theIncomingSpec.getVersion();
++		if (incomingVersion == null || !existingPackageName.equals(incomingName)) {
++			return false;
++		}
++
++		int cmp = PackageVersionComparator.INSTANCE.compare(incomingVersion, existingPackageVersion);
++		if (cmp < 0) {
++			ourLog.info(
++					"Skipping update of {} because existing resource was installed from a newer version "
++							+ "of the same package (existing: {}|{}, incoming: {}|{})",
++					theExistingResource.getIdElement().toUnqualifiedVersionless(),
++					existingPackageName,
++					existingPackageVersion,
++					incomingName,
++					incomingVersion);
++			return true;
++		}
++		return false;
++	}
++}
+diff --git a/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/packages/PackageDependencyRegistryTest.java b/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/packages/PackageDependencyRegistryTest.java
+new file mode 100644
+index 000000000000..5e3fadb85f8f
+--- /dev/null
++++ b/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/packages/PackageDependencyRegistryTest.java
+@@ -0,0 +1,92 @@
++package ca.uhn.fhir.jpa.packages;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import org.junit.jupiter.api.Test;
++
++// Created by Claude Opus 4.6
++class PackageDependencyRegistryTest {
++
++	private final PackageInstallationSpec mySingleVersionSpec = new PackageInstallationSpec()
++			.setVersionPolicy(PackageInstallationSpec.VersionPolicyEnum.SINGLE_VERSION);
++	private final PackageInstallationSpec myMultiVersionSpec = new PackageInstallationSpec()
++			.setVersionPolicy(PackageInstallationSpec.VersionPolicyEnum.MULTI_VERSION);
++
++	@Test
++	void isRedundant_sameVersion_skipsInBothModes() {
++		PackageDependencyRegistry registry = new PackageDependencyRegistry();
++		registry.addDependency("hl7.terminology.r4", "6.2.0");
++
++		assertThat(registry.isRedundant("hl7.terminology.r4", "6.2.0", mySingleVersionSpec)).isTrue();
++		assertThat(registry.isRedundant("hl7.terminology.r4", "6.2.0", myMultiVersionSpec)).isTrue();
++	}
++
++	@Test
++	void isRedundant_olderVersion_singleVersionMode_skips() {
++		PackageDependencyRegistry registry = new PackageDependencyRegistry();
++		registry.addDependency("hl7.terminology.r4", "6.2.0");
++
++		assertThat(registry.isRedundant("hl7.terminology.r4", "5.4.0", mySingleVersionSpec)).isTrue();
++	}
++
++	@Test
++	void isRedundant_olderVersion_multiVersionMode_doesNotSkip() {
++		PackageDependencyRegistry registry = new PackageDependencyRegistry();
++		registry.addDependency("hl7.terminology.r4", "6.2.0");
++
++		assertThat(registry.isRedundant("hl7.terminology.r4", "5.4.0", myMultiVersionSpec)).isFalse();
++	}
++
++	@Test
++	void isRedundant_newerVersion_doesNotSkip() {
++		PackageDependencyRegistry registry = new PackageDependencyRegistry();
++		registry.addDependency("hl7.terminology.r4", "5.4.0");
++
++		assertThat(registry.isRedundant("hl7.terminology.r4", "6.2.0", mySingleVersionSpec)).isFalse();
++		assertThat(registry.isRedundant("hl7.terminology.r4", "6.2.0", myMultiVersionSpec)).isFalse();
++	}
++
++	@Test
++	void isRedundant_differentPackage_doesNotSkip() {
++		PackageDependencyRegistry registry = new PackageDependencyRegistry();
++		registry.addDependency("hl7.terminology.r4", "6.2.0");
++
++		assertThat(registry.isRedundant("hl7.fhir.r4.core", "4.0.1", mySingleVersionSpec)).isFalse();
++	}
++
++	@Test
++	void isRedundant_neverSeen_doesNotSkip() {
++		PackageDependencyRegistry registry = new PackageDependencyRegistry();
++
++		assertThat(registry.isRedundant("hl7.terminology.r4", "5.4.0", mySingleVersionSpec)).isFalse();
++	}
++
++	@Test
++	void addDependency_tracksHighestVersion() {
++		PackageDependencyRegistry registry = new PackageDependencyRegistry();
++		registry.addDependency("hl7.terminology.r4", "5.4.0");
++		registry.addDependency("hl7.terminology.r4", "6.2.0");
++
++		assertThat(registry.isRedundant("hl7.terminology.r4", "5.4.0", mySingleVersionSpec)).isTrue();
++		assertThat(registry.isRedundant("hl7.terminology.r4", "6.2.0", mySingleVersionSpec)).isTrue();
++	}
++
++	@Test
++	void isRedundant_nullVersion_treatedAsSameVersion() {
++		PackageDependencyRegistry registry = new PackageDependencyRegistry();
++		registry.addDependency("my.package", null);
++
++		assertThat(registry.isRedundant("my.package", null, mySingleVersionSpec)).isTrue();
++		assertThat(registry.isRedundant("my.package", null, myMultiVersionSpec)).isTrue();
++	}
++
++	@Test
++	void addDependency_doesNotDowngradeTrackedVersion() {
++		PackageDependencyRegistry registry = new PackageDependencyRegistry();
++		registry.addDependency("hl7.terminology.r4", "6.2.0");
++		registry.addDependency("hl7.terminology.r4", "5.4.0");
++
++		assertThat(registry.isRedundant("hl7.terminology.r4", "5.4.0", mySingleVersionSpec)).isTrue();
++		assertThat(registry.isRedundant("hl7.terminology.r4", "6.2.0", mySingleVersionSpec)).isTrue();
++	}
++}
+diff --git a/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/packages/PackageInstallerSvcImplTest.java b/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/packages/PackageInstallerSvcImplTest.java
+index 582576977398..70a9f89e2338 100644
+--- a/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/packages/PackageInstallerSvcImplTest.java
++++ b/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/packages/PackageInstallerSvcImplTest.java
+@@ -149,6 +149,8 @@ public class PackageInstallerSvcImplTest {
+ 	private PartitionSettings myPartitionSettings = new PartitionSettings();
+ 	@Spy
+ 	private CommonCodeSystemsTerminologyService myCommonCodeSystemsTerminologyService = new CommonCodeSystemsTerminologyService(myCtx);
++	@Spy
++	private PackageVersionStamper myPackageVersionStamper = new PackageVersionStamper(myCtx);
+ 
+ 	@InjectMocks
+ 	private PackageInstallerSvcImpl mySvc;
+@@ -534,6 +536,23 @@ void testInstall_existingResource_returnsUpdated() throws IOException {
+ 			.hasInfoMessage("-- Updated 1 resources of type CodeSystem");
+ 	}
+ 
++	// Created by Claude Opus 4.6
++	@Test
++	void install_newResource_stampsMetaSourceFromPackageSpec() throws IOException {
++		CodeSystem cs = new CodeSystem();
++		cs.setUrl("http://new-code-system");
++		cs.setContent(CodeSystem.CodeSystemContentMode.COMPLETE);
++
++		PackageInstallationSpec spec = setupResourceInPackage(null, cs, myCodeSystemDao);
++
++		when(myVersionCanonicalizerMock.codeSystemToCanonical(any())).thenReturn(cs);
++
++		mySvc.install(spec);
++
++		verify(myCodeSystemDao).create(myCodeSystemCaptor.capture(), any(RequestDetails.class));
++		assertThat(myCodeSystemCaptor.getValue().getMeta().getSource()).isEqualTo(PACKAGE_ID_1 + "|" + PACKAGE_VERSION);
++	}
++
+ 	// Created by Claude Opus 4.6
+ 	@Test
+ 	void testInstallPackage_nullPackage_throwsWithPackageNameAndVersion() throws IOException {
+@@ -1227,4 +1246,172 @@ void testUpdateResource_versionConflict_skipsResourceAndLogsErrorWithCause() thr
+ 				.hasErrorMessage("Version conflict error")
+ 				.hasErrorMessage("Cause: HAPI-0825: Conflict with resource version");
+ 	}
++
++	// Created by Claude Opus 4.6
++	@Nested
++	class SkipOlderSearchParameterInMultiVersionModeTest {
++
++		@RegisterExtension
++		LogbackTestExtension myPackageVersionStamperLogCapture = new LogbackTestExtension(PackageVersionStamper.class);
++
++		@Test
++		void install_searchParameterFromOlderPackage_skipsUpdate() throws IOException {
++			SearchParameter existingSP = createSearchParameter("existing-sp", List.of("Patient"));
++			existingSP.setUrl("http://example.org/sp");
++			existingSP.setStatus(Enumerations.PublicationStatus.ACTIVE);
++			existingSP.getMeta().setSource("package1|2.0");
++
++			SearchParameter installSP = createSearchParameter("existing-sp", List.of("Patient"));
++			installSP.setUrl("http://example.org/sp");
++			installSP.setStatus(Enumerations.PublicationStatus.ACTIVE);
++
++			PackageInstallationSpec spec = setupResourceInPackage(existingSP, installSP, mySearchParameterDao);
++			spec.setName("package1");
++			spec.setVersion("1.0");
++			spec.setVersionPolicy(PackageInstallationSpec.VersionPolicyEnum.MULTI_VERSION);
++			setupSearchParameterValidationMocksForSuccess();
++
++			mySvc.install(spec);
++
++			verify(mySearchParameterDao, never()).update(any(), any(RequestDetails.class));
++
++			LogbackTestExtensionAssert.assertThat(myPackageVersionStamperLogCapture)
++					.hasInfoMessage(
++							"Skipping update of SearchParameter/existing-sp because existing resource was installed"
++									+ " from a newer version of the same package (existing: package1|2.0, incoming: package1|1.0)");
++		}
++
++		@Test
++		void install_searchParameterFromNewerPackage_allowsUpdate() throws IOException {
++			SearchParameter existingSP = createSearchParameter("existing-sp", List.of("Patient"));
++			existingSP.setUrl("http://example.org/sp");
++			existingSP.setStatus(Enumerations.PublicationStatus.ACTIVE);
++			existingSP.getMeta().setSource("package1|1.0");
++
++			SearchParameter installSP = createSearchParameter("existing-sp", List.of("Patient"));
++			installSP.setUrl("http://example.org/sp");
++			installSP.setStatus(Enumerations.PublicationStatus.ACTIVE);
++
++			PackageInstallationSpec spec = setupResourceInPackage(existingSP, installSP, mySearchParameterDao);
++			spec.setName("package1");
++			spec.setVersion("2.0");
++			spec.setVersionPolicy(PackageInstallationSpec.VersionPolicyEnum.MULTI_VERSION);
++			setupSearchParameterValidationMocksForSuccess();
++			when(mySearchParameterDao.update(any(), any(RequestDetails.class))).thenReturn(new DaoMethodOutcome());
++
++			mySvc.install(spec);
++
++			verify(mySearchParameterDao, times(1)).update(any(), any(RequestDetails.class));
++		}
++
++		@Test
++		void install_searchParameterWithNoExistingSource_allowsUpdate() throws IOException {
++			SearchParameter existingSP = createSearchParameter("existing-sp", List.of("Patient"));
++			existingSP.setUrl("http://example.org/sp");
++			existingSP.setStatus(Enumerations.PublicationStatus.ACTIVE);
++
++			SearchParameter installSP = createSearchParameter("existing-sp", List.of("Patient"));
++			installSP.setUrl("http://example.org/sp");
++			installSP.setStatus(Enumerations.PublicationStatus.ACTIVE);
++
++			PackageInstallationSpec spec = setupResourceInPackage(existingSP, installSP, mySearchParameterDao);
++			spec.setVersionPolicy(PackageInstallationSpec.VersionPolicyEnum.MULTI_VERSION);
++			setupSearchParameterValidationMocksForSuccess();
++			when(mySearchParameterDao.update(any(), any(RequestDetails.class))).thenReturn(new DaoMethodOutcome());
++
++			mySvc.install(spec);
++
++			verify(mySearchParameterDao, times(1)).update(any(), any(RequestDetails.class));
++		}
++
++		@Test
++		void install_searchParameterWithRequestIdInMetaSource_skipsOlderVersion() throws IOException {
++			SearchParameter existingSP = createSearchParameter("existing-sp", List.of("Patient"));
++			existingSP.setUrl("http://example.org/sp");
++			existingSP.setStatus(Enumerations.PublicationStatus.ACTIVE);
++			existingSP.getMeta().setSource("package1|2.0#some-request-id");
++
++			SearchParameter installSP = createSearchParameter("existing-sp", List.of("Patient"));
++			installSP.setUrl("http://example.org/sp");
++			installSP.setStatus(Enumerations.PublicationStatus.ACTIVE);
++
++			PackageInstallationSpec spec = setupResourceInPackage(existingSP, installSP, mySearchParameterDao);
++			spec.setName("package1");
++			spec.setVersion("1.0");
++			spec.setVersionPolicy(PackageInstallationSpec.VersionPolicyEnum.MULTI_VERSION);
++			setupSearchParameterValidationMocksForSuccess();
++
++			mySvc.install(spec);
++
++			verify(mySearchParameterDao, never()).update(any(), any(RequestDetails.class));
++		}
++
++		@Test
++		void install_codeSystemInMultiVersionMode_allowsUpdateFromOlderPackage() throws IOException {
++			CodeSystem existingCs = new CodeSystem();
++			existingCs.setId("CodeSystem/existing-cs");
++			existingCs.setUrl("http://example.org/cs");
++			existingCs.setContent(CodeSystem.CodeSystemContentMode.COMPLETE);
++			existingCs.getMeta().setSource("package1|2.0");
++
++			CodeSystem installCs = new CodeSystem();
++			installCs.setUrl("http://example.org/cs");
++			installCs.setContent(CodeSystem.CodeSystemContentMode.COMPLETE);
++
++			PackageInstallationSpec spec = setupResourceInPackage(existingCs, installCs, myCodeSystemDao);
++			spec.setName("package1");
++			spec.setVersion("1.0");
++			spec.setVersionPolicy(PackageInstallationSpec.VersionPolicyEnum.MULTI_VERSION);
++			when(myVersionCanonicalizerMock.codeSystemToCanonical(any())).thenReturn(installCs);
++			when(myCodeSystemDao.update(any(), any(RequestDetails.class))).thenReturn(new DaoMethodOutcome());
++
++			mySvc.install(spec);
++
++			verify(myCodeSystemDao, times(1)).update(any(), any(RequestDetails.class));
++		}
++
++		@Test
++		void install_codeSystemInSingleVersionMode_skipsOlderPackage() throws IOException {
++			CodeSystem existingCs = new CodeSystem();
++			existingCs.setId("CodeSystem/existing-cs");
++			existingCs.setUrl("http://example.org/cs");
++			existingCs.setContent(CodeSystem.CodeSystemContentMode.COMPLETE);
++			existingCs.getMeta().setSource("package1|2.0");
++
++			CodeSystem installCs = new CodeSystem();
++			installCs.setUrl("http://example.org/cs");
++			installCs.setContent(CodeSystem.CodeSystemContentMode.COMPLETE);
++
++			PackageInstallationSpec spec = setupResourceInPackage(existingCs, installCs, myCodeSystemDao);
++			spec.setName("package1");
++			spec.setVersion("1.0");
++			spec.setVersionPolicy(PackageInstallationSpec.VersionPolicyEnum.SINGLE_VERSION);
++			when(myVersionCanonicalizerMock.codeSystemToCanonical(any())).thenReturn(installCs);
++
++			mySvc.install(spec);
++
++			verify(myCodeSystemDao, never()).update(any(), any(RequestDetails.class));
++		}
++
++		@Test
++		void install_searchParameterFromDifferentPackage_allowsUpdate() throws IOException {
++			SearchParameter existingSP = createSearchParameter("existing-sp", List.of("Patient"));
++			existingSP.setUrl("http://example.org/sp");
++			existingSP.setStatus(Enumerations.PublicationStatus.ACTIVE);
++			existingSP.getMeta().setSource("other-package|5.0");
++
++			SearchParameter installSP = createSearchParameter("existing-sp", List.of("Patient"));
++			installSP.setUrl("http://example.org/sp");
++			installSP.setStatus(Enumerations.PublicationStatus.ACTIVE);
++
++			PackageInstallationSpec spec = setupResourceInPackage(existingSP, installSP, mySearchParameterDao);
++			spec.setVersionPolicy(PackageInstallationSpec.VersionPolicyEnum.MULTI_VERSION);
++			setupSearchParameterValidationMocksForSuccess();
++			when(mySearchParameterDao.update(any(), any(RequestDetails.class))).thenReturn(new DaoMethodOutcome());
++
++			mySvc.install(spec);
++
++			verify(mySearchParameterDao, times(1)).update(any(), any(RequestDetails.class));
++		}
++	}
+ }
+diff --git a/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/packages/PackageVersionStamperTest.java b/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/packages/PackageVersionStamperTest.java
+new file mode 100644
+index 000000000000..ef4aee893aee
+--- /dev/null
++++ b/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/packages/PackageVersionStamperTest.java
+@@ -0,0 +1,170 @@
++package ca.uhn.fhir.jpa.packages;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import ca.uhn.fhir.context.FhirContext;
++import ca.uhn.fhir.util.UrlUtil;
++import java.util.Optional;
++import org.hl7.fhir.r4.model.Patient;
++import org.hl7.fhir.r4.model.SearchParameter;
++import org.junit.jupiter.api.Test;
++
++// Created by Claude Opus 4.6
++class PackageVersionStamperTest {
++
++	private static final FhirContext ourCtx = FhirContext.forR4Cached();
++	private final PackageVersionStamper myStamper = new PackageVersionStamper(ourCtx);
++
++	@Test
++	void stampPackageSource_setsMetaSource() {
++		Patient resource = new Patient();
++		PackageInstallationSpec spec = new PackageInstallationSpec()
++				.setName("my.package")
++				.setVersion("1.2.0");
++
++		myStamper.stampPackageSource(resource, spec);
++
++		assertThat(resource.getMeta().getSource()).isEqualTo("my.package|1.2.0");
++	}
++
++	@Test
++	void stampPackageSource_nullSpec_doesNothing() {
++		Patient resource = new Patient();
++
++		myStamper.stampPackageSource(resource, null);
++
++		assertThat(resource.getMeta().getSource()).isNullOrEmpty();
++	}
++
++	@Test
++	void parsePackageSource_validSource_returnsParts() {
++		Patient resource = new Patient();
++		resource.getMeta().setSource("my.package|1.2.0");
++
++		Optional<UrlUtil.CanonicalUrlParts> result = myStamper.parsePackageSource(resource);
++
++		assertThat(result).isPresent();
++		assertThat(result.get().url()).isEqualTo("my.package");
++		assertThat(result.get().versionId()).hasValue("1.2.0");
++	}
++
++	@Test
++	void parsePackageSource_sourceWithRequestId_returnsParts() {
++		Patient resource = new Patient();
++		resource.getMeta().setSource("my.package|1.2.0#request-123");
++
++		Optional<UrlUtil.CanonicalUrlParts> result = myStamper.parsePackageSource(resource);
++
++		assertThat(result).isPresent();
++		assertThat(result.get().url()).isEqualTo("my.package");
++		assertThat(result.get().versionId()).hasValue("1.2.0");
++	}
++
++	@Test
++	void parsePackageSource_noSource_returnsEmpty() {
++		Patient resource = new Patient();
++
++		Optional<UrlUtil.CanonicalUrlParts> result = myStamper.parsePackageSource(resource);
++
++		assertThat(result).isEmpty();
++	}
++
++	@Test
++	void parsePackageSource_sourceWithoutVersion_returnsEmpty() {
++		Patient resource = new Patient();
++		resource.getMeta().setSource("my.package");
++
++		Optional<UrlUtil.CanonicalUrlParts> result = myStamper.parsePackageSource(resource);
++
++		assertThat(result).isEmpty();
++	}
++
++	@Test
++	void isOlderPackageVersion_olderIncoming_returnsTrue() {
++		SearchParameter existing = new SearchParameter();
++		existing.setId("SearchParameter/sp1");
++		existing.getMeta().setSource("my.package|2.0.0");
++
++		PackageInstallationSpec spec = new PackageInstallationSpec()
++				.setName("my.package")
++				.setVersion("1.0.0");
++
++		assertThat(myStamper.isOlderPackageVersion(spec, existing)).isTrue();
++	}
++
++	@Test
++	void isOlderPackageVersion_newerIncoming_returnsFalse() {
++		SearchParameter existing = new SearchParameter();
++		existing.setId("SearchParameter/sp1");
++		existing.getMeta().setSource("my.package|1.0.0");
++
++		PackageInstallationSpec spec = new PackageInstallationSpec()
++				.setName("my.package")
++				.setVersion("2.0.0");
++
++		assertThat(myStamper.isOlderPackageVersion(spec, existing)).isFalse();
++	}
++
++	@Test
++	void isOlderPackageVersion_sameVersion_returnsFalse() {
++		SearchParameter existing = new SearchParameter();
++		existing.setId("SearchParameter/sp1");
++		existing.getMeta().setSource("my.package|1.0.0");
++
++		PackageInstallationSpec spec = new PackageInstallationSpec()
++				.setName("my.package")
++				.setVersion("1.0.0");
++
++		assertThat(myStamper.isOlderPackageVersion(spec, existing)).isFalse();
++	}
++
++	@Test
++	void isOlderPackageVersion_differentPackageName_returnsFalse() {
++		SearchParameter existing = new SearchParameter();
++		existing.setId("SearchParameter/sp1");
++		existing.getMeta().setSource("other.package|5.0.0");
++
++		PackageInstallationSpec spec = new PackageInstallationSpec()
++				.setName("my.package")
++				.setVersion("1.0.0");
++
++		assertThat(myStamper.isOlderPackageVersion(spec, existing)).isFalse();
++	}
++
++	@Test
++	void isOlderPackageVersion_noExistingSource_returnsFalse() {
++		SearchParameter existing = new SearchParameter();
++		existing.setId("SearchParameter/sp1");
++
++		PackageInstallationSpec spec = new PackageInstallationSpec()
++				.setName("my.package")
++				.setVersion("1.0.0");
++
++		assertThat(myStamper.isOlderPackageVersion(spec, existing)).isFalse();
++	}
++
++	@Test
++	void isOlderPackageVersion_nullIncomingVersion_returnsFalse() {
++		SearchParameter existing = new SearchParameter();
++		existing.setId("SearchParameter/sp1");
++		existing.getMeta().setSource("my.package|2.0.0");
++
++		PackageInstallationSpec spec = new PackageInstallationSpec()
++				.setName("my.package");
++
++		assertThat(myStamper.isOlderPackageVersion(spec, existing)).isFalse();
++	}
++
++	@Test
++	void isOlderPackageVersion_existingSourceWithRequestId_comparesCorrectly() {
++		SearchParameter existing = new SearchParameter();
++		existing.setId("SearchParameter/sp1");
++		existing.getMeta().setSource("my.package|2.0.0#request-456");
++
++		PackageInstallationSpec spec = new PackageInstallationSpec()
++				.setName("my.package")
++				.setVersion("1.0.0");
++
++		assertThat(myStamper.isOlderPackageVersion(spec, existing)).isTrue();
++	}
++}

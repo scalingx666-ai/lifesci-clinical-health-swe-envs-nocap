@@ -1,0 +1,198 @@
+diff --git a/packages/api/src/external/commonwell-v2/api.ts b/packages/api/src/external/commonwell-v2/api.ts
+index 5704c48c8c..37b856b7d3 100644
+--- a/packages/api/src/external/commonwell-v2/api.ts
++++ b/packages/api/src/external/commonwell-v2/api.ts
+@@ -12,6 +12,8 @@ import { Config } from "../../shared/config";
+ import { CommonWellMock } from "./mock/api-mock";
+ import { CommonWellMemberMock } from "./mock/member-mock";
+ 
++const MAX_ATTEMPTS = 5;
++const INITIAL_DELAY = 1_000;
+ const apiMode = Config.isProdEnv() ? APIMode.production : APIMode.integration;
+ 
+ /**
+@@ -36,6 +38,13 @@ export function makeCommonWellMemberAPI(): CommonWellMemberAPI {
+     memberName: memberName,
+     memberId: memberId,
+     apiMode,
++    options: {
++      onError500: {
++        retry: true,
++        maxAttempts: MAX_ATTEMPTS,
++        initialDelay: INITIAL_DELAY,
++      },
++    },
+   });
+ }
+ 
+@@ -67,6 +76,13 @@ export function makeCommonWellAPI(
+     npi,
+     apiMode,
+     authGrantorReferenceOid: queryGrantorOid,
++    options: {
++      onError500: {
++        retry: true,
++        maxAttempts: MAX_ATTEMPTS,
++        initialDelay: INITIAL_DELAY,
++      },
++    },
+   });
+ }
+ 
+diff --git a/packages/commonwell-sdk/src/client/commonwell-base.ts b/packages/commonwell-sdk/src/client/commonwell-base.ts
+index d5d1861dbb..abea66edbe 100644
+--- a/packages/commonwell-sdk/src/client/commonwell-base.ts
++++ b/packages/commonwell-sdk/src/client/commonwell-base.ts
+@@ -1,6 +1,14 @@
+ import axios, { AxiosInstance, AxiosResponse, InternalAxiosRequestConfig } from "axios";
+ import { Agent } from "https";
+-import { APIMode, CommonWellOptions, DEFAULT_AXIOS_TIMEOUT_SECONDS } from "./common";
++import { executeWithNetworkRetries, defaultOptionsRequestNotAccepted } from "@metriport/shared";
++import httpStatus from "http-status";
++import {
++  APIMode,
++  CommonWellOptions,
++  DEFAULT_AXIOS_TIMEOUT_SECONDS,
++  defaultOnError500,
++  OnError500Options,
++} from "./common";
+ 
+ /**
+  * Implementation of the CommonWell API, v4.
+@@ -17,6 +25,7 @@ export class CommonWellBase {
+   protected rsaPrivateKey: string;
+   private httpsAgent: Agent;
+   private _lastTransactionId: string | undefined;
++  protected onError500: OnError500Options;
+ 
+   /**
+    * Creates a new instance of the CommonWell API client pertaining to an
+@@ -43,6 +52,7 @@ export class CommonWellBase {
+   }) {
+     this.rsaPrivateKey = rsaPrivateKey;
+     this.httpsAgent = new Agent({ cert: orgCert, key: rsaPrivateKey });
++    this.onError500 = { ...defaultOnError500, ...(options.onError500 ?? {}) };
+     this.api = axios.create({
+       timeout: options?.timeout ?? DEFAULT_AXIOS_TIMEOUT_SECONDS * 1_000,
+       baseURL:
+@@ -106,4 +116,18 @@ export class CommonWellBase {
+       return Promise.reject(error);
+     };
+   }
++
++  protected async executeWithRetriesOn500IfEnabled<T>(fn: () => Promise<T>): Promise<T> {
++    return this.onError500.retry
++      ? executeWithNetworkRetries(fn, {
++          ...this.onError500,
++          httpCodesToRetry: [...defaultOptionsRequestNotAccepted.httpCodesToRetry],
++          httpStatusCodesToRetry: [
++            ...defaultOptionsRequestNotAccepted.httpStatusCodesToRetry,
++            httpStatus.INTERNAL_SERVER_ERROR,
++            httpStatus.SERVICE_UNAVAILABLE,
++          ],
++        })
++      : fn();
++  }
+ }
+diff --git a/packages/commonwell-sdk/src/client/commonwell.ts b/packages/commonwell-sdk/src/client/commonwell.ts
+index c703ae9421..e89c02e3b1 100644
+--- a/packages/commonwell-sdk/src/client/commonwell.ts
++++ b/packages/commonwell-sdk/src/client/commonwell.ts
+@@ -1,11 +1,4 @@
+-import {
+-  BadRequestError,
+-  base64ToBuffer,
+-  defaultOptionsRequestNotAccepted,
+-  executeWithNetworkRetries,
+-  MetriportError,
+-  NotFoundError,
+-} from "@metriport/shared";
++import { BadRequestError, base64ToBuffer, MetriportError, NotFoundError } from "@metriport/shared";
+ import { isAxiosError } from "axios";
+ import httpStatus from "http-status";
+ import * as stream from "stream";
+@@ -37,7 +30,7 @@ import {
+   StatusResponse,
+   statusResponseSchema,
+ } from "../models/patient";
+-import { APIMode, CommonWellOptions, defaultOnError500, OnError500Options } from "./common";
++import { APIMode, CommonWellOptions } from "./common";
+ import {
+   BaseOptions,
+   CommonWellAPI,
+@@ -58,7 +51,6 @@ export class CommonWell extends CommonWellBase implements CommonWellAPI {
+   private _npi: string;
+   private _homeCommunityId: string;
+   private _authGrantorReferenceOid?: string | undefined;
+-  private onError500: OnError500Options;
+ 
+   /**
+    * Creates a new instance of the CommonWell API client pertaining to an
+@@ -108,7 +100,6 @@ export class CommonWell extends CommonWellBase implements CommonWellAPI {
+     this._npi = npi;
+     this._homeCommunityId = homeCommunityId;
+     this._authGrantorReferenceOid = authGrantorReference;
+-    this.onError500 = { ...defaultOnError500, ...options.onError500 };
+   }
+ 
+   get oid() {
+@@ -282,6 +273,8 @@ export class CommonWell extends CommonWellBase implements CommonWellAPI {
+    *
+    * The links returned are confirmed links of LOLA 2 or higher.
+    *
++   * Note, there is no retry logic included for this method, since it's best used with custom logic.
++   *
+    * @param meta                Metadata about the request.
+    * @param patientId           The person id to be link to a patient.
+    * @returns Response with list of links to Patients
+@@ -293,9 +286,7 @@ export class CommonWell extends CommonWellBase implements CommonWellAPI {
+     const headers = this.buildQueryHeaders(options?.meta);
+     const url = buildPatientLinkEndpoint(this.oid, patientId);
+     try {
+-      const resp = await this.executeWithRetriesOn500IfEnabled(() =>
+-        this.api.get(url, { headers })
+-      );
++      const resp = await this.api.get(url, { headers });
+       return patientExistingLinksSchema.parse(resp.data);
+     } catch (error) {
+       throw this.getDescriptiveError(error, "Failed to get patient links by patient id");
+@@ -315,6 +306,8 @@ export class CommonWell extends CommonWellBase implements CommonWellAPI {
+    *
+    * The links returned are LOLA 1.
+    *
++   * Note, there is no retry logic included for this method, since it's best used with custom logic.
++   *
+    * @param patientId The ID of the patient to get probable links for.
+    * @returns Response with list of probable (LOLA1) links to other Patients
+    */
+@@ -326,9 +319,7 @@ export class CommonWell extends CommonWellBase implements CommonWellAPI {
+     const url = buildProbableLinkEndpoint(this.oid, patientId);
+ 
+     try {
+-      const resp = await this.executeWithRetriesOn500IfEnabled(() =>
+-        this.api.get(url, { headers })
+-      );
++      const resp = await this.api.get(url, { headers });
+       return patientProbableLinksRespSchema.parse(resp.data);
+     } catch (error) {
+       throw this.getDescriptiveError(error, "Failed to get probable links by patient id");
+@@ -622,19 +613,6 @@ export class CommonWell extends CommonWellBase implements CommonWellAPI {
+     };
+   }
+ 
+-  private async executeWithRetriesOn500IfEnabled<T>(fn: () => Promise<T>): Promise<T> {
+-    return this.onError500.retry
+-      ? executeWithNetworkRetries(fn, {
+-          ...this.onError500,
+-          httpCodesToRetry: [...defaultOptionsRequestNotAccepted.httpCodesToRetry],
+-          httpStatusCodesToRetry: [
+-            ...defaultOptionsRequestNotAccepted.httpStatusCodesToRetry,
+-            httpStatus.INTERNAL_SERVER_ERROR,
+-          ],
+-        })
+-      : fn();
+-  }
+-
+   private getDescriptiveError(error: unknown, title: string): unknown {
+     if (isAxiosError(error)) {
+       const status = error.response?.status;

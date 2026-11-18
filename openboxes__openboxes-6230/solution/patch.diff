@@ -1,0 +1,562 @@
+diff --git a/grails-app/services/org/pih/warehouse/api/receiving/v2/ReceiptV2Service.groovy b/grails-app/services/org/pih/warehouse/api/receiving/v2/ReceiptV2Service.groovy
+index d2b902a6ed0..fa6ccbb5b0c 100644
+--- a/grails-app/services/org/pih/warehouse/api/receiving/v2/ReceiptV2Service.groovy
++++ b/grails-app/services/org/pih/warehouse/api/receiving/v2/ReceiptV2Service.groovy
+@@ -16,9 +16,11 @@ import org.pih.warehouse.core.date.JavaUtilDateParser
+ import org.pih.warehouse.core.localization.MessageLocalizer
+ import org.pih.warehouse.core.validation.ObjectValidationResult
+ import org.pih.warehouse.inventory.InventoryItem
++import org.pih.warehouse.inventory.InventoryItemByProductLot
+ import org.pih.warehouse.inventory.InventoryItemManager
+ import org.pih.warehouse.inventory.RefreshProductAvailabilityEvent
+ import org.pih.warehouse.inventory.Transaction
++import org.pih.warehouse.product.lot.ProductLot
+ import org.pih.warehouse.receiving.Receipt
+ import org.pih.warehouse.receiving.ReceiptCompleteRequestCommand
+ import org.pih.warehouse.receiving.ReceiptDto
+@@ -200,32 +202,41 @@ class ReceiptV2Service {
+      * to the one shipment item identified in the URL, and without support for deletes.
+      *
+      * The receipt and shipment item are carried (and validated as existing/pending) by the command, so this assumes a
+-     * validated command - see {@link ReceiptEditReceivingInfoCommandValidator}.
++     * validated command - see {@link org.pih.warehouse.receiving.ReceiptEditReceivingInfoCommandValidator}.
+      */
+     @Transactional
+     ReceiptSaveResponseDto editReceivingInfo(ReceiptEditReceivingInfoCommand command) {
++
++        // Create any new inventory items in bulk upfront in case there are multiple rows that use the same new lot.
++        InventoryItemByProductLot inventoryItemMap = upsertInventoryItems(command.itemsToSave)
++
+         List<ReceiptItemSaveDto> updatedLines =
+                 command.itemsToSave.collect { ReceiptItemEditReceivingInfoRequest item ->
+-                    upsertReceiptItem(command.receipt, command.shipmentItem, item)
++                    InventoryItem inventoryItem = inventoryItemMap.get(item.product, item.lotNumber)
++                    upsertReceiptItem(command.receipt, command.shipmentItem, item, inventoryItem)
+                 }
+ 
+         return new ReceiptSaveResponseDto(updatedLines: updatedLines)
+     }
+ 
++    private InventoryItemByProductLot upsertInventoryItems(List<ReceiptItemEditReceivingInfoRequest> receiptItems) {
++        List<ProductLot> itemsToGetOrCreate = receiptItems.collect {
++            new ProductLot(
++                    product: it.product,
++                    lotNumber: it.lotNumber,
++                    expirationDate: it.expirationDate ? JavaUtilDateParser.asDate(it.expirationDate) : null,
++            )
++        }
++        return inventoryItemManager.upsertInventoryItems(itemsToGetOrCreate)
++    }
++
+     /**
+-     * Creates or updates a single receipt item from an edit-receiving-info request. The inventory item is resolved
+-     * (and created if necessary) from the requested product + lot number + expiration date and is potentially swapped
+-     * onto the receipt item, which is what allows the lot to be edited.
++     * Creates or updates a single receipt item from an edit-receiving-info request.
+      */
+-    private ReceiptItemSaveDto upsertReceiptItem(
+-            Receipt receipt, ShipmentItem shipmentItem, ReceiptItemEditReceivingInfoRequest item) {
+-        // InventoryItem.expirationDate is a (legacy) java.util.Date, so convert the request's date-only LocalDate at
+-        // the domain boundary. asDate resolves it to start-of-day in the system zone, so the stored Date and its
+-        // MM/dd/yyyy formatting (see the InventoryItem JSON marshaller) stay identical to before.
+-        Date expirationDate = item.expirationDate ? JavaUtilDateParser.asDate(item.expirationDate) : null
+-        InventoryItem inventoryItem = inventoryItemManager.getOrCreateInventoryItem(
+-                item.product, item.lotNumber, expirationDate)
+-        inventoryItemManager.updateExpirationDate(inventoryItem, expirationDate)
++    private ReceiptItemSaveDto upsertReceiptItem(Receipt receipt,
++                                                 ShipmentItem shipmentItem,
++                                                 ReceiptItemEditReceivingInfoRequest item,
++                                                 InventoryItem inventoryItem) {
+ 
+         // Lines created here are split lines - the original line always exists already (created when the receipt
+         // was started), so the split flag is owned by the server: forced on creation, never rebound afterwards.
+@@ -314,7 +325,7 @@ class ReceiptV2Service {
+      * the follow-up notifications and the product availability refresh.
+      *
+      * The receipt is bound and validated (as existing and pending, with the items belonging to it) by the command,
+-     * so this assumes a validated command - see {@link ReceiptCompleteRequestCommandValidator}.
++     * so this assumes a validated command - see {@link org.pih.warehouse.receiving.ReceiptCompleteRequestCommandValidator}.
+      */
+     @Transactional
+     ReceiptDto completeReceipt(ReceiptCompleteRequestCommand command) {
+diff --git a/grails-app/services/org/pih/warehouse/inventory/InventoryService.groovy b/grails-app/services/org/pih/warehouse/inventory/InventoryService.groovy
+index ce2e4d94fdd..f25c39aa202 100755
+--- a/grails-app/services/org/pih/warehouse/inventory/InventoryService.groovy
++++ b/grails-app/services/org/pih/warehouse/inventory/InventoryService.groovy
+@@ -1474,7 +1474,7 @@ class InventoryService implements ApplicationContextAware {
+             }
+             // ...Then get/create them all in bulk. Don't refresh product availability for any newly created items.
+             // We will manually perform a product availability refresh at the end.
+-            InventoryItemByProductLot inventoryItemMap = inventoryItemManager.getOrCreateInventoryItems(
++            InventoryItemByProductLot inventoryItemMap = inventoryItemManager.upsertInventoryItems(
+                     itemsToGetOrCreate, true)
+ 
+             // 3. Process each row added to the record inventory page
+diff --git a/src/main/groovy/org/pih/warehouse/inventory/InventoryItemManager.groovy b/src/main/groovy/org/pih/warehouse/inventory/InventoryItemManager.groovy
+index b19730cc035..e43a64dab9d 100644
+--- a/src/main/groovy/org/pih/warehouse/inventory/InventoryItemManager.groovy
++++ b/src/main/groovy/org/pih/warehouse/inventory/InventoryItemManager.groovy
+@@ -11,53 +11,64 @@ import org.pih.warehouse.product.Product
+ class InventoryItemManager {
+ 
+     /**
+-     * Finds the inventory item for the given product and lot number, creating it if it doesn't exist.
++     * Finds the inventory item for the given product lot, creating it if it doesn't exist, and otherwise updating its
++     * expiration date if it has changed.
+      *
+-     * @param product The product to get the item for.
+-     * @param lotNumber The lot number of the item to get.
+-     * @param expirationDate The expiration date of the lot. Will only be used if we need to create a new item.
++     * @param product The product associated with the lot.
++     * @param lotNumber The lot number of the item.
++     * @param expirationDate The expiration date of the lot. If the lot exists, it's expiration date will be updated
++     *                       to this one if they differ.
+      * @param disableRefresh True if the creation of a new InventoryItem should NOT trigger an asynchronous
+      *                       product availability refresh. Typically this is only true when callers want to
+      *                       trigger the refresh themselves, manually.
+      */
+-    InventoryItem getOrCreateInventoryItem(Product product,
+-                                           String lotNumber,
+-                                           Date expirationDate,
+-                                           boolean disableRefresh = false) {
++    InventoryItem upsertInventoryItem(Product product,
++                                      String lotNumber,
++                                      Date expirationDate,
++                                      boolean disableRefresh = false) {
+         InventoryItem inventoryItem = getInventoryItem(product, lotNumber)
+-        if (inventoryItem) {
+-            return inventoryItem
++        if (!inventoryItem) {
++            inventoryItem = createInventoryItem(product, lotNumber, expirationDate, disableRefresh)
+         }
+-
+-        return createInventoryItem(product, lotNumber, expirationDate, disableRefresh)
++        if (expirationDate != inventoryItem.expirationDate) {
++            inventoryItem = updateExpirationDate(inventoryItem, expirationDate)
++        }
++        return inventoryItem
+     }
+ 
+     /**
+-     * Finds the inventory item for the given product lot, creating it if it doesn't exist.
++     * Finds the inventory item for the given product lot, creating it if it doesn't exist, and otherwise updating its
++     * expiration date if it has changed.
+      *
+-     * @param productLot The product + lot of the item to get or create.
++     * @param productLot The product + lot of the item to upsert.
+      * @param disableRefresh True if the creation of a new InventoryItem should NOT trigger an asynchronous
+      *                       product availability refresh. Typically this is only true when callers want to
+      *                       trigger the refresh themselves, manually.
+      */
+-    InventoryItem getOrCreateInventoryItem(ProductLot productLot, boolean disableRefresh = false) {
+-        return getOrCreateInventoryItem(
+-                productLot.product, productLot.lotNumber, productLot.expirationDate, disableRefresh)
++    InventoryItem upsertInventoryItem(ProductLot productLot, boolean disableRefresh = false) {
++        return upsertInventoryItem(productLot.product, productLot.lotNumber, productLot.expirationDate, disableRefresh)
+     }
+ 
+     /**
+-     * Bulk method for finding the inventory items for the given product lots, creating them if they don't exist.
++     * Finds the inventory items for the given product lots, creating them if they don't exist, and otherwise
++     * updating their expiration dates if they have changed.
++     *
++     * @param productLot The product + lot of the items to upsert.
++     * @param disableRefresh True if the creation of a new InventoryItem should NOT trigger an asynchronous
++     *                       product availability refresh. Typically this is only true when callers want to
++     *                       trigger the refresh themselves, manually.
+      */
+-    InventoryItemByProductLot getOrCreateInventoryItems(Collection<ProductLot> productLots,
+-                                                        boolean disableRefresh = false) {
++    InventoryItemByProductLot upsertInventoryItems(Collection<ProductLot> productLots, boolean disableRefresh = false) {
+         InventoryItemByProductLot inventoryItemMap = new InventoryItemByProductLot()
+         for (ProductLot productLot in productLots) {
++            // We might have been given the same lot multiple times, so ignore any repeats that we've already processed
+             if (inventoryItemMap.containsKey(productLot)) {
+-                // We could consider adding some validation here, such as checking that the expiration dates match,
+-                // but for now we simply continue if we've already fetched or created this inventory item.
++                // We could consider adding some validation here, such as checking that the expiration dates match
++                // across repeat lots.
+                 continue
+             }
+-            InventoryItem inventoryItem = getOrCreateInventoryItem(productLot, disableRefresh)
++
++            InventoryItem inventoryItem = upsertInventoryItem(productLot, disableRefresh)
+             inventoryItemMap.put(productLot, inventoryItem)
+         }
+         return inventoryItemMap
+@@ -71,7 +82,7 @@ class InventoryItemManager {
+         // that any pre-existing lots (from before we were sanitizing inputs) can still be found.
+         InventoryItem inventoryItem = InventoryItem.createCriteria().get() {
+             and {
+-                eq("product.id", product.id)
++                eq("product", product)
+                 if (lotNumber) {
+                     eq("lotNumber", lotNumber)
+                 } else {
+@@ -150,8 +161,9 @@ class InventoryItemManager {
+                 product: product,
+                 lotNumber: sanitizeLotNumber(lotNumber),
+                 expirationDate: expirationDate,
+-                disableRefresh: disableRefresh,
+         )
++        inventoryItem.disableRefresh = disableRefresh  // Transient fields can't be set via map constructor
++
+         if (!inventoryItem.save()) {
+             throw new ValidationException("Error saving inventory item", inventoryItem.errors)
+         }
+diff --git a/src/main/groovy/org/pih/warehouse/receiving/ReceiptTransactionManager.groovy b/src/main/groovy/org/pih/warehouse/receiving/ReceiptTransactionManager.groovy
+index 398c14dc3bd..da6af056335 100644
+--- a/src/main/groovy/org/pih/warehouse/receiving/ReceiptTransactionManager.groovy
++++ b/src/main/groovy/org/pih/warehouse/receiving/ReceiptTransactionManager.groovy
+@@ -69,7 +69,7 @@ class ReceiptTransactionManager {
+         receivedItems.each { ReceiptItem receiptItem ->
+             // Receipt items created via the v2 endpoints always carry an inventory item, but fall back to resolving
+             // one from the lot fields to support receipts against legacy shipment items that never had one.
+-            InventoryItem inventoryItem = receiptItem.inventoryItem ?: inventoryItemManager.getOrCreateInventoryItem(
++            InventoryItem inventoryItem = receiptItem.inventoryItem ?: inventoryItemManager.upsertInventoryItem(
+                     receiptItem.product, receiptItem.lotNumber, receiptItem.expirationDate)
+ 
+             transaction.addToTransactionEntries(new TransactionEntry(
+diff --git a/src/test/groovy/org/pih/warehouse/api/receiving/v2/ReceiptV2ServiceSpec.groovy b/src/test/groovy/org/pih/warehouse/api/receiving/v2/ReceiptV2ServiceSpec.groovy
+index 5f9686babee..25de7fe49ea 100644
+--- a/src/test/groovy/org/pih/warehouse/api/receiving/v2/ReceiptV2ServiceSpec.groovy
++++ b/src/test/groovy/org/pih/warehouse/api/receiving/v2/ReceiptV2ServiceSpec.groovy
+@@ -20,19 +20,19 @@ import org.pih.warehouse.core.Location
+ import org.pih.warehouse.core.date.JavaUtilDateParser
+ import org.pih.warehouse.core.localization.MessageLocalizer
+ import org.pih.warehouse.core.mapper.SmartMapper
+-import org.pih.warehouse.importer.CSVUtils
+ import org.pih.warehouse.inventory.Inventory
+ import org.pih.warehouse.inventory.InventoryItem
++import org.pih.warehouse.inventory.InventoryItemByProductLot
+ import org.pih.warehouse.inventory.InventoryItemManager
+ import org.pih.warehouse.inventory.RefreshProductAvailabilityEvent
+ import org.pih.warehouse.inventory.Transaction
+-import org.pih.warehouse.inventory.TransactionAction
+ import org.pih.warehouse.inventory.TransactionCode
+ import org.pih.warehouse.inventory.TransactionEntry
+ import org.pih.warehouse.inventory.TransactionIdentifierService
+ import org.pih.warehouse.inventory.TransactionSource
+ import org.pih.warehouse.inventory.TransactionType
+ import org.pih.warehouse.product.Product
++import org.pih.warehouse.product.lot.ProductLot
+ import org.pih.warehouse.receiving.Receipt
+ import org.pih.warehouse.receiving.ReceiptCompleteRequestCommand
+ import org.pih.warehouse.receiving.ReceiptDto
+@@ -716,13 +716,13 @@ class ReceiptV2ServiceSpec extends Specification implements ServiceUnitTest<Rece
+                 )],
+         )
+ 
++        and: 'the item exists as is'
++        stubUpsertInventoryItem(splitLot, splitLot.expirationDate)
++
+         when:
+         service.editReceivingInfo(command)
+ 
+-        then:
+-        1 * inventoryItemManager.getOrCreateInventoryItem(shipmentItem.product, "LOT-2", null) >> splitLot
+-
+-        and: 'the new line is flagged as a split server-side and carries no quantity shipped of its own'
++        then: 'the new line is flagged as a split server-side and carries no quantity shipped of its own'
+         ReceiptItem splitItem = receipt.receiptItems.find { it.isSplitItem }
+         assert splitItem.quantityShipped == 0
+         assert splitItem.quantityReceived == 30
+@@ -749,14 +749,13 @@ class ReceiptV2ServiceSpec extends Specification implements ServiceUnitTest<Rece
+                 )],
+         )
+ 
++        and: 'the item exists as is'
++        stubUpsertInventoryItem(shipmentItem.inventoryItem, shipmentItem.inventoryItem.expirationDate)
++
+         when:
+         service.editReceivingInfo(command)
+ 
+-        then:
+-        1 * inventoryItemManager.getOrCreateInventoryItem(shipmentItem.product, "LOT-1", null) >>
+-                shipmentItem.inventoryItem
+-
+-        and: 'only the receiving info changes - the line stays the original with its full quantity shipped'
++        then: 'only the receiving info changes - the line stays the original with its full quantity shipped'
+         assert originalItem.quantityReceived == 60
+         assert originalItem.isSplitItem == Boolean.FALSE
+         assert originalItem.quantityShipped == 100
+@@ -784,19 +783,13 @@ class ReceiptV2ServiceSpec extends Specification implements ServiceUnitTest<Rece
+                 )],
+         )
+ 
++        and: 'the item exists but the expiration has changed'
++        stubUpsertInventoryItem(shipmentItem.inventoryItem, expectedExpirationDate)
++
+         when:
+         service.editReceivingInfo(command)
+ 
+-        then: 'the date is pushed onto the existing lot, which getOrCreateInventoryItem alone would have left as is'
+-        1 * inventoryItemManager.getOrCreateInventoryItem(shipmentItem.product, "LOT-1", expectedExpirationDate) >>
+-                shipmentItem.inventoryItem
+-        1 * inventoryItemManager.updateExpirationDate(shipmentItem.inventoryItem, expectedExpirationDate) >>
+-                { InventoryItem inventoryItem, Date expirationDate ->
+-                    inventoryItem.expirationDate = expirationDate
+-                    return inventoryItem
+-                }
+-
+-        and: 'the received line follows the lot'
++        then: 'the received line follows the lot'
+         assert originalItem.expirationDate == expectedExpirationDate
+     }
+ 
+@@ -820,19 +813,13 @@ class ReceiptV2ServiceSpec extends Specification implements ServiceUnitTest<Rece
+                 )],
+         )
+ 
++        and: 'the item exists but the expiration has been nulled'
++        stubUpsertInventoryItem(shipmentItem.inventoryItem, null)
++
+         when:
+         service.editReceivingInfo(command)
+ 
+-        then: 'the emptied date reaches the lot instead of being dropped on the way'
+-        1 * inventoryItemManager.getOrCreateInventoryItem(shipmentItem.product, "LOT-1", null) >>
+-                shipmentItem.inventoryItem
+-        1 * inventoryItemManager.updateExpirationDate(shipmentItem.inventoryItem, null) >>
+-                { InventoryItem inventoryItem, Date expirationDate ->
+-                    inventoryItem.expirationDate = expirationDate
+-                    return inventoryItem
+-                }
+-
+-        and: 'the received line follows the lot'
++        then: 'the received line follows the lot'
+         assert originalItem.expirationDate == null
+     }
+ 
+@@ -1290,6 +1277,25 @@ class ReceiptV2ServiceSpec extends Specification implements ServiceUnitTest<Rece
+     // Fixture helpers
+     // ----------------------------------------------------------------------------------------------------------
+ 
++    private stubUpsertInventoryItem(InventoryItem expectedInventoryItem, Date updatedExpirationDate = null) {
++        inventoryItemManager.upsertInventoryItems(_ as Collection<ProductLot>) >> {
++
++            // Stub updating the expiration date
++            expectedInventoryItem.expirationDate = updatedExpirationDate
++
++            // Then return the item
++            InventoryItemByProductLot inventoryItemMap = new InventoryItemByProductLot()
++            inventoryItemMap.put(
++                    new ProductLot(
++                            product: expectedInventoryItem.product,
++                            lotNumber: expectedInventoryItem.lotNumber,
++                    ),
++                    expectedInventoryItem)
++
++            return inventoryItemMap
++        }
++    }
++
+     private static Container buildPallet(String name, Integer sortOrder) {
+         return new Container(name: name, sortOrder: sortOrder)
+     }
+diff --git a/src/test/groovy/org/pih/warehouse/inventory/InventoryItemManagerSpec.groovy b/src/test/groovy/org/pih/warehouse/inventory/InventoryItemManagerSpec.groovy
+index 07ab496deed..71797d49191 100644
+--- a/src/test/groovy/org/pih/warehouse/inventory/InventoryItemManagerSpec.groovy
++++ b/src/test/groovy/org/pih/warehouse/inventory/InventoryItemManagerSpec.groovy
+@@ -5,11 +5,13 @@ import java.time.LocalDate
+ import grails.testing.gorm.DataTest
+ import spock.lang.Shared
+ import spock.lang.Specification
++import spock.lang.Unroll
+ 
+ import org.pih.warehouse.core.date.JavaUtilDateParser
+ import org.pih.warehouse.product.Product
+ import org.pih.warehouse.product.lot.ProductLot
+ 
++@Unroll
+ class InventoryItemManagerSpec extends Specification implements DataTest {
+ 
+     @Shared
+@@ -103,6 +105,165 @@ class InventoryItemManagerSpec extends Specification implements DataTest {
+         assert InventoryItem.count() == 1
+     }
+ 
++    void 'upsertInventoryItems should return an empty map when given no product lots'() {
++        when:
++        InventoryItemByProductLot result = inventoryItemManager.upsertInventoryItems([])
++
++        then:
++        assert result.isEmpty()
++        assert InventoryItem.count() == 0
++    }
++
++    void 'upsertInventoryItems should create the lots that do not exist yet'() {
++        given:
++        Product product = new Product(name: 'Test product').save(validate: false)
++        Product otherProduct = new Product(name: 'Other product').save(validate: false)
++
++        when:
++        InventoryItemByProductLot result = inventoryItemManager.upsertInventoryItems([
++                new ProductLot(product: product, lotNumber: 'LOT-1', expirationDate: expirationDate),
++                new ProductLot(product: otherProduct, lotNumber: 'LOT-2'),
++        ])
++
++        then: 'a lot is created for each product lot, carrying the given expiration date'
++        assert InventoryItem.count() == 2
++
++        InventoryItem lot = result.get(product, 'LOT-1')
++        assert lot.id != null
++        assert lot.product == product
++        assert lot.lotNumber == 'LOT-1'
++        assert lot.expirationDate == expirationDate
++
++        InventoryItem otherLot = result.get(otherProduct, 'LOT-2')
++        assert otherLot.id != null
++        assert otherLot.product == otherProduct
++        assert otherLot.lotNumber == 'LOT-2'
++        assert otherLot.expirationDate == null
++    }
++
++    void 'upsertInventoryItems should sanitize the lot number of the lots it creates'() {
++        given:
++        Product product = new Product(name: 'Test product').save(validate: false)
++
++        when:
++        InventoryItemByProductLot result = inventoryItemManager.upsertInventoryItems([
++                new ProductLot(product: product, lotNumber: ' LOT-1 '),
++        ])
++
++        then: 'the lot is stored trimmed, but is still keyed on the lot number as it was given'
++        assert result.get(product, ' LOT-1 ').lotNumber == 'LOT-1'
++    }
++
++    void 'upsertInventoryItems should create new lots with disableRefresh set to #disableRefresh'() {
++        given:
++        Product product = new Product(name: 'Test product').save(validate: false)
++
++        when:
++        InventoryItemByProductLot result = inventoryItemManager.upsertInventoryItems(
++                [new ProductLot(product: product, lotNumber: 'LOT-1')],
++                disableRefresh,
++        )
++
++        then:
++        assert result.get(product, 'LOT-1').disableRefresh == disableRefresh
++
++        where:
++        disableRefresh << [true, false]
++    }
++
++    void 'upsertInventoryItems should return the existing lot instead of creating a new one'() {
++        given:
++        InventoryItem existingLot = buildInventoryItem(expirationDate)
++
++        when:
++        InventoryItemByProductLot result = inventoryItemManager.upsertInventoryItems([
++                new ProductLot(product: existingLot.product, lotNumber: 'LOT-1', expirationDate: expirationDate),
++        ])
++
++        then: 'nothing is created and the lot is left untouched'
++        assert result.get(existingLot.product, 'LOT-1') == existingLot
++        assert InventoryItem.count() == 1
++        assert !existingLot.isDirty()
++    }
++
++    void 'upsertInventoryItems should find an existing lot through its sanitized lot number'() {
++        given:
++        InventoryItem existingLot = buildInventoryItem(expirationDate)
++
++        when: 'we upsert with the same lot number but with whitespace around it'
++        String lotNumber = " ${existingLot.lotNumber} "
++        InventoryItemByProductLot result = inventoryItemManager.upsertInventoryItems([
++                new ProductLot(product: existingLot.product, lotNumber: lotNumber, expirationDate: expirationDate),
++        ])
++
++        then: 'the result is keyed on the lot with whitespace but the returned item is the existing one with no spaces'
++        InventoryItem returnedItem = result.get(existingLot.product, lotNumber)
++        assert returnedItem == existingLot
++        assert returnedItem.lotNumber == existingLot.lotNumber
++        assert InventoryItem.count() == 1
++    }
++
++    void 'upsertInventoryItems should find existing blank lots when given a null lot'() {
++        given: 'a product whose default lot is stored with an empty lot number'
++        Product product = new Product(name: 'Test product').save(validate: false)
++        InventoryItem defaultLot = buildLot(product, '')
++
++        when:
++        InventoryItemByProductLot result = inventoryItemManager.upsertInventoryItems([
++                new ProductLot(product: product, lotNumber: null),
++        ])
++
++        then:
++        assert result.get(product, null) == defaultLot
++        assert InventoryItem.count() == 1
++    }
++
++    void 'upsertInventoryItems should update the expiration date of an existing lot when it has changed'() {
++        given:
++        InventoryItem existingLot = buildInventoryItem(JavaUtilDateParser.asDate(LocalDate.of(2026, 9, 9)))
++
++        when:
++        InventoryItemByProductLot result = inventoryItemManager.upsertInventoryItems([
++                new ProductLot(product: existingLot.product, lotNumber: 'LOT-1', expirationDate: expirationDate),
++        ])
++
++        then: 'the date is updated'
++        assert result.get(existingLot.product, 'LOT-1') == existingLot
++        assert existingLot.expirationDate == expirationDate
++        assert InventoryItem.count() == 1
++    }
++
++    void 'upsertInventoryItems should clear the expiration date of an existing lot when none is given'() {
++        given:
++        InventoryItem existingLot = buildInventoryItem(expirationDate)
++
++        when:
++        InventoryItemByProductLot result = inventoryItemManager.upsertInventoryItems([
++                new ProductLot(product: existingLot.product, lotNumber: 'LOT-1', expirationDate: null),
++        ])
++
++        then: 'the date is removed'
++        assert result.get(existingLot.product, 'LOT-1') == existingLot
++        assert existingLot.expirationDate == null
++    }
++
++    void 'upsertInventoryItems should only process the first of a repeated product lot'() {
++        given:
++        Product product = new Product(name: 'Test product').save(validate: false)
++        Date otherExpirationDate = JavaUtilDateParser.asDate(LocalDate.of(2029, 1, 1))
++
++        when: 'the same new lot is given twice, with different expiration dates'
++        InventoryItemByProductLot result = inventoryItemManager.upsertInventoryItems([
++                new ProductLot(product: product, lotNumber: 'LOT-1', expirationDate: expirationDate),
++                new ProductLot(product: product, lotNumber: 'LOT-1', expirationDate: otherExpirationDate),
++        ])
++
++        then: 'a single lot is created, and the different date in the second item is ignored'
++        assert result.size() == 1
++        assert InventoryItem.count() == 1
++        assert result.get(product, 'LOT-1').expirationDate == expirationDate
++    }
++
+     void 'updateExpirationDate should save the new date on the lot'() {
+         given: 'the following db data'
+         InventoryItem inventoryItem = buildInventoryItem(JavaUtilDateParser.asDate(LocalDate.of(2026, 9, 9)))
+diff --git a/src/test/groovy/org/pih/warehouse/receiving/ReceiptTransactionManagerSpec.groovy b/src/test/groovy/org/pih/warehouse/receiving/ReceiptTransactionManagerSpec.groovy
+index 05daaa34024..801a5901791 100644
+--- a/src/test/groovy/org/pih/warehouse/receiving/ReceiptTransactionManagerSpec.groovy
++++ b/src/test/groovy/org/pih/warehouse/receiving/ReceiptTransactionManagerSpec.groovy
+@@ -118,7 +118,7 @@ class ReceiptTransactionManagerSpec extends Specification implements DataTest {
+         assert entry.quantity == 70
+ 
+         and: 'no inventory item is resolved for the lines that were left out'
+-        0 * inventoryItemManager.getOrCreateInventoryItem(_, _, _)
++        0 * inventoryItemManager.upsertInventoryItem(_, _, _)
+     }
+ 
+     void 'deleteTransactionSourcesForReceipts should clear the transaction that the source it deletes stamps'() {
+@@ -155,7 +155,7 @@ class ReceiptTransactionManagerSpec extends Specification implements DataTest {
+         Transaction transaction = receiptTransactionManager.createInboundTransaction(receipt)
+ 
+         then:
+-        1 * inventoryItemManager.getOrCreateInventoryItem(receiptItem.product, "LOT-9", expirationDate) >> resolvedInventoryItem
++        1 * inventoryItemManager.upsertInventoryItem(receiptItem.product, "LOT-9", expirationDate) >> resolvedInventoryItem
+         assert transaction.transactionEntries.first().inventoryItem == resolvedInventoryItem
+     }
+ 

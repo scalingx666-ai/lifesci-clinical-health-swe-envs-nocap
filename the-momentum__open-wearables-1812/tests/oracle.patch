@@ -1,0 +1,400 @@
+diff --git a/backend/app/services/seed_data/constants.py b/backend/app/services/seed_data/constants.py
+index 2002c626bb..4f52c13a73 100644
+--- a/backend/app/services/seed_data/constants.py
++++ b/backend/app/services/seed_data/constants.py
+@@ -59,6 +59,20 @@
+ 
+ SEED_PROVIDERS = list(PROVIDER_CONFIGS.keys())
+ 
++# Series the daily activity summary aggregates per (day, provider, device).
++# Seeded from one device so that device's day carries all of them.
++DAILY_ACTIVITY_SERIES: frozenset[SeriesType] = frozenset(
++    {
++        SeriesType.steps,
++        SeriesType.active_energy,
++        SeriesType.basal_energy,
++        SeriesType.heart_rate,
++        SeriesType.distance_walking_running,
++        SeriesType.flights_climbed,
++        SeriesType.active_time,
++    }
++)
++
+ # Workout types where elevation gain is realistic
+ OUTDOOR_WORKOUT_TYPES: frozenset[WorkoutType] = frozenset(
+     {
+diff --git a/backend/app/services/seed_data/event_generators.py b/backend/app/services/seed_data/event_generators.py
+index b1f8fa9af9..cab3ee07ae 100644
+--- a/backend/app/services/seed_data/event_generators.py
++++ b/backend/app/services/seed_data/event_generators.py
+@@ -26,6 +26,7 @@
+     OUTDOOR_WORKOUT_TYPES,
+     PROVIDER_CONFIGS,
+ )
++from .time_series_generators import ProviderDescriptor
+ 
+ # Zones reach us from a FIT file (Garmin) or from per-zone durations in the
+ # provider's own payload (Whoop). Nobody else reports them, and seeding them
+@@ -47,6 +48,39 @@
+     }
+ )
+ 
++# Average speed (m/s) per pace-based sport; distance and Garmin's average_speed
++# both derive from it so they agree with the workout duration.
++_SPEED_RANGES: dict[frozenset[WorkoutType], tuple[float, float]] = {
++    frozenset({WorkoutType.SWIMMING, WorkoutType.POOL_SWIMMING, WorkoutType.OPEN_WATER_SWIMMING}): (0.6, 1.4),
++    frozenset(
++        {
++            WorkoutType.WALKING,
++            WorkoutType.HIKING,
++            WorkoutType.MOUNTAINEERING,
++            WorkoutType.TRAIL_HIKING,
++            WorkoutType.WALKING_FITNESS,
++            WorkoutType.CASUAL_WALKING,
++        }
++    ): (1.0, 1.8),
++    frozenset({WorkoutType.RUNNING, WorkoutType.TRAIL_RUNNING, WorkoutType.TREADMILL}): (2.3, 4.5),
++    frozenset(
++        {
++            WorkoutType.CYCLING,
++            WorkoutType.MOUNTAIN_BIKING,
++            WorkoutType.INDOOR_CYCLING,
++            WorkoutType.CYCLOCROSS,
++            WorkoutType.E_BIKING,
++        }
++    ): (5.0, 10.0),
++}
++_DEFAULT_SPEED_RANGE = (1.5, 5.0)
++
++
++def _pick_speed(workout_type: WorkoutType, fake: Faker) -> float:
++    low, high = next((r for types, r in _SPEED_RANGES.items() if workout_type in types), _DEFAULT_SPEED_RANGE)
++    return round(fake.random.uniform(low, high), 3)
++
++
+ # Fractions of max heart rate, the boundaries a FIT file carries.
+ HR_ZONE_CEILINGS = (0.6, 0.7, 0.8, 0.9, 1.0)
+ 
+@@ -158,8 +192,9 @@ def _generate_workout(
+     provider: ProviderName,
+     last_synced_at: datetime,
+     config: WorkoutConfig,
++    device: ProviderDescriptor | None = None,
+ ) -> tuple[EventRecordCreate, EventRecordDetailCreate]:
+-    """Generate a single workout with parameters from *config*."""
++    """Generate a single workout with parameters from *config*, recorded on *device* if given."""
+     start_bound, end_bound = _resolve_date_bounds(
+         config.date_from,
+         config.date_to,
+@@ -191,7 +226,10 @@ def _generate_workout(
+     # Oura doesn't expose device info via its API
+     device_name: str | None = None
+     sw_version: str | None = None
+-    if provider != ProviderName.OURA and fake.boolean(chance_of_getting_true=80):
++    if device is not None:
++        device_name = device.device_model
++        sw_version = device.software_version
++    elif provider != ProviderName.OURA and fake.boolean(chance_of_getting_true=80):
+         device_name = fake.random.choice(prov_config["devices"])
+         sw_version = fake.random.choice(prov_config["os_versions"])
+ 
+@@ -199,13 +237,19 @@ def _generate_workout(
+     energy_burned: Decimal | None = None
+     elevation_gain: Decimal | None = None
+     average_speed: Decimal | None = None
++    distance: Decimal | None = None
++
++    # Every seeded provider reports distance for pace-based sports
++    speed = _pick_speed(workout_type, fake) if workout_type in WORKOUTS_WITH_PACE else None
++    if speed is not None:
++        distance = Decimal(round(speed * duration_seconds))
+ 
+     if provider == ProviderName.GARMIN:
+         energy_burned = Decimal(fake.random_int(min=200, max=800))
+         if workout_type in OUTDOOR_WORKOUT_TYPES:
+             elevation_gain = Decimal(fake.random_int(min=10, max=500))
+-        if workout_type in WORKOUTS_WITH_PACE:
+-            average_speed = Decimal(str(round(fake.random.uniform(1.5, 8.0), 3)))
++        if speed is not None:
++            average_speed = Decimal(str(speed))
+     elif provider == ProviderName.APPLE:
+         energy_burned = Decimal(fake.random_int(min=150, max=700))
+         if workout_type in OUTDOOR_WORKOUT_TYPES:
+@@ -244,6 +288,7 @@ def _generate_workout(
+         heart_rate_avg=heart_rate_avg,
+         steps_count=steps,
+         energy_burned=energy_burned,
++        distance=distance,
+         total_elevation_gain=elevation_gain,
+         average_speed=average_speed,
+         hr_zones=hr_zones,
+diff --git a/backend/app/services/seed_data/service.py b/backend/app/services/seed_data/service.py
+index 62eb22fb4a..33f4fb2129 100644
+--- a/backend/app/services/seed_data/service.py
++++ b/backend/app/services/seed_data/service.py
+@@ -8,8 +8,8 @@
+ from faker import Faker
+ from sqlalchemy.orm import Session
+ 
+-from app.models import PersonalRecord, UserConnection
+-from app.repositories import CrudRepository
++from app.models import PersonalRecord, ProviderPriority, UserConnection
++from app.repositories import CrudRepository, ProviderPriorityRepository
+ from app.schemas.enums import ProviderName, SeriesType, WorkoutType
+ from app.schemas.model_crud.user_management import UserConnectionUpdate, UserCreate
+ from app.schemas.utils.seed_data import SeedDataRequest
+@@ -19,7 +19,7 @@
+ from app.services.timeseries_service import timeseries_service
+ from app.services.user_service import user_service
+ 
+-from .constants import PAIRED_SERIES_SPECS, PROVIDER_CONFIGS, SERIES_TYPE_SPECS, Cadence
++from .constants import DAILY_ACTIVITY_SERIES, PAIRED_SERIES_SPECS, PROVIDER_CONFIGS, SERIES_TYPE_SPECS, Cadence
+ from .event_generators import (
+     _generate_meal,
+     _generate_personal_record,
+@@ -35,15 +35,33 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _random_descriptor(prov: ProviderName, fake: Faker) -> ProviderDescriptor:
++    prov_config = PROVIDER_CONFIGS[prov]
++    is_sdk = prov == ProviderName.APPLE
++    # Oura exposes no device info; Apple is SDK-style (source name only)
++    device_model = None if prov == ProviderName.OURA else fake.random.choice(prov_config["devices"])
++    software_version = None if prov == ProviderName.OURA or is_sdk else fake.random.choice(prov_config["os_versions"])
++    return ProviderDescriptor(
++        provider=prov,
++        # Same source as workout records (and real ingestion), so one device is one data source
++        source=prov.value,
++        device_model=device_model,
++        software_version=software_version,
++    )
++
++
+ def _build_provider_map(
+     providers: list[ProviderName],
++    primary: ProviderDescriptor | None,
+     fake: Faker,
+ ) -> dict[SeriesType, ProviderDescriptor]:
+     """Assign one provider descriptor per series type, reused for all samples.
+ 
+     Ensures that e.g. every heart_rate sample for a user comes from the same
+     provider + device + software version. Covers non-workout-bound types plus
+-    paired members (blood pressure).
++    paired members (blood pressure). Daily activity types all come from
++    *primary*: the activity summary picks one source per day, so steps on one
++    device and energy on another would leave the winning day without steps.
+     """
+     provider_map: dict[SeriesType, ProviderDescriptor] = {}
+     if not providers:
+@@ -54,24 +72,22 @@ def _build_provider_map(
+         all_series.extend(paired.members.keys())
+ 
+     for series_type in all_series:
+-        prov = fake.random.choice(providers)
+-        prov_config = PROVIDER_CONFIGS[prov]
+-        is_sdk = prov == ProviderName.APPLE
+-        # Oura exposes no device info; Apple is SDK-style (source name only)
+-        device_model = None if prov == ProviderName.OURA else fake.random.choice(prov_config["devices"])
+-        software_version = (
+-            None if prov == ProviderName.OURA or is_sdk else fake.random.choice(prov_config["os_versions"])
+-        )
+-        provider_map[series_type] = ProviderDescriptor(
+-            provider=prov,
+-            source=prov_config["source_name"],
+-            device_model=device_model,
+-            software_version=software_version,
+-        )
++        if primary is not None and series_type in DAILY_ACTIVITY_SERIES:
++            provider_map[series_type] = primary
++        else:
++            provider_map[series_type] = _random_descriptor(fake.random.choice(providers), fake)
+ 
+     return provider_map
+ 
+ 
++def _pick_primary_provider(db: Session, providers: list[ProviderName]) -> ProviderName | None:
++    """The user's provider the activity summary ranks first."""
++    if not providers:
++        return None
++    order = ProviderPriorityRepository(ProviderPriority).get_priority_order(db)
++    return min(providers, key=lambda p: order.get(p, 99))
++
++
+ def _resolve_time_series_window(
+     config_date_from: date | None,
+     config_date_to: date | None,
+@@ -106,9 +122,10 @@ def generate(self, db: Session, request: SeedDataRequest) -> dict:
+         identity_fake = Faker()
+         identity_fake.seed_instance(int.from_bytes(os.urandom(8)))
+ 
+-        # Use a fixed anchor date so the same seed always produces identical
+-        # data regardless of when the generator is run.
+-        now = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
++        # Anchor to today's midnight UTC so seeded data lands in recent date
++        # ranges. Within a day the same seed produces identical data; across
++        # days it's the same data shifted in time.
++        now = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+ 
+         personal_record_repo = CrudRepository(PersonalRecord)
+         connection_repo = CrudRepository(UserConnection)
+@@ -157,14 +174,22 @@ def generate(self, db: Session, request: SeedDataRequest) -> dict:
+ 
+             # Stable per-user mapping: each series type gets one provider, used
+             # for every sample of that type across the whole generation run.
+-            provider_map = _build_provider_map(list(provider_sync_times.keys()), fake)
++            primary_provider = _pick_primary_provider(db, list(provider_sync_times.keys()))
++            primary = _random_descriptor(primary_provider, fake) if primary_provider else None
++            provider_map = _build_provider_map(list(provider_sync_times.keys()), primary, fake)
+ 
+             # Workouts (+ workout-bound time series)
+             if profile.generate_workouts:
+                 for _ in range(profile.workout_config.count):
+                     prov = fake.random.choice(list(provider_sync_times.keys()))
+                     record, detail = _generate_workout(
+-                        user.id, fake, prov, provider_sync_times[prov], profile.workout_config
++                        user.id,
++                        fake,
++                        prov,
++                        provider_sync_times[prov],
++                        profile.workout_config,
++                        # Workouts on the primary device land in its activity day, not a rival one
++                        device=primary if primary and prov == primary.provider else None,
+                     )
+                     event_record_service.create(db, record)
+                     event_record_service.create_detail(db, detail)
+diff --git a/backend/tests/services/test_seed_data_service.py b/backend/tests/services/test_seed_data_service.py
+index c611afd151..48d443e8b7 100644
+--- a/backend/tests/services/test_seed_data_service.py
++++ b/backend/tests/services/test_seed_data_service.py
+@@ -1,6 +1,7 @@
+ """Tests for the seed data generation service."""
+ 
+-from datetime import date
++from datetime import date, datetime, timezone
++from uuid import uuid4
+ 
+ from sqlalchemy.orm import Session
+ 
+@@ -10,9 +11,11 @@
+     EventRecord,
+     MealDetails,
+     PersonalRecord,
++    ProviderPriority,
+     SeriesTypeDefinition,
+     User,
+     UserConnection,
++    WorkoutDetails,
+ )
+ from app.schemas.enums import ProviderName, SeriesType, WorkoutType
+ from app.schemas.utils.seed_data import (
+@@ -24,6 +27,7 @@
+     WorkoutConfig,
+ )
+ from app.services.seed_data import seed_data_service
++from app.services.summaries_service import summaries_service
+ 
+ 
+ class TestSeedDataServiceGenerate:
+@@ -133,6 +137,34 @@ def test_generate_with_specific_workout_types(self, db: Session) -> None:
+         for w in workouts:
+             assert w.type in ("boxing", "running")
+ 
++    def test_distance_only_for_pace_based_workouts(self, db: Session) -> None:
++        """Pace-based sports get a distance; others (e.g. boxing) don't."""
++        request = SeedDataRequest(
++            num_users=1,
++            profile=SeedProfileConfig(
++                generate_workouts=True,
++                generate_sleep=False,
++                generate_time_series=False,
++                workout_config=WorkoutConfig(
++                    count=20,
++                    workout_types=[WorkoutType.BOXING, WorkoutType.RUNNING],
++                ),
++            ),
++        )
++
++        seed_data_service.generate(db, request)
++
++        rows = (
++            db.query(EventRecord, WorkoutDetails).join(WorkoutDetails).filter(EventRecord.category == "workout").all()
++        )
++        assert rows
++        for record, detail in rows:
++            if record.type == "running":
++                assert detail.distance is not None
++                assert detail.distance > 0
++            else:
++                assert detail.distance is None
++
+     def test_generate_with_specific_providers(self, db: Session) -> None:
+         """Connections should use the specified providers."""
+         request = SeedDataRequest(
+@@ -310,6 +342,53 @@ def test_no_samples_when_nothing_selected(self, db: Session) -> None:
+ 
+         assert summary["time_series_samples"] == 0
+ 
++    def test_every_activity_day_has_steps(self, db: Session) -> None:
++        """Daily activity series share the top-priority device, so the day the summary picks has steps."""
++        now = datetime.now(timezone.utc)
++        db.add_all(
++            [
++                ProviderPriority(id=uuid4(), provider=ProviderName.GARMIN, priority=1, updated_at=now),
++                ProviderPriority(id=uuid4(), provider=ProviderName.POLAR, priority=2, updated_at=now),
++            ]
++        )
++        db.flush()
++        request = SeedDataRequest(
++            num_users=1,
++            random_seed=1926769294,
++            profile=SeedProfileConfig(
++                generate_workouts=True,
++                generate_sleep=False,
++                generate_time_series=True,
++                providers=[ProviderName.POLAR, ProviderName.GARMIN],
++                num_connections=2,
++                workout_config=WorkoutConfig(
++                    count=10,
++                    date_from=date(2024, 11, 1),
++                    date_to=date(2024, 11, 7),
++                ),
++                time_series_config=TimeSeriesConfig(
++                    enabled_types=[SeriesType.steps, SeriesType.active_energy, SeriesType.heart_rate],
++                    date_from=date(2024, 11, 1),
++                    date_to=date(2024, 11, 7),
++                ),
++            ),
++        )
++
++        seed_data_service.generate(db, request)
++
++        user = db.query(User).one()
++        page = summaries_service.get_activity_summaries(
++            db,
++            user.id,
++            datetime(2024, 11, 1, tzinfo=timezone.utc),
++            datetime(2024, 11, 8, tzinfo=timezone.utc),
++            cursor=None,
++            limit=100,
++        )
++        assert page.data
++        for day in page.data:
++            assert day.steps, f"no steps on {day.date}"
++
+ 
+ class TestSeededDataSourceProviders:
+     """Seeded records must resolve to a real provider, never the `unknown` fallback."""
+diff --git a/docs/developer-portal/settings/seed-data-generator.mdx b/docs/developer-portal/settings/seed-data-generator.mdx
+index b47dbc8699..20e79a0677 100644
+--- a/docs/developer-portal/settings/seed-data-generator.mdx
++++ b/docs/developer-portal/settings/seed-data-generator.mdx
+@@ -117,7 +117,7 @@ Every generated user's first name is prefixed with the seed and preset:
+ If the preset is `custom`, you also need the other form values - seed alone isn't enough to reproduce a hand-tuned configuration.
+ 
+ <Note>
+-Data is anchored to a fixed reference date (2025-01-01) inside the service, so the same seed produces the same dates regardless of when you run the generator. Explicit **Date range** inputs override this anchor.
++Data is anchored to the current day (midnight UTC), so seeded users always have recent data. The same seed produces the same values, shifted to end around the day you run the generator. Explicit **Date range** inputs override this anchor.
+ </Note>
+ 
+ ## API

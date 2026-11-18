@@ -1,0 +1,892 @@
+diff --git a/docs/install/smoke-check.md b/docs/install/smoke-check.md
+index bc76af0609..e8cc1ffe78 100644
+--- a/docs/install/smoke-check.md
++++ b/docs/install/smoke-check.md
+@@ -50,13 +50,26 @@ sentinels. The adapter profile additionally exercises REST, the Python REST
+ client and the read-only MCP adapter through in-memory transports. Test scores
+ are synthetic fixtures, not calibrated model evidence or clinical validation.
+ 
++The adapter profile then checks every service transport against one shared
++service runtime whose model loader is a synthetic stand-in. The stand-in tags
++only a synthetic marker and never touches weights, tokenizers, caches or the
++network:
++
++| Check | What it proves |
++| --- | --- |
++| `rest_pii_extract` | `POST /pii/extract` returns the expected label and offsets, and an unserved model is refused with `model_not_served` without echoing input. |
++| `graphql_query` | One `deidentify` query on `/graphql` returns the masked synthetic text with no errors. |
++| `grpc_stubs` | The generated `openmed.service.proto.generated` stubs are packaged files, import from the installed tree and describe `openmed.service.v1.OpenMedService`. |
++| `grpc_loopback` | A gRPC server bound explicitly to `127.0.0.1` on an ephemeral port serves one `Extract` RPC that matches the REST offsets, and refuses an unserved model with `INVALID_ARGUMENT`. |
++
+ Probes run under `python -I` in a temporary directory outside the checkout.
+ They reject editable installs, check imported module locations, and require
+ the repository root to be absent from `sys.path`. Python outbound connection
+ and DNS calls are blocked during application operations, with an empty cache
+-and offline flags. Windows event-loop self-pipe setup happens before the guard;
+-no application listener is started. These guards are test controls, not an
+-OS-level security sandbox for untrusted native code.
++and offline flags. Windows event-loop self-pipe setup happens before the guard.
++REST and GraphQL run in memory; the only listener is the adapter profile's
++loopback gRPC server, which is stopped before the probe ends. These guards are
++test controls, not an OS-level security sandbox for untrusted native code.
+ 
+ Resource checks load the packaged review-packet schema, thresholds and synthetic
+ grounding vocabulary using `importlib.resources`. Unix outputs must have mode
+@@ -75,8 +88,18 @@ The artifact directory must contain exactly one wheel and one sdist. This
+ **explicit artifact mode** uses `uv` to install package/build dependencies in
+ fresh disposable environments; dependency preparation may use the network.
+ Runtime probes do not. Each artifact is tested with core and adapter installs,
+-then a disposable copy with the required schema deliberately omitted is
+-installed. That negative control must fail specifically at resource resolution.
+-The original artifacts and existing environments are never modified. Installer
+-output, traceback contents and local paths are not relayed to reports; failures
+-use fixed codes. A successful lane has six passing rows, including two controls.
++then with two negative controls, each installed from a disposable damaged copy:
++
++| Control | Omitted from the copy | Must fail only at |
++| --- | --- | --- |
++| `missing_resource` | the review-packet schema (core install) | `packaged_resources` |
++| `missing_proto_stubs` | every generated protobuf stub (adapter install) | `grpc_stubs` |
++
++A control passes only when exactly that check fails, and it refuses to run
++against an artifact that already lacked the resource. The original artifacts
++and existing environments are never modified. Each row records the artifact
++type, profile, the original artifact's SHA-256 digest and fixed pass or fail
++codes; install rows also list each check, including the metadata-confirmed
++package version and synthetic-surface hashes. Installer output, request and
++response bodies, traceback contents and local paths are not relayed to
++reports. A successful lane has eight passing rows, including four controls.
+diff --git a/scripts/install/smoke_check.py b/scripts/install/smoke_check.py
+index 752860061a..251ff418e3 100644
+--- a/scripts/install/smoke_check.py
++++ b/scripts/install/smoke_check.py
+@@ -43,6 +43,20 @@
+ _HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+ BRIEF_PROFILES = ("core", "adapters")
+ BRIEF_RESOURCE = "core/schemas/json/clinical_review_packet.schema.json"
++# Generated protobuf modules the gRPC transport imports at runtime.
++PROTO_STUBS = (
++    "service/proto/generated/kserve_v2_pb2.py",
++    "service/proto/generated/openmed_pb2.py",
++    "service/proto/generated/openmed_pb2_grpc.py",
++)
++ADAPTER_CHECKS = (
++    "brief_rest_client",
++    "brief_mcp",
++    "rest_pii_extract",
++    "graphql_query",
++    "grpc_stubs",
++    "grpc_loopback",
++)
+ BRIEF_CHECKS = (
+     "installed_origin",
+     "packaged_resources",
+@@ -50,10 +64,29 @@
+     "missing_runtime",
+     "privacy_sentinel",
+     "brief_cli",
+-    "brief_rest_client",
+-    "brief_mcp",
++    *ADAPTER_CHECKS,
+     "no_network",
+ )
++# Each control installs a disposable artifact copy without the named resources
++# and must then fail at exactly one check: (resources, probe profile, check).
++NEGATIVE_CONTROLS = {
++    "missing_resource": ((BRIEF_RESOURCE,), "core", "packaged_resources"),
++    "missing_proto_stubs": (PROTO_STUBS, "adapters", "grpc_stubs"),
++}
++ADAPTER_EXTRAS = "[cli,service,mcp]"
++GRPC_TIMEOUT_SECONDS = 30
++_SERVICE_TEXT = "Synthetic service marker OM-SMOKE-0002"
++_SERVICE_MARKER = "OM-SMOKE-0002"
++_SERVICE_LABEL = "ID_NUM"
++_SERVICE_SPANS = (
++    (
++        _SERVICE_LABEL,
++        _SERVICE_TEXT.index(_SERVICE_MARKER),
++        _SERVICE_TEXT.index(_SERVICE_MARKER) + len(_SERVICE_MARKER),
++    ),
++)
++# A public-identifier shape, so the served-set policy (not syntax) refuses it.
++_UNSERVED_MODEL = "synthetic/unserved-model"
+ 
+ # The probe carries only a synthetic marker. It emits hashes and offsets, never
+ # the marker itself, so captured child output remains safe for release logs.
+@@ -309,6 +342,181 @@ async def send():
+     loop.run_until_complete(transport.aclose())
+ 
+ 
++class _SyntheticPIIPipeline:
++    """Token-classification stand-in that tags only the synthetic marker."""
++
++    openmed_max_length = 512
++    tokenizer = None
++
++    def __call__(self, inputs, **kwargs):
++        def predict(text):
++            start = text.find(_SERVICE_MARKER)
++            if start < 0:
++                return []
++            end = start + len(_SERVICE_MARKER)
++            return [
++                dict(
++                    entity_group=_SERVICE_LABEL,
++                    score=0.99,
++                    word=_SERVICE_MARKER,
++                    start=start,
++                    end=end,
++                )
++            ]
++
++        if isinstance(inputs, list):
++            return [predict(text) for text in inputs]
++        return predict(inputs)
++
++
++class _SyntheticPIILoader:
++    """Model-loader double: no weights, tokenizer, cache, or download is used."""
++
++    def __init__(self, config) -> None:
++        self.config = config
++        self.loaded: list[str] = []
++
++    def resolve_model_name(self, model_name: str) -> str:
++        return model_name
++
++    def create_pipeline(self, model_name: str, **kwargs) -> _SyntheticPIIPipeline:
++        self.loaded.append(model_name)
++        return _SyntheticPIIPipeline()
++
++    def loaded_models(self) -> dict[str, Any]:
++        return {}
++
++
++def _entity_spans(entities) -> tuple[tuple[str, int, int], ...]:
++    return tuple((item["label"], item["start"], item["end"]) for item in entities)
++
++
++def _post_in_memory(app, loop, path: str, payloads) -> list:
++    """POST each payload through ASGI in memory and return the responses."""
++    import httpx
++
++    transport = httpx.ASGITransport(app=app)
++
++    async def send():
++        async with httpx.AsyncClient(
++            transport=transport, base_url="http://127.0.0.1"
++        ) as client:
++            return [await client.post(path, json=payload) for payload in payloads]
++
++    try:
++        return loop.run_until_complete(send())
++    finally:
++        loop.run_until_complete(transport.aclose())
++
++
++def _probe_rest_pii(app, loop) -> tuple[tuple[str, int, int], ...]:
++    """Extract the synthetic marker over REST and refuse an unserved model."""
++    accepted, refused = _post_in_memory(
++        app,
++        loop,
++        "/pii/extract",
++        (
++            dict(text=_SERVICE_TEXT),
++            dict(text=_SERVICE_TEXT, model_name=_UNSERVED_MODEL),
++        ),
++    )
++    assert accepted.status_code == 200
++    spans = _entity_spans(accepted.json()["entities"])
++    assert spans == _SERVICE_SPANS
++    assert refused.status_code == 422
++    assert refused.json()["error"]["code"] == "model_not_served"
++    assert _SERVICE_MARKER not in refused.text
++    return spans
++
++
++def _probe_graphql(app, loop) -> None:
++    """Run one GraphQL query through the same app and shared runtime."""
++    query = (
++        "query($input: DeidentifyInput!) "
++        "{ deidentify(input: $input) { deidentifiedText } }"
++    )
++    (response,) = _post_in_memory(
++        app,
++        loop,
++        "/graphql",
++        (dict(query=query, variables=dict(input=dict(text=_SERVICE_TEXT))),),
++    )
++    assert response.status_code == 200
++    payload = response.json()
++    assert "errors" not in payload
++    assert payload["data"]["deidentify"]["deidentifiedText"] == (
++        _SERVICE_TEXT.replace(_SERVICE_MARKER, f"[{_SERVICE_LABEL}]")
++    )
++
++
++def _check_proto_stubs(root: Path) -> None:
++    """Require the packaged generated stubs, imported from the installed tree."""
++    from importlib.resources import files
++
++    for resource in PROTO_STUBS:
++        assert files("openmed").joinpath(resource).is_file()
++    from openmed.service.proto.generated import (
++        kserve_v2_pb2,
++        openmed_pb2,
++        openmed_pb2_grpc,
++    )
++
++    for module in (kserve_v2_pb2, openmed_pb2, openmed_pb2_grpc):
++        assert Path(module.__file__).resolve().is_relative_to(root)
++    service = openmed_pb2.DESCRIPTOR.services_by_name["OpenMedService"]
++    assert service.full_name == "openmed.service.v1.OpenMedService"
++    assert [method.name for method in service.methods] == [
++        "Analyze",
++        "Extract",
++        "Deidentify",
++        "StreamDeidentify",
++    ]
++    assert callable(openmed_pb2_grpc.OpenMedServiceStub)
++    assert kserve_v2_pb2.DESCRIPTOR.package == "openmed.kserve.v2"
++
++
++def _probe_grpc(runtime) -> tuple[tuple[str, int, int], ...]:
++    """Serve one unary RPC from a loopback-only server on an ephemeral port."""
++    import grpc
++
++    from openmed.service.grpc_server import create_grpc_server
++    from openmed.service.proto.generated import openmed_pb2, openmed_pb2_grpc
++
++    server = create_grpc_server(runtime=runtime, max_workers=1)
++    try:
++        # Bind explicitly; the probe never depends on the default address.
++        port = server.add_insecure_port("127.0.0.1:0")
++        assert port > 0
++        server.start()
++        with grpc.insecure_channel(
++            f"127.0.0.1:{port}", options=[("grpc.enable_http_proxy", 0)]
++        ) as channel:
++            grpc.channel_ready_future(channel).result(timeout=GRPC_TIMEOUT_SECONDS)
++            stub = openmed_pb2_grpc.OpenMedServiceStub(channel)
++            response = stub.Extract(
++                openmed_pb2.ExtractRequest(text=_SERVICE_TEXT),
++                timeout=GRPC_TIMEOUT_SECONDS,
++            )
++            spans = tuple(
++                (entity.label, entity.start, entity.end) for entity in response.entities
++            )
++            try:
++                stub.Extract(
++                    openmed_pb2.ExtractRequest(
++                        text=_SERVICE_TEXT, model_name=_UNSERVED_MODEL
++                    ),
++                    timeout=GRPC_TIMEOUT_SECONDS,
++                )
++            except grpc.RpcError as error:
++                assert error.code() is grpc.StatusCode.INVALID_ARGUMENT
++                assert error.details() == "model_not_served"
++            else:
++                raise AssertionError("unserved model accepted")
++    finally:
++        server.stop(None).wait(GRPC_TIMEOUT_SECONDS)
++    return spans
++
++
+ def _run_brief_probe(profile: str, source_root: Path) -> SmokeReport:
+     """Run only in an isolated child against a non-editable installation."""
+     import asyncio
+@@ -480,12 +688,37 @@ def faulty_provider(*args):
+                     is True
+                 )
+                 checks.append(_passed(active))
++                active = "rest_pii_extract"
++                # Every service runtime built from here on gets the fake loader.
++                stack.enter_context(
++                    patch("openmed.service.runtime.ModelLoader", _SyntheticPIILoader)
++                )
++                from openmed.service.app import create_app
++
++                service_app = create_app()
++                spans = _probe_rest_pii(service_app, loop)
++                runtime = service_app.state.runtime
++                loader = runtime.get_model_loader()
++                assert isinstance(loader, _SyntheticPIILoader) and loader.loaded
++                assert set(loader.loaded) <= set(runtime.served_model_ids())
++                checks.append(_passed(active))
++                active = "graphql_query"
++                _probe_graphql(service_app, loop)
++                assert service_app.state.runtime is runtime
++                checks.append(_passed(active))
++                active = "grpc_stubs"
++                _check_proto_stubs(root)
++                checks.append(_passed(active))
++                active = "grpc_loopback"
++                # Same shared runtime, so the RPC must match the REST spans.
++                assert _probe_grpc(runtime) == spans
++                checks.append(_passed(active))
+             active = "no_network"
+             assert not network_attempts
+             assert socket.socket.connect is blocked
+-            assert (
+-                marker not in captured.getvalue()
+-                and "dehydration" not in captured.getvalue()
++            assert all(
++                value not in captured.getvalue()
++                for value in (marker, "dehydration", _SERVICE_MARKER)
+             )
+             # Imported package modules must also resolve to the installed tree.
+             assert all(
+@@ -839,16 +1072,20 @@ def run_smoke_check(
+         return SmokeReport(status=status, checks=tuple(checks))
+ 
+ 
++def _expected_checks(profile: str) -> tuple[str, ...]:
++    """Return the ordered child checks a probe profile must report."""
++    if profile == "adapters":
++        return BRIEF_CHECKS
++    return tuple(name for name in BRIEF_CHECKS if name not in ADAPTER_CHECKS)
++
++
+ def _brief_probe_results(result, profile: str) -> tuple[CheckResult, ...]:
+     """Allow-list child fields; never relay arbitrary output or exceptions."""
+     if result is None:
+         return (_failed("brief_probe", "command_failed"),)
+     try:
+         payload = json.loads(result.stdout)
+-        expected = list(BRIEF_CHECKS)
+-        if profile == "core":
+-            expected.remove("brief_rest_client")
+-            expected.remove("brief_mcp")
++        expected = list(_expected_checks(profile))
+         rows = payload["checks"]
+         if not isinstance(rows, list) or not rows or len(rows) > len(expected):
+             raise ValueError
+@@ -874,22 +1111,35 @@ def _brief_probe_results(result, profile: str) -> tuple[CheckResult, ...]:
+         return (_failed("brief_probe", "invalid_result"),)
+ 
+ 
+-def _omit_brief_resource(artifact: Path, destination: Path) -> Path:
+-    """Create a damaged artifact in a disposable directory for a negative control."""
++def _omit_packaged_resources(
++    artifact: Path, destination: Path, resources: Sequence[str]
++) -> Path:
++    """Create a damaged artifact in a disposable directory for a negative control.
++
++    Every named ``openmed/`` resource must be present exactly once, so a control
++    cannot pass against an artifact that already lacked it.
++    """
+     import tarfile
+     import zipfile
+ 
+     target = destination / artifact.name
+-    member_suffix = "openmed/" + BRIEF_RESOURCE
+-    omitted = 0
++    suffixes = {"openmed/" + resource for resource in resources}
++    omitted = []
++
++    def matched(name: str, *, wheel: bool) -> str | None:
++        # Wheels hold package paths at the root; sdists under one project dir.
++        candidate = name if wheel else name.partition("/")[2]
++        return candidate if candidate in suffixes else None
++
+     if artifact.suffix == ".whl":
+         with (
+             zipfile.ZipFile(artifact) as source,
+             zipfile.ZipFile(target, "w") as output,
+         ):
+             for member in source.infolist():
+-                if member.filename == member_suffix:
+-                    omitted += 1
++                suffix = matched(member.filename, wheel=True)
++                if suffix is not None:
++                    omitted.append(suffix)
+                 else:
+                     output.writestr(member, source.read(member))
+     else:
+@@ -898,17 +1148,25 @@ def _omit_brief_resource(artifact: Path, destination: Path) -> Path:
+             tarfile.open(target, "w:gz") as output,
+         ):
+             for member in source.getmembers():
+-                if member.name.endswith("/" + member_suffix):
+-                    omitted += 1
++                suffix = matched(member.name, wheel=False)
++                if suffix is not None:
++                    omitted.append(suffix)
+                 else:
+                     output.addfile(
+                         member, source.extractfile(member) if member.isfile() else None
+                     )
+-    if omitted != 1:
++    if sorted(omitted) != sorted(suffixes):
+         raise ValueError("invalid resource inventory")
+     return target
+ 
+ 
++def _artifact_digest(artifact: Path) -> str:
++    import hashlib
++
++    with artifact.open("rb") as handle:
++        return "sha256:" + hashlib.file_digest(handle, "sha256").hexdigest()
++
++
+ def run_artifact_checks(
+     directory: Path, *, python_executable: str, constraints: Path | None = None
+ ) -> dict[str, Any]:
+@@ -916,6 +1174,8 @@ def run_artifact_checks(
+ 
+     Only this explicit mode invokes uv and may download build/package dependencies.
+     Each runtime probe still runs offline, outside the source and without weights.
++    Every row records the original artifact's SHA-256 digest; negative controls
++    install a damaged copy and pass only when the expected check rejects it.
+     """
+     artifacts = [list(directory.glob(pattern)) for pattern in ("*.whl", "*.tar.gz")]
+     if any(len(matches) != 1 for matches in artifacts):
+@@ -926,8 +1186,13 @@ def run_artifact_checks(
+     rows = []
+     for artifact_type, matches in zip(("wheel", "sdist"), artifacts):
+         artifact = matches[0].resolve()
+-        for profile in (*BRIEF_PROFILES, "missing_resource"):
+-            row = dict(artifact=artifact_type, profile=profile, status="failed")
++        digest = _artifact_digest(artifact)
++        for profile in (*BRIEF_PROFILES, *NEGATIVE_CONTROLS):
++            row = dict(
++                artifact=artifact_type, digest=digest, profile=profile, status="failed"
++            )
++            control = NEGATIVE_CONTROLS.get(profile)
++            probe = profile if control is None else control[1]
+             with tempfile.TemporaryDirectory(prefix="openmed-artifact-") as temporary:
+                 root = Path(temporary)
+                 env = root / "venv"
+@@ -935,10 +1200,10 @@ def run_artifact_checks(
+                     "Scripts/python.exe" if os.name == "nt" else "bin/python"
+                 )
+                 selected = artifact
+-                if profile == "missing_resource":
+-                    selected = _omit_brief_resource(artifact, root)
++                if control is not None:
++                    selected = _omit_packaged_resources(artifact, root, control[0])
+                 requirement = str(selected) + (
+-                    "[cli,service,mcp]" if profile == "adapters" else ""
++                    ADAPTER_EXTRAS if probe == "adapters" else ""
+                 )
+                 install = [uv, "pip", "install", "--python", str(python), requirement]
+                 if constraints is not None:
+@@ -967,21 +1232,18 @@ def run_artifact_checks(
+                     row["reason"] = "installation_failed"
+                 else:
+                     report = run_smoke_check(
+-                        python_executable=str(python),
+-                        brief_profile="core"
+-                        if profile == "missing_resource"
+-                        else profile,
++                        python_executable=str(python), brief_profile=probe
+                     )
+-                    if profile == "missing_resource":
++                    if control is not None:
+                         failed = [c for c in report.checks if c.status == "failed"]
+                         passed = (
+                             report.status == "failed"
+                             and len(failed) == 1
+-                            and failed[0].name == "packaged_resources"
++                            and failed[0].name == control[2]
+                         )
+                         row["status"] = "passed" if passed else "failed"
+                         row["reason"] = (
+-                            "missing_resource_rejected"
++                            f"{profile}_rejected"
+                             if passed
+                             else "negative_control_failed"
+                         )
+diff --git a/tests/unit/install/test_smoke_check.py b/tests/unit/install/test_smoke_check.py
+index 73dee395e5..8597b44d17 100644
+--- a/tests/unit/install/test_smoke_check.py
++++ b/tests/unit/install/test_smoke_check.py
+@@ -376,13 +376,23 @@ def runner(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+     }
+ 
+ 
++def test_probe_profiles_order_service_transports_before_network_check():
++    core = smoke_check._expected_checks("core")
++    adapters = smoke_check._expected_checks("adapters")
++    assert not set(core) & set(smoke_check.ADAPTER_CHECKS)
++    assert adapters[-1] == core[-1] == "no_network"
++    assert adapters[adapters.index("brief_mcp") + 1 : -1] == (
++        "rest_pii_extract",
++        "graphql_query",
++        "grpc_stubs",
++        "grpc_loopback",
++    )
++
++
+ def test_brief_probe_report_requires_the_complete_ordered_contract(subtests):
+     for profile in smoke_check.BRIEF_PROFILES:
+         with subtests.test(profile=profile):
+-            names = list(smoke_check.BRIEF_CHECKS)
+-            if profile == "core":
+-                names.remove("brief_rest_client")
+-                names.remove("brief_mcp")
++            names = list(smoke_check._expected_checks(profile))
+             rows = [{"name": name, "status": "passed"} for name in names]
+             result = _completed(
+                 [], stdout=json.dumps({"status": "passed", "checks": rows})
+@@ -435,55 +445,81 @@ def test_brief_probe_preserves_a_specific_controlled_failure():
+     assert smoke_check._brief_probe_results(result, "core") == tuple(rows)
+ 
+ 
+-def test_missing_resource_control_changes_only_disposable_artifact(subtests, tmp_path):
+-    case_root = tmp_path
+-    for kind in ["wheel", "sdist"]:
+-        with subtests.test(kind=kind):
+-            tmp_path = case_root / str(len(list(case_root.iterdir())))
+-            tmp_path.mkdir()
+-            import hashlib
+-            import io
+-            import tarfile
+-            import zipfile
+-
+-            name = "openmed/" + smoke_check.BRIEF_RESOURCE
+-            data = b'{"synthetic": true}'
+-            output = tmp_path / "control"
+-            output.mkdir()
+-            if kind == "wheel":
+-                artifact = tmp_path / "openmed-0.0.0-py3-none-any.whl"
+-                with zipfile.ZipFile(artifact, "w") as archive:
+-                    archive.writestr(name, data)
+-                    archive.writestr("openmed/__init__.py", b"")
+-            else:
+-                artifact = tmp_path / "openmed-0.0.0.tar.gz"
+-                with tarfile.open(artifact, "w:gz") as archive:
+-                    for path, content in [(name, data), ("openmed/__init__.py", b"")]:
+-                        member = tarfile.TarInfo("openmed-0.0.0/" + path)
+-                        member.size = len(content)
+-                        archive.addfile(member, io.BytesIO(content))
+-            before = hashlib.sha256(artifact.read_bytes()).hexdigest()
+-            damaged = smoke_check._omit_brief_resource(artifact, output)
+-            assert hashlib.sha256(artifact.read_bytes()).hexdigest() == before
+-            assert damaged.parent == output
+-            if kind == "wheel":
+-                with zipfile.ZipFile(damaged) as archive:
+-                    assert archive.namelist() == ["openmed/__init__.py"]
+-            else:
+-                with tarfile.open(damaged, "r:gz") as archive:
+-                    assert archive.getnames() == ["openmed-0.0.0/openmed/__init__.py"]
+-
++def _synthetic_artifact(directory: Path, kind: str, resources: tuple[str, ...]) -> Path:
++    import io
++    import tarfile
++    import zipfile
+ 
+-def test_resource_control_cannot_succeed_when_resource_was_already_missing(tmp_path):
++    names = ["openmed/" + resource for resource in resources]
++    names.append("openmed/__init__.py")
++    if kind == "wheel":
++        artifact = directory / "openmed-0.0.0-py3-none-any.whl"
++        with zipfile.ZipFile(artifact, "w") as archive:
++            for name in names:
++                archive.writestr(name, b'{"synthetic": true}')
++        return artifact
++    artifact = directory / "openmed-0.0.0.tar.gz"
++    with tarfile.open(artifact, "w:gz") as archive:
++        for name in names:
++            content = b'{"synthetic": true}'
++            member = tarfile.TarInfo("openmed-0.0.0/" + name)
++            member.size = len(content)
++            archive.addfile(member, io.BytesIO(content))
++    return artifact
++
++
++def test_negative_controls_change_only_disposable_artifacts(subtests, tmp_path):
++    import hashlib
++    import tarfile
+     import zipfile
+ 
+-    artifact = tmp_path / "openmed-0.0.0-py3-none-any.whl"
+-    with zipfile.ZipFile(artifact, "w") as archive:
+-        archive.writestr("openmed/__init__.py", b"")
+-    output = tmp_path / "control"
+-    output.mkdir()
+-    with pytest.raises(ValueError, match="invalid resource inventory"):
+-        smoke_check._omit_brief_resource(artifact, output)
++    for control, (resources, _, _) in smoke_check.NEGATIVE_CONTROLS.items():
++        for kind in ["wheel", "sdist"]:
++            with subtests.test(control=control, kind=kind):
++                case = tmp_path / f"{control}-{kind}"
++                output = case / "control"
++                output.mkdir(parents=True)
++                artifact = _synthetic_artifact(case, kind, resources)
++                before = hashlib.sha256(artifact.read_bytes()).hexdigest()
++                damaged = smoke_check._omit_packaged_resources(
++                    artifact, output, resources
++                )
++                assert hashlib.sha256(artifact.read_bytes()).hexdigest() == before
++                assert damaged.parent == output
++                if kind == "wheel":
++                    with zipfile.ZipFile(damaged) as archive:
++                        assert archive.namelist() == ["openmed/__init__.py"]
++                else:
++                    with tarfile.open(damaged, "r:gz") as archive:
++                        assert archive.getnames() == [
++                            "openmed-0.0.0/openmed/__init__.py"
++                        ]
++
++
++def test_proto_control_omits_every_generated_stub():
++    resources, profile, check = smoke_check.NEGATIVE_CONTROLS["missing_proto_stubs"]
++    generated = Path(smoke_check.__file__).resolve().parents[2] / "openmed"
++    assert resources == smoke_check.PROTO_STUBS
++    assert (profile, check) == ("adapters", "grpc_stubs")
++    assert {
++        path.relative_to(generated).as_posix()
++        for path in (generated / "service/proto/generated").glob("*_pb2*.py")
++    } == set(resources)
++
++
++def test_resource_control_cannot_succeed_when_resource_was_already_missing(
++    subtests, tmp_path
++):
++    for control, (resources, _, _) in smoke_check.NEGATIVE_CONTROLS.items():
++        for kind in ["wheel", "sdist"]:
++            with subtests.test(control=control, kind=kind):
++                case = tmp_path / f"{control}-{kind}"
++                output = case / "control"
++                output.mkdir(parents=True)
++                # Drop one required resource: the control must refuse, not pass.
++                artifact = _synthetic_artifact(case, kind, resources[1:])
++                with pytest.raises(ValueError, match="invalid resource inventory"):
++                    smoke_check._omit_packaged_resources(artifact, output, resources)
+ 
+ 
+ def test_brief_fixture_is_synthetic_reviewed_and_not_diagnostic():
+@@ -504,15 +540,25 @@ def test_artifact_checks_reject_missing_or_ambiguous_inputs(tmp_path):
+         smoke_check.run_artifact_checks(tmp_path, python_executable="python")
+ 
+ 
+-def test_artifact_install_failures_are_redacted_and_all_six_cases_run(
+-    tmp_path, monkeypatch, capsys
+-):
++def _fake_artifacts(tmp_path: Path, monkeypatch: Any) -> list[tuple[str, ...]]:
++    """Create two empty artifacts and record each damaged-copy request."""
+     for name in ("openmed-0.0.0-py3-none-any.whl", "openmed-0.0.0.tar.gz"):
+         (tmp_path / name).touch()
++    omitted: list[tuple[str, ...]] = []
++
++    def omit(artifact, destination, resources):
++        omitted.append(tuple(resources))
++        return artifact
++
+     monkeypatch.setattr(smoke_check.shutil, "which", lambda _: "/synthetic/uv")
+-    monkeypatch.setattr(
+-        smoke_check, "_omit_brief_resource", lambda artifact, destination: artifact
+-    )
++    monkeypatch.setattr(smoke_check, "_omit_packaged_resources", omit)
++    return omitted
++
++
++def test_artifact_install_failures_are_redacted_and_all_eight_cases_run(
++    tmp_path, monkeypatch, capsys
++):
++    omitted = _fake_artifacts(tmp_path, monkeypatch)
+     secret = "synthetic-sensitive-installer-error"
+     monkeypatch.setattr(
+         smoke_check.subprocess,
+@@ -520,29 +566,184 @@ def test_artifact_install_failures_are_redacted_and_all_six_cases_run(
+         lambda *args, **kwargs: _completed([], returncode=1, stdout=secret),
+     )
+     payload = smoke_check.run_artifact_checks(tmp_path, python_executable="python")
+-    assert payload["status"] == "failed" and len(payload["checks"]) == 6
++    rendered = json.dumps(payload) + capsys.readouterr().out
++    assert payload["status"] == "failed" and len(payload["checks"]) == 8
+     assert all(row["reason"] == "installation_failed" for row in payload["checks"])
+-    assert secret not in json.dumps(payload) + capsys.readouterr().out
++    assert [row["profile"] for row in payload["checks"][:4]] == [
++        "core",
++        "adapters",
++        "missing_resource",
++        "missing_proto_stubs",
++    ]
++    assert (
++        omitted
++        == [
++            (smoke_check.BRIEF_RESOURCE,),
++            smoke_check.PROTO_STUBS,
++        ]
++        * 2
++    )
++    # Rows hold only controlled fields; the digest is of the original artifact.
++    empty = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
++    for row in payload["checks"]:
++        assert set(row) == {"artifact", "digest", "profile", "reason", "status"}
++        assert row["digest"] == empty
++    assert secret not in rendered and str(tmp_path) not in rendered
+ 
+ 
+-def test_resource_control_must_fail_at_the_resource_check(tmp_path, monkeypatch):
+-    for name in ("openmed-0.0.0-py3-none-any.whl", "openmed-0.0.0.tar.gz"):
+-        (tmp_path / name).touch()
+-    monkeypatch.setattr(smoke_check.shutil, "which", lambda _: "/synthetic/uv")
++def test_negative_controls_must_fail_at_their_own_check(
++    subtests, tmp_path, monkeypatch
++):
++    _fake_artifacts(tmp_path, monkeypatch)
++    requirements: list[str] = []
++
++    def run(command, **kwargs):
++        if command[1:3] == ["pip", "install"]:
++            requirements.append(command[5])
++        return _completed([])
++
++    monkeypatch.setattr(smoke_check.subprocess, "run", run)
++    expected = {"core": "packaged_resources", "adapters": "grpc_stubs"}
++    for swapped in (False, True):
++        with subtests.test(swapped=swapped):
++            requirements.clear()
++
++            def report(*, python_executable, brief_profile):
++                if swapped:
++                    brief_profile = {"core": "adapters", "adapters": "core"}[
++                        brief_profile
++                    ]
++                failed = expected[brief_profile]
++                return smoke_check.SmokeReport(
++                    "failed",
++                    (
++                        smoke_check._passed("entry_point"),
++                        smoke_check._failed(failed, "contract_failed"),
++                    ),
++                )
++
++            monkeypatch.setattr(smoke_check, "run_smoke_check", report)
++            payload = smoke_check.run_artifact_checks(
++                tmp_path, python_executable="python"
++            )
++            controls = {
++                (row["artifact"], row["profile"]): row["reason"]
++                for row in payload["checks"]
++                if row["profile"] in smoke_check.NEGATIVE_CONTROLS
++            }
++            assert len(controls) == 4
++            if swapped:
++                assert set(controls.values()) == {"negative_control_failed"}
++            else:
++                assert controls == {
++                    (kind, control): f"{control}_rejected"
++                    for kind in ("wheel", "sdist")
++                    for control in smoke_check.NEGATIVE_CONTROLS
++                }
++            # Only adapter installs, including the proto control, add extras.
++            assert [r.endswith(smoke_check.ADAPTER_EXTRAS) for r in requirements] == [
++                False,
++                True,
++                False,
++                True,
++            ] * 2
++
++
++@pytest.fixture
++def service_probe_env(monkeypatch: Any):
++    """Mirror the child's clean, default-profile, auth-free service environment."""
++    for module in ("fastapi", "grpc", "httpx", "strawberry"):
++        pytest.importorskip(module)
++    for name in list(os.environ):
++        if name == "OPENMED_PROFILE" or name.startswith("OPENMED_SERVICE_"):
++            monkeypatch.delenv(name)
+     monkeypatch.setattr(
+-        smoke_check, "_omit_brief_resource", lambda artifact, destination: artifact
++        "openmed.service.runtime.ModelLoader", smoke_check._SyntheticPIILoader
+     )
++    import asyncio
++
++    loop = asyncio.new_event_loop()
++    yield loop
++    loop.close()
++
++
++def test_service_transport_probes_share_a_fake_runtime_offline(
++    service_probe_env, caplog
++):
++    import logging
++
++    import openmed
++    from openmed.service.app import create_app
++
++    caplog.set_level(logging.DEBUG)
++    app = create_app()
++    spans = smoke_check._probe_rest_pii(app, service_probe_env)
++    assert spans == smoke_check._SERVICE_SPANS
++    smoke_check._probe_graphql(app, service_probe_env)
++    smoke_check._check_proto_stubs(Path(openmed.__file__).resolve().parent)
++    runtime = app.state.runtime
++    assert smoke_check._probe_grpc(runtime) == spans
++    loader = runtime.get_model_loader()
++    assert isinstance(loader, smoke_check._SyntheticPIILoader)
++    assert loader.loaded and set(loader.loaded) <= set(runtime.served_model_ids())
++    assert smoke_check._SERVICE_MARKER not in caplog.text
++
++
++def test_service_probes_fail_without_the_synthetic_prediction(
++    service_probe_env, monkeypatch
++):
++    from openmed.service.app import create_app
++
+     monkeypatch.setattr(
+-        smoke_check.subprocess, "run", lambda *args, **kwargs: _completed([])
++        smoke_check._SyntheticPIIPipeline, "__call__", lambda self, inputs, **_: []
++    )
++    app = create_app()
++    with pytest.raises(AssertionError):
++        smoke_check._probe_rest_pii(app, service_probe_env)
++    with pytest.raises(AssertionError):
++        smoke_check._probe_graphql(app, service_probe_env)
++    assert smoke_check._probe_grpc(app.state.runtime) == ()
++
++
++def test_grpc_probe_binds_only_an_ephemeral_loopback_port(
++    service_probe_env, monkeypatch
++):
++    from openmed.service import grpc_server
++    from openmed.service.runtime import ServiceRuntime
++
++    original = grpc_server.create_grpc_server
++    addresses: list[str] = []
++
++    def create(**kwargs):
++        server = original(**kwargs)
++        bind = server.add_insecure_port
++
++        def record(address):
++            addresses.append(address)
++            return bind(address)
++
++        server.add_insecure_port = record
++        return server
++
++    monkeypatch.setattr(grpc_server, "create_grpc_server", create)
++    assert smoke_check._probe_grpc(ServiceRuntime.from_env()) == (
++        smoke_check._SERVICE_SPANS
+     )
++    assert addresses == ["127.0.0.1:0"]
++
++
++def test_proto_stub_check_rejects_missing_or_foreign_stubs(
++    service_probe_env, monkeypatch, tmp_path
++):
++    import openmed
++
++    root = Path(openmed.__file__).resolve().parent
++    with pytest.raises(AssertionError):
++        smoke_check._check_proto_stubs(tmp_path)
+     monkeypatch.setattr(
+         smoke_check,
+-        "run_smoke_check",
+-        lambda **kwargs: smoke_check.SmokeReport(
+-            "failed", (smoke_check._failed("entry_point", "command_failed"),)
+-        ),
++        "PROTO_STUBS",
++        (*smoke_check.PROTO_STUBS, "service/proto/generated/absent_pb2.py"),
+     )
+-    report = smoke_check.run_artifact_checks(tmp_path, python_executable="python")
+-    controls = [row for row in report["checks"] if row["profile"] == "missing_resource"]
+-    assert len(controls) == 2
+-    assert all(row["reason"] == "negative_control_failed" for row in controls)
++    with pytest.raises(AssertionError):
++        smoke_check._check_proto_stubs(root)

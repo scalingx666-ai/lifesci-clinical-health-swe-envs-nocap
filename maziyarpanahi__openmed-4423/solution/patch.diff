@@ -1,0 +1,1173 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ea35a3fe06..8c834ddff7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Reconcile fixed overlapping ASR outputs by exact token/timing evidence, preserving ambiguous alternatives and explicit gaps, emitting existing transcript revision events, and retaining PHI-withholding control over release (#3675).
++
+ - Generate reproducible synthetic DICOM files with paired metadata, burned-in identifier masks, annotation and ruler geometry, native pixel roundtrips and source-bound privacy-mask lineage (#2849).
+ 
+ - Compare packet-scoped identity digests, page numbering, rendered pixels, template anchors and continuation cues across document pages; preserve original evidence and masks when splitting or quarantining inconsistent groups (#2805).
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index f53fab3bf3..5201959001 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -506,6 +506,7 @@ classification:
+     - multimodal/asr-audio-profiles.md
+     - multimodal/ecg-waveform-contract.md
+     - multimodal/streaming/transcript-revisions.md
++    - multimodal/streaming/asr-window-stitching.md
+     - multimodal/ecg-lead-layout.md
+     - multimodal/ecg-annotation-privacy.md
+     - multimodal/ecg-signal-quality.md
+diff --git a/docs/multimodal/streaming/asr-window-stitching.md b/docs/multimodal/streaming/asr-window-stitching.md
+new file mode 100644
+index 0000000000..0602efa34b
+--- /dev/null
++++ b/docs/multimodal/streaming/asr-window-stitching.md
+@@ -0,0 +1,143 @@
++# Reconciling overlapping ASR windows
++
++`openmed.multimodal.streaming.transcript.window_stitching` reconciles fixed, local ASR provider outputs into one bounded transcript edit plan. It uses the existing audio-window planner, provider declarations, transcript revision ledger, and PHI-withholding buffer. It does not run an ASR model, make a network request, download weights, or make a clinical decision.
++
++A shared phrase is coalesced only when both windows supply the same complete, ordered overlap tokens with identical text and stream-relative start/end times. Repeated phrases outside that shared time interval remain separate. A lost negation, changed medication, timing disagreement, uncovered word, or ambiguous boundary keeps the result provisional and preserves every original hypothesis for review. Provider confidence does not override those checks.
++
++## Source and alignment contract
++
++Create an `AlignedWindow` for each received window. Supply its zero-based planner index, exact audio-source digest, pinned `ProviderProvenance`, original `PartialHypothesis`, explicit character offsets for every `TokenTime`, and a coverage-completeness declaration. Every window must refer to the same source and offline provider/model declaration.
++
++Times are integer **stream-relative milliseconds**, as in the existing provider contract. Convert window-relative timing explicitly before constructing an input. The reconciler does not round, shift, or infer timing. Zero-duration or duplicate timing identities require review. Every token must fit within its planned window and match its exact original substring. All non-whitespace characters, including punctuation and negation, must be covered by those offsets. Supplying only a transcript and guessed word boundaries is insufficient evidence.
++
++The planner output is revalidated against `plan_audio_windows`; edited metadata cannot silently redefine the overlap. This reconciler accepts at most 64 windows, 65,536 total input characters, and 4,096 total input tokens. Existing PHI-buffer limits can impose smaller output and retention budgets. The API operates on fixed, already obtained results, rather than maintaining a new long-lived streaming decoder.
++
++Coverage completeness and provider finality are declarations from the caller's provider integration. They do not prove recognition accuracy, audio authenticity, speaker attribution, or that the provider heard every spoken word. Qualify the provider and its alignment separately. Exact matching is intentionally conservative: real models with jittered or clipped boundary timings may require human review instead of automatic merging.
++
++## Synthetic example
++
++This example supplies fixed outputs with one shared timed token. The first window's negation is preserved and the shared token appears only once.
++
++```python
++import hashlib
++
++from openmed.multimodal.audio_windows import plan_audio_windows
++from openmed.multimodal.streaming.speech.providers import (
++    PartialHypothesis,
++    ProviderProvenance,
++    TokenTime,
++)
++from openmed.multimodal.streaming.transcript.window_stitching import (
++    AlignedWindow,
++    reconcile_windows,
++)
++
++plan = plan_audio_windows(3000, window_ms=2000, overlap_ms=1000)
++source_digest = hashlib.sha256(b"synthetic fixed-output example").hexdigest()
++provider = ProviderProvenance("synthetic-overlap", "v1", "sha256:" + "a" * 64)
++
++first = AlignedWindow(
++    window_index=0,
++    source_digest=source_digest,
++    provider=provider,
++    hypothesis=PartialHypothesis(
++        revision=0,
++        text="No allergy",
++        is_final=True,
++        token_times=(
++            TokenTime(0, 100, 300, 900000, "No"),
++            TokenTime(1, 1500, 1700, 900000, "allergy"),
++        ),
++    ),
++    character_offsets=((0, 2), (3, 10)),
++    coverage_complete=True,
++)
++second = AlignedWindow(
++    window_index=1,
++    source_digest=source_digest,
++    provider=provider,
++    hypothesis=PartialHypothesis(
++        revision=0,
++        text="allergy reported",
++        is_final=True,
++        token_times=(
++            TokenTime(0, 1500, 1700, 900000, "allergy"),
++            TokenTime(1, 2200, 2500, 900000, "reported"),
++        ),
++    ),
++    character_offsets=((0, 7), (8, 16)),
++    coverage_complete=True,
++)
++result = reconcile_windows(
++    plan,
++    (first, second),
++    session_ref="1" * 32,
++    source_digest=source_digest,
++    provider=provider,
++)
++assert not result.review_required
++assert "".join(edit.text for edit in result.operations) == "No allergy reported"
++assert result == reconcile_windows(
++    plan, (first, second), session_ref="1" * 32,
++    source_digest=source_digest, provider=provider,
++)
++```
++
++The assertions above inspect synthetic protected text. In real workflows, keep `operations`, `alternatives`, and provider hypotheses inside the authorized local review boundary. Use only `result.to_json()` for content-free audit output. It includes closed reason codes, counts, time gaps, edit coordinates, and opaque token/segment references. It excludes source transcript text and hypothesis alternatives. Opaque references and timing can still be linkable; apply the workflow's access and retention policy.
++
++## Ambiguity, gaps, and replay
++
++The caller's arrival order is preserved. Missing windows, out-of-order windows, duplicates, and uncovered audio tails produce explicit reason codes and gap intervals where applicable. The reconciler does not silently sort, infer missing audio, or invent continuity. A provider-declared silent overlap can be accepted only when both complete window results agree on its empty token set. Silence is not inferred from a missing window.
++
++On the first unresolved seam, only the known coherent prefix becomes provisional edits; all original windows remain in `alternatives`. No finalization event is emitted while any window or boundary requires review. Non-overlapping word fragments are not glued together when the provider supplied no separator. Existing whitespace is retained, including harmless duplicate whitespace at a seam, rather than normalizing clinical content.
++
++The segment identity binds the opaque session reference, source digest, provider/model declaration, and complete window plan. Replaying the same inputs produces identical edits and token references. Token references also bind the originating window, provider hypothesis revision, token index, original character offsets, and timing; duplicate overlap tokens retain their original lineage. A changed provider/model or source is a distinct segment binding. The same audio decoded again can still be correlated evidence and is not an independent clinical sample.
++
++A corrected provider result must be reconciled again before release. The API does not mutate an earlier finalized transcript or retroactively repair its citations. Preserve any already released evidence and use an explicit higher-level correction/review workflow when necessary.
++
++## Revision and PHI release
++
++Edits use the existing `RevisionKind.INSERT` and `RevisionKind.FINALIZE`, expected revision counters, and fragment-local `TranscriptToken` coordinates. They replay through `RevisionLedger` without introducing another lineage model. Finalization seals the transcript; it does not assert that its content is PHI-free.
++
++`result.release_with(local_screener, policy=..., clock=...)` recomputes the exact reconciliation, refuses altered decision/edit objects, creates a fresh `WithholdingBuffer`, applies the edits, and asks that buffer to finish. It returns existing protected `ReleasedSpeechSegment` objects only when the whole transcript is finalized and local PHI screening resolves every required identifier. Incomplete or ambiguous transcripts remain provisional and return no release. Critical or unresolved PHI, screening failure, retention expiry, or buffer exhaustion also prevent release. The optional clock is for controlled local evaluation; ordinary calls use the existing monotonic retention clock.
++
++The following continuation deliberately withholds even a coherent transcript pending privacy review:
++
++```python
++from openmed.multimodal.streaming.privacy import (
++    PhiResolution,
++    PhiScreenDeclaration,
++    PhiScreenResult,
++    SegmentPhiDecision,
++)
++
++class HoldForPrivacyReview:
++    declaration = PhiScreenDeclaration(artifact_digest="b" * 64)
++
++    def screen(self, request):
++        return PhiScreenResult(
++            request_digest=request.request_digest,
++            decisions=tuple(
++                SegmentPhiDecision(
++                    segment_ref=segment.segment_ref,
++                    revision=segment.revision,
++                    resolution=PhiResolution.UNRESOLVED,
++                )
++                for segment in request.segments
++            ),
++        )
++
++assert result.release_with(HoldForPrivacyReview(), clock=lambda: 0) == ()
++```
++
++Supply a qualified local PHI screener for actual use; the library cannot establish detector recall from a declaration. Known-marker fixtures test plumbing only. No identity text, transcript, or source audio is logged or written by this reconciler. Its temporary withholding buffer closes after each call; caller-owned alternatives and returned protected text remain caller-owned and are not erased by that close. Python memory handling does not guarantee secure zeroization.
++
++## Offline regression controls
++
++The fixtures in `tests/fixtures/multimodal/asr_overlap.py` contain fixed synthetic provider outputs, not recordings or model weights. Unit controls cover repeated phrases, seam negation, medication/timing conflict, missing/reordered windows, source/provider mismatch, incomplete alignment, forged finalization, and buffer limits. Integration controls exercise the real ledger and withholding buffer, including a synthetic identifier split across the overlap and sealed citation lineage.
++
++```bash
++python -m pytest \
++  tests/unit/multimodal/streaming/transcript/test_window_stitching.py \
++  tests/integration/multimodal/test_asr_overlap_withholding.py -q
++```
+diff --git a/mkdocs.yml b/mkdocs.yml
+index f831279920..fd4c24ab2c 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -446,6 +446,7 @@ nav:
+       - ASR Audio Profiles: multimodal/asr-audio-profiles.md
+       - Non-diagnostic ECG Waveform Contract: multimodal/ecg-waveform-contract.md
+       - Transcript Revision Lineage: multimodal/streaming/transcript-revisions.md
++      - ASR Window Reconciliation: multimodal/streaming/asr-window-stitching.md
+       - ECG Lead Identity and Layout: multimodal/ecg-lead-layout.md
+       - ECG Annotation Privacy: multimodal/ecg-annotation-privacy.md
+       - ECG Signal Quality Gates: multimodal/ecg-signal-quality.md
+diff --git a/openmed/multimodal/streaming/transcript/window_stitching.py b/openmed/multimodal/streaming/transcript/window_stitching.py
+new file mode 100644
+index 0000000000..b936b9d341
+--- /dev/null
++++ b/openmed/multimodal/streaming/transcript/window_stitching.py
+@@ -0,0 +1,478 @@
++"""Conservative overlap reconciliation for fixed local ASR window results.
++
++Only identical, explicitly timed overlap tokens are coalesced. Ambiguous source
++alternatives stay protected and provisional; no textual similarity heuristic may
++remove a medication, repeated statement or negation. Existing revision and PHI
++withholding contracts own finalization and release.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++from collections.abc import Callable
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import Any
++
++from openmed.multimodal.audio_windows import AudioWindowPlan, plan_audio_windows
++from openmed.multimodal.streaming.privacy.withholding_buffer import (
++    LocalPhiScreener,
++    ReleasedSpeechSegment,
++    WithholdingBuffer,
++    WithholdingPolicy,
++)
++from openmed.multimodal.streaming.speech.providers import (
++    PartialHypothesis,
++    ProviderProvenance,
++    TokenTime,
++)
++
++from .revision_ledger import RevisionKind, TranscriptToken
++
++_REF = re.compile(r"[0-9a-f]{32}\Z")
++_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
++
++
++class StitchingError(ValueError):
++    """Fixed contract refusal without protected source or transcript values."""
++
++
++def _require(condition: bool) -> None:
++    if not condition:
++        raise StitchingError("invalid_asr_window_reconciliation")
++
++
++def _hash(value: object) -> str:
++    return hashlib.sha256(
++        json.dumps(
++            value, sort_keys=True, separators=(",", ":"), allow_nan=False
++        ).encode()
++    ).hexdigest()
++
++
++def _text(value: str) -> None:
++    _require(type(value) is str and len(value) <= 65_536)
++    try:
++        value.encode("utf-8")
++    except UnicodeError:
++        raise StitchingError("invalid_asr_window_reconciliation") from None
++
++
++class SeamReason(str, Enum):
++    """Closed reasons that prevent automatic transcript finalization."""
++
++    MISSING_WINDOW = "missing_window"
++    OUT_OF_ORDER = "out_of_order_window"
++    DUPLICATE_WINDOW = "duplicate_window"
++    INCOMPLETE = "incomplete_provider_coverage"
++    PROVISIONAL = "provisional_provider_result"
++    UNALIGNED = "uncovered_transcript_characters"
++    TIMING = "ambiguous_token_timing"
++    CONFLICT = "conflicting_overlap"
++    BOUNDARY = "ambiguous_text_boundary"
++    UNCOVERED_TAIL = "uncovered_audio_tail"
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class AlignedWindow:
++    """Protected provider output with explicit source and character alignment.
++
++    Token times are stream-relative milliseconds, never window-relative. Each
++    character interval points to the exact token text in the original hypothesis;
++    uncovered non-whitespace characters force review rather than being dropped.
++    Coverage completeness is a caller-governed provider declaration, not proof of
++    speech-recognition accuracy. No ASR model is invoked by this module.
++    """
++
++    window_index: int
++    source_digest: str
++    provider: ProviderProvenance
++    hypothesis: PartialHypothesis = field(repr=False)
++    character_offsets: tuple[tuple[int, int], ...]
++    coverage_complete: bool
++
++    def __post_init__(self) -> None:
++        _require(type(self.window_index) is int and 0 <= self.window_index < 64)
++        _require(
++            type(self.source_digest) is str
++            and _DIGEST.fullmatch(self.source_digest) is not None
++        )
++        _require(
++            type(self.provider) is ProviderProvenance
++            and not self.provider.requires_network
++        )
++        _require(type(self.hypothesis) is PartialHypothesis)
++        _text(self.hypothesis.text)
++        _require(
++            type(self.hypothesis.token_times) is tuple
++            and len(self.hypothesis.token_times) <= 4096
++        )
++        _require(all(type(token) is TokenTime for token in self.hypothesis.token_times))
++        _require(
++            type(self.character_offsets) is tuple
++            and len(self.character_offsets) == len(self.hypothesis.token_times)
++        )
++        _require(type(self.coverage_complete) is bool)
++        end = 0
++        for token, offsets in zip(self.hypothesis.token_times, self.character_offsets):
++            _require(
++                type(offsets) is tuple
++                and len(offsets) == 2
++                and all(type(value) is int for value in offsets)
++            )
++            start, stop = offsets
++            _require(end <= start < stop <= len(self.hypothesis.text))
++            _require(self.hypothesis.text[start:stop] == token.token)
++            end = stop
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class TranscriptEdit:
++    """Existing ledger operation with fragment-local token coordinates."""
++
++    kind: RevisionKind
++    expected_revision: int
++    position: int
++    text: str = field(repr=False)
++    tokens: tuple[TranscriptToken, ...]
++
++    def to_dict(self) -> dict[str, Any]:
++        """Describe offsets and opaque token references without transcript text."""
++        return {
++            "kind": self.kind.value,
++            "expected_revision": self.expected_revision,
++            "position": self.position,
++            "characters": len(self.text),
++            "tokens": [
++                {
++                    "token_ref": token.token_ref,
++                    "start": token.start,
++                    "end": token.end,
++                    "start_ms": token.start_ms,
++                    "end_ms": token.end_ms,
++                }
++                for token in self.tokens
++            ],
++        }
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class ReconciledWindows:
++    """Protected source alternatives and a deterministic provisional edit plan.
++
++    Only ``to_json`` is an audit report. Original hypotheses and edit text stay
++    protected. ``release_with`` recomputes this plan and routes it through a fresh
++    existing PHI-withholding buffer; it cannot silently revise a finalized ledger.
++    """
++
++    segment_ref: str
++    review_required: bool
++    reasons: tuple[SeamReason, ...]
++    gaps: tuple[tuple[int, int], ...]
++    operations: tuple[TranscriptEdit, ...] = field(repr=False)
++    alternatives: tuple[AlignedWindow, ...] = field(repr=False)
++    _plan: AudioWindowPlan = field(repr=False)
++    _session_ref: str = field(repr=False)
++    _source_digest: str = field(repr=False)
++    _provider: ProviderProvenance = field(repr=False)
++
++    def to_json(self) -> str:
++        """Serialize controlled codes, offsets and opaque identities, never text."""
++        return json.dumps(
++            {
++                "schema_version": "openmed.asr_window_stitching.v1",
++                "segment_ref": self.segment_ref,
++                "review_required": self.review_required,
++                "reasons": [reason.value for reason in self.reasons],
++                "gaps_ms": self.gaps,
++                "received_windows": len(self.alternatives),
++                "expected_windows": len(self._plan.windows),
++                "operations": [operation.to_dict() for operation in self.operations],
++            },
++            sort_keys=True,
++            separators=(",", ":"),
++        )
++
++    def release_with(
++        self,
++        screener: LocalPhiScreener,
++        *,
++        policy: WithholdingPolicy | None = None,
++        clock: Callable[[], float] | None = None,
++    ) -> tuple[ReleasedSpeechSegment, ...]:
++        """Apply exact edits and release only through local PHI screening.
++
++        Args:
++            screener: Trusted locally qualified PHI screener; no network fallback.
++            policy: Existing holdback limits, including retention and character caps.
++            clock: Optional injected monotonic clock for controlled offline evaluation.
++
++        Returns:
++            Existing protected release objects, or an empty tuple for ambiguous,
++            incomplete, provisional, expired, over-budget or PHI-unresolved input.
++            The temporary buffer closes after the call. Caller-owned source and
++            returned text remain caller-owned and are not erased by that close.
++        """
++        expected = reconcile_windows(
++            self._plan,
++            self.alternatives,
++            session_ref=self._session_ref,
++            source_digest=self._source_digest,
++            provider=self._provider,
++        )
++        _require(self == expected)
++        target = (
++            WithholdingBuffer(self._session_ref, screener, policy=policy)
++            if clock is None
++            else WithholdingBuffer(
++                self._session_ref, screener, policy=policy, clock=clock
++            )
++        )
++        with target:
++            if not target.append(self.segment_ref, ""):
++                return ()
++            for operation in self.operations:
++                if operation.kind is RevisionKind.FINALIZE:
++                    applied = target.finalize(
++                        self.segment_ref, expected_revision=operation.expected_revision
++                    )
++                else:
++                    applied = target.edit(
++                        self.segment_ref,
++                        operation.kind,
++                        operation.position,
++                        operation.position,
++                        operation.text,
++                        operation.tokens,
++                        expected_revision=operation.expected_revision,
++                    )
++                if not applied:
++                    return ()
++            return target.finish()
++
++
++def _window_reasons(window: AlignedWindow, plan: AudioWindowPlan) -> set[SeamReason]:
++    reasons: set[SeamReason] = set()
++    source = plan.windows[window.window_index]
++    hypothesis = window.hypothesis
++    if not window.coverage_complete:
++        reasons.add(SeamReason.INCOMPLETE)
++    if not hypothesis.is_final:
++        reasons.add(SeamReason.PROVISIONAL)
++    end = 0
++    previous_start = previous_end = -1
++    seen: set[tuple[int, int]] = set()
++    for index, (token, (start, stop)) in enumerate(
++        zip(hypothesis.token_times, window.character_offsets)
++    ):
++        _require(token.token_index == index)
++        _require(source.start_ms <= token.start_ms <= token.end_ms <= source.end_ms)
++        gap = hypothesis.text[end:start]
++        if gap and not gap.isspace():
++            reasons.add(SeamReason.UNALIGNED)
++        if (
++            token.start_ms == token.end_ms
++            or (token.start_ms, token.end_ms) in seen
++            or token.start_ms < previous_start
++            or token.end_ms < previous_end
++        ):
++            reasons.add(SeamReason.TIMING)
++        seen.add((token.start_ms, token.end_ms))
++        previous_start, previous_end = token.start_ms, token.end_ms
++        end = stop
++    if hypothesis.text[end:] and not hypothesis.text[end:].isspace():
++        reasons.add(SeamReason.UNALIGNED)
++    return reasons
++
++
++def _tokens(
++    window: AlignedWindow, segment_ref: str, first: int, cut: int
++) -> tuple[TranscriptToken, ...]:
++    return tuple(
++        TranscriptToken(
++            token_ref=_hash(
++                [
++                    segment_ref,
++                    window.window_index,
++                    window.hypothesis.revision,
++                    token.token_index,
++                    token.start_ms,
++                    token.end_ms,
++                    start,
++                    stop,
++                ]
++            )[:32],
++            start=start - cut,
++            end=stop - cut,
++            start_ms=token.start_ms,
++            end_ms=token.end_ms,
++        )
++        for token, (start, stop) in zip(
++            window.hypothesis.token_times[first:], window.character_offsets[first:]
++        )
++    )
++
++
++def _seam(
++    previous: AlignedWindow, current: AlignedWindow, plan: AudioWindowPlan
++) -> tuple[int, int] | None:
++    start = plan.windows[current.window_index].start_ms
++    end = plan.windows[previous.window_index].end_ms
++    left = [
++        token
++        for token in previous.hypothesis.token_times
++        if token.start_ms < end and token.end_ms > start
++    ]
++    right = [
++        token
++        for token in current.hypothesis.token_times
++        if token.start_ms < end and token.end_ms > start
++    ]
++    identity = lambda token: (token.start_ms, token.end_ms, token.token)
++    if [identity(token) for token in left] != [identity(token) for token in right]:
++        return None
++    # An overlap must be a complete previous suffix and incoming prefix. Never
++    # delete a repeated phrase found somewhere else in either source window.
++    if left and tuple(left) != previous.hypothesis.token_times[-len(left) :]:
++        return None
++    if right and tuple(right) != current.hypothesis.token_times[: len(right)]:
++        return None
++    return len(right), current.character_offsets[len(right) - 1][1] if right else 0
++
++
++def reconcile_windows(
++    plan: AudioWindowPlan,
++    windows: tuple[AlignedWindow, ...],
++    *,
++    session_ref: str,
++    source_digest: str,
++    provider: ProviderProvenance,
++) -> ReconciledWindows:
++    """Reconcile bounded fixed outputs without ASR, fuzzy deletion or PHI release.
++
++    Args:
++        plan: Canonical planner output, limited here to 64 windows.
++        windows: Received order, including protected alternatives and explicit alignment.
++        session_ref: Opaque 32-hex session identity, never a patient identifier.
++        source_digest: Exact audio source digest shared by every window.
++        provider: Exact offline provider/model declaration shared by every window.
++
++    Returns:
++        A deterministic edit plan. Missing, reordered, nonfinal, conflicting or
++        incompletely aligned evidence stays provisional and preserves all original
++        alternatives. Timing equality is deliberately exact: uncertain or shifted
++        alignments need external review, never a confidence-only deletion rule.
++
++    Raises:
++        StitchingError: Invalid shapes, source/provider mismatch or exceeded bounds.
++    """
++    _require(type(plan) is AudioWindowPlan and 1 <= len(plan.windows) <= 64)
++    _require(
++        plan
++        == plan_audio_windows(
++            plan.duration_ms,
++            window_ms=plan.window_ms,
++            overlap_ms=plan.overlap_ms,
++            min_tail_ms=plan.min_tail_ms,
++            tail_policy=plan.tail_policy,
++        )
++    )
++    _require(type(session_ref) is str and _REF.fullmatch(session_ref) is not None)
++    _require(
++        type(source_digest) is str and _DIGEST.fullmatch(source_digest) is not None
++    )
++    _require(type(provider) is ProviderProvenance and not provider.requires_network)
++    _require(type(windows) is tuple and len(windows) <= 64)
++    _require(all(type(window) is AlignedWindow for window in windows))
++    _require(sum(len(window.hypothesis.text) for window in windows) <= 65_536)
++    _require(sum(len(window.hypothesis.token_times) for window in windows) <= 4096)
++    _require(
++        all(
++            window.window_index < len(plan.windows)
++            and window.source_digest == source_digest
++            and window.provider == provider
++            for window in windows
++        )
++    )
++    segment_ref = _hash(
++        [
++            "asr-window-reconciliation-v1",
++            session_ref,
++            source_digest,
++            provider.to_dict(),
++            plan.to_dict(),
++        ]
++    )[:32]
++    reasons: set[SeamReason] = set()
++    gaps: set[tuple[int, int]] = set()
++    seen: set[int] = set()
++    individual = []
++    for position, window in enumerate(windows):
++        if window.window_index in seen:
++            reasons.add(SeamReason.DUPLICATE_WINDOW)
++        seen.add(window.window_index)
++        if window.window_index != position:
++            reasons.add(SeamReason.OUT_OF_ORDER)
++            expected = plan.windows[min(position, len(plan.windows) - 1)]
++            gaps.add((expected.start_ms, expected.end_ms))
++        local = _window_reasons(window, plan)
++        reasons.update(local)
++        individual.append(local)
++    for source in plan.windows:
++        if source.window_index not in seen:
++            reasons.add(SeamReason.MISSING_WINDOW)
++            gaps.add((source.start_ms, source.end_ms))
++    if plan.covered_ms < plan.duration_ms:
++        reasons.add(SeamReason.UNCOVERED_TAIL)
++        gaps.add((plan.covered_ms, plan.duration_ms))
++    operations: list[TranscriptEdit] = []
++    draft = ""
++    for position, window in enumerate(windows):
++        if window.window_index != position or individual[position]:
++            break
++        first = cut = 0
++        if position:
++            seam = _seam(windows[position - 1], window, plan)
++            if seam is None:
++                reasons.add(SeamReason.CONFLICT)
++                break
++            first, cut = seam
++        suffix = window.hypothesis.text[cut:]
++        if draft and suffix and draft[-1].isalnum() and suffix[0].isalnum():
++            reasons.add(SeamReason.BOUNDARY)
++            break
++        if suffix:
++            operations.append(
++                TranscriptEdit(
++                    kind=RevisionKind.INSERT,
++                    expected_revision=len(operations),
++                    position=len(draft),
++                    text=suffix,
++                    tokens=_tokens(window, segment_ref, first, cut),
++                )
++            )
++            draft += suffix
++    if not reasons:
++        operations.append(
++            TranscriptEdit(
++                kind=RevisionKind.FINALIZE,
++                expected_revision=len(operations),
++                position=len(draft),
++                text="",
++                tokens=(),
++            )
++        )
++    return ReconciledWindows(
++        segment_ref=segment_ref,
++        review_required=bool(reasons),
++        reasons=tuple(sorted(reasons, key=lambda value: value.value)),
++        gaps=tuple(sorted(gaps)),
++        operations=tuple(operations),
++        alternatives=windows,
++        _plan=plan,
++        _session_ref=session_ref,
++        _source_digest=source_digest,
++        _provider=provider,
++    )
+diff --git a/tests/fixtures/multimodal/asr_overlap.py b/tests/fixtures/multimodal/asr_overlap.py
+new file mode 100644
+index 0000000000..1b00d8d2a4
+--- /dev/null
++++ b/tests/fixtures/multimodal/asr_overlap.py
+@@ -0,0 +1,127 @@
++"""Fixed synthetic provider outputs and local screening; no ASR or patient audio."""
++
++import hashlib
++
++from openmed.multimodal.audio_windows import plan_audio_windows
++from openmed.multimodal.streaming.privacy import (
++    PhiRedactionSpan,
++    PhiResolution,
++    PhiScreenDeclaration,
++    PhiScreenResult,
++    SegmentPhiDecision,
++)
++from openmed.multimodal.streaming.speech.providers import (
++    PartialHypothesis,
++    ProviderProvenance,
++    TokenTime,
++)
++from openmed.multimodal.streaming.transcript.window_stitching import (
++    AlignedWindow,
++    reconcile_windows,
++)
++
++SESSION = "1" * 32
++SOURCE = hashlib.sha256(
++    b"synthetic fixed ASR window source; no clinical recording"
++).hexdigest()
++PRIVATE = "SYNTHETIC PATIENT"
++PROVIDER = ProviderProvenance("synthetic-overlap", "v1", "sha256:" + "a" * 64)
++PLAN = plan_audio_windows(3000, window_ms=2000, overlap_ms=1000)
++
++
++def window(index, words, *, final=True, complete=True):
++    """Build explicitly timed word/character alignments from fixed synthetic tokens."""
++    text = " ".join(word for word, _, _ in words)
++    offsets = []
++    position = 0
++    for word, _, _ in words:
++        offsets.append((position, position + len(word)))
++        position += len(word) + 1
++    return AlignedWindow(
++        window_index=index,
++        source_digest=SOURCE,
++        provider=PROVIDER,
++        hypothesis=PartialHypothesis(
++            revision=0,
++            text=text,
++            is_final=final,
++            token_times=tuple(
++                TokenTime(
++                    token_index=i,
++                    start_ms=start,
++                    end_ms=end,
++                    confidence_ppm=900000,
++                    token=word,
++                )
++                for i, (word, start, end) in enumerate(words)
++            ),
++        ),
++        character_offsets=tuple(offsets),
++        coverage_complete=complete,
++    )
++
++
++def negation_windows():
++    """A negation before the seam and a repeated medication inside the overlap."""
++    return (
++        window(
++            0,
++            (
++                ("No", 100, 300),
++                ("allergy", 1100, 1250),
++                ("to", 1300, 1350),
++                ("penicillin", 1500, 1800),
++            ),
++        ),
++        window(
++            1,
++            (
++                ("allergy", 1100, 1250),
++                ("to", 1300, 1350),
++                ("penicillin", 1500, 1800),
++                ("reported", 2200, 2500),
++            ),
++        ),
++    )
++
++
++def reconcile(windows=None, *, plan=PLAN):
++    """Use fixed synthetic source and provider metadata for replay controls."""
++    return reconcile_windows(
++        plan,
++        negation_windows() if windows is None else windows,
++        session_ref=SESSION,
++        source_digest=SOURCE,
++        provider=PROVIDER,
++    )
++
++
++class SyntheticScreener:
++    """Exact known marker control; it is not a clinical identifier detector."""
++
++    declaration = PhiScreenDeclaration(artifact_digest="b" * 64)
++
++    def __init__(self, resolution=PhiResolution.RESOLVED):
++        self.resolution = resolution
++        self.calls = 0
++
++    def screen(self, request):
++        """Resolve only a known synthetic marker against the bound whole transcript."""
++        self.calls += 1
++        decisions = []
++        for segment in request.segments:
++            start = segment.text.find(PRIVATE)
++            spans = (
++                (PhiRedactionSpan(start, start + len(PRIVATE)),) if start >= 0 else ()
++            )
++            decisions.append(
++                SegmentPhiDecision(
++                    segment_ref=segment.segment_ref,
++                    revision=segment.revision,
++                    resolution=self.resolution,
++                    redactions=spans,
++                )
++            )
++        return PhiScreenResult(
++            request_digest=request.request_digest, decisions=tuple(decisions)
++        )
+diff --git a/tests/integration/multimodal/test_asr_overlap_withholding.py b/tests/integration/multimodal/test_asr_overlap_withholding.py
+new file mode 100644
+index 0000000000..fd3c10b210
+--- /dev/null
++++ b/tests/integration/multimodal/test_asr_overlap_withholding.py
+@@ -0,0 +1,83 @@
++"""Offline seam-to-ledger-to-PHI-buffer controls with fixed provider outputs."""
++
++import json
++import socket
++
++import pytest
++
++from openmed.multimodal.streaming.transcript import (
++    RevisionLedger,
++    RevisionLedgerError,
++    TranscriptToken,
++)
++from tests.fixtures.multimodal.asr_overlap import (
++    PRIVATE,
++    SESSION,
++    SyntheticScreener,
++    reconcile,
++    window,
++)
++
++pytestmark = pytest.mark.integration
++
++
++def test_identifier_crossing_overlap_is_screened_only_after_stable_reconciliation(
++    monkeypatch,
++):
++    def deny(*args, **kwargs):
++        raise AssertionError("network is outside the overlap contract")
++
++    monkeypatch.setattr(socket, "create_connection", deny)
++    result = reconcile(
++        (
++            window(0, (("Name", 100, 300), ("SYNTHETIC", 1500, 1700))),
++            window(1, (("SYNTHETIC", 1500, 1700), ("PATIENT", 2200, 2500))),
++        )
++    )
++    screener = SyntheticScreener()
++    released = result.release_with(screener, clock=lambda: 0)
++    assert len(released) == 1 and screener.calls == 1
++    assert released[0].text == "Name [REDACTED]"
++    assert PRIVATE not in result.to_json() + released[0].lineage_json + repr(
++        result
++    ) + repr(released)
++    lineage = json.loads(released[0].lineage_json)
++    assert lineage["finalized"] and lineage["revision"] == 3
++    assert [op["kind"] for op in lineage["operations"]] == [
++        "insert",
++        "insert",
++        "finalize",
++    ]
++    assert [item["start_ms"] for item in lineage["tokens"]] == [100, 1500, 2200]
++    assert released[0].mappings[-1].redacted
++
++
++def test_emitted_operations_replay_through_existing_ledger_and_seal_citations():
++    result = reconcile()
++    ledger = RevisionLedger(SESSION, result.segment_ref, 0)
++    for operation in result.operations[:-1]:
++        ledger.insert(
++            operation.position,
++            len(operation.text),
++            operation.tokens,
++            expected_revision=operation.expected_revision,
++        )
++    citation = ledger.capture_span("c" * 32, 0, 2)
++    final = result.operations[-1]
++    ledger.finalize(expected_revision=final.expected_revision)
++    mapped = ledger.remap_span(citation)
++    assert mapped.valid and mapped.finalized and mapped.start_ms == 100
++    with pytest.raises(RevisionLedgerError):
++        ledger.insert(
++            0,
++            3,
++            (
++                TranscriptToken(
++                    token_ref="d" * 32, start=0, end=3, start_ms=0, end_ms=10
++                ),
++            ),
++            expected_revision=ledger.revision,
++        )
++    released = result.release_with(SyntheticScreener(), clock=lambda: 0)
++    assert released[0].text == "No allergy to penicillin reported"
++    assert json.loads(released[0].lineage_json)["tokens"] == ledger.to_dict()["tokens"]
+diff --git a/tests/unit/multimodal/streaming/transcript/test_window_stitching.py b/tests/unit/multimodal/streaming/transcript/test_window_stitching.py
+new file mode 100644
+index 0000000000..a6722381bf
+--- /dev/null
++++ b/tests/unit/multimodal/streaming/transcript/test_window_stitching.py
+@@ -0,0 +1,275 @@
++"""Exact overlap, replay, incomplete evidence and protected alternative controls."""
++
++import json
++from dataclasses import replace
++
++import pytest
++
++from openmed.multimodal.audio_windows import TailPolicy, plan_audio_windows
++from openmed.multimodal.streaming.privacy import PhiResolution, WithholdingPolicy
++from openmed.multimodal.streaming.transcript import RevisionKind
++from openmed.multimodal.streaming.transcript.window_stitching import (
++    SeamReason,
++    StitchingError,
++    reconcile_windows,
++)
++from tests.fixtures.multimodal.asr_overlap import (
++    PLAN,
++    PRIVATE,
++    PROVIDER,
++    SESSION,
++    SOURCE,
++    SyntheticScreener,
++    negation_windows,
++    reconcile,
++    window,
++)
++
++
++def protected_text(result):
++    return "".join(operation.text for operation in result.operations)
++
++
++def test_exact_timing_match_preserves_negation_and_emits_existing_ledger_edits():
++    result = reconcile()
++    assert not result.review_required
++    assert protected_text(result) == "No allergy to penicillin reported"
++    assert [op.kind for op in result.operations] == [
++        RevisionKind.INSERT,
++        RevisionKind.INSERT,
++        RevisionKind.FINALIZE,
++    ]
++    assert [op.expected_revision for op in result.operations] == [0, 1, 2]
++    assert [op.position for op in result.operations] == [0, 24, 33]
++    assert len(result.operations[1].tokens) == 1
++    assert result.operations[1].tokens[0].start == 1
++    assert result == reconcile()
++    public = result.to_json() + repr(result)
++    for word in ("penicillin", "allergy", "reported"):
++        assert word not in public
++
++
++def test_repeated_phrase_at_distinct_times_is_not_deleted_by_substring_matching():
++    result = reconcile(
++        (
++            window(0, (("drug", 500, 700), ("drug", 1500, 1700))),
++            window(1, (("drug", 1500, 1700), ("drug", 2500, 2700))),
++        )
++    )
++    assert protected_text(result) == "drug drug drug"
++    assert not result.review_required
++    assert (
++        len({token.token_ref for op in result.operations for token in op.tokens}) == 3
++    )
++
++
++@pytest.mark.parametrize(
++    "variant", ["missing_negation", "changed_medication", "shifted_timing"]
++)
++def test_conflicting_overlap_remains_provisional_with_all_original_alternatives(
++    variant,
++):
++    first, second = negation_windows()
++    if variant == "missing_negation":
++        first = window(0, (("No", 1100, 1200), ("allergy", 1500, 1800)))
++        second = window(1, (("allergy", 1500, 1800), ("reported", 2200, 2500)))
++    elif variant == "changed_medication":
++        second = window(
++            1,
++            (
++                ("allergy", 1100, 1250),
++                ("to", 1300, 1350),
++                ("aspirin", 1500, 1800),
++                ("reported", 2200, 2500),
++            ),
++        )
++    else:
++        second = window(
++            1,
++            (
++                ("allergy", 1101, 1250),
++                ("to", 1300, 1350),
++                ("penicillin", 1500, 1800),
++                ("reported", 2200, 2500),
++            ),
++        )
++    result = reconcile((first, second))
++    assert SeamReason.CONFLICT in result.reasons
++    assert result.alternatives == (first, second)
++    assert all(op.kind is not RevisionKind.FINALIZE for op in result.operations)
++    screener = SyntheticScreener()
++    assert result.release_with(screener, clock=lambda: 0) == ()
++    assert screener.calls == 0
++
++
++@pytest.mark.parametrize(
++    "kind", ["missing_first", "missing_last", "reordered", "duplicate", "empty"]
++)
++def test_missing_and_out_of_order_windows_have_explicit_gaps_or_duplicate_reason(kind):
++    first, second = negation_windows()
++    windows = {
++        "missing_first": (second,),
++        "missing_last": (first,),
++        "reordered": (second, first),
++        "duplicate": (first, first, second),
++        "empty": (),
++    }[kind]
++    result = reconcile(windows)
++    assert result.review_required
++    assert result.gaps or SeamReason.DUPLICATE_WINDOW in result.reasons
++    assert result.release_with(SyntheticScreener(), clock=lambda: 0) == ()
++    assert result.segment_ref == reconcile().segment_ref
++
++
++@pytest.mark.parametrize(
++    "changes,reason",
++    [
++        ({"final": False}, SeamReason.PROVISIONAL),
++        ({"complete": False}, SeamReason.INCOMPLETE),
++    ],
++)
++def test_provider_stability_and_coverage_are_required(changes, reason):
++    first, second = negation_windows()
++    first = window(
++        0,
++        (
++            ("No", 100, 300),
++            ("allergy", 1100, 1250),
++            ("to", 1300, 1350),
++            ("penicillin", 1500, 1800),
++        ),
++        **changes,
++    )
++    result = reconcile((first, second))
++    assert reason in result.reasons
++    assert result.release_with(SyntheticScreener(), clock=lambda: 0) == ()
++
++
++def test_unaligned_negation_or_punctuation_cannot_disappear_from_transcript():
++    first, second = negation_windows()
++    for text, offsets in (
++        (
++            "NOT " + first.hypothesis.text,
++            tuple((a + 4, b + 4) for a, b in first.character_offsets),
++        ),
++        (first.hypothesis.text + "?", first.character_offsets),
++    ):
++        changed = replace(
++            first,
++            hypothesis=replace(first.hypothesis, text=text),
++            character_offsets=offsets,
++        )
++        result = reconcile((changed, second))
++        assert SeamReason.UNALIGNED in result.reasons
++        assert result.release_with(SyntheticScreener(), clock=lambda: 0) == ()
++        assert result.alternatives[0].hypothesis.text == text
++
++
++def test_zero_duration_and_duplicate_timing_force_review():
++    for words in ((("No", 100, 100),), (("No", 100, 300), ("No", 100, 300))):
++        result = reconcile((window(0, words), negation_windows()[1]))
++        assert SeamReason.TIMING in result.reasons
++
++
++def test_uncovered_audio_tail_is_not_silently_finalized():
++    plan = plan_audio_windows(
++        4100, window_ms=2000, overlap_ms=0, min_tail_ms=500, tail_policy=TailPolicy.DROP
++    )
++    result = reconcile(
++        (window(0, (("First", 100, 300),)), window(1, (("Second", 2200, 2400),))),
++        plan=plan,
++    )
++    assert SeamReason.UNCOVERED_TAIL in result.reasons
++    assert (4000, 4100) in result.gaps
++    assert result.release_with(SyntheticScreener(), clock=lambda: 0) == ()
++
++
++def test_untimed_boundary_does_not_invent_word_continuity():
++    plan = plan_audio_windows(4000, window_ms=2000, overlap_ms=0)
++    result = reconcile(
++        (window(0, (("met", 100, 300),)), window(1, (("formin", 2200, 2500),))),
++        plan=plan,
++    )
++    assert SeamReason.BOUNDARY in result.reasons
++    assert protected_text(result) == "met"
++    assert result.alternatives[1].hypothesis.text == "formin"
++
++
++@pytest.mark.parametrize("change", ["source", "provider", "plan", "shape", "unicode"])
++def test_invalid_source_provider_plan_or_alignment_has_value_free_refusal(change):
++    first, second = negation_windows()
++    with pytest.raises(StitchingError) as caught:
++        if change == "source":
++            first = replace(first, source_digest="c" * 64)
++        elif change == "provider":
++            first = replace(first, provider=replace(PROVIDER, provider_revision="v2"))
++        elif change == "plan":
++            reconcile((first, second), plan=replace(PLAN, covered_ms=1))
++        elif change == "shape":
++            replace(first, character_offsets=((0, 1),) + first.character_offsets[1:])
++        else:
++            replace(
++                first, hypothesis=replace(first.hypothesis, text=PRIVATE + "\ud800")
++            )
++        reconcile((first, second))
++    assert PRIVATE not in str(caught.value)
++
++
++def test_bounded_plan_and_window_payloads_refuse_before_reconciliation():
++    large = plan_audio_windows(65000, window_ms=1000)
++    with pytest.raises(StitchingError):
++        reconcile((), plan=large)
++    first = negation_windows()[0]
++    with pytest.raises(StitchingError):
++        reconcile((first,) * 65)
++
++
++def test_forged_finalization_or_changed_edit_cannot_bypass_fresh_reconciliation():
++    first, second = negation_windows()
++    result = reconcile((first, replace(second, coverage_complete=False)))
++    forged = replace(
++        result, review_required=False, reasons=(), operations=reconcile().operations
++    )
++    with pytest.raises(StitchingError):
++        forged.release_with(SyntheticScreener(), clock=lambda: 0)
++    valid = reconcile()
++    altered = replace(
++        valid,
++        operations=(replace(valid.operations[0], text=PRIVATE),) + valid.operations[1:],
++    )
++    with pytest.raises(StitchingError):
++        altered.release_with(SyntheticScreener(), clock=lambda: 0)
++
++
++@pytest.mark.parametrize(
++    "resolution", [PhiResolution.UNRESOLVED, PhiResolution.CRITICAL_UNRESOLVED]
++)
++def test_alignment_success_never_substitutes_for_phi_clearance(resolution):
++    result = reconcile()
++    screener = SyntheticScreener(resolution)
++    assert result.release_with(screener, clock=lambda: 0) == ()
++    assert screener.calls == 1
++
++
++def test_existing_holdback_character_and_latency_limits_still_apply():
++    result = reconcile()
++    assert (
++        result.release_with(
++            SyntheticScreener(), policy=WithholdingPolicy(max_chars=10), clock=lambda: 0
++        )
++        == ()
++    )
++    ticks = iter((0, 0, 100))
++    assert (
++        result.release_with(SyntheticScreener(), clock=lambda: next(ticks, 100)) == ()
++    )
++
++
++def test_new_model_revision_changes_segment_binding_but_replay_does_not():
++    provider = replace(PROVIDER, provider_revision="v2")
++    windows = tuple(replace(item, provider=provider) for item in negation_windows())
++    result = reconcile_windows(
++        PLAN, windows, session_ref=SESSION, source_digest=SOURCE, provider=provider
++    )
++    assert result.segment_ref != reconcile().segment_ref
++    assert json.loads(result.to_json())["received_windows"] == 2

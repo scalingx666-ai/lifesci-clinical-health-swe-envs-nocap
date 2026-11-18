@@ -1,0 +1,220 @@
+diff --git a/packages/fhir-router/src/batch.ts b/packages/fhir-router/src/batch.ts
+index dcfc8910116..866d7786fc9 100644
+--- a/packages/fhir-router/src/batch.ts
++++ b/packages/fhir-router/src/batch.ts
+@@ -24,6 +24,7 @@ import type {
+ import type { IncomingHttpHeaders } from 'node:http';
+ import type { FhirRequest, FhirRouteHandler, FhirRouteMetadata, FhirRouter, RestInteraction } from './fhirrouter';
+ import type { FhirRepository } from './repo';
++import { RepositoryMode } from './repo';
+ import type { HttpMethod, RouteResult } from './urlrouter';
+ 
+ const maxUpdates = 50;
+@@ -41,6 +42,8 @@ export interface BundlePreprocessInfo {
+   requiresStrongTransaction: boolean;
+   updates: number;
+   resourceTypes: Set<ResourceType>;
++  /** True if every entry is a read, search, or history interaction. */
++  readOnly: boolean;
+ }
+ 
+ /**
+@@ -76,6 +79,16 @@ export interface BatchInitialState {
+   preprocessResults: Record<number, BundleEntry>;
+ }
+ 
++const readOnlyInteractions = new Set<RestInteraction>([
++  'read',
++  'vread',
++  'search-system',
++  'search-type',
++  'history-system',
++  'history-type',
++  'history-instance',
++]);
++
+ /**
+  * Processes a FHIR batch request.
+  *
+@@ -197,6 +210,9 @@ export class BatchProcessor {
+     const bundleInfo = this.bundleInfo as BundlePreprocessInfo;
+ 
+     if (!this.isTransaction()) {
++      if (this.bundle.type === 'batch' && bundleInfo.readOnly && this.req.config?.readonlyBatchOnReader) {
++        this.repo.setMode(RepositoryMode.READER);
++      }
+       const result = await this.processEntriesAndBuild();
+       this.dispatchPostEvent();
+       return result;
+@@ -279,6 +295,7 @@ export class BatchProcessor {
+         resourceTypes: this.bundleInfo.resourceTypes,
+         requiresStrongTransaction: this.bundleInfo.requiresStrongTransaction,
+         updates: this.bundleInfo.updates,
++        readOnly: this.bundleInfo.readOnly,
+       },
+       resolvedIdentities: this.resolvedIdentities,
+       assignedIds: this.assignedIds,
+@@ -424,6 +441,7 @@ export class BatchProcessor {
+     const resourceTypes = new Set<ResourceType>();
+     let requiresStrongTransaction = false;
+     let updates = 0;
++    let readOnly = true;
+ 
+     for (let i = 0; i < entries.length; i++) {
+       const entry = entries[i];
+@@ -476,6 +494,7 @@ export class BatchProcessor {
+         // Conditional delete requires strong (serializable) transaction
+         requiresStrongTransaction = true;
+       }
++      readOnly &&= readOnlyInteractions.has(interaction);
+       bucketedEntries[interaction].push(i);
+     }
+ 
+@@ -488,6 +507,7 @@ export class BatchProcessor {
+       requiresStrongTransaction,
+       updates,
+       resourceTypes,
++      readOnly,
+     };
+   }
+ 
+diff --git a/packages/fhir-router/src/fhirrouter.ts b/packages/fhir-router/src/fhirrouter.ts
+index 17384e35312..734b185bfec 100644
+--- a/packages/fhir-router/src/fhirrouter.ts
++++ b/packages/fhir-router/src/fhirrouter.ts
+@@ -47,6 +47,7 @@ export type FhirRequestConfig = {
+   graphqlBatchedSearchSize?: number;
+   graphqlMaxDepth?: number;
+   graphqlMaxSearches?: number;
++  readonlyBatchOnReader?: boolean;
+   searchOnReader?: boolean;
+   transactions?: boolean;
+ };
+@@ -77,13 +78,20 @@ export interface FhirOptions {
+ }
+ 
+ // Execute batch
+-async function batch(req: FhirRequest, repo: FhirRepository, router: FhirRouter): Promise<FhirResponse> {
++async function batch(
++  req: FhirRequest,
++  repo: FhirRepository,
++  router: FhirRouter,
++  options?: FhirRouteOptions
++): Promise<FhirResponse> {
+   const bundle = req.body as Resource;
+   if (bundle.resourceType !== 'Bundle') {
+     return [badRequest('Not a bundle')];
+   }
+ 
+-  const result = await processBatch(req, repo, router, bundle);
++  // A nested bundle shares the outer bundle's repository, so it must not change the repository mode
++  const batchReq = options?.batch ? { ...req, config: { ...req.config, readonlyBatchOnReader: false } } : req;
++  const result = await processBatch(batchReq, repo, router, bundle);
+   return [allOk, result];
+ }
+ 
+diff --git a/packages/server/src/fhir/batch/checkpoint-store.test.ts b/packages/server/src/fhir/batch/checkpoint-store.test.ts
+index f2c10554734..23f3b0e25df 100644
+--- a/packages/server/src/fhir/batch/checkpoint-store.test.ts
++++ b/packages/server/src/fhir/batch/checkpoint-store.test.ts
+@@ -19,7 +19,13 @@ describe('BatchCheckpointStore', () => {
+   function makeInitialState(): BatchInitialState {
+     return {
+       bundle: { resourceType: 'Bundle', type: 'batch', entry: [{ request: { method: 'GET', url: 'Patient' } }] },
+-      bundleInfo: { ordering: [0], resourceTypes: new Set(['Patient']), requiresStrongTransaction: false, updates: 0 },
++      bundleInfo: {
++        ordering: [0],
++        resourceTypes: new Set(['Patient']),
++        requiresStrongTransaction: false,
++        updates: 0,
++        readOnly: true,
++      },
+       resolvedIdentities: { 'urn:uuid:abc': 'Patient/123' },
+       assignedIds: { 0: '123' },
+       preprocessResults: {},
+diff --git a/packages/server/src/fhir/routes.test.ts b/packages/server/src/fhir/routes.test.ts
+index dc5ae60e88b..9046dec9c8b 100644
+--- a/packages/server/src/fhir/routes.test.ts
++++ b/packages/server/src/fhir/routes.test.ts
+@@ -726,6 +726,69 @@ describe('FHIR Routes', () => {
+     }
+   });
+ 
++  test('readonlyBatchOnReader only routes read-only batches to reader', async () => {
++    const token = await initTestAuth({
++      project: { systemSetting: [{ name: 'readonlyBatchOnReader', valueBoolean: true }] },
++    });
++
++    const search = { request: { method: 'GET', url: 'Patient?name=Alice' } };
++    const create = { request: { method: 'POST', url: 'Patient' }, resource: { resourceType: 'Patient' } };
++    const nested = {
++      request: { method: 'POST', url: '/' },
++      resource: { resourceType: 'Bundle', type: 'batch', entry: [search] },
++    };
++    for (const [type, entry, expectReader] of [
++      ['batch', [search, search], true],
++      ['batch', [search, create], false],
++      ['transaction', [search, search], false],
++      ['batch', [nested, search], false],
++    ] as const) {
++      const { readerSpy, writerSpy, restore } = spyOnDatabasePools(shardId);
++      try {
++        const res = await request(app)
++          .post('/fhir/R4')
++          .set('Authorization', 'Bearer ' + token)
++          .set('Content-Type', ContentType.FHIR_JSON)
++          .send({ resourceType: 'Bundle', type, entry });
++        expect(res).toHaveStatus(200);
++        expect(readerSpy.mock.calls.length > 0).toBe(expectReader);
++        expect(writerSpy.mock.calls.length > 0).toBe(!expectReader);
++      } finally {
++        restore();
++      }
++    }
++  });
++
++  test('readonlyBatchOnReader does not break a nested read-only batch inside a transaction', async () => {
++    const token = await initTestAuth({
++      project: {
++        features: ['transaction-bundles'],
++        systemSetting: [{ name: 'readonlyBatchOnReader', valueBoolean: true }],
++      },
++    });
++
++    const res = await request(app)
++      .post('/fhir/R4')
++      .set('Authorization', 'Bearer ' + token)
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .send({
++        resourceType: 'Bundle',
++        type: 'transaction',
++        entry: [
++          { request: { method: 'POST', url: 'Patient' }, resource: { resourceType: 'Patient' } },
++          {
++            request: { method: 'POST', url: '/' },
++            resource: {
++              resourceType: 'Bundle',
++              type: 'batch',
++              entry: [{ request: { method: 'GET', url: 'Patient?name=Alice' } }],
++            },
++          },
++        ],
++      });
++    expect(res).toHaveStatus(200);
++  });
++
+   test('Search invalid resource', async () => {
+     const res = await request(app)
+       .get(`/fhir/R4/Patientx`)
+diff --git a/packages/server/src/fhir/routes.ts b/packages/server/src/fhir/routes.ts
+index c30de3b3b11..2251c69aea4 100644
+--- a/packages/server/src/fhir/routes.ts
++++ b/packages/server/src/fhir/routes.ts
+@@ -507,6 +507,7 @@ protectedRoutes.use('{*splat}', async function routeFhirRequest(req: Request, re
+         ?.valueInteger,
+       graphqlMaxDepth: ctx.project.systemSetting?.find((s) => s.name === 'graphqlMaxDepth')?.valueInteger,
+       graphqlMaxSearches: ctx.project.systemSetting?.find((s) => s.name === 'graphqlMaxSearches')?.valueInteger,
++      readonlyBatchOnReader: ctx.project.systemSetting?.find((s) => s.name === 'readonlyBatchOnReader')?.valueBoolean,
+       searchOnReader: ctx.project.systemSetting?.find((s) => s.name === 'searchOnReader')?.valueBoolean,
+       transactions: ctx.project.features?.includes('transaction-bundles'),
+     },

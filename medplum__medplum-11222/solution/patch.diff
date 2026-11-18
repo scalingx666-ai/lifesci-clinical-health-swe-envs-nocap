@@ -1,0 +1,544 @@
+diff --git a/packages/docs/docs/auth/how-mfa-works.md b/packages/docs/docs/auth/how-mfa-works.md
+index 2c9be04f68a..4605c78458d 100644
+--- a/packages/docs/docs/auth/how-mfa-works.md
++++ b/packages/docs/docs/auth/how-mfa-works.md
+@@ -35,7 +35,7 @@ The routes fall into two groups depending on what they authenticate against.
+ 
+ | Method & Path | Body | Purpose |
+ |---|---|---|
+-| `GET /auth/mfa/status` | — | Read the user's current enrollment status and the TOTP QR code. |
++| `GET /auth/mfa/status` | — | Read the user's current enrollment status and the TOTP QR code while TOTP is not enrolled. |
+ | `POST /auth/mfa/send-email-challenge` | `{}` | Email a 6-digit code to the current user (used to prove control of their email when enrolling email MFA, removing a factor, or disabling MFA). |
+ | `POST /auth/mfa/enroll` | `{ method?, token }` | Enroll the current user in a method. `method` defaults to `totp`. |
+ | `POST /auth/mfa/disable` | `{ token, method? }` | Remove a single factor (when `method` is given) or disable MFA entirely (when `method` is omitted). |
+@@ -110,7 +110,7 @@ For TOTP, `login-enroll` both enrolls the user and verifies the supplied code, c
+ 
+ ## Flow: Self-enrolling from a settings page
+ 
+-These flows assume the user is already authenticated (you have a bearer token). The token must not be limited by SMART resource scopes. Start by reading status:
++These flows assume the user is already authenticated (you have a bearer token). The token must not be limited by SMART resource scopes. For users that are not scoped to a single project, the token must come from a direct sign-in, e.g. password or Google. Start by reading status:
+ 
+ ```ts
+ const status = await medplum.get('auth/mfa/status', { cache: 'no-cache' });
+@@ -120,12 +120,12 @@ const status = await medplum.get('auth/mfa/status', { cache: 'no-cache' });
+ //   allowedMethods: ('totp' | 'email')[],
+ //   mfaRequired: boolean,   // if true, do not offer "Disable MFA"
+ //   email: string,
+-//   enrollUri: string,      // otpauth:// URI
+-//   enrollQrCode: string,   // data-URL QR image
++//   enrollUri?: string,     // otpauth:// URI, only while TOTP is not enrolled
++//   enrollQrCode?: string,  // data-URL QR image, only while TOTP is not enrolled
+ // }
+ ```
+ 
+-`/auth/mfa/status` always returns a TOTP `enrollQrCode`/`enrollUri` (generating a secret if the user does not have one yet), so you can offer authenticator enrollment at any time — including adding TOTP to an account that currently only has email.
++`/auth/mfa/status` returns a TOTP `enrollQrCode`/`enrollUri` while the user is not enrolled in TOTP (generating a secret if the user does not have one yet), so you can offer authenticator enrollment at any time — including adding TOTP to an account that currently only has email. Once TOTP is enrolled, they are no longer returned.
+ 
+ **Enroll in TOTP (authenticator app):**
+ 
+diff --git a/packages/docs/docs/auth/logout.md b/packages/docs/docs/auth/logout.md
+index e2c10c45589..7e9f9b7cde8 100644
+--- a/packages/docs/docs/auth/logout.md
++++ b/packages/docs/docs/auth/logout.md
+@@ -36,6 +36,8 @@ Users can retrieve a list of active sessions using the `/auth/me` endpoint. It w
+ 
+ Each session has a login `id`. You can use this login `id` to revoke a specific session access token.
+ 
++Users who signed in with a password or Google can list and revoke their sessions in all of their projects. Other logins can only list and revoke sessions in the current project.
++
+ ```bash
+ curl 'https://api.medplum.com/auth/revoke' \
+   -X POST \
+diff --git a/packages/server/src/auth/changepassword.ts b/packages/server/src/auth/changepassword.ts
+index d9edd7d9817..8dd22cd7a4d 100644
+--- a/packages/server/src/auth/changepassword.ts
++++ b/packages/server/src/auth/changepassword.ts
+@@ -12,7 +12,7 @@ import { sendOutcome } from '../fhir/outcomes';
+ import type { SystemRepository } from '../fhir/repo';
+ import { makeValidationMiddleware } from '../util/validator';
+ import { setPassword } from './setpassword';
+-import { getCallerUserReference } from './utils';
++import { readUserForAccountManagement } from './utils';
+ 
+ export const changePasswordValidator = makeValidationMiddleware([
+   body('oldPassword').notEmpty().withMessage('Missing oldPassword'),
+@@ -26,7 +26,7 @@ export const changePasswordValidator = makeValidationMiddleware([
+ export async function changePasswordHandler(req: Request, res: Response): Promise<void> {
+   const ctx = getAuthenticatedContext();
+ 
+-  const user = await ctx.systemRepo.readReference<User>(getCallerUserReference(ctx));
++  const user = await readUserForAccountManagement(ctx);
+ 
+   await changePassword(ctx.systemRepo, {
+     user,
+diff --git a/packages/server/src/auth/me.ts b/packages/server/src/auth/me.ts
+index 79b51f58003..25a2f8af4d4 100644
+--- a/packages/server/src/auth/me.ts
++++ b/packages/server/src/auth/me.ts
+@@ -18,7 +18,7 @@ import { getAccessPolicyForLogin } from '../fhir/accesspolicy';
+ import { membershipProfileTypes, readMembershipReference } from '../fhir/projectmembership';
+ import type { SystemRepository } from '../fhir/repo';
+ import { rewriteAttachments, RewriteMode } from '../fhir/rewrite';
+-import { hasSmartResourceScopes, isMfaRequired } from './utils';
++import { canManageUserAccount, hasSmartResourceScopes, isMfaRequired } from './utils';
+ 
+ interface UserSession {
+   id: string;
+@@ -59,7 +59,6 @@ export async function meHandler(req: Request, res: Response): Promise<void> {
+ 
+   // Account security details are only for logins that can manage the account (see getCallerUserReference)
+   if (user && !hasSmartResourceScopes(authState.login)) {
+-    const sessions = await getSessions(systemRepo, user);
+     const memberships = await systemRepo.searchResources<ProjectMembership>({
+       resourceType: 'ProjectMembership',
+       filters: [
+@@ -75,6 +74,11 @@ export async function meHandler(req: Request, res: Response): Promise<void> {
+         },
+       ],
+     });
++    const sessions = await getSessions(
++      systemRepo,
++      user,
++      canManageUserAccount(authState.login) ? undefined : memberships
++    );
+     security = {
+       mfaEnrolled: !!user.mfaEnrolled,
+       mfaRequired: isMfaRequired(user, project),
+@@ -183,7 +187,19 @@ export function getUserConfigurationMenu(project: Project, membership: ProjectMe
+   return result;
+ }
+ 
+-async function getSessions(systemRepo: SystemRepository, user: WithId<User>): Promise<UserSession[]> {
++/**
++ * Returns the user's recent sessions.
++ * @param systemRepo - The system repository.
++ * @param user - The user.
++ * @param memberships - Optional memberships; if set, only sessions for one of these memberships are returned.
++ * @returns The user's sessions.
++ */
++async function getSessions(
++  systemRepo: SystemRepository,
++  user: WithId<User>,
++  memberships?: WithId<ProjectMembership>[]
++): Promise<UserSession[]> {
++  const membershipRefs = memberships && new Set(memberships.map((m) => getReferenceString(m)));
+   const logins = await systemRepo.searchResources<Login>({
+     resourceType: 'Login',
+     filters: [
+@@ -203,7 +219,10 @@ async function getSessions(systemRepo: SystemRepository, user: WithId<User>): Pr
+   const result = [];
+   for (const login of logins) {
+     // A login that has not been granted yet is not a session
+-    if (!login.membership || !login.granted || login.revoked) {
++    if (!login.membership?.reference || !login.granted || login.revoked) {
++      continue;
++    }
++    if (membershipRefs && !membershipRefs.has(login.membership.reference)) {
+       continue;
+     }
+ 
+diff --git a/packages/server/src/auth/mfa.test.ts b/packages/server/src/auth/mfa.test.ts
+index 8b5c47bc741..9ce808a4621 100644
+--- a/packages/server/src/auth/mfa.test.ts
++++ b/packages/server/src/auth/mfa.test.ts
+@@ -2,7 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ import { SendEmailCommand, SESv2Client } from '@aws-sdk/client-sesv2';
+ import type { WithId } from '@medplum/core';
+-import { allOk, badRequest, getReferenceString } from '@medplum/core';
++import { allOk, badRequest, getReferenceString, OAuthGrantType } from '@medplum/core';
+ import type { Login, Project, Reference, User } from '@medplum/fhirtypes';
+ import type { AwsClientStub } from 'aws-sdk-client-mock';
+ import { mockClient } from 'aws-sdk-client-mock';
+@@ -152,22 +152,62 @@ describe('MFA', () => {
+   });
+ 
+   test.each([
+-    ['GET', '/auth/mfa/status', {}],
+-    ['POST', '/auth/mfa/enroll', {}],
+-    ['POST', '/auth/mfa/send-email-challenge', {}],
+-    ['POST', '/auth/mfa/disable', {}],
+-    ['POST', '/auth/changepassword', { oldPassword: 'old-password', newPassword: 'new-password-123' }],
+-    ['POST', '/auth/revoke', { loginId: randomUUID() }],
+-  ])('%s %s requires a user login', async (method, url, body) => {
++    ['GET', '/auth/mfa/status', {}, 403],
++    ['POST', '/auth/mfa/enroll', {}, 403],
++    ['POST', '/auth/mfa/send-email-challenge', {}, 403],
++    ['POST', '/auth/mfa/disable', {}, 403],
++    ['POST', '/auth/changepassword', { oldPassword: 'old-password', newPassword: 'new-password-123' }, 403],
++    ['POST', '/auth/revoke', { loginId: randomUUID() }, 404],
++  ])('%s %s requires a user login', async (method, url, body, issuedTokenStatus) => {
+     const { client, project } = await withTestContext(() =>
+       createTestProject({ withClient: true, membership: { admin: true } })
+     );
+     const { profile } = await withTestContext(() => addTestUser(project));
+     const basicAuth = 'Basic ' + Buffer.from(client.id + ':' + client.secret).toString('base64');
++    const send = (): request.Test =>
++      method === 'GET' ? request(app).get(url) : request(app).post(url).type('json').send(body);
++
++    const res1 = await send()
++      .set('Authorization', basicAuth)
++      .set('X-Medplum-On-Behalf-Of', getReferenceString(profile));
++    expect(res1).toHaveStatus(403);
++
++    // Token issued by the project for a user who also has their own project
++    const email = `user${randomUUID()}@example.com`;
++    const { membership } = await withTestContext(async () => {
++      await registerNew({
++        firstName: 'Other',
++        lastName: 'User',
++        projectName: 'Other Project',
++        email,
++        password: randomUUID(),
++      });
++      return inviteUser({
++        project,
++        resourceType: 'Practitioner',
++        firstName: 'Other',
++        lastName: 'User',
++        email,
++        sendEmail: false,
++      });
++    });
++    const res2 = await request(app)
++      .post('/auth/preauthorize')
++      .set('Authorization', basicAuth)
++      .set('X-Medplum-On-Behalf-Of', getReferenceString(membership))
++      .type('json')
++      .send({ clientId: client.id });
++    expect(res2).toHaveStatus(200);
++    const res3 = await request(app).post('/oauth2/token').type('form').send({
++      grant_type: OAuthGrantType.PreAuthorizedCode,
++      client_id: client.id,
++      'pre-authorized_code': res2.body.preAuthorizedCode,
++    });
++    expect(res3).toHaveStatus(200);
+ 
+-    const req = method === 'GET' ? request(app).get(url) : request(app).post(url).type('json').send(body);
+-    const res = await req.set('Authorization', basicAuth).set('X-Medplum-On-Behalf-Of', getReferenceString(profile));
+-    expect(res).toHaveStatus(403);
++    const res4 = await send().set('Authorization', `Bearer ${res3.body.access_token}`);
++    expect(res4).toHaveStatus(issuedTokenStatus);
++    expect(res4.body.enrollUri).toBeUndefined();
+   });
+ 
+   test('Login with SMART resource scopes cannot read status', async () => {
+@@ -2362,8 +2402,11 @@ describe('MFA', () => {
+       expect(res).toHaveStatus(200);
+       // The field old clients read:
+       expect(res.body.enrolled).toBe(true);
+-      // For an already-enrolled user the secret must NOT be regenerated.
+-      expect(new URL(res.body.enrollUri).searchParams.get('secret')).toBe(secret);
++      // For an already-enrolled user the secret must NOT be regenerated, and enrollment details are not returned.
++      const stored = await withTestContext(() => getGlobalSystemRepo().readResource<User>('User', user.id));
++      expect(stored.mfaSecret).toBe(secret);
++      expect(res.body.enrollUri).toBeUndefined();
++      expect(res.body.enrollQrCode).toBeUndefined();
+       // The new fields are additive and reflect the inferred method.
+       expect(res.body.enrolledMethods).toEqual(['totp']);
+     });
+diff --git a/packages/server/src/auth/mfa.ts b/packages/server/src/auth/mfa.ts
+index c35473c24fd..e2212edb99d 100644
+--- a/packages/server/src/auth/mfa.ts
++++ b/packages/server/src/auth/mfa.ts
+@@ -20,10 +20,10 @@ import {
+   buildTotpEnrollment,
+   clearMfaEmailCode,
+   getAllowedMfaMethods,
+-  getCallerUserReference,
+   getEnrolledMfaMethods,
+   getLoginProject,
+   isMfaRequired,
++  readUserForAccountManagement,
+   sendLoginResult,
+   sendMfaEmailCode,
+   verifyEmailMfaCode,
+@@ -89,24 +89,26 @@ export async function verifyConnectedFactor(user: User, login: Login, token: str
+ 
+ mfaRouter.get('/status', authenticateRequest, async (_req: Request, res: Response) => {
+   const ctx = getAuthenticatedContext();
+-  const user = await ctx.systemRepo.readReference<User>(getCallerUserReference(ctx));
++  const user = await readUserForAccountManagement(ctx);
+   const allowedMethods = getAllowedMfaMethods(ctx.project);
++  const enrolledMethods = getEnrolledMfaMethods(user);
+ 
+-  // The TOTP QR code can always be shown, whether for initial enrollment or for
+-  // adding TOTP as a second method to an account already enrolled in
+-  // email-based MFA, because a secret is generated on demand if missing.
+-  const { enrollUri, enrollQrCode } = await buildTotpEnrollment(ctx.systemRepo, user, ctx.project);
++  // The TOTP QR code is only returned while TOTP is not enrolled: for initial enrollment,
++  // or to add TOTP alongside email-based MFA. A secret is generated if the user has none.
++  const enrollment = enrolledMethods.includes('totp')
++    ? undefined
++    : await buildTotpEnrollment(ctx.systemRepo, user, ctx.project);
+ 
+   res.json({
+     enrolled: Boolean(user.mfaEnrolled),
+-    enrolledMethods: getEnrolledMfaMethods(user),
++    enrolledMethods,
+     allowedMethods,
+     // When MFA is required for the account, the client must not offer to disable
+     // it (the `/disable` endpoint enforces this server-side as well).
+     mfaRequired: isMfaRequired(user, ctx.project),
+     email: user.email,
+-    enrollUri,
+-    enrollQrCode,
++    enrollUri: enrollment?.enrollUri,
++    enrollQrCode: enrollment?.enrollQrCode,
+   });
+ });
+ 
+@@ -176,7 +178,7 @@ mfaRouter.post(
+ mfaRouter.post('/enroll', authenticateRequest, async (req: Request, res: Response) => {
+   const systemRepo = getGlobalSystemRepo();
+   const ctx = getAuthenticatedContext();
+-  const user = await systemRepo.readReference<User>(getCallerUserReference(ctx));
++  const user = await readUserForAccountManagement(ctx);
+ 
+   const method = parseMfaMethod(req.body.method);
+ 
+@@ -292,7 +294,7 @@ mfaRouter.post(
+  */
+ mfaRouter.post('/send-email-challenge', authenticateRequest, async (_req: Request, res: Response) => {
+   const ctx = getAuthenticatedContext();
+-  const user = await ctx.systemRepo.readReference<User>(getCallerUserReference(ctx));
++  const user = await readUserForAccountManagement(ctx);
+ 
+   const emailEnrolled = getEnrolledMfaMethods(user).includes('email');
+   const emailAllowed = getAllowedMfaMethods(ctx.project).includes('email');
+@@ -311,7 +313,7 @@ mfaRouter.post(
+   [body('token').optional().isString(), body('method').optional().isString()],
+   async (req: Request, res: Response) => {
+     const ctx = getAuthenticatedContext();
+-    const user = await ctx.systemRepo.readReference<User>(getCallerUserReference(ctx));
++    const user = await readUserForAccountManagement(ctx);
+ 
+     if (!user.mfaEnrolled) {
+       sendOutcome(res, badRequest('User not enrolled in MFA'));
+diff --git a/packages/server/src/auth/revoke.test.ts b/packages/server/src/auth/revoke.test.ts
+index d1f11233c93..c3498ae3f81 100644
+--- a/packages/server/src/auth/revoke.test.ts
++++ b/packages/server/src/auth/revoke.test.ts
+@@ -1,17 +1,15 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+-import { createReference } from '@medplum/core';
++import { createReference, getReferenceString, OAuthGrantType } from '@medplum/core';
+ import { randomUUID } from 'crypto';
+ import express from 'express';
+ import request from 'supertest';
+ import { inviteUser } from '../admin/invite';
+ import { initApp, shutdownApp } from '../app';
+ import { loadTestConfig } from '../config/loader';
+-import { getGlobalSystemRepo } from '../fhir/repo';
+ import { getAuthTokens, tryLogin } from '../oauth/utils';
+ import { withTestContext } from '../test.setup';
+ import { registerNew } from './register';
+-import { setPassword } from './setpassword';
+ 
+ const app = express();
+ 
+@@ -111,7 +109,7 @@ describe('Revoke', () => {
+     const bobEmail = `bob${randomUUID()}@example.com`;
+     const bobPassword = randomUUID();
+ 
+-    const { bobLogin, aliceAccessToken } = await withTestContext(async () => {
++    const { aliceRegResult, bobRegResult, bobMembership } = await withTestContext(async () => {
+       const aliceRegResult = await registerNew({
+         firstName: 'Alice',
+         lastName: 'Smith',
+@@ -122,37 +120,82 @@ describe('Revoke', () => {
+         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/107.0.0.0',
+       });
+ 
+-      // Second, Alice invites Bob to the project
+-      const { user: bobUser } = await inviteUser({
+-        project: aliceRegResult.project,
+-        resourceType: 'Practitioner',
++      // Bob has his own project
++      const bobRegResult = await registerNew({
+         firstName: 'Bob',
+         lastName: 'Jones',
++        projectName: 'Bob Project',
+         email: bobEmail,
++        password: bobPassword,
++        remoteAddress: '5.5.5.5',
++        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/107.0.0.0',
+       });
+ 
+-      // Set Bob password
+-      await setPassword(getGlobalSystemRepo(), bobUser, bobPassword);
+-
+-      // Login as Bob
+-      const bobLogin = await tryLogin({
+-        authMethod: 'password',
++      // Alice invites Bob to her project
++      const { membership: bobMembership } = await inviteUser({
++        project: aliceRegResult.project,
++        resourceType: 'Practitioner',
++        firstName: 'Bob',
++        lastName: 'Jones',
+         email: bobEmail,
+-        password: bobPassword,
+-        scope: 'openid',
+-        nonce: 'nonce',
++        sendEmail: false,
+       });
+-      expect(bobLogin).toBeDefined();
+-      return { bobLogin, aliceAccessToken: aliceRegResult.accessToken };
++      return { aliceRegResult, bobRegResult, bobMembership };
+     });
+ 
+     // Try to revoke Bob's session as Alice
+     // This should fail
+-    const revokeResponse = await request(app)
++    const res1 = await request(app)
++      .post('/auth/revoke')
++      .set('Authorization', `Bearer ${aliceRegResult.accessToken}`)
++      .type('json')
++      .send({ loginId: bobRegResult.login.id });
++    expect(res1).toHaveStatus(404);
++
++    // Get a token for Bob in Alice's project
++    const res2 = await request(app)
++      .post('/auth/preauthorize')
++      .set('Authorization', `Bearer ${aliceRegResult.accessToken}`)
++      .set('X-Medplum-On-Behalf-Of', getReferenceString(bobMembership))
++      .type('json')
++      .send({ clientId: aliceRegResult.client.id });
++    expect(res2).toHaveStatus(200);
++
++    const res3 = await request(app).post('/oauth2/token').type('form').send({
++      grant_type: OAuthGrantType.PreAuthorizedCode,
++      client_id: aliceRegResult.client.id,
++      'pre-authorized_code': res2.body.preAuthorizedCode,
++    });
++    expect(res3).toHaveStatus(200);
++    const bobToken2 = res3.body.access_token;
++
++    // Sessions are limited to Alice's project
++    const res4 = await request(app).get('/auth/me').set('Authorization', `Bearer ${bobToken2}`);
++    expect(res4).toHaveStatus(200);
++    expect(res4.body.security.sessions.map((s: { id: string }) => s.id)).not.toContain(bobRegResult.login.id);
++
++    const res5 = await request(app)
+       .post('/auth/revoke')
+-      .set('Authorization', `Bearer ${aliceAccessToken}`)
++      .set('Authorization', `Bearer ${bobToken2}`)
+       .type('json')
+-      .send({ loginId: bobLogin.id });
+-    expect(revokeResponse).toHaveStatus(404);
++      .send({ loginId: bobRegResult.login.id });
++    expect(res5).toHaveStatus(404);
++
++    // Bob's own login sees and revokes sessions in both projects
++    const res6 = await request(app).get('/auth/me').set('Authorization', `Bearer ${bobRegResult.accessToken}`);
++    expect(res6).toHaveStatus(200);
++    const bobSessions: string[] = res6.body.security.sessions.map((s: { id: string }) => s.id);
++    expect(bobSessions).toHaveLength(2);
++    expect(bobSessions).toContain(bobRegResult.login.id);
++
++    const res7 = await request(app)
++      .post('/auth/revoke')
++      .set('Authorization', `Bearer ${bobRegResult.accessToken}`)
++      .type('json')
++      .send({ loginId: bobSessions.find((id) => id !== bobRegResult.login.id) });
++    expect(res7).toHaveStatus(200);
++
++    const res8 = await request(app).get('/auth/me').set('Authorization', `Bearer ${bobToken2}`);
++    expect(res8).toHaveStatus(401);
+   });
+ });
+diff --git a/packages/server/src/auth/revoke.ts b/packages/server/src/auth/revoke.ts
+index 6fa3a69a449..180a60db3c6 100644
+--- a/packages/server/src/auth/revoke.ts
++++ b/packages/server/src/auth/revoke.ts
+@@ -1,15 +1,16 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+-import { allOk, notFound } from '@medplum/core';
+-import type { Login } from '@medplum/fhirtypes';
++import { allOk, getReferenceString, notFound, Operator, resolveId } from '@medplum/core';
++import type { Login, ProjectMembership } from '@medplum/fhirtypes';
+ import type { Request, Response } from 'express';
+ import { body } from 'express-validator';
+ import { getAuthenticatedContext } from '../context';
+ import { sendOutcome } from '../fhir/outcomes';
+ import { getGlobalSystemRepo } from '../fhir/repo';
++import { getLogger } from '../logger';
+ import { revokeLogin } from '../oauth/utils';
+ import { makeValidationMiddleware } from '../util/validator';
+-import { getCallerUserReference } from './utils';
++import { canManageUserAccount, getCallerUserReference } from './utils';
+ 
+ export const revokeValidator = makeValidationMiddleware([
+   body('loginId').isUUID().withMessage('Login ID is required.'),
+@@ -28,6 +29,28 @@ export async function revokeHandler(req: Request, res: Response): Promise<void>
+     return;
+   }
+ 
++  // Other logins can only revoke sessions in the current project
++  if (!canManageUserAccount(ctx.authState.login)) {
++    const loginMembership =
++      login.membership &&
++      (await systemRepo.searchOne<ProjectMembership>({
++        resourceType: 'ProjectMembership',
++        filters: [
++          { code: '_id', operator: Operator.EQUALS, value: resolveId(login.membership) as string },
++          { code: 'project', operator: Operator.EQUALS, value: getReferenceString(ctx.project) },
++        ],
++      }));
++    if (!loginMembership) {
++      getLogger().warn('Revoke denied', {
++        loginId: login.id,
++        projectId: ctx.project.id,
++        authMethod: ctx.authState.login.authMethod,
++      });
++      sendOutcome(res, notFound);
++      return;
++    }
++  }
++
+   // Mark the login as revoked
+   await revokeLogin(systemRepo, login);
+ 
+diff --git a/packages/server/src/auth/utils.ts b/packages/server/src/auth/utils.ts
+index ae3dce002c4..f648681506f 100644
+--- a/packages/server/src/auth/utils.ts
++++ b/packages/server/src/auth/utils.ts
+@@ -70,6 +70,35 @@ export function getCallerUserReference(ctx: AuthenticatedRequestContext): Refere
+   return membership.user as Reference<User>;
+ }
+ 
++/**
++ * Returns true if the user signed in directly (password or Google).
++ * Such logins may manage the user's account and sessions across all of the user's projects.
++ * @param login - The login.
++ * @returns True if the login may manage the user's account.
++ */
++export function canManageUserAccount(login: Login): boolean {
++  return login.authMethod === 'password' || login.authMethod === 'google';
++}
++
++/**
++ * Reads the User of the authenticated caller, for routes that manage the caller's own account.
++ * A server-scoped User can only be managed from a login where the user signed in directly.
++ * @param ctx - The authenticated request context.
++ * @returns The caller's User.
++ */
++export async function readUserForAccountManagement(ctx: AuthenticatedRequestContext): Promise<WithId<User>> {
++  const user = await ctx.systemRepo.readReference<User>(getCallerUserReference(ctx));
++  if (!user.project && !canManageUserAccount(ctx.authState.login)) {
++    getLogger().warn('Account update denied', {
++      userId: user.id,
++      projectId: ctx.project.id,
++      authMethod: ctx.authState.login.authMethod,
++    });
++    throw new OperationOutcomeError(forbidden);
++  }
++  return user;
++}
++
+ /**
+  * Returns the MFA methods that a project allows users to enroll in.
+  * Controlled by the `allowedMfaMethods` project setting, a comma-delimited

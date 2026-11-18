@@ -1,0 +1,184 @@
+diff --git a/erpnext/accounts/doctype/purchase_invoice/purchase_invoice.py b/erpnext/accounts/doctype/purchase_invoice/purchase_invoice.py
+index e3d06c7a72bd..82fe909da2e7 100644
+--- a/erpnext/accounts/doctype/purchase_invoice/purchase_invoice.py
++++ b/erpnext/accounts/doctype/purchase_invoice/purchase_invoice.py
+@@ -39,7 +39,7 @@
+ from erpnext.assets.doctype.asset_category.asset_category import get_asset_category_account
+ from erpnext.buying.utils import check_on_hold_or_closed_status
+ from erpnext.controllers.accounts_controller import merge_taxes, validate_account_head
+-from erpnext.controllers.buying_controller import BuyingController, get_stock_qty
++from erpnext.controllers.buying_controller import BuyingController, get_stock_qty, get_transit_amount
+ from erpnext.controllers.mapper import get_qty_already_mapped
+ from erpnext.projects.doctype.project.project import update_purchase_cost
+ from erpnext.stock import get_warehouse_account_map
+@@ -1568,7 +1568,7 @@ def make_stock_adjustment_entry(self, gl_entries, item, voucher_wise_stock_value
+ 			if item.sales_incoming_rate:
+ 				# Material of a transfer goes back at the rate it came in with, the rejected
+ 				# material along with the accepted.
+-				net_rate = (flt(item.qty) + flt(item.rejected_qty)) * item.sales_incoming_rate
++				net_rate = get_transit_amount(item, item.qty) + get_transit_amount(item, item.rejected_qty)
+ 
+ 			stock_amount = net_rate + item.item_tax_amount + flt(item.landed_cost_voucher_amount)
+ 			warehouse_debit_amount = flt(
+diff --git a/erpnext/accounts/doctype/purchase_invoice/test_purchase_invoice.py b/erpnext/accounts/doctype/purchase_invoice/test_purchase_invoice.py
+index 1916f6f903ac..dfcc70d3545e 100644
+--- a/erpnext/accounts/doctype/purchase_invoice/test_purchase_invoice.py
++++ b/erpnext/accounts/doctype/purchase_invoice/test_purchase_invoice.py
+@@ -3238,6 +3238,63 @@ def test_return_of_an_internal_transfer_invoice_that_rejected_everything(self):
+ 		self.assertEqual(booked[get_inventory_account(company, transit_warehouse)], 1000)
+ 		self.assertEqual(booked[get_inventory_account(company, rejected_warehouse)], -1000)
+ 
++	def test_return_of_an_internal_transfer_invoice_in_another_uom(self):
++		"""A return takes back the stock value the invoice moved, when the stock qty is rounded."""
++		from erpnext.accounts.doctype.sales_invoice.sales_invoice import make_inter_company_purchase_invoice
++		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
++		from erpnext.stock.doctype.item.test_item import make_item
++		from erpnext.stock.doctype.purchase_receipt.test_purchase_receipt import (
++			prepare_data_for_internal_transfer,
++		)
++
++		prepare_data_for_internal_transfer()
++		company = "_Test Company with perpetual inventory"
++		item = make_item(
++			"_Test Kg Item For Returned Transfer",
++			{
++				"stock_uom": "Kg",
++				"uoms": [{"uom": "Kg", "conversion_factor": 1}, {"uom": "Box", "conversion_factor": 0.3356}],
++			},
++		).name
++		make_purchase_receipt(
++			item_code=item, company=company, warehouse="Stores - TCP1", qty=20, rate=100, uom="Kg"
++		)
++
++		si = create_sales_invoice(
++			company=company,
++			customer="_Test Internal Customer 2",
++			item_code=item,
++			qty=4,
++			rate=100,
++			warehouse="Stores - TCP1",
++			update_stock=1,
++			cost_center="Main - TCP1",
++			debit_to="Debtors - TCP1",
++			income_account="Sales - TCP1",
++			do_not_save=1,
++		)
++		si.items[0].update(
++			{"uom": "Box", "conversion_factor": 0.3356, "target_warehouse": "Work In Progress - TCP1"}
++		)
++		si.submit()
++
++		pi = make_inter_company_purchase_invoice(si.name)
++		pi.update_stock = 1
++		pi.items[0].warehouse = "Finished Goods - TCP1"
++		pi.items[0].expense_account = "Cost of Goods Sold - TCP1"
++		pi.submit()
++
++		returned = make_return_doc("Purchase Invoice", pi.name)
++		returned.update_stock = 1
++		returned.submit()
++
++		self.assertFalse(
++			frappe.db.exists(
++				"GL Entry",
++				{"voucher_no": returned.name, "account": "Cost of Goods Sold - TCP1", "is_cancelled": 0},
++			)
++		)
++
+ 	def test_stock_updating_invoice_rejects_every_unit_of_a_row(self):
+ 		"""A row of a stock updating invoice may be rejected in full."""
+ 		from erpnext.stock.doctype.item.test_item import make_item
+diff --git a/erpnext/controllers/buying_controller.py b/erpnext/controllers/buying_controller.py
+index 6db1ad7dae92..1f1e0bc80414 100644
+--- a/erpnext/controllers/buying_controller.py
++++ b/erpnext/controllers/buying_controller.py
+@@ -670,7 +670,7 @@ def update_valuation_rate(self, reset_outgoing_rate=True):
+ 
+ 				net_rate = item.base_net_amount
+ 				if item.sales_incoming_rate:  # for internal transfer
+-					net_rate = self.get_internal_transfer_qty(item) * item.sales_incoming_rate
++					net_rate = get_transit_amount(item, self.get_internal_transfer_qty(item))
+ 
+ 				if (
+ 					not net_rate
+@@ -1488,6 +1488,11 @@ def get_stock_qty(row, qty) -> float:
+ 	return flt(flt(qty) * flt(row.conversion_factor), row.precision("stock_qty"))
+ 
+ 
++def get_transit_amount(row, qty) -> float:
++	"""Value of qty of an internal transfer row at its transit rate, as the stock ledger moves it."""
++	return get_stock_qty(row, qty) * flt(row.sales_incoming_rate) / flt(row.conversion_factor)
++
++
+ def get_linked_asset_qty(detail_field, details, exclude_asset=None):
+ 	asset = frappe.qb.DocType("Asset")
+ 	query = (
+diff --git a/erpnext/stock/doctype/purchase_receipt/test_purchase_receipt.py b/erpnext/stock/doctype/purchase_receipt/test_purchase_receipt.py
+index 606798d4cd43..a7ab36057502 100644
+--- a/erpnext/stock/doctype/purchase_receipt/test_purchase_receipt.py
++++ b/erpnext/stock/doctype/purchase_receipt/test_purchase_receipt.py
+@@ -6391,6 +6391,64 @@ def get_sabb_qty(sabb):
+ 		# Test 3 - OverAllowanceError should be thrown as qty is greater than qty in DN
+ 		self.assertRaises(erpnext.controllers.status_updater.OverAllowanceError, pr.submit)
+ 
++	def test_internal_pr_of_batch_item_takes_the_value_that_leaves_transit(self):
++		"""A batch item received from transit in another UOM is valued at the stock qty that moved."""
++		from erpnext.stock.doctype.delivery_note.delivery_note import make_inter_company_purchase_receipt
++		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
++
++		company = "_Test Company with perpetual inventory"
++		item = make_item(
++			"_Test Kg Batch Item For Transit Value",
++			{
++				"stock_uom": "Kg",
++				"has_batch_no": 1,
++				"create_new_batch": 1,
++				"batch_number_series": "BT-KGTV-.####",
++				"uoms": [{"uom": "Kg", "conversion_factor": 1}, {"uom": "Box", "conversion_factor": 0.3356}],
++			},
++		).name
++		make_purchase_receipt(
++			item_code=item,
++			company=company,
++			warehouse="Stores - TCP1",
++			qty=20,
++			rate=100,
++			uom="Kg",
++			posting_date=add_days(today(), -2),
++		)
++		dn = create_delivery_note(
++			item_code=item,
++			company=company,
++			customer="_Test Internal Customer 2",
++			cost_center="Main - TCP1",
++			expense_account="Cost of Goods Sold - TCP1",
++			qty=4,
++			rate=100,
++			warehouse="Stores - TCP1",
++			target_warehouse="Work In Progress - TCP1",
++			posting_date=add_days(today(), -1),
++			do_not_submit=True,
++		)
++		dn.items[0].update({"uom": "Box", "conversion_factor": 0.3356})
++		dn.submit()
++
++		# received after the delivery, so no repost revalues it
++		pr = make_inter_company_purchase_receipt(dn.name)
++		pr.update({"set_posting_time": 1, "posting_date": today(), "posting_time": nowtime()})
++		pr.items[0].warehouse = "Finished Goods - TCP1"
++		pr.submit()
++
++		stock_value = dict(
++			frappe.get_all(
++				"Stock Ledger Entry",
++				filters={"voucher_no": pr.name, "is_cancelled": 0},
++				fields=["warehouse", "stock_value_difference"],
++				as_list=True,
++			)
++		)
++		self.assertEqual(stock_value["Finished Goods - TCP1"], -stock_value["Work In Progress - TCP1"])
++		self.assertFalse(get_gl_entries("Purchase Receipt", pr.name))
++
+ 	def test_valuation_rate_for_rejected_materials(self):
+ 		item = make_item("Test Item with Rej Material Valuation", {"is_stock_item": 1})
+ 		company = "_Test Company with perpetual inventory"

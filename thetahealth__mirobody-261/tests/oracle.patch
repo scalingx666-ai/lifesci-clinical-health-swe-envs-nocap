@@ -1,0 +1,436 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2c50e7c1..d3f59f0f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -90,6 +90,14 @@
+   tell: the re-import prints "Retracted the daily values on N days";
+   `SELECT DISTINCT timezone FROM series_data WHERE source =
+   'apple_health_export'` names the phone's offset or zone, not `UTC`.
++- An older Apple Health export could beat a stream containing later measurements
++  for the same day. Generated summaries now choose one valid Apple transport
++  by actual sample freshness before coverage, then compete normally with other
++  vendors. Push, export and direct-watch totals stay separate and are never
++  added together. Reimporting an old export cannot make it fresh by write time;
++  missing sample evidence retains the existing ranking. Reproduce with a
++  morning export and afternoon push for the same metric and day: the later
++  measurements publish their own value (see `docs/apple-health.md`).
+ - **A Chinese reader sees a coded reading's name in Chinese.** A report that
+   printed 低密度脂蛋白胆固醇 was standardized and then listed as
+   `Cholesterol in LDL [Moles/volume] in Serum or Plasma` in the indicator
+diff --git a/docs/apple-health.md b/docs/apple-health.md
+index fcace945..ae545567 100644
+--- a/docs/apple-health.md
++++ b/docs/apple-health.md
+@@ -26,6 +26,36 @@ this rule (the day was read in `--tz`, `UTC` by default) is repaired by
+ importing it again: the readings move, and the daily values left on the days
+ they moved off are retracted.
+ 
++For generated daily summaries, `apple_health`, `apple_health_export` and
++`apple_health_watch` remain separate streams. Before competing with other
++vendors, their valid alternatives elect one Apple representative by source
++class, actual measurement freshness, coverage, then static priority. The
++freshness lookup uses the maximum valid `series_data.time` from the same
++source-id winner and catalogue window as SQL aggregation (including DST and
++the 18:00 sleep-day anchor). Filtered points, nonnumeric values and losing
++source IDs cannot refresh a stream. Display names are not device identities.
++
++Freshness takes precedence only when every valid alternative has retained
++sample evidence; otherwise the existing deterministic ranking applies. Equal
++measurement times fall back to coverage and priority. Reimporting an old
++export does not refresh its measurements: neither database write time nor a
++summary's synthetic day boundaries count. The representative then competes
++with other vendors under the ordinary coverage-first policy. Values are
++never summed across transports, validation still rejects impossible totals,
++and the authority row records the Apple transport policy in `rule`.
++
++To reproduce the former stale choice, import a morning export, then push
++new afternoon measurements for the same metric and local day. The afternoon
++stream should publish its own value even if the morning stream has more
++coverage. Reverse the transports and the later measured export should win.
++Run the regression with:
++
++```bash
++python -m pytest -q mirobody/tests/test_apple_transport_election.py
++MIROBODY_TEST_POSTGRES_DSN=postgresql://localhost/mirobody_regression \
++  python -m pytest -q mirobody/tests/test_apple_transport_election.py -m needs_db
++```
++
+ ## The vocabulary is HealthKit's own
+ 
+ **`type` is a HealthKit identifier**: `HKQuantityTypeIdentifierHeartRate`, not
+diff --git a/docs/pipeline.md b/docs/pipeline.md
+index 4f06ee76..13736609 100644
+--- a/docs/pipeline.md
++++ b/docs/pipeline.md
+@@ -198,6 +198,24 @@ rewritten daily and looks fresh), then the deployment's own priority list — an
+ `standardize/aggregate/election.py` records the winner in `th_day_authority`,
+ which the read view exposes as `elected`.
+ 
++For generated daily summaries, `apple_health`, `apple_health_export` and
++`apple_health_watch` remain separate streams. Before competing with other
++vendors, their valid alternatives elect one Apple representative by source
++class, actual measurement freshness, coverage, then static priority. The
++freshness lookup uses the maximum valid `series_data.time` from the same
++source-id winner and catalogue window as SQL aggregation (including DST and
++the 18:00 sleep-day anchor). Filtered points, nonnumeric values and losing
++source IDs cannot refresh a stream. Display names are not device identities.
++
++Freshness takes precedence only when every valid alternative has retained
++sample evidence; otherwise the existing deterministic ranking applies. Equal
++measurement times fall back to coverage and priority. Reimporting an old
++export does not refresh its measurements: neither database write time nor a
++summary's synthetic day boundaries count. The representative then competes
++with other vendors under the ordinary coverage-first policy. Values are
++never summed across transports, validation still rejects impossible totals,
++and the authority row records the Apple transport policy in `rule`.
++
+ A candidate is **rejected** rather than ranked when its numbers are impossible:
+ a total sleep time longer than the night it was measured in is arithmetic, not
+ opinion, and an aggregation pass's own day total is checked as the metric it
+diff --git a/mirobody/standardize/aggregate/README.md b/mirobody/standardize/aggregate/README.md
+index 45517bca..810665f7 100644
+--- a/mirobody/standardize/aggregate/README.md
++++ b/mirobody/standardize/aggregate/README.md
+@@ -96,6 +96,24 @@ then coverage, then measurement freshness, then the deployment's
+ (forty hours of sleep in one night) is rejected and the rejection is a row of
+ `th_check_result`. Every reader joins `th_day_authority`; none re-decides.
+ 
++For generated daily summaries, `apple_health`, `apple_health_export` and
++`apple_health_watch` remain separate streams. Before competing with other
++vendors, their valid alternatives elect one Apple representative by source
++class, actual measurement freshness, coverage, then static priority. The
++freshness lookup uses the maximum valid `series_data.time` from the same
++source-id winner and catalogue window as SQL aggregation (including DST and
++the 18:00 sleep-day anchor). Filtered points, nonnumeric values and losing
++source IDs cannot refresh a stream. Display names are not device identities.
++
++Freshness takes precedence only when every valid alternative has retained
++sample evidence; otherwise the existing deterministic ranking applies. Equal
++measurement times fall back to coverage and priority. Reimporting an old
++export does not refresh its measurements: neither database write time nor a
++summary's synthetic day boundaries count. The representative then competes
++with other vendors under the ordinary coverage-first policy. Values are
++never summed across transports, validation still rejects impossible totals,
++and the authority row records the Apple transport policy in `rule`.
++
+ ## Running it
+ 
+ | | |
+diff --git a/mirobody/standardize/aggregate/election.py b/mirobody/standardize/aggregate/election.py
+index d5be79af..7796f119 100644
+--- a/mirobody/standardize/aggregate/election.py
++++ b/mirobody/standardize/aggregate/election.py
+@@ -39,7 +39,8 @@
+ from __future__ import annotations
+ 
+ import logging
+-from datetime import date, datetime
++from dataclasses import replace
++from datetime import UTC, date, datetime
+ from functools import lru_cache
+ 
+ from mirobody import units
+@@ -47,6 +48,8 @@
+ from mirobody.utils import execute_query
+ 
+ from .rule_generator import get_all_aggregation_rules
++from .aggregators.source_id_priority import APPLE_SOURCES, build_apple_priority_case
++from .aggregators.sql_aggregator import _num
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -54,6 +57,8 @@
+ #: default so that changing what this application prefers is a visible diff.
+ RANKING: tuple[str, ...] = ("source_class", "coverage", "measurement_freshness", "static_priority")
+ RULE = "|".join(RANKING)
++APPLE_RANKING = ("source_class", "measurement_freshness", "coverage", "static_priority")
++APPLE_RULE = "apple_transport(" + "|".join(APPLE_RANKING) + ");" + RULE
+ 
+ #: How many (series, day) cells one page of `elect_range` reads.
+ CHUNK = 5_000
+@@ -76,7 +81,7 @@
+ """
+ 
+ _CANDIDATES = """
+-SELECT id, stream_key, source_class, vendor, name_text, value_num, value_canonical, observed_start, observed_end
++SELECT id, stream_key, source_class, vendor, name_text, value_num, value_canonical, observed_start, observed_end, tz
+   FROM v_observation
+  WHERE user_id = :uid AND series_id = :series_id AND local_date = :day AND value_num IS NOT NULL
+  ORDER BY observed_start, id
+@@ -90,6 +95,7 @@
+        candidates = EXCLUDED.candidates, decided_at = now()
+  WHERE th_day_authority.observation_id IS DISTINCT FROM EXCLUDED.observation_id
+     OR th_day_authority.candidates <> EXCLUDED.candidates
++    OR th_day_authority.rule IS DISTINCT FROM EXCLUDED.rule
+ """
+ 
+ _CHECK_FAIL = """
+@@ -121,6 +127,9 @@ async def elect_day(
+     decision = series.elect(
+         candidates, ranking=RANKING, priorities=ordered, validators=_validators_for(name, day),
+     )
++    decision, transport_policy = await _elect_apple_transports(
++        user_id, day, candidates, last_row, ordered, _validators_for(name, day), decision,
++    )
+     params = {"uid": str(user_id), "series_id": series_id, "day": day}
+     if decision.elected is None:
+         if decision.blocked:
+@@ -136,7 +145,7 @@ async def elect_day(
+     await execute_query(_MARK, {
+         **params,
+         "observation_id": int(last_row[decision.elected.identity]["id"]),
+-        "rule": RULE,
++        "rule": APPLE_RULE if transport_policy else RULE,
+         "candidates": len(candidates),
+     }, log_sql=False)
+     return decision
+@@ -169,6 +178,77 @@ async def elect_range(user_id: str, start: date, end: date, *, series_ids: list[
+ # --- the pieces --------------------------------------------------------------
+ 
+ 
++@lru_cache(maxsize=1)
++def _generated_sources() -> dict[str, str]:
++    return {r.target_indicator: r.source_indicator for r in get_all_aggregation_rules()}
++
++
++async def _elect_apple_transports(
++    user_id: str, day: date, candidates: list[series.Candidate], rows: dict[str, dict],
++    priorities: list[str], validators: list, original: series.Decision,
++) -> tuple[series.Decision, bool]:
++    """Choose one valid Apple stream without changing inter-vendor ranking."""
++    apple = [c for c in candidates if rows[c.identity].get("vendor") in APPLE_SOURCES]
++    if len(apple) < 2:
++        return original, False
++    sources = {_generated_sources().get(rows[c.identity]["name_text"].split(".", 1)[0]) for c in apple}
++    if len(sources) != 1 or None in sources:
++        return original, False
++    indicator = sources.pop()
++    metric = metrics.METRICS.get(indicator)
++    if metric is None:
++        return original, False
++    # Summary boundaries are synthetic. Read the same source-id winner and
++    # window as SQLAggregator, including its selection before numeric filtering.
++    evidence: dict[tuple[str, str], int | None] = {}
++    for tz in sorted({rows[c.identity].get("tz") or "UTC" for c in apple}):
++        start, end = series.day_bounds_ms(day, tz, metric.window)
++        points = await execute_query(f"""
++WITH chosen_source_id AS MATERIALIZED (
++    SELECT DISTINCT ON (source) source, source_id
++      FROM series_data
++     WHERE user_id = :uid AND indicator = :indicator AND source = ANY(:sources)
++       AND time >= :start AND time < :end
++       AND (task_id IS NULL OR task_id != 'filtered_out_of_range')
++     ORDER BY source, ({build_apple_priority_case('source', 'source_id')}) ASC,
++              source_id ASC NULLS LAST
++)
++SELECT sd.source, MAX(sd.time) AS measured_at
++  FROM series_data sd
++  JOIN chosen_source_id c ON c.source = sd.source AND c.source_id = sd.source_id
++ WHERE sd.user_id = :uid AND sd.indicator = :indicator AND sd.source = ANY(:sources)
++   AND sd.time >= :start AND sd.time < :end
++   AND (sd.task_id IS NULL OR sd.task_id != 'filtered_out_of_range')
++   AND {_num('sd.value')} IS NOT NULL
++ GROUP BY sd.source
++""", {
++            "uid": str(user_id), "indicator": indicator,
++            "sources": [rows[c.identity]["vendor"] for c in apple if (rows[c.identity].get("tz") or "UTC") == tz],
++            "start": datetime.fromtimestamp(start / 1000, UTC).replace(tzinfo=None),
++            "end": datetime.fromtimestamp(end / 1000, UTC).replace(tzinfo=None),
++        }, log_sql=False) or []
++        for point in points:
++            at = point["measured_at"]
++            if isinstance(at, datetime):
++                evidence[(tz, point["source"])] = _ms(at.replace(tzinfo=UTC) if at.tzinfo is None else at)
++    blocked = {c.identity: reasons for c in apple
++               if (reasons := [reason for validate in validators for reason in validate(c)])}
++    valid = [c for c in apple if c.identity not in blocked and c.is_information]
++    fresh = {c.identity: evidence.get((rows[c.identity].get("tz") or "UTC", rows[c.identity]["vendor"])) for c in valid}
++    if len(valid) < 2 or any(at is None for at in fresh.values()):
++        return replace(original, blocked={**original.blocked, **blocked}), False
++    representative = series.rank_candidates(
++        [replace(c, measured_at_ms=fresh[c.identity]) for c in valid], APPLE_RANKING, priorities,
++    )[0].identity
++    finalists = [c for c in candidates if c not in apple or c.identity == representative]
++    result = series.elect(finalists, ranking=RANKING, priorities=priorities, validators=validators)
++    ranked = result.ranked + [c for c in original.ranked if c in apple and c.identity != representative]
++    return series.Decision(
++        result.elected, ranked, {**original.blocked, **blocked, **result.blocked},
++        series.stable_hash(APPLE_RULE, *(f"{c.identity}={sorted(c.values.items())}" for c in ranked)),
++    ), True
++
++
+ async def source_priorities() -> list[str]:
+     """The deployment's vendor order, best first. Empty when the table is not
+     there: the framework ships no opinion about whose watch is better."""
+diff --git a/mirobody/tests/test_apple_transport_election.py b/mirobody/tests/test_apple_transport_election.py
+new file mode 100644
+index 00000000..58881f6a
+--- /dev/null
++++ b/mirobody/tests/test_apple_transport_election.py
+@@ -0,0 +1,166 @@
++"""Apple transports publish one stream, using retained measurement instants."""
++
++from datetime import UTC, date, datetime, timedelta
++import os
++from unittest.mock import AsyncMock
++
++import pytest
++
++from mirobody.standardize.aggregate import election
++
++
++@pytest.mark.parametrize("reverse", [False, True])
++@pytest.mark.parametrize("newer", ["apple_health", "apple_health_export", "apple_health_watch"])
++@pytest.mark.parametrize("name", ["dailyTotalSteps", "dailyAvgHeartRates"])
++@pytest.mark.parametrize("competitor", [None, "measurer", "profile_echo"])
++async def test_transport_freshness_precedes_coverage(monkeypatch, reverse, newer, name, competitor):
++    day = date(2026, 11, 1)
++    start = datetime(2026, 11, 1, tzinfo=UTC)
++    older = "apple_health_export" if newer != "apple_health_export" else "apple_health"
++    rows = [{"id": i, "stream_key": f"stream:{vendor}", "source_class": "aggregator", "vendor": vendor,
++                 "name_text": f"{name}.{vendor}", "value_num": value, "value_canonical": None,
++                 "observed_start": start, "observed_end": start + timedelta(hours=hours), "tz": "America/New_York"}
++            for i, vendor, value, hours in [(1, older, 100, 24), (2, newer, 120, 20)]]
++    if competitor:
++        rows.append({**rows[0], "id": 3, "stream_key": "vendor:other", "vendor": "other",
++                     "source_class": competitor, "observed_end": start + timedelta(hours=1)})
++    if reverse:
++        rows.reverse()
++    execute = AsyncMock(side_effect=[rows, [
++        {"source": older, "measured_at": datetime(2026, 11, 1, 12)},
++        {"source": newer, "measured_at": datetime(2026, 11, 1, 20)},
++    ], None, None] * 2)
++    monkeypatch.setattr(election, "execute_query", execute)
++    first = await election.elect_day("1", "synthetic", day, priorities=[older, newer])
++    second = await election.elect_day("1", "synthetic", day, priorities=[older, newer])
++    expected = "vendor:other" if competitor == "measurer" else f"stream:{newer}"
++    assert first.elected.identity == expected
++    assert first.elected.values == {"value": 100 if competitor == "measurer" else 120}
++    assert first.fingerprint == second.fingerprint
++    assert len(first.ranked) == len(rows)
++    mark = execute.call_args_list[3].args[1]
++    assert mark["observation_id"] == (3 if competitor == "measurer" else 2)
++    assert mark["candidates"] == len(rows)
++    assert mark["rule"] == election.APPLE_RULE
++    bounds = execute.call_args_list[1].args[1]
++    assert bounds["start"] == datetime(2026, 11, 1, 4)
++    assert bounds["end"] == datetime(2026, 11, 2, 5)  # 25-hour DST day
++
++
++@pytest.mark.parametrize("evidence", [[], [{"source": "apple_health", "measured_at": datetime(2026, 1, 1, 9)},
++                                         {"source": "apple_health_export", "measured_at": datetime(2026, 1, 1, 9)}]])
++async def test_missing_or_equal_evidence_keeps_coverage_order(monkeypatch, evidence):
++    start = datetime(2026, 1, 1, tzinfo=UTC)
++    rows = [{"id": i, "stream_key": vendor, "source_class": "aggregator", "vendor": vendor,
++                 "name_text": "dailyTotalSteps", "value_num": i * 100, "value_canonical": None,
++                 "observed_start": start, "observed_end": start + timedelta(hours=i), "tz": "UTC"}
++            for i, vendor in enumerate(("apple_health", "apple_health_export"), 1)]
++    execute = AsyncMock(side_effect=[rows, evidence, None, None])
++    monkeypatch.setattr(election, "execute_query", execute)
++    result = await election.elect_day("1", "synthetic", start.date(), priorities=[])
++    assert result.elected.identity == "apple_health_export"
++
++
++@pytest.mark.parametrize("values", [(180_000_000, 24_000_000), (180_000_000, 240_000_000)])
++async def test_invalid_transport_preserves_valid_alternative_or_authority(monkeypatch, values):
++    start = datetime(2026, 1, 1, tzinfo=UTC)
++    rows = [{"id": i, "stream_key": vendor, "source_class": "aggregator", "vendor": vendor,
++                 "name_text": "dailyTotalSleepAnalysis_Asleep(Total)", "value_num": value, "value_canonical": None,
++                 "observed_start": start, "observed_end": start + timedelta(days=1), "tz": "UTC"}
++            for i, vendor, value in [(1, "apple_health", values[0]), (2, "apple_health_export", values[1])]]
++    execute = AsyncMock(side_effect=[rows, [
++        {"source": "apple_health", "measured_at": datetime(2026, 1, 2, 16)},
++        {"source": "apple_health_export", "measured_at": datetime(2026, 1, 2, 9)},
++    ], None, None])
++    monkeypatch.setattr(election, "execute_query", execute)
++    result = await election.elect_day("1", "synthetic", start.date(), priorities=["apple_health"])
++    assert "apple_health" in result.blocked
++    if values[1] == 24_000_000:
++        assert result.elected.identity == "apple_health_export"
++    else:
++        assert result.elected is None
++        assert execute.call_args.args[0] == election._CHECK_FAIL
++
++
++@pytest.mark.parametrize("name,vendors", [
++    ("dailyTotalSteps", ["apple_health"]),
++    ("dailySteps", ["apple_health", "apple_health_export"]),
++])
++async def test_single_transport_and_direct_daily_statistics_need_no_lookup(monkeypatch, name, vendors):
++    start = datetime(2026, 1, 1, tzinfo=UTC)
++    rows = [{"id": i, "stream_key": vendor, "source_class": "measurer", "vendor": vendor,
++             "name_text": name, "value_num": 100, "value_canonical": None,
++             "observed_start": start, "observed_end": start, "tz": "UTC"}
++            for i, vendor in enumerate(vendors, 1)]
++    execute = AsyncMock(side_effect=[rows, None, None])
++    monkeypatch.setattr(election, "execute_query", execute)
++    result = await election.elect_day("1", "synthetic", start.date(), priorities=[])
++    assert result.elected.identity == "apple_health"
++    assert execute.call_count == 3
++
++
++@pytest.mark.needs_db
++@pytest.mark.skipif(not os.environ.get("MIROBODY_TEST_POSTGRES_DSN"), reason="MIROBODY_TEST_POSTGRES_DSN is not set")
++@pytest.mark.parametrize("reverse", [False, True])
++@pytest.mark.parametrize("newer", ["apple_health", "apple_health_export"])
++@pytest.mark.parametrize("indicator,target,tz,day", [
++    ("steps", "dailyTotalSteps", "America/New_York", date(2026, 11, 1)),
++    ("heartRates", "dailyAvgHeartRates", "UTC", date(2026, 1, 1)),
++    ("sleepAnalysis_Asleep(Total)", "dailyTotalSleepAnalysis_Asleep(Total)", "UTC", date(2026, 1, 1)),
++])
++async def test_aggregation_publishes_one_transport(database, reverse, newer, indicator, target, tz, day):  # noqa: F811
++    from mirobody.collect.ingest.repositories.health_data import HealthDataRepository
++    from mirobody.collect.query import PostgresHealthQuery
++    from mirobody.kernel import query
++    from mirobody.standardize.aggregate.service import AggregateIndicatorService
++
++    metric = election.metrics.METRICS[indicator]
++    lo, hi = election.series.day_bounds_ms(day, tz, metric.window)
++    begin = datetime.fromtimestamp(lo / 1000, UTC).replace(tzinfo=None)
++    end = datetime.fromtimestamp(hi / 1000, UTC).replace(tzinfo=None)
++    older = "apple_health_export" if newer == "apple_health" else "apple_health"
++    # Unknown source IDs are chosen deterministically without assuming that
++    # an export's display name identifies the push's physical device.
++    ids = {"apple_health": "unknown.bundle.a", "apple_health_export": "Unknown device A"}
++    rows = [{"user_id": "1", "indicator": indicator, "source": source,
++             "start_time": begin + timedelta(hours=hour), "value": value,
++             "timezone": tz, "source_id": ids[source]}
++            for source, hour, value in [(older, 9, "100"), (newer, 16, "120")]]
++    writer = HealthDataRepository()
++    for row in rows[::-1] if reverse else rows:
++        assert await writer.save_health_records([row])
++        result = await AggregateIndicatorService().recalculate_date_range(begin, end, "1")
++        assert result["status"] == "success"
++    # Later losing-device, rejected and invalid samples cannot refresh the
++    # older stream; an adjacent day's chosen-device sample cannot either.
++    old = next(row for row in rows if row["source"] == older)
++    for hour, changes in [
++        (17, {"source_id": "zzz-losing-device"}),
++        (18, {"task_id": "filtered_out_of_range"}),
++        (19, {"value": "--"}),
++    ]:
++        assert await writer.save_health_records([{**old, "start_time": begin + timedelta(hours=hour), **changes}])
++    assert await writer.save_health_records([{**old, "start_time": end}])
++    assert await writer.save_health_records([old])  # reimport after newer measurements
++    [cell] = await database(
++        "SELECT a.series_id FROM th_day_authority a JOIN v_observation o ON o.id=a.observation_id "
++        "WHERE o.name_text = :name AND a.local_date = :day",
++        {"name": f"{target}.{newer}", "day": day}, log_sql=False,
++    )
++    for _ in range(2):
++        decision = await election.elect_day("1", cell["series_id"], day, priorities=[older, newer])
++        assert decision.elected.values == {"value": 120}
++    [authority] = await database(
++        "SELECT o.vendor, o.value_num FROM th_day_authority a JOIN v_observation o ON o.id=a.observation_id "
++        "WHERE a.series_id=:sid AND a.local_date=:day",
++        {"sid": cell["series_id"], "day": day}, log_sql=False,
++    )
++    assert authority["vendor"] == newer and float(authority["value_num"]) == 120
++    readings = await PostgresHealthQuery().stats(
++        "1", query.Selection(indicators=(target,)), query.Window(0, 0, tz),
++    )
++    assert readings and float(readings[0]["avg"]) == 120
++
++
++# Reuse the existing isolated PostgreSQL schema seam.
++from .test_postgres_regressions import database  # noqa: F401

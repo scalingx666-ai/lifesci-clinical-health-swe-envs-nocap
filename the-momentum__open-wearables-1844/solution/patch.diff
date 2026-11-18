@@ -1,0 +1,286 @@
+diff --git a/backend/app/repositories/health_score_repository.py b/backend/app/repositories/health_score_repository.py
+index 77c459ef78..2487433f9f 100644
+--- a/backend/app/repositories/health_score_repository.py
++++ b/backend/app/repositories/health_score_repository.py
+@@ -1,14 +1,15 @@
+ from datetime import date, datetime, timedelta, timezone
+-from typing import Any, cast
++from typing import Any
++from typing import cast as typing_cast
+ from uuid import UUID
+ 
+-from sqlalchemy import and_, asc, desc, tuple_
++from sqlalchemy import Date, and_, asc, cast, desc, func, select, tuple_
+ from sqlalchemy.dialects.postgresql import insert
+ 
+ from app.database import DbSession
+ from app.models import DataSource, HealthScore
+-from app.repositories.repositories import CrudRepository
+-from app.schemas.enums import HealthScoreCategory
++from app.repositories.repositories import CrudRepository, source_priority_order
++from app.schemas.enums import DeviceType, HealthScoreCategory, ProviderName
+ from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
+ from app.utils.pagination import decode_cursor
+ 
+@@ -107,25 +108,49 @@ def get_recovery_summaries(
+         end_date: datetime,
+         cursor: str | None,
+         limit: int,
++        provider_order: dict[ProviderName, int],
++        device_type_order: dict[DeviceType, int],
+     ) -> list[dict[str, Any]]:
+         """Get recovery health scores for a date range with cursor-based pagination.
+ 
++        Per date only the highest-priority source's earliest score is kept, picked before pagination
++        so a page holds `limit` dates however many sources scored each day.
++
+         Returns list of dicts with keys: recovery_date, provider, source, device_model,
+         device_type, record_id, recorded_at, recovery_score, resting_heart_rate,
+         hrv_rmssd_milli, spo2_percentage.
+         Fetches limit+1 rows so callers can detect has_more without a separate COUNT query.
+         Ordering matches get_sleep_summaries: ASC by default, DESC when paginating backward.
+         """
+-        # Outer join so scores without a data_source (older rows) still come back.
+-        query = (
+-            db_session.query(HealthScore, DataSource)
++        # Provider scores have no data_source, so the provider rank comes from the score itself
++        ranked = (
++            select(
++                HealthScore.id,
++                func.row_number()
++                .over(
++                    partition_by=cast(HealthScore.recorded_at, Date),
++                    order_by=(
++                        *source_priority_order(provider_order, device_type_order, HealthScore.provider),
++                        HealthScore.recorded_at,
++                        HealthScore.id,
++                    ),
++                )
++                .label("source_rank"),
++            )
+             .outerjoin(DataSource, HealthScore.data_source_id == DataSource.id)
+-            .filter(
++            .where(
+                 HealthScore.user_id == user_id,
+                 HealthScore.category == HealthScoreCategory.RECOVERY,
+                 HealthScore.recorded_at >= start_date,
+                 HealthScore.recorded_at < end_date,
+             )
++            .subquery()
++        )
++        # Outer join so scores without a data_source (older rows) still come back.
++        query = (
++            db_session.query(HealthScore, DataSource)
++            .outerjoin(DataSource, HealthScore.data_source_id == DataSource.id)
++            .filter(HealthScore.id.in_(select(ranked.c.id).where(ranked.c.source_rank == 1)))
+         )
+ 
+         if cursor:
+@@ -153,9 +178,11 @@ def get_recovery_summaries(
+                 "record_id": row.id,
+                 "recorded_at": row.recorded_at,
+                 "recovery_score": int(row.value) if row.value is not None else None,
+-                "resting_heart_rate": cast(dict, row.components or {}).get("resting_heart_rate", {}).get("value"),
+-                "hrv_rmssd_milli": cast(dict, row.components or {}).get("hrv_rmssd_milli", {}).get("value"),
+-                "spo2_percentage": cast(dict, row.components or {}).get("spo2_percentage", {}).get("value"),
++                "resting_heart_rate": typing_cast(dict, row.components or {})
++                .get("resting_heart_rate", {})
++                .get("value"),
++                "hrv_rmssd_milli": typing_cast(dict, row.components or {}).get("hrv_rmssd_milli", {}).get("value"),
++                "spo2_percentage": typing_cast(dict, row.components or {}).get("spo2_percentage", {}).get("value"),
+             }
+             for row, data_source in rows
+         ]
+diff --git a/backend/app/repositories/repositories.py b/backend/app/repositories/repositories.py
+index 0a41cf5627..25c88ffd9e 100644
+--- a/backend/app/repositories/repositories.py
++++ b/backend/app/repositories/repositories.py
+@@ -55,10 +55,14 @@ def source_filter_conditions(
+ def source_priority_order(
+     provider_order: Mapping[ProviderName, int],
+     device_type_order: Mapping[DeviceType, int],
++    provider_column: InstrumentedAttribute[str] | ColumnElement[str] = DataSource.provider,
+ ) -> tuple[ColumnElement, ColumnElement, ColumnElement]:
+-    """ORDER BY terms ranking sources best first: provider, device type, device model. Assumes ``DataSource``."""
++    """ORDER BY terms ranking sources best first: provider, device type, device model. Assumes ``DataSource``.
++
++    ``provider_column`` is for rows that carry their own provider and may have no source (health scores).
++    """
+     provider_rank = (
+-        case(*[(DataSource.provider == p, r) for p, r in provider_order.items()], else_=UNRANKED_PRIORITY)
++        case(*[(provider_column == p, r) for p, r in provider_order.items()], else_=UNRANKED_PRIORITY)
+         if provider_order
+         else literal(UNRANKED_PRIORITY)
+     )
+diff --git a/backend/app/services/summaries_service.py b/backend/app/services/summaries_service.py
+index 37b4302818..54cb7a9732 100644
+--- a/backend/app/services/summaries_service.py
++++ b/backend/app/services/summaries_service.py
+@@ -406,11 +406,9 @@ def get_recovery_summaries(
+         resting_heart_rate, hrv_rmssd_milli, spo2_percentage.
+         """
+         results = self.health_score_repo.get_recovery_summaries(
+-            db_session, user_id, start_date, end_date, cursor, limit
++            db_session, user_id, start_date, end_date, cursor, limit, *self._priority_orders(db_session)
+         )
+ 
+-        results = self._filter_by_priority(db_session, user_id, results, date_key="recovery_date")
+-
+         has_more = len(results) > limit
+         if has_more:
+             results = results[:limit]
+diff --git a/backend/tests/api/v1/test_summaries.py b/backend/tests/api/v1/test_summaries.py
+index 6badcd0405..0f14a6930d 100644
+--- a/backend/tests/api/v1/test_summaries.py
++++ b/backend/tests/api/v1/test_summaries.py
+@@ -1690,6 +1690,42 @@ def test_pagination_limit(self, client: TestClient, db: Session) -> None:
+         assert data["pagination"]["has_more"] is True
+         assert data["pagination"]["next_cursor"] is not None
+ 
++    def test_pagination_pages_days_not_scores(self, client: TestClient, db: Session) -> None:
++        """A provider that scores many times a day still pages one summary per day.
++
++        Suunto stores one recovery score per Balance sample, without a data source.
++        """
++        user = UserFactory()
++        for day in range(1, 6):
++            for hour, balance in ((0, 10), (6, 20), (12, 30), (18, 40)):
++                HealthScoreFactory(
++                    user_id=user.id,
++                    data_source_id=None,
++                    provider=ProviderName.SUUNTO,
++                    category=HealthScoreCategory.RECOVERY,
++                    value=Decimal(balance),
++                    recorded_at=datetime(2025, 12, day, hour, 30, tzinfo=timezone.utc),
++                )
++        headers = api_key_headers(ApiKeyFactory().plain_key)
++        params = {"start_date": "2025-12-01T00:00:00Z", "end_date": "2025-12-31T00:00:00Z"}
++
++        everything = client.get(self._url(user.id), headers=headers, params={**params, "limit": 50}).json()["data"]
++        paged: list[dict] = []
++        page_params: dict[str, str | int] = {**params, "limit": 2}
++        while True:
++            page = client.get(self._url(user.id), headers=headers, params=page_params)
++            assert page.status_code == 200
++            paged += page.json()["data"]
++            if not page.json()["pagination"]["has_more"]:
++                break
++            page_params["cursor"] = page.json()["pagination"]["next_cursor"]
++
++        # Each day is summarised from its first sample.
++        assert [(s["date"], s["recovery_score"]) for s in everything] == [
++            (f"2025-12-0{day}", 10) for day in range(1, 6)
++        ]
++        assert paged == everything
++
+ 
+ class TestDataTimelineEndpoint:
+     """Test suite for GET /users/{user_id}/summaries/data/timeline."""
+diff --git a/backend/tests/services/test_summaries_service.py b/backend/tests/services/test_summaries_service.py
+index a122abf3b0..849b1a743b 100644
+--- a/backend/tests/services/test_summaries_service.py
++++ b/backend/tests/services/test_summaries_service.py
+@@ -11,12 +11,13 @@
+ 
+ from app.models import ProviderPriority
+ from app.repositories import ProviderPriorityRepository
+-from app.schemas.enums import ProviderName
++from app.schemas.enums import HealthScoreCategory, ProviderName
+ from app.services.summaries_service import SummariesService
+ from tests.factories import (
+     DataPointSeriesFactory,
+     DataSourceFactory,
+     EventRecordFactory,
++    HealthScoreFactory,
+     PersonalRecordFactory,
+     SeriesTypeDefinitionFactory,
+     SleepDetailsFactory,
+@@ -361,7 +362,7 @@ def test_rmssd_input_is_exposed_as_rmssd_not_sdnn(
+             "spo2_percentage": 98.4,
+         }
+         monkeypatch.setattr(service.health_score_repo, "get_recovery_summaries", lambda *_: [row])
+-        monkeypatch.setattr(service, "_filter_by_priority", lambda *_args, **_kwargs: [row])
++        monkeypatch.setattr(service, "_priority_orders", lambda *_: ({}, {}))
+ 
+         result = service.get_recovery_summaries(
+             db_session=None,
+@@ -377,6 +378,79 @@ def test_rmssd_input_is_exposed_as_rmssd_not_sdnn(
+         assert summary.avg_hrv_rmssd_ms == 63.2
+ 
+ 
++class TestRecoveryPagingPerDate:
++    """A page holds `limit` days, however many providers scored each one."""
++
++    DAYS = [date(2026, 1, day) for day in range(2, 7)]
++    START = _dt("2026-01-01T00:00:00+00:00")
++    END = _dt("2026-01-31T00:00:00+00:00")
++
++    def _two_providers_per_day(self, db: Session) -> Any:
++        """WHOOP and Polar both score every day; WHOOP wins each one.
++
++        The losing Polar score gets the lower id at the same timestamp, so within a day
++        it sorts first: a page cut between the two rows would elect Polar.
++        """
++        priorities = ProviderPriorityRepository(ProviderPriority)
++        priorities.upsert(db, ProviderName.WHOOP, 1)
++        priorities.upsert(db, ProviderName.POLAR, 2)
++        user = UserFactory()
++        whoop = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop", device_type="band")
++        polar = DataSourceFactory(user=user, provider=ProviderName.POLAR, source="polar", device_type="watch")
++        for n, day in enumerate(self.DAYS):
++            scored_at = datetime(day.year, day.month, day.day, 7, tzinfo=timezone.utc)
++            for ds, provider, id_prefix in (
++                (polar, ProviderName.POLAR, "00000000"),
++                (whoop, ProviderName.WHOOP, "ffffffff"),
++            ):
++                HealthScoreFactory(
++                    id=UUID(f"{id_prefix}-0000-0000-0000-{n:012d}"),
++                    data_source=ds,
++                    provider=provider,
++                    category=HealthScoreCategory.RECOVERY,
++                    recorded_at=scored_at,
++                )
++        return user
++
++    @pytest.mark.parametrize("limit", [1, 2])
++    def test_pages_forward_through_every_day_once(self, db: Session, service: SummariesService, limit: int) -> None:
++        user = self._two_providers_per_day(db)
++
++        seen: list[tuple[date, str]] = []
++        has_more: list[bool] = []
++        cursor = None
++        while True:
++            page = service.get_recovery_summaries(db, user.id, self.START, self.END, cursor=cursor, limit=limit)
++            seen += [(summary.date, summary.source.provider) for summary in page.data]
++            has_more.append(page.pagination.has_more)
++            if not page.pagination.next_cursor:
++                break
++            cursor = page.pagination.next_cursor
++
++        assert seen == [(day, "whoop") for day in self.DAYS]
++        # Only the last page says there is nothing more
++        assert has_more == [True] * (math.ceil(len(self.DAYS) / limit) - 1) + [False]
++
++    def test_previous_cursor_returns_the_page_before(self, db: Session, service: SummariesService) -> None:
++        user = self._two_providers_per_day(db)
++        first = service.get_recovery_summaries(db, user.id, self.START, self.END, cursor=None, limit=2)
++        second = service.get_recovery_summaries(
++            db, user.id, self.START, self.END, cursor=first.pagination.next_cursor, limit=2
++        )
++        third = service.get_recovery_summaries(
++            db, user.id, self.START, self.END, cursor=second.pagination.next_cursor, limit=2
++        )
++
++        back = service.get_recovery_summaries(
++            db, user.id, self.START, self.END, cursor=third.pagination.previous_cursor, limit=2
++        )
++
++        assert sorted((s.date, s.source.provider) for s in back.data) == [
++            (self.DAYS[2], "whoop"),
++            (self.DAYS[3], "whoop"),
++        ]
++
++
+ # ---------------------------------------------------------------------------
+ # get_activity_summaries
+ # ---------------------------------------------------------------------------

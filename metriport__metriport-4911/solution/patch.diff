@@ -1,0 +1,599 @@
+diff --git a/packages/core/src/command/hl7-notification/hl7-notification-webhook-sender-direct.ts b/packages/core/src/command/hl7-notification/hl7-notification-webhook-sender-direct.ts
+index 9248f479c6..fd4a1de40f 100644
+--- a/packages/core/src/command/hl7-notification/hl7-notification-webhook-sender-direct.ts
++++ b/packages/core/src/command/hl7-notification/hl7-notification-webhook-sender-direct.ts
+@@ -45,6 +45,7 @@ import {
+   persistHl7MessageError,
+   SupportedTriggerEvent,
+ } from "./utils";
++import { sendHeartbeatToMonitoringService } from "../../external/monitoring/heartbeat";
+ 
+ type HieConfig = { timezone: string };
+ 
+@@ -423,6 +424,18 @@ export class Hl7NotificationWebhookSenderDirect implements Hl7NotificationWebhoo
+             posthogApiKey
+           );
+         })(),
++        (async () => {
++          const heartBeatMonitorMap = Config.getHeartBeatMonitorMap();
++          const heartBeatMonitorUrl = heartBeatMonitorMap[hieName];
++          if (!heartBeatMonitorUrl) {
++            throw new MetriportError(
++              `Heartbeat monitor URL not found for HIE: ${hieName}`,
++              undefined,
++              { hieName, heartBeatMonitorMap: JSON.stringify(heartBeatMonitorMap) }
++            );
++          }
++          await sendHeartbeatToMonitoringService(heartBeatMonitorUrl);
++        })(),
+       ]);
+     } catch (error) {
+       capture.error("Failed to notify analytics", {
+diff --git a/packages/core/src/command/hl7v2-subscriptions/types.ts b/packages/core/src/command/hl7v2-subscriptions/types.ts
+index b2ede4c134..2da43b9702 100644
+--- a/packages/core/src/command/hl7v2-subscriptions/types.ts
++++ b/packages/core/src/command/hl7v2-subscriptions/types.ts
+@@ -57,6 +57,7 @@ export type HieConfig = {
+   timezone: HieIanaTimezone;
+   states: USState[];
+   subscriptions: Hl7v2Subscription[];
++  checklyPingUrl?: string;
+   cron: string;
+   sftpConfig: HieSftpConfig;
+   mapping: HiePatientRosterMapping;
+diff --git a/packages/core/src/util/config.ts b/packages/core/src/util/config.ts
+index cad7cb96ed..6487deca35 100644
+--- a/packages/core/src/util/config.ts
++++ b/packages/core/src/util/config.ts
+@@ -519,4 +519,8 @@ export class Config {
+   static getAiBriefBucketName(): string {
+     return getEnvVarOrFail("AI_BRIEF_BUCKET_NAME");
+   }
++
++  static getHeartBeatMonitorMap(): Record<string, string> {
++    return getEnvVarAsRecordOrFail("HEARTBEAT_MONITOR_MAP");
++  }
+ }
+diff --git a/packages/infra/lib/hl7-notification-webhook-sender-nested-stack.ts b/packages/infra/lib/hl7-notification-webhook-sender-nested-stack.ts
+index 2593b01e20..2f744ed7b9 100644
+--- a/packages/infra/lib/hl7-notification-webhook-sender-nested-stack.ts
++++ b/packages/infra/lib/hl7-notification-webhook-sender-nested-stack.ts
+@@ -72,6 +72,17 @@ export class Hl7NotificationWebhookSenderNestedStack extends NestedStack {
+     if (!hl7Base64ScramblerSeed) {
+       throw new Error("HL7 base64 scrambler seed is undefined");
+     }
++    const hieConfigs = props.config.hl7Notification?.hieConfigs;
++    if (!hieConfigs) {
++      throw new Error("HIE configs are undefined");
++    }
++    const heartbeatMonitorMap = Object.fromEntries(
++      Object.values(hieConfigs)
++        .filter((hieConfig): hieConfig is HieConfig & { checklyPingUrl: string } =>
++          Boolean(hieConfig.checklyPingUrl)
++        )
++        .map(hieConfig => [hieConfig.name, hieConfig.checklyPingUrl])
++    );
+ 
+     const setup = this.setupHl7NotificationWebhookSenderLambda({
+       lambdaLayers: props.lambdaLayers,
+@@ -83,8 +94,9 @@ export class Hl7NotificationWebhookSenderNestedStack extends NestedStack {
+       hl7ConversionBucket: props.hl7ConversionBucket,
+       incomingHl7NotificationBucket: props.incomingHl7NotificationBucket,
+       analyticsSecret,
+-      hieConfigs: props.config.hl7Notification?.hieConfigs ?? {},
++      hieConfigs,
+       hl7Base64ScramblerSeed,
++      heartbeatMonitorMap,
+     });
+ 
+     this.lambda = setup.lambda;
+@@ -102,6 +114,7 @@ export class Hl7NotificationWebhookSenderNestedStack extends NestedStack {
+     analyticsSecret: ISecret;
+     hl7Base64ScramblerSeed: ISecret;
+     hieConfigs: Record<string, HieConfig | VpnlessHieConfig>;
++    heartbeatMonitorMap: Record<string, string>;
+   }): { lambda: Lambda } {
+     const {
+       lambdaLayers,
+@@ -115,6 +128,7 @@ export class Hl7NotificationWebhookSenderNestedStack extends NestedStack {
+       hieConfigs,
+       incomingHl7NotificationBucket,
+       hl7Base64ScramblerSeed,
++      heartbeatMonitorMap,
+     } = ownProps;
+     const {
+       name,
+@@ -157,6 +171,7 @@ export class Hl7NotificationWebhookSenderNestedStack extends NestedStack {
+         ...(sentryDsn ? { SENTRY_DSN: sentryDsn } : {}),
+         HIE_CONFIG_DICTIONARY: JSON.stringify(createHieConfigDictionary(hieConfigs)),
+         POST_HOG_API_KEY_SECRET: analyticsSecret.secretArn,
++        HEARTBEAT_MONITOR_MAP: JSON.stringify(heartbeatMonitorMap),
+       },
+     });
+ 
+diff --git a/packages/utils/src/document/reconversion-kickoff-loader.ts b/packages/utils/src/document/reconversion-kickoff-loader.ts
+index 5345a90114..f96e161634 100644
+--- a/packages/utils/src/document/reconversion-kickoff-loader.ts
++++ b/packages/utils/src/document/reconversion-kickoff-loader.ts
+@@ -4,14 +4,19 @@ dotenv.config();
+ import { ReconversionKickoffParams } from "@metriport/core/command/reconversion/reconversion-kickoff-direct";
+ import { SQSClient } from "@metriport/core/external/aws/sqs";
+ import { executeAsynchronously } from "@metriport/core/util";
++import { executeWithNetworkRetries, sleep } from "@metriport/shared";
++import { buildDayjs } from "@metriport/shared/common/date";
+ import { getEnvVarOrFail } from "@metriport/shared/common/env-var";
+ import { errorToString } from "@metriport/shared/common/error";
+ import { createUuidFromText } from "@metriport/shared/common/uuid";
+ import { JSONParser, ParsedElementInfo } from "@streamparser/json";
+ import dayjs from "dayjs";
+ import duration from "dayjs/plugin/duration";
+-import fs from "fs";
++import * as fs from "fs";
+ import { groupBy, isEmpty } from "lodash";
++import readline from "readline/promises";
++import { readCsv } from "../shared/csv";
++import { elapsedTimeAsStr } from "../shared/duration";
+ 
+ dayjs.extend(duration);
+ 
+@@ -20,15 +25,16 @@ dayjs.extend(duration);
+  * It will send a message to the reconversion kickoff queue for each patient chunk (recommended to be 10/chunk).
+  *
+  * The reconversion kickoff lambda will then pick up the message and ping the API to reconvert patient documents.
++ * @see `POST /internal/docs/re-convert` on the API.
+  *
+  * The input file is generated using the following SQL command:
+  * ```
+- * SELECT patient_id, cx_id
++ * SELECT cx_id, patient_id
+  * FROM docref_mapping
+  * WHERE created_at BETWEEN <dateFrom> AND <dateTo>;
+  * ```
+- * Once the query is executed, export the results to a JSON file. Then, remove the SQL query from the object, and
+- * only leave the array of objects. Indicate the path to the file in the `fileName` variable.
++ * Once the query is executed, export the results to a CSV file with headers: cx_id,patient_id
++ * Indicate the path to the file in the `fileName` variable and set `isCsvFile` to true.
+  *
+  * To run the script, execute:
+  * - ts-node src/document/reconversion-kickoff-loader.ts
+@@ -55,27 +61,35 @@ const sqsClient = new SQSClient({ region: getEnvVarOrFail("AWS_REGION") });
+  * @see https://aws.amazon.com/sqs/faqs/#topic-3:~:text=What%20is%20the%20throughput%20quota%20for%20an%20Amazon%20SQS%20FIFO%20queue%3F
+  */
+ const SQS_BATCH_SIZE = 2000;
+-const MIN_JITTER_BETWEEN_BATCHES = dayjs.duration(1, "seconds");
++const MIN_JITTER_BETWEEN_PUT_TO_SQS = dayjs.duration(10, "milliseconds");
++const MAX_JITTER_BETWEEN_PUT_TO_SQS = dayjs.duration(100, "milliseconds");
+ 
+ const fileName = "";
+-const dateFrom = "2025-06-01"; // YYYY-MM-DD, with optional timestamp, e.g. 2025-07-10 12:00
+-const dateTo = ""; // YYYY-MM-DD, with optional timestamp, e.g. 2025-07-11 12:00
++const isCsvFile = true; // Set to true if the file is CSV format, false for JSON format
++/** Start date that doc refs will be filtered by (required, inclusive) */
++const dateFrom = "1901-02-03"; // YYYY-MM-DD
++/** End date that doc refs will be filtered by (optional, inclusive) */
++const dateTo = ""; // YYYY-MM-DD
+ 
+ async function main() {
+-  if (isEmpty(fileName)) {
+-    throw new Error("fileName is required");
+-  }
+-  if (isEmpty(dateFrom)) {
+-    throw new Error("dateFrom is required");
+-  }
++  await sleep(50); // Give some time to avoid mixing logs w/ Node's
++  const startedAt = Date.now();
++  console.log(`\n############ Started at ${buildDayjs(startedAt).toISOString()} ############\n`);
++
++  if (isEmpty(fileName)) throw new Error("fileName is required");
++  if (isEmpty(dateFrom)) throw new Error("dateFrom is required");
+ 
+   const patients: Array<{ patient_id: string; cx_id: string }> = [];
+ 
+   console.log("Loading patient data from file...");
+-  await loadDataFromLargeJsonFile(fileName, ({ value }) => {
+-    const patient = value as { patient_id: string; cx_id: string };
+-    patients.push(patient);
+-  });
++  if (isCsvFile) {
++    patients.push(...(await loadDataFromCsvFile(fileName)));
++  } else {
++    await loadDataFromLargeJsonFile(fileName, ({ value }) => {
++      const patient = value as { patient_id: string; cx_id: string };
++      patients.push(patient);
++    });
++  }
+ 
+   console.log(`Loaded ${patients.length} patients from file`);
+ 
+@@ -102,6 +116,8 @@ async function main() {
+ 
+   console.log(`Total unique payloads to send: ${payloads.length}`);
+ 
++  await displayWarningAndConfirmationPrompt(payloads.length);
++
+   let totalSent = 0;
+   let totalErrors = 0;
+   const failedPayloads: Array<{
+@@ -112,39 +128,45 @@ async function main() {
+ 
+   await executeAsynchronously(
+     payloads,
+-    async (payload, itemIndex) => {
+-      const payloadString = JSON.stringify(payload);
++    async payload => {
+       try {
++        if (!payload.cxId || payload.cxId === "undefined") {
++          console.log(`Invalid payload: ${JSON.stringify(payload)}`);
++          throw new Error(`Invalid cxId`);
++        }
++
++        const payloadString = JSON.stringify(payload);
+         // For debugging - write to file
+         // fs.appendFile("sqsMessages.json", payloadString + "\n", "utf8", () => {});
+ 
+-        await sqsClient.sendMessageToQueue(sqsUrl, payloadString, {
+-          fifo: true,
+-          messageDeduplicationId: createUuidFromText(payloadString),
+-          messageGroupId: RECONVESION_KICKOFF_JOB,
+-        });
++        await executeWithNetworkRetries(async () =>
++          sqsClient.sendMessageToQueue(sqsUrl, payloadString, {
++            fifo: true,
++            messageDeduplicationId: createUuidFromText(payloadString),
++            messageGroupId: RECONVESION_KICKOFF_JOB,
++          })
++        );
+ 
+         totalSent++;
+-        if (itemIndex % 1000 === 0) {
+-          console.log(`Progress: ${itemIndex + 1}/${payloads.length} messages sent`);
++        if (totalSent % 200 === 0) {
++          console.log(`Progress: ${totalSent}/${payloads.length} messages sent`);
+         }
+       } catch (e) {
+-        console.error(`Error sending message ${itemIndex + 1}: ${errorToString(e)}`);
++        console.error(`Error sending message ${totalSent}: ${errorToString(e)}`);
+ 
+         failedPayloads.push({
+           payload,
+           error: errorToString(e),
+-          itemIndex,
++          itemIndex: totalSent,
+         });
+         totalErrors++;
+       }
+     },
+     {
+       numberOfParallelExecutions: SQS_BATCH_SIZE,
+-      minJitterMillis: MIN_JITTER_BETWEEN_BATCHES.asMilliseconds(),
+-      maxJitterMillis: MIN_JITTER_BETWEEN_BATCHES.asMilliseconds() * 1.5,
++      minJitterMillis: MIN_JITTER_BETWEEN_PUT_TO_SQS.asMilliseconds(),
++      maxJitterMillis: MAX_JITTER_BETWEEN_PUT_TO_SQS.asMilliseconds(),
+       keepExecutingOnError: true,
+-      log: console.log,
+     }
+   );
+ 
+@@ -166,6 +188,17 @@ async function main() {
+   console.log(`- Successfully sent: ${totalSent}`);
+   console.log(`- Errors: ${totalErrors}`);
+   console.log(`- Success rate: ${((totalSent / payloads.length) * 100).toFixed(2)}%`);
++
++  console.log(`\n############ Done in ${elapsedTimeAsStr(startedAt)} ############`);
++}
++
++/**
++ * Loads data from a CSV file
++ */
++async function loadDataFromCsvFile(path: string): Promise<{ patient_id: string; cx_id: string }[]> {
++  const records = await readCsv<{ cx_id?: string; patient_id?: string }>(path);
++  const patients = records.filter(record => record.cx_id && record.patient_id);
++  return patients as { patient_id: string; cx_id: string }[];
+ }
+ 
+ /**
+@@ -187,4 +220,22 @@ async function loadDataFromLargeJsonFile(
+   });
+ }
+ 
++async function displayWarningAndConfirmationPrompt(payloadsLength: number) {
++  const msg =
++    `You are about to send ${payloadsLength} messages to the reconversion kickoff ` +
++    `queue: ${sqsUrl}`;
++  console.log(msg);
++  console.log("Are you sure you want to proceed?");
++  const rl = readline.createInterface({
++    input: process.stdin,
++    output: process.stdout,
++  });
++  const answer = await rl.question("Type 'yes' to proceed: ");
++  if (answer !== "yes") {
++    console.log("Aborting...");
++    process.exit(0);
++  }
++  rl.close();
++}
++
+ main();
+diff --git a/packages/utils/src/sqs/peek-dlq-print-details.ts b/packages/utils/src/sqs/peek-dlq-print-details.ts
+index 55abc07461..cb362ed625 100644
+--- a/packages/utils/src/sqs/peek-dlq-print-details.ts
++++ b/packages/utils/src/sqs/peek-dlq-print-details.ts
+@@ -3,60 +3,48 @@ dotenv.config();
+ // keep that ^ on top
+ import { S3Utils } from "@metriport/core/external/aws/s3";
+ import { executeAsynchronously } from "@metriport/core/util/concurrency";
+-import { BadRequestError, errorToString, getEnvVarOrFail } from "@metriport/shared";
++import { BadRequestError, errorToString, getEnvVarOrFail, sleep } from "@metriport/shared";
+ import { buildDayjs } from "@metriport/shared/common/date";
+ import { SQS } from "aws-sdk";
+-import fs from "fs";
+-import path from "path";
++import { Command } from "commander";
++import * as fs from "fs";
++import * as path from "path";
+ import { elapsedTimeAsStr } from "../shared/duration";
+ 
+ /**
+  * This script saves the details of the messages in the DLQ to a file.
++ * It assumes the messages are from the FHIR Converter DLQ, so the body contains the s3FileName and s3BucketName.
+  *
+  * Usage:
+  * - set the `DLQ_URL` environment variable to the URL of the DLQ
+- * - ts-node src/sqs/peek-dlq-print-details.ts     # peek all messages
+- * - ts-node src/sqs/peek-dlq-print-details.ts 100 # peek 100 messages
++ * - ts-node src/sqs/peek-dlq-print-details.ts -m 100 # peeks 100 messages
++ * - ts-node src/sqs/peek-dlq-print-details.ts -d     # downloads files from S3
++ * - ts-node src/sqs/peek-dlq-print-details.ts        # peeks all messages
+  */
+ 
+ const dlqUrl = getEnvVarOrFail("DLQ_URL");
+ const awsRegion = getEnvVarOrFail("AWS_REGION");
+ 
+-const dirName = `runs/sqs/fhir-converter-dlq_${buildDayjs()
+-  .toISOString()
+-  .replace("T", "_")
+-  .replace(":", "-")}`;
+-
+-const maxNumberOfMessagesPerQuery = 1;
+ const numberOfParallelPeeks = 10;
+ const numberOfParallelDownloadsFromS3 = 10;
+-const maxMessagesToPeek = process.argv[2] ? parseInt(process.argv[2]) : undefined;
++const messagesToRetrievePerReceiveMsg = 10;
+ 
+ /**
+  * @deprecated Use @metriport/core instead
+  */
+-const sqs = new SQS({
+-  apiVersion: "2012-11-05",
+-  region: awsRegion,
+-});
++const sqs = new SQS({ apiVersion: "2012-11-05", region: awsRegion });
+ 
+ const s3Utils = new S3Utils(awsRegion);
+ 
+-type GetMessageSQSParameters = SharedInternalGetMessageSQSParameters & {
+-  /**
+-   * How many messages to return per query, from 1 to 10. Defaults to 1.
+-   */
+-  maxNumberOfMessagesPerQuery?: number;
+-  /**
+-   * Maximum number of messages to return. Defaults to 10.
+-   */
+-  maxNumberOfMessages?: number;
+-  /**
+-   * Determines whether it should keep pooling until the queue is empty or `maxNumberOfMessages`
+-   * has been reached. Defaults to false, which means it will only pool once.
+-   */
+-  poolUntilEmpty?: boolean;
+-};
++const program = new Command();
++program
++  .name("peek-dlq-print-details")
++  .description("CLI to peek into DLQ messages and optionally download files from S3")
++  .option("-m, --max-messages <number>", "Maximum number of messages to peek")
++  .option("-d, --download-files", "Download files from S3", false)
++  .showHelpAfterError()
++  .action(main)
++  .parse();
+ 
+ type MessageDetails = {
+   messageId: string | undefined;
+@@ -87,12 +75,28 @@ type DlqMessageAttributes = {
+   };
+ };
+ 
+-async function peekIntoQueue() {
++async function main({
++  maxMessages,
++  downloadFiles,
++}: {
++  maxMessages: string;
++  downloadFiles: boolean;
++}) {
++  await sleep(50);
+   const startedAt = Date.now();
+   console.log(
+     `###### Starting to peek into queue at ${buildDayjs(startedAt).toISOString()} ######`
+   );
+-  console.log(`Running with maxMessagesToPeek: ${maxMessagesToPeek}`);
++
++  const maxMessagesToPeek = maxMessages ? parseInt(maxMessages) : undefined;
++  console.log(
++    `Running with: maxMessagesToPeek: ${maxMessagesToPeek}, downloadFiles: ${downloadFiles}`
++  );
++
++  const dirName = `runs/sqs/fhir-converter-dlq_${buildDayjs()
++    .toISOString()
++    .replace("T", "_")
++    .replace(":", "-")}`;
+ 
+   if (!fs.existsSync(dirName)) {
+     fs.mkdirSync(dirName, { recursive: true });
+@@ -103,27 +107,24 @@ async function peekIntoQueue() {
+   console.log(`>>> Message count: ${messageCount}`);
+ 
+   const messageDetailsMap = new Map<string, MessageDetails>();
++  const uniqueCxIdPatientIds = new Set<string>();
+ 
+-  const messagesToPeek = Math.min(messageCount, maxMessagesToPeek ?? messageCount);
++  const messagesToPeek = Math.min(messageCount, maxMessagesToPeek ?? Number.MAX_SAFE_INTEGER);
++  const peekRequestCount = Math.ceil(messagesToPeek / messagesToRetrievePerReceiveMsg);
+ 
+   console.log(`>>> Getting messages from source queue...`);
+-  const tmpArr = Array.from({ length: messagesToPeek }, (_, i) => i + 1);
++  const loopArray = Array.from({ length: peekRequestCount }, (_, i) => i + 1);
+   await executeAsynchronously(
+-    tmpArr,
++    loopArray,
+     async idx => {
+-      console.log(`>>> Peek ${idx} of ${messagesToPeek}`);
+-      const messagesOfRequest = await peekMessagesFromQueue(dlqUrl, {
+-        maxNumberOfMessagesPerQuery,
+-        maxNumberOfMessages: maxNumberOfMessagesPerQuery,
+-      });
+-
++      console.log(`Peek ${idx} of ${peekRequestCount}`);
++      const messagesOfRequest = await peekMessagesFromQueue(dlqUrl);
+       if (!messagesOfRequest || !messagesOfRequest.length) {
+         console.log(`>>> No messages found`);
+         return;
+       }
+-
+       messagesOfRequest.forEach(m => {
+-        const attr = m.MessageAttributes as DlqMessageAttributes | undefined;
++        const attr = m.MessageAttributes as unknown as DlqMessageAttributes | undefined;
+         if (!attr) return;
+         const startedAt = attr.jobStartedAt?.StringValue ?? attr.startedAt?.StringValue;
+         const patientId = attr.patientId?.StringValue;
+@@ -132,6 +133,9 @@ async function peekIntoQueue() {
+         const s3BucketName = body.s3BucketName;
+         if (!patientId || !startedAt || !s3FileName || !s3BucketName || !m.MessageId) return;
+ 
++        // Add cxId, patientId to unique set
++        uniqueCxIdPatientIds.add(`${attr.cxId?.StringValue ?? ""},${patientId}`);
++
+         const details: MessageDetails = {
+           messageId: m.MessageId,
+           bucketName: s3BucketName,
+@@ -153,27 +157,39 @@ async function peekIntoQueue() {
+ 
+   const uniqueMessageDetails = Array.from(messageDetailsMap.values());
+ 
+-  console.log(`>>> Downloading files from S3 for ${uniqueMessageDetails.length} messages...`);
+-  const errors: unknown[] = [];
+-  await executeAsynchronously(
+-    uniqueMessageDetails,
+-    async messageDetails => {
+-      try {
+-        await downloadFileFromS3(messageDetails, dirName);
+-      } catch (error) {
+-        errors.push(error);
+-      }
+-    },
+-    {
+-      numberOfParallelExecutions: numberOfParallelDownloadsFromS3,
+-    }
++  // Store unique patient IDs to file
++  const patientIdsArray = Array.from(uniqueCxIdPatientIds).sort();
++  fs.writeFileSync(
++    `${dirName}/patient_ids.csv`,
++    ["cx_id,patient_id", ...patientIdsArray].join("\n")
+   );
++  console.log(`>>> Saved ${patientIdsArray.length} unique patient IDs to patient_ids.csv`);
++
++  if (downloadFiles) {
++    console.log(`>>> Downloading files from S3 for ${uniqueMessageDetails.length} messages...`);
++    const errors: unknown[] = [];
++    await executeAsynchronously(
++      uniqueMessageDetails,
++      async messageDetails => {
++        try {
++          await downloadFileFromS3(messageDetails, dirName);
++        } catch (error) {
++          errors.push(error);
++        }
++      },
++      {
++        numberOfParallelExecutions: numberOfParallelDownloadsFromS3,
++      }
++    );
+ 
+-  if (errors.length > 0) {
+-    console.error(`>>> Failed to download files for ${errors.length} messages:`);
+-    errors.forEach(error => {
+-      console.error(errorToString(error));
+-    });
++    if (errors.length > 0) {
++      console.error(`>>> Failed to download files for ${errors.length} messages:`);
++      errors.forEach(error => {
++        console.error(errorToString(error));
++      });
++    }
++  } else {
++    console.log(`>>> Skipping S3 file downloads (--download-files not specified)`);
+   }
+ 
+   // Also store a general summary of the messages in a file with the name of the output file.
+@@ -190,50 +206,19 @@ async function peekIntoQueue() {
+  * Reads messages from the queue, returns them, but does not remove them.
+  * Only queries the queue once.
+  */
+-async function peekMessagesFromQueue(
+-  queueUrl: string,
+-  sqsParams: GetMessageSQSParameters
+-): Promise<SQS.Message[]> {
+-  return _getMessagesFromQueue(queueUrl, {
+-    ...sqsParams,
+-    visibilityTimeout: 1, // we don't want to leave them "in flight" after we peek into them
+-  });
+-}
+-
+-type SharedInternalGetMessageSQSParameters = {
+-  maxNumberOfMessagesPerQuery?: number;
+-  visibilityTimeout?: number;
+-  waitTimeSeconds?: number;
+-};
+-type InternalGetMessageSQSParameters = SharedInternalGetMessageSQSParameters & {
+-  maxNumberOfMessages?: number;
+-};
+-
+-async function _getMessagesFromQueue(
+-  queueUrl: string,
+-  sqsParams: InternalGetMessageSQSParameters,
+-  rollingResult: SQS.Message[] = []
+-): Promise<SQS.Message[]> {
+-  const { maxNumberOfMessages = 10, maxNumberOfMessagesPerQuery = 1 } = sqsParams;
+-
+-  const remainingMessagesToQuery = maxNumberOfMessages - rollingResult.length;
+-  const maxMessagesOnQuery = Math.min(maxNumberOfMessagesPerQuery, remainingMessagesToQuery);
+-  if (maxMessagesOnQuery <= 0) return rollingResult;
+-
++async function peekMessagesFromQueue(queueUrl: string): Promise<SQS.Message[]> {
+   const messageParams: SQS.Types.ReceiveMessageRequest = {
+     QueueUrl: queueUrl,
+-    MaxNumberOfMessages: maxMessagesOnQuery,
+-    VisibilityTimeout: sqsParams.visibilityTimeout,
+-    WaitTimeSeconds: sqsParams.waitTimeSeconds ?? 1,
++    MaxNumberOfMessages: messagesToRetrievePerReceiveMsg,
++    VisibilityTimeout: 1, // we don't want to leave them "in flight" after we peek into them
++    WaitTimeSeconds: 2, // Give it some time to get the messages
+     AttributeNames: ["All"],
+     MessageAttributeNames: ["All"],
+   };
+ 
+   const resultReceive = await sqs.receiveMessage(messageParams).promise();
+   const messages = resultReceive.Messages ?? [];
+-  const result = [...rollingResult, ...messages];
+-
+-  return result;
++  return messages;
+ }
+ 
+ /**
+@@ -318,4 +303,4 @@ async function downloadFileFromS3(
+   }
+ }
+ 
+-peekIntoQueue();
++export default program;

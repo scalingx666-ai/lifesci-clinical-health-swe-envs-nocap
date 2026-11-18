@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Add identifier pre-resolution interceptor
+
+## Description
+
+An interceptor has been added that can be used to pre-resolve chained identifier searches (e.g. upon receiving a query like `Observation?subject.identifier=http://foo|123` this interceptor will resolve the subject identifier and replace the query with an equivalent unchained query such as `Observation?subject=Patient/123`. This performs better at large scale, especially on heavily loaded systems.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `f2c3a748d470`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

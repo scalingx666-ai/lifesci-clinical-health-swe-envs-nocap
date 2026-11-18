@@ -1,0 +1,2774 @@
+diff --git a/docs/api/compatibility-gate.md b/docs/api/compatibility-gate.md
+index 2905473181..9388d27723 100644
+--- a/docs/api/compatibility-gate.md
++++ b/docs/api/compatibility-gate.md
+@@ -23,7 +23,8 @@ field values, credentials, or model payloads.
+ 
+ The service error envelope currently exposes these stable categories:
+ 
+-`auth_rate_limited`, `authentication_required`, `backpressure`, `bad_request`,
++`admission_limited`, `admission_saturated`, `auth_rate_limited`,
++`authentication_required`, `backpressure`, `bad_request`,
+ `budget_exceeded`, `capability_error`, `circuit_breaker_open`,
+ `configuration_error`, `forbidden`, `grounding_invalid_request`,
+ `inference_error`, `input_error`, `internal_error`, `invalid_credentials`,
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index 26b77af18a..d401cdb2a8 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -209,6 +209,7 @@ classification:
+     - guides/session-end-hook.md
+     - serving/resilience.md
+     - serving/backpressure.md
++    - serving/fair-admission.md
+     - serving/kserve-triton.md
+     - deploy/hardened-image.md
+     - deploy/self-hosted-compose.md
+diff --git a/docs/serving/fair-admission.md b/docs/serving/fair-admission.md
+new file mode 100644
+index 0000000000..bc0db78da0
+--- /dev/null
++++ b/docs/serving/fair-admission.md
+@@ -0,0 +1,163 @@
++# Fair Request Admission
++
++OpenMed can bound how much model-backed work each caller holds at once, so one
++busy principal cannot use up the service for everyone else. Fair admission
++counts in-flight and waiting requests at three levels:
++
++- one global ceiling for the whole service runtime,
++- one ceiling per authenticated principal, and
++- optionally, one ceiling per namespace (a group of principals).
++
++REST and GraphQL draw on the same counters, so a caller cannot get more than
++its share by switching protocol. Fair admission is off until you set a
++concurrency ceiling. It is in-process: each replica keeps its own counters.
++
++## Configuration
++
++| Environment variable | Default | Meaning |
++| --- | ---: | --- |
++| `OPENMED_SERVICE_ADMISSION_MAX_CONCURRENCY` | `0` | Global in-flight ceiling. `0` leaves the global level unlimited. |
++| `OPENMED_SERVICE_ADMISSION_MAX_QUEUE` | `0` | Global ceiling on waiting requests. |
++| `OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_CONCURRENCY` | `0` | In-flight ceiling for each principal. |
++| `OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_QUEUE` | `0` | Waiting ceiling for each principal. |
++| `OPENMED_SERVICE_ADMISSION_NAMESPACE_MAX_CONCURRENCY` | `0` | In-flight ceiling for each namespace. |
++| `OPENMED_SERVICE_ADMISSION_NAMESPACE_MAX_QUEUE` | `0` | Waiting ceiling for each namespace. |
++| `OPENMED_SERVICE_ADMISSION_NAMESPACE_CLAIM` | unset | JWT claim that names a principal's namespace. Unset turns namespace ceilings off. |
++| `OPENMED_SERVICE_ADMISSION_QUEUE_TIMEOUT_SECONDS` | `5` | Longest a request waits before it is rejected. |
++| `OPENMED_SERVICE_ADMISSION_RETRY_AFTER_SECONDS` | `1` | Constant `Retry-After` hint sent with every rejection. |
++
++A level with a concurrency ceiling of `0` is unlimited and its queue setting is
++ignored. A level with a ceiling uses its queue setting as the number of
++requests that may wait there; `0` means a request that cannot start is
++rejected at once. A request may wait only when it fits the queue of every
++level that has a ceiling. With the defaults, nothing ever waits.
++
++Example for one replica that serves several API clients:
++
++```bash
++OPENMED_SERVICE_ADMISSION_MAX_CONCURRENCY=8 \
++OPENMED_SERVICE_ADMISSION_MAX_QUEUE=32 \
++OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_CONCURRENCY=4 \
++OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_QUEUE=8 \
++python -m openmed.service.logging --host 127.0.0.1 --port 8080
++```
++
++Keep the principal ceiling below the global ceiling so a busy principal always
++leaves room for others, and keep the principal queue well below the global
++queue so one principal cannot fill it.
++
++## Principals and namespaces
++
++The principal is the authenticated subject that
++[REST authentication](authentication.md) or [mutual TLS](mtls.md) attaches to
++the request: the API key's configured principal, the JWT `sub` (or
++`client_id`) claim, or the certificate principal. Requests without an
++authenticated principal, including every request when authentication is off,
++share one anonymous bucket.
++
++When `OPENMED_SERVICE_ADMISSION_NAMESPACE_CLAIM` names a claim (for example
++`tenant`), JWT principals whose token carries that claim as a string of at most
++128 characters are also counted against that namespace's ceilings. Principals
++without the claim, API-key principals and anonymous callers are not
++namespaced.
++
++Principal and namespace values are reduced to process-local keyed digests
++before they are stored. They never appear in error bodies, headers, metrics or
++logs.
++
++## What is admitted
++
++- REST routes whose declared route policy is `model` or `heavy`, such as
++  `/analyze`, `/pii/extract`, `/pii/deidentify`, `/brief`, `/v1/decisions`,
++  `/omop/load` and `/jobs` submissions. Health, readiness, metrics and other
++  control routes are never admitted.
++- GraphQL root fields `analyze`, `deidentify` and `journeyResources`. Each
++  selected field, aliases included, takes one unit when it executes, so
++  batching fields into one document cannot exceed a principal's share.
++  `entityTypes` and introspection are free.
++
++An admitted unit is held until the response and any model work the request
++started have settled. A request whose HTTP wait times out or is cancelled
++keeps its unit while its model work still runs. Cancellation, timeout and
++worker failure release each unit exactly once. Streaming endpoints hold their
++unit until the stream response starts, the same as the throttle's concurrency
++gate.
++
++## Scheduling
++
++Each principal has its own first-in, first-out queue. When capacity frees, it
++goes to the next principal in a round-robin rotation whose oldest waiting
++request fits its own principal and namespace ceilings. A principal with
++waiting work is served within `k - 1` grants to other principals, where `k`
++is the number of principals waiting, unless its own ceiling holds it back.
++The queue timeout bounds every wait.
++
++A new request from a principal with nothing waiting starts at once when every
++level has room. It cannot overtake requests that are waiting for shared
++capacity, because freed capacity is handed to the rotation first.
++
++## Rejections
++
++| Status | Error code | `details.reason` | Meaning |
++| --- | --- | --- | --- |
++| `429` | `admission_limited` | `principal_limit` | The principal is over its own concurrency or queue share. |
++| `429` | `admission_limited` | `namespace_limit` | The principal's namespace is over its share. |
++| `503` | `admission_saturated` | `global_limit` | The caller is within its share, but the service's shared capacity or queue is full. |
++
++A request that times out while waiting gets the status of the level that held
++it back. Every rejection has a `Retry-After` header and `details` of the form
++`{"reason": "...", "retry_after_seconds": 1.0}`. The retry hint is the
++configured constant; it never reflects current load, and no response reveals
++queue depths or other callers' activity.
++
++A GraphQL document with a rejected field returns the same status and
++`Retry-After` header with a single error and no partial data:
++
++```json
++{
++  "data": null,
++  "errors": [
++    {
++      "message": "Request admission limit reached; retry later.",
++      "extensions": {"code": "OPENMED_ADMISSION_REJECTED", "reason": "principal_limit"}
++    }
++  ]
++}
++```
++
++Clients should honor `Retry-After` and retry with bounded exponential backoff
++and jitter.
++
++## Other limits
++
++Fair admission sits between authentication and the route handler, inside the
++[throttle](../rest-service.md): authentication runs first, then the throttle's
++rate limit and process-wide concurrency gate, then fair admission. The
++throttle's concurrency gate is not principal-aware; leave it unset or size it
++at or above `OPENMED_SERVICE_ADMISSION_MAX_CONCURRENCY` when you use fair
++admission. [Serving backpressure](backpressure.md) for dynamic batching, model
++residency limits and async job submission bounds are separate controls and
++still apply.
++
++## gRPC
++
++The admission controller is transport-neutral. A gRPC server interceptor can
++share the REST and GraphQL budget by calling
++`runtime.admission_controller.admit_blocking(ticket)` with
++`AdmissionTicket.for_principal(principal, transport="grpc", ...)` and mapping a
++rejection to its `grpc_status` (`RESOURCE_EXHAUSTED` or `UNAVAILABLE`) with
++`grpc_trailing_metadata()`. The bundled [gRPC server](grpc.md) does not call it
++yet, because it does not authenticate callers.
++
++## Metrics
++
++With `OPENMED_SERVICE_METRICS_ENABLED=true`, `/metrics` exports only aggregate
++values:
++
++- `openmed_service_principal_admission_inflight`: admitted units held.
++- `openmed_service_principal_admission_queued`: requests waiting.
++- `openmed_service_principal_admission_active_principals`: principals with
++  admitted or waiting requests.
++- `openmed_service_principal_admission_rejected_total{reason,transport}`:
++  rejections by static reason (`principal_limit`, `namespace_limit`,
++  `global_limit`) and transport (`rest`, `graphql`, `grpc`).
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 5a061507ec..b771121056 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -138,6 +138,7 @@ nav:
+       - Session-end Trace Scrub Hook: guides/session-end-hook.md
+       - Serving Resilience: serving/resilience.md
+       - Serving Backpressure: serving/backpressure.md
++      - Fair Request Admission: serving/fair-admission.md
+       - KServe & Triton Model Repositories: serving/kserve-triton.md
+       - Hardened Service Image: deploy/hardened-image.md
+       - Self-hosted Compose Deployment: deploy/self-hosted-compose.md
+diff --git a/openmed/service/admission.py b/openmed/service/admission.py
+new file mode 100644
+index 0000000000..3aafec18e4
+--- /dev/null
++++ b/openmed/service/admission.py
+@@ -0,0 +1,891 @@
++"""Fair, bounded request admission shared by every service transport.
++
++The controller bounds in-flight and waiting work at three levels: one global
++ceiling, one ceiling per authenticated principal and, optionally, one ceiling
++per namespace. Requests that cannot start immediately wait in a bounded
++per-principal FIFO queue. Freed capacity is handed out by round-robin rotation
++over principals with waiting work, so one principal's backlog cannot starve
++another principal's queued request.
++
++The controller is transport-neutral. REST requests are admitted by
++:class:`HttpAdmission`, GraphQL operations by the schema extension in
++:mod:`openmed.service.graphql_schema`, and synchronous transports such as a
++gRPC server interceptor call :meth:`AdmissionController.admit_blocking` with an
++:class:`AdmissionTicket` built from their own authenticated principal. When a
++:class:`~openmed.service.runtime.ServiceRuntime` is shared, every transport
++draws on the same budget.
++
++Principal and namespace identities are reduced to process-local keyed digests
++before they are stored. Rejections, metrics and snapshots contain only static
++reason codes and aggregate counts, never principal identifiers or other
++tenants' load.
++
++This module owns request admission only. Async job admission, model residency
++limits and the dynamic-batching queues remain separate controls.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import hmac
++import secrets
++import threading
++import time
++from collections import deque
++from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
++from contextlib import asynccontextmanager, contextmanager
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any, Optional, Union
++
++if TYPE_CHECKING:
++    from starlette.requests import Request
++    from starlette.responses import Response
++
++ADMISSION_MAX_CONCURRENCY_ENV_VAR = "OPENMED_SERVICE_ADMISSION_MAX_CONCURRENCY"
++ADMISSION_MAX_QUEUE_ENV_VAR = "OPENMED_SERVICE_ADMISSION_MAX_QUEUE"
++ADMISSION_PRINCIPAL_MAX_CONCURRENCY_ENV_VAR = (
++    "OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_CONCURRENCY"
++)
++ADMISSION_PRINCIPAL_MAX_QUEUE_ENV_VAR = "OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_QUEUE"
++ADMISSION_NAMESPACE_MAX_CONCURRENCY_ENV_VAR = (
++    "OPENMED_SERVICE_ADMISSION_NAMESPACE_MAX_CONCURRENCY"
++)
++ADMISSION_NAMESPACE_MAX_QUEUE_ENV_VAR = "OPENMED_SERVICE_ADMISSION_NAMESPACE_MAX_QUEUE"
++ADMISSION_NAMESPACE_CLAIM_ENV_VAR = "OPENMED_SERVICE_ADMISSION_NAMESPACE_CLAIM"
++ADMISSION_QUEUE_TIMEOUT_ENV_VAR = "OPENMED_SERVICE_ADMISSION_QUEUE_TIMEOUT_SECONDS"
++ADMISSION_RETRY_AFTER_ENV_VAR = "OPENMED_SERVICE_ADMISSION_RETRY_AFTER_SECONDS"
++
++DEFAULT_ADMISSION_QUEUE_TIMEOUT_SECONDS = 5.0
++DEFAULT_ADMISSION_RETRY_AFTER_SECONDS = 1.0
++MAX_NAMESPACE_VALUE_LENGTH = 128
++
++ANONYMOUS_PRINCIPAL = "anonymous"
++AUTH_SCOPE_KEY = "openmed.auth"
++
++REASON_PRINCIPAL_LIMIT = "principal_limit"
++REASON_NAMESPACE_LIMIT = "namespace_limit"
++REASON_GLOBAL_LIMIT = "global_limit"
++ADMISSION_REASONS = (
++    REASON_PRINCIPAL_LIMIT,
++    REASON_NAMESPACE_LIMIT,
++    REASON_GLOBAL_LIMIT,
++)
++
++TRANSPORT_REST = "rest"
++TRANSPORT_GRAPHQL = "graphql"
++TRANSPORT_GRPC = "grpc"
++TRANSPORT_OTHER = "other"
++ADMISSION_TRANSPORTS = frozenset({TRANSPORT_REST, TRANSPORT_GRAPHQL, TRANSPORT_GRPC})
++
++# GraphQL documents can select several model-backed fields in one HTTP request,
++# so the GraphQL schema admits each field at execution time instead.
++EXECUTION_ADMITTED_PATHS = frozenset({"/graphql"})
++_ADMITTED_ROUTE_CLASSES = frozenset({"model", "heavy"})
++_BLOCKING_CANCEL_POLL_SECONDS = 0.05
++
++# A fresh key per process keeps stored bucket keys from being stable,
++# reusable identifiers. Transports in one process share the same key.
++_IDENTITY_KEY = secrets.token_bytes(32)
++
++_WAITING = 0
++_GRANTED = 1
++_ABANDONED = 2
++
++
++@dataclass(frozen=True)
++class AdmissionConfig:
++    """Ceilings for fair request admission.
++
++    A concurrency ceiling of ``0`` leaves that level unlimited; that level's
++    queue setting is then ignored. With a ceiling set, the matching queue
++    setting bounds how many requests may wait at that level, and ``0`` means
++    requests that cannot start are rejected at once. A request may wait only
++    when it fits every limited level's queue.
++
++    Attributes:
++        max_concurrency: Global in-flight ceiling across all principals.
++        max_queue: Global ceiling on waiting requests.
++        principal_max_concurrency: In-flight ceiling for each principal.
++            Anonymous callers share one pooled principal.
++        principal_max_queue: Waiting ceiling for each principal.
++        namespace_max_concurrency: In-flight ceiling for each namespace.
++        namespace_max_queue: Waiting ceiling for each namespace.
++        namespace_claim: JWT claim that names a principal's namespace. Unset
++            disables namespace accounting.
++        queue_timeout_seconds: Longest a request waits before rejection.
++        retry_after_seconds: Constant ``Retry-After`` hint on rejections. It
++            never reflects current load.
++    """
++
++    max_concurrency: int = 0
++    max_queue: int = 0
++    principal_max_concurrency: int = 0
++    principal_max_queue: int = 0
++    namespace_max_concurrency: int = 0
++    namespace_max_queue: int = 0
++    namespace_claim: Optional[str] = None
++    queue_timeout_seconds: float = DEFAULT_ADMISSION_QUEUE_TIMEOUT_SECONDS
++    retry_after_seconds: float = DEFAULT_ADMISSION_RETRY_AFTER_SECONDS
++
++    def __post_init__(self) -> None:
++        for name in (
++            "max_concurrency",
++            "max_queue",
++            "principal_max_concurrency",
++            "principal_max_queue",
++            "namespace_max_concurrency",
++            "namespace_max_queue",
++        ):
++            value = getattr(self, name)
++            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
++                raise ValueError(f"Admission {name} must be a non-negative integer")
++        for name in ("queue_timeout_seconds", "retry_after_seconds"):
++            value = getattr(self, name)
++            if isinstance(value, bool) or not isinstance(value, (int, float)):
++                raise ValueError(f"Admission {name} must be a positive number")
++            if not value > 0 or value == float("inf"):
++                raise ValueError(f"Admission {name} must be a positive number")
++
++    @property
++    def enabled(self) -> bool:
++        """Return whether any admission ceiling is configured."""
++        return (
++            self.max_concurrency > 0
++            or self.principal_max_concurrency > 0
++            or self.namespace_max_concurrency > 0
++        )
++
++    @property
++    def namespaces_enabled(self) -> bool:
++        """Return whether namespace ceilings apply."""
++        return bool(self.namespace_claim) and self.namespace_max_concurrency > 0
++
++
++@dataclass(frozen=True)
++class AdmissionTicket:
++    """One request's admission identity, independent of transport.
++
++    Attributes:
++        principal: Opaque bucket key. Use :meth:`for_principal` rather than
++            passing a raw subject.
++        namespace: Opaque namespace key, or ``None`` when not namespaced.
++        transport: Static transport label used only for aggregate metrics.
++    """
++
++    principal: str = ANONYMOUS_PRINCIPAL
++    namespace: Optional[str] = None
++    transport: str = TRANSPORT_OTHER
++
++    @classmethod
++    def for_principal(
++        cls,
++        principal: object | None,
++        *,
++        transport: str,
++        namespace_claim: Optional[str] = None,
++    ) -> AdmissionTicket:
++        """Build a ticket from an authenticated principal.
++
++        Args:
++            principal: Object with a ``subject`` string and optional ``claims``
++                mapping, such as :class:`~openmed.service.auth.AuthPrincipal`.
++                ``None`` or a principal without a subject joins the shared
++                anonymous bucket.
++            transport: ``rest``, ``graphql`` or ``grpc``; other values are
++                reported as ``other``.
++            namespace_claim: Claim that names the principal's namespace.
++
++        Returns:
++            A ticket whose keys are process-local digests.
++        """
++        label = transport if transport in ADMISSION_TRANSPORTS else TRANSPORT_OTHER
++        subject = getattr(principal, "subject", None)
++        if not isinstance(subject, str) or not subject:
++            return cls(ANONYMOUS_PRINCIPAL, None, label)
++        namespace = None
++        if namespace_claim:
++            claims = getattr(principal, "claims", None)
++            value = claims.get(namespace_claim) if isinstance(claims, Mapping) else None
++            if isinstance(value, str) and 0 < len(value) <= MAX_NAMESPACE_VALUE_LENGTH:
++                namespace = _identity_digest("n", value)
++        return cls(_identity_digest("p", subject), namespace, label)
++
++
++@dataclass(frozen=True)
++class AdmissionStats:
++    """Aggregate admission state without identifiers."""
++
++    in_flight: int
++    queued: int
++    active_principals: int
++
++
++class AdmissionRejected(RuntimeError):
++    """A request could not be admitted within its bounds.
++
++    Attributes:
++        reason: One of :data:`ADMISSION_REASONS`.
++        retry_after_seconds: Constant retry hint from configuration.
++    """
++
++    status_code = 503
++    error_code = "admission_saturated"
++    grpc_status = "UNAVAILABLE"
++
++    def __init__(self, reason: str, *, retry_after_seconds: float) -> None:
++        self.reason = reason
++        self.retry_after_seconds = float(retry_after_seconds)
++        super().__init__("Request admission limit reached; retry later")
++
++    @property
++    def retry_after_header(self) -> str:
++        """Return the ``Retry-After`` delta-seconds value."""
++        from .throttle import format_retry_after
++
++        return format_retry_after(self.retry_after_seconds)
++
++    def to_details(self) -> dict[str, Any]:
++        """Return value-free API error details."""
++        return {
++            "reason": self.reason,
++            "retry_after_seconds": self.retry_after_seconds,
++        }
++
++    def grpc_trailing_metadata(self) -> tuple[tuple[str, str], ...]:
++        """Return value-free trailing metadata for a gRPC rejection."""
++        return (
++            ("retry-after", self.retry_after_header),
++            ("openmed-admission-reason", self.reason),
++        )
++
++
++class PrincipalAdmissionLimited(AdmissionRejected):
++    """The caller's principal or namespace is over its configured share."""
++
++    status_code = 429
++    error_code = "admission_limited"
++    grpc_status = "RESOURCE_EXHAUSTED"
++
++
++class AdmissionSaturated(AdmissionRejected):
++    """The caller is within its share but shared capacity is exhausted."""
++
++    status_code = 503
++    error_code = "admission_saturated"
++    grpc_status = "UNAVAILABLE"
++
++
++class AdmissionCancelled(RuntimeError):
++    """A blocking acquisition was abandoned because its caller cancelled."""
++
++
++class AdmissionPermit:
++    """Ownership of one admitted unit of work.
++
++    :meth:`release` is idempotent: the first call returns the unit to the
++    controller and later calls do nothing.
++    """
++
++    __slots__ = ("_controller", "_principal", "_namespace", "_released")
++
++    def __init__(
++        self,
++        controller: Optional[AdmissionController],
++        principal: str,
++        namespace: Optional[str],
++    ) -> None:
++        self._controller = controller
++        self._principal = principal
++        self._namespace = namespace
++        self._released = False
++
++    @property
++    def released(self) -> bool:
++        """Return whether this permit has been released."""
++        return self._released
++
++    def release(self) -> bool:
++        """Release the permit once.
++
++        Returns:
++            ``True`` for the call that released it, otherwise ``False``.
++        """
++        controller = self._controller
++        if controller is None:
++            if self._released:
++                return False
++            self._released = True
++            return True
++        return controller._release(self)
++
++
++class _Bucket:
++    __slots__ = ("key", "in_flight", "waiters")
++
++    def __init__(self, key: str) -> None:
++        self.key = key
++        self.in_flight = 0
++        self.waiters: deque[_Waiter] = deque()
++
++
++class _NamespaceLoad:
++    __slots__ = ("in_flight", "waiting")
++
++    def __init__(self) -> None:
++        self.in_flight = 0
++        self.waiting = 0
++
++
++class _Waiter:
++    __slots__ = ("bucket", "namespace", "state", "permit", "wake")
++
++    def __init__(
++        self,
++        bucket: _Bucket,
++        namespace: Optional[str],
++        wake: Callable[[], bool],
++    ) -> None:
++        self.bucket = bucket
++        self.namespace = namespace
++        self.state = _WAITING
++        self.permit: Optional[AdmissionPermit] = None
++        self.wake = wake
++
++
++class AdmissionController:
++    """Thread-safe fair admission accounting shared across transports.
++
++    Every state transition happens under one lock, and a waiter's state decides
++    who owns a granted unit, so a cancelled, expired or failed request releases
++    each permit exactly once. Async callers wait on their own event loop;
++    blocking callers wait on a thread event.
++
++    Starvation bound: when shared capacity frees, it goes to the next principal
++    in rotation whose head request fits its own ceilings. A principal with
++    waiting work is therefore granted within ``k - 1`` grants to others, where
++    ``k`` is the number of principals waiting, unless it is held back by its
++    own principal or namespace ceiling. ``queue_timeout_seconds`` bounds every
++    wait in time.
++    """
++
++    def __init__(
++        self,
++        config: Optional[AdmissionConfig] = None,
++        *,
++        metrics: Any = None,
++    ) -> None:
++        """Create a controller.
++
++        Args:
++            config: Admission ceilings; defaults to a disabled configuration.
++            metrics: Optional registry with ``record_principal_admission_state``
++                and ``record_principal_admission_rejection`` hooks.
++        """
++        self._config = config if config is not None else AdmissionConfig()
++        self._metrics = metrics
++        self._lock = threading.Lock()
++        self._buckets: dict[str, _Bucket] = {}
++        self._namespaces: dict[str, _NamespaceLoad] = {}
++        self._rotation: deque[str] = deque()
++        self._in_flight = 0
++        self._waiting = 0
++        if self.enabled:
++            self._publish_state()
++
++    @property
++    def config(self) -> AdmissionConfig:
++        """Return the active configuration."""
++        return self._config
++
++    @property
++    def enabled(self) -> bool:
++        """Return whether any ceiling is enforced."""
++        return self._config.enabled
++
++    def ticket(self, principal: object | None, *, transport: str) -> AdmissionTicket:
++        """Build a ticket for ``principal`` using this controller's claim."""
++        return AdmissionTicket.for_principal(
++            principal,
++            transport=transport,
++            namespace_claim=self._config.namespace_claim,
++        )
++
++    def snapshot(self) -> AdmissionStats:
++        """Return aggregate in-flight, waiting and active-principal counts."""
++        with self._lock:
++            return AdmissionStats(
++                in_flight=self._in_flight,
++                queued=self._waiting,
++                active_principals=len(self._buckets),
++            )
++
++    async def acquire(
++        self,
++        ticket: AdmissionTicket,
++        *,
++        timeout: Optional[float] = None,
++    ) -> AdmissionPermit:
++        """Admit one unit of work, waiting fairly when necessary.
++
++        Args:
++            ticket: The caller's admission identity.
++            timeout: Longest wait in seconds; defaults to the configured queue
++                timeout.
++
++        Returns:
++            A permit to release when the work has settled.
++
++        Raises:
++            PrincipalAdmissionLimited: The caller is over its own share.
++            AdmissionSaturated: Shared capacity is exhausted.
++            asyncio.CancelledError: The waiting task was cancelled; any unit
++                granted in the meantime has been released.
++        """
++        if not self.enabled:
++            return AdmissionPermit(None, ticket.principal, ticket.namespace)
++        loop = asyncio.get_running_loop()
++        signal: asyncio.Future[None] = loop.create_future()
++
++        def wake() -> bool:
++            try:
++                loop.call_soon_threadsafe(_resolve_signal, signal)
++            except RuntimeError:
++                return False
++            return True
++
++        outcome = self._arrive(ticket, wake)
++        if isinstance(outcome, AdmissionPermit):
++            return outcome
++        wait = self._config.queue_timeout_seconds if timeout is None else timeout
++        try:
++            # ``asyncio.wait`` neither cancels the signal on timeout nor, unlike
++            # ``wait_for`` on Python 3.11, swallows a cancellation that races
++            # with the grant; the waiter state below decides the outcome.
++            await asyncio.wait((signal,), timeout=max(float(wait), 0.0))
++        except BaseException:
++            self._abandon(outcome)
++            raise
++        return self._settle(outcome, ticket)
++
++    def acquire_blocking(
++        self,
++        ticket: AdmissionTicket,
++        *,
++        timeout: Optional[float] = None,
++        cancelled: Optional[Callable[[], bool]] = None,
++    ) -> AdmissionPermit:
++        """Admit one unit of work from a worker thread.
++
++        This is the adapter for synchronous transports, for example a gRPC
++        server interceptor that maps :class:`AdmissionRejected` to
++        ``grpc_status`` with :meth:`AdmissionRejected.grpc_trailing_metadata`.
++
++        Args:
++            ticket: The caller's admission identity.
++            timeout: Longest wait in seconds; defaults to the queue timeout.
++            cancelled: Optional probe, such as ``lambda: not
++                context.is_active()``, polled while waiting.
++
++        Returns:
++            A permit to release when the work has settled.
++
++        Raises:
++            PrincipalAdmissionLimited: The caller is over its own share.
++            AdmissionSaturated: Shared capacity is exhausted.
++            AdmissionCancelled: ``cancelled`` reported a cancelled caller.
++        """
++        if not self.enabled:
++            return AdmissionPermit(None, ticket.principal, ticket.namespace)
++        event = threading.Event()
++
++        def wake() -> bool:
++            event.set()
++            return True
++
++        outcome = self._arrive(ticket, wake)
++        if isinstance(outcome, AdmissionPermit):
++            return outcome
++        wait = self._config.queue_timeout_seconds if timeout is None else timeout
++        deadline = time.monotonic() + max(float(wait), 0.0)
++        try:
++            while True:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    break
++                if cancelled is None:
++                    event.wait(remaining)
++                    break
++                if event.wait(min(remaining, _BLOCKING_CANCEL_POLL_SECONDS)):
++                    break
++                if cancelled():
++                    raise AdmissionCancelled("Admission wait was cancelled")
++        except BaseException:
++            self._abandon(outcome)
++            raise
++        return self._settle(outcome, ticket)
++
++    @asynccontextmanager
++    async def admit(
++        self,
++        ticket: AdmissionTicket,
++        *,
++        timeout: Optional[float] = None,
++    ) -> AsyncIterator[AdmissionPermit]:
++        """Hold one permit for the duration of an ``async with`` block."""
++        permit = await self.acquire(ticket, timeout=timeout)
++        try:
++            yield permit
++        finally:
++            permit.release()
++
++    @contextmanager
++    def admit_blocking(
++        self,
++        ticket: AdmissionTicket,
++        *,
++        timeout: Optional[float] = None,
++        cancelled: Optional[Callable[[], bool]] = None,
++    ) -> Iterator[AdmissionPermit]:
++        """Hold one permit for the duration of a ``with`` block."""
++        permit = self.acquire_blocking(ticket, timeout=timeout, cancelled=cancelled)
++        try:
++            yield permit
++        finally:
++            permit.release()
++
++    def _arrive(
++        self,
++        ticket: AdmissionTicket,
++        wake: Callable[[], bool],
++    ) -> Union[AdmissionPermit, _Waiter]:
++        namespace_key = ticket.namespace if self._config.namespaces_enabled else None
++        with self._lock:
++            bucket = self._buckets.get(ticket.principal)
++            if bucket is None:
++                bucket = _Bucket(ticket.principal)
++                self._buckets[ticket.principal] = bucket
++            namespace = self._namespace_load(namespace_key)
++            if not bucket.waiters and self._has_room(bucket, namespace):
++                permit = self._grant(bucket, namespace_key, namespace)
++                self._publish_state()
++                return permit
++            reason = self._arrival_rejection(bucket, namespace)
++            if reason is not None:
++                self._forget_if_idle(bucket, namespace_key)
++                self._record_rejection(reason, ticket.transport)
++                raise self._rejection(reason)
++            waiter = _Waiter(bucket, namespace_key, wake)
++            bucket.waiters.append(waiter)
++            if len(bucket.waiters) == 1:
++                self._rotation.append(bucket.key)
++            self._waiting += 1
++            if namespace is not None:
++                namespace.waiting += 1
++            self._publish_state()
++            return waiter
++
++    def _settle(self, waiter: _Waiter, ticket: AdmissionTicket) -> AdmissionPermit:
++        woken: list[_Waiter] = []
++        with self._lock:
++            if waiter.state == _GRANTED and waiter.permit is not None:
++                return waiter.permit
++            namespace = (
++                self._namespaces.get(waiter.namespace)
++                if waiter.namespace is not None
++                else None
++            )
++            reason = self._blocking_reason(waiter.bucket, namespace)
++            if waiter.state == _WAITING:
++                woken = self._remove_waiter(waiter)
++            self._record_rejection(reason, ticket.transport)
++            self._publish_state()
++        self._wake_all(woken)
++        raise self._rejection(reason)
++
++    def _abandon(self, waiter: _Waiter) -> None:
++        granted: Optional[AdmissionPermit] = None
++        woken: list[_Waiter] = []
++        with self._lock:
++            if waiter.state == _GRANTED:
++                granted = waiter.permit
++            elif waiter.state == _WAITING:
++                woken = self._remove_waiter(waiter)
++                self._publish_state()
++        if granted is not None:
++            granted.release()
++        self._wake_all(woken)
++
++    def _release(self, permit: AdmissionPermit) -> bool:
++        with self._lock:
++            if permit._released:
++                return False
++            permit._released = True
++            self._in_flight -= 1
++            bucket = self._buckets[permit._principal]
++            bucket.in_flight -= 1
++            if permit._namespace is not None:
++                self._namespaces[permit._namespace].in_flight -= 1
++            woken = self._dispatch()
++            self._forget_if_idle(bucket, permit._namespace)
++            self._publish_state()
++        self._wake_all(woken)
++        return True
++
++    def _remove_waiter(self, waiter: _Waiter) -> list[_Waiter]:
++        bucket = waiter.bucket
++        bucket.waiters.remove(waiter)
++        waiter.state = _ABANDONED
++        self._waiting -= 1
++        if waiter.namespace is not None:
++            self._namespaces[waiter.namespace].waiting -= 1
++        if not bucket.waiters:
++            self._rotation.remove(bucket.key)
++        # Removing a head may unblock the request queued behind it.
++        woken = self._dispatch()
++        self._forget_if_idle(bucket, waiter.namespace)
++        return woken
++
++    def _dispatch(self) -> list[_Waiter]:
++        woken: list[_Waiter] = []
++        max_concurrency = self._config.max_concurrency
++        while self._rotation:
++            if max_concurrency and self._in_flight >= max_concurrency:
++                break
++            granted = False
++            for _ in range(len(self._rotation)):
++                key = self._rotation.popleft()
++                bucket = self._buckets[key]
++                head = bucket.waiters[0]
++                namespace = self._namespace_load(head.namespace)
++                if self._has_room(bucket, namespace):
++                    bucket.waiters.popleft()
++                    self._waiting -= 1
++                    if namespace is not None:
++                        namespace.waiting -= 1
++                    head.permit = self._grant(bucket, head.namespace, namespace)
++                    head.state = _GRANTED
++                    woken.append(head)
++                    if bucket.waiters:
++                        self._rotation.append(key)
++                    granted = True
++                    break
++                self._rotation.append(key)
++            if not granted:
++                break
++        return woken
++
++    def _wake_all(self, woken: list[_Waiter]) -> None:
++        for waiter in woken:
++            if not waiter.wake() and waiter.permit is not None:
++                # The waiter's event loop is gone; nobody can consume the unit.
++                waiter.permit.release()
++
++    def _grant(
++        self,
++        bucket: _Bucket,
++        namespace_key: Optional[str],
++        namespace: Optional[_NamespaceLoad],
++    ) -> AdmissionPermit:
++        self._in_flight += 1
++        bucket.in_flight += 1
++        if namespace is not None:
++            namespace.in_flight += 1
++        return AdmissionPermit(self, bucket.key, namespace_key)
++
++    def _namespace_load(self, key: Optional[str]) -> Optional[_NamespaceLoad]:
++        if key is None:
++            return None
++        load = self._namespaces.get(key)
++        if load is None:
++            load = _NamespaceLoad()
++            self._namespaces[key] = load
++        return load
++
++    def _has_room(
++        self,
++        bucket: _Bucket,
++        namespace: Optional[_NamespaceLoad],
++    ) -> bool:
++        config = self._config
++        if config.max_concurrency and self._in_flight >= config.max_concurrency:
++            return False
++        if (
++            config.principal_max_concurrency
++            and bucket.in_flight >= config.principal_max_concurrency
++        ):
++            return False
++        return not (
++            namespace is not None
++            and namespace.in_flight >= config.namespace_max_concurrency
++        )
++
++    def _blocking_reason(
++        self,
++        bucket: _Bucket,
++        namespace: Optional[_NamespaceLoad],
++    ) -> str:
++        config = self._config
++        if (
++            config.principal_max_concurrency
++            and bucket.in_flight >= config.principal_max_concurrency
++        ):
++            return REASON_PRINCIPAL_LIMIT
++        if (
++            namespace is not None
++            and namespace.in_flight >= config.namespace_max_concurrency
++        ):
++            return REASON_NAMESPACE_LIMIT
++        return REASON_GLOBAL_LIMIT
++
++    def _arrival_rejection(
++        self,
++        bucket: _Bucket,
++        namespace: Optional[_NamespaceLoad],
++    ) -> Optional[str]:
++        config = self._config
++        principal_queue_full = (
++            config.principal_max_concurrency > 0
++            and len(bucket.waiters) >= config.principal_max_queue
++        )
++        namespace_queue_full = (
++            namespace is not None and namespace.waiting >= config.namespace_max_queue
++        )
++        global_queue_full = (
++            config.max_concurrency > 0 and self._waiting >= config.max_queue
++        )
++        if not (principal_queue_full or namespace_queue_full or global_queue_full):
++            return None
++        reason = self._blocking_reason(bucket, namespace)
++        if reason != REASON_GLOBAL_LIMIT:
++            return reason
++        if principal_queue_full:
++            return REASON_PRINCIPAL_LIMIT
++        if namespace_queue_full:
++            return REASON_NAMESPACE_LIMIT
++        return REASON_GLOBAL_LIMIT
++
++    def _forget_if_idle(self, bucket: _Bucket, namespace_key: Optional[str]) -> None:
++        if not bucket.in_flight and not bucket.waiters:
++            self._buckets.pop(bucket.key, None)
++        if namespace_key is not None:
++            load = self._namespaces.get(namespace_key)
++            if load is not None and not load.in_flight and not load.waiting:
++                del self._namespaces[namespace_key]
++
++    def _rejection(self, reason: str) -> AdmissionRejected:
++        retry_after = self._config.retry_after_seconds
++        if reason == REASON_GLOBAL_LIMIT:
++            return AdmissionSaturated(reason, retry_after_seconds=retry_after)
++        return PrincipalAdmissionLimited(reason, retry_after_seconds=retry_after)
++
++    def _publish_state(self) -> None:
++        record = getattr(self._metrics, "record_principal_admission_state", None)
++        if callable(record):
++            record(
++                in_flight=self._in_flight,
++                queued=self._waiting,
++                active_principals=len(self._buckets),
++            )
++
++    def _record_rejection(self, reason: str, transport: str) -> None:
++        record = getattr(self._metrics, "record_principal_admission_rejection", None)
++        if callable(record):
++            record(reason=reason, transport=transport)
++
++
++ErrorResponseFactory = Callable[..., "Response"]
++CallNext = Callable[["Request"], Awaitable["Response"]]
++
++
++class HttpAdmission:
++    """REST middleware dispatcher for fair principal admission.
++
++    It admits routes whose declared policy is ``model`` or ``heavy``. GraphQL
++    routes are skipped here because the GraphQL schema admits each
++    model-backed field when it executes. The permit is held until the response
++    and any work the request started have settled.
++    """
++
++    def __init__(
++        self,
++        controller: AdmissionController,
++        *,
++        error_response: ErrorResponseFactory,
++    ) -> None:
++        """Create the dispatcher.
++
++        Args:
++            controller: Shared admission controller, usually the runtime's.
++            error_response: Factory for the service error envelope.
++        """
++        self.controller = controller
++        self._error_response = error_response
++
++    async def dispatch(self, request: Request, call_next: CallNext) -> Response:
++        """Admit one HTTP request around ``call_next``."""
++        controller = self.controller
++        if not controller.enabled or not request_needs_principal_admission(request):
++            return await call_next(request)
++        ticket = controller.ticket(
++            request.scope.get(AUTH_SCOPE_KEY), transport=TRANSPORT_REST
++        )
++        try:
++            permit = await controller.acquire(ticket)
++        except AdmissionRejected as exc:
++            return self.rejection_response(exc)
++        try:
++            return await call_next(request)
++        finally:
++            release_when_settled(permit)
++
++    def rejection_response(self, exc: AdmissionRejected) -> Response:
++        """Render a value-free 429 or 503 envelope with ``Retry-After``."""
++        response = self._error_response(
++            exc.status_code,
++            exc.error_code,
++            str(exc),
++            details=exc.to_details(),
++        )
++        response.headers["Retry-After"] = exc.retry_after_header
++        return response
++
++
++def request_needs_principal_admission(request: Request) -> bool:
++    """Return whether REST middleware admits ``request``."""
++    from .auth import ROUTE_POLICIES, route_key_for_request
++
++    route_key = route_key_for_request(request)
++    if route_key[1] in EXECUTION_ADMITTED_PATHS:
++        return False
++    policy = ROUTE_POLICIES.get(route_key)
++    return policy is not None and policy.admission in _ADMITTED_ROUTE_CLASSES
++
++
++def release_when_settled(permit: AdmissionPermit) -> None:
++    """Release ``permit`` once the current request's accepted work settles.
++
++    Inside a throttled request the release waits for the request's tracked
++    work, so a timed-out or cancelled request whose model work still runs
++    keeps its unit. Elsewhere the permit is released immediately.
++    """
++    from .throttle import current_request_work
++
++    def release() -> None:
++        permit.release()
++
++    work = current_request_work()
++    if work is None:
++        release()
++    else:
++        work.on_finished(release)
++
++
++def _identity_digest(prefix: str, value: str) -> str:
++    digest = hmac.new(_IDENTITY_KEY, value.encode("utf-8"), hashlib.sha256)
++    return f"{prefix}:{digest.hexdigest()[:32]}"
++
++
++def _resolve_signal(signal: asyncio.Future[None]) -> None:
++    if not signal.done():
++        signal.set_result(None)
+diff --git a/openmed/service/api_compatibility.py b/openmed/service/api_compatibility.py
+index f473d61c97..8560a50201 100644
+--- a/openmed/service/api_compatibility.py
++++ b/openmed/service/api_compatibility.py
+@@ -33,6 +33,8 @@
+ # list is intentionally value-only metadata: it never contains a request,
+ # response, credential, or model payload.
+ _LEGACY_STABLE_ERROR_CATEGORIES = (
++    "admission_limited",
++    "admission_saturated",
+     "auth_rate_limited",
+     "authentication_required",
+     "backpressure",
+diff --git a/openmed/service/app.py b/openmed/service/app.py
+index 603bc6e9b9..d476f46ad8 100644
+--- a/openmed/service/app.py
++++ b/openmed/service/app.py
+@@ -45,6 +45,7 @@
+ )
+ from openmed.utils.validation import validate_model_name
+ 
++from .admission import HttpAdmission
+ from .auth import (
+     ROUTE_POLICIES,
+     ServiceAuth,
+@@ -602,6 +603,10 @@ def _attach_runtime(app: FastAPI, runtime: ServiceRuntime) -> None:
+         ),
+         limited_paths=_MODEL_BACKED_PATHS,
+     )
++    app.state.admission = HttpAdmission(
++        runtime.admission_controller,
++        error_response=_error_response,
++    )
+ 
+ 
+ def _get_service_runtime(request: Request) -> ServiceRuntime:
+@@ -1105,6 +1110,15 @@ async def metrics(request: Request) -> Response:
+                 media_type=PROMETHEUS_CONTENT_TYPE,
+             )
+ 
++    # Declared before the throttle so it runs inside it: rate limits shed first,
++    # and the request's tracked work is visible when the permit is released.
++    @app.middleware("http")
++    async def _admission_middleware(request: Request, call_next):
++        admission = getattr(request.app.state, "admission", None)
++        if admission is None:
++            return await call_next(request)
++        return await admission.dispatch(request, call_next)
++
+     @app.middleware("http")
+     async def _throttle_middleware(request: Request, call_next):
+         throttle = getattr(request.app.state, "throttle", None)
+diff --git a/openmed/service/graphql_app.py b/openmed/service/graphql_app.py
+index 27a12153cc..0575334512 100644
+--- a/openmed/service/graphql_app.py
++++ b/openmed/service/graphql_app.py
+@@ -10,7 +10,14 @@
+ from strawberry.http import GraphQLHTTPResponse
+ from strawberry.types import ExecutionResult
+ 
+-from .graphql_schema import SAFE_RESOLVER_ERROR, OpenMedGraphQLContext, schema
++from .admission import REASON_GLOBAL_LIMIT
++from .graphql_schema import (
++    ADMISSION_REJECTED_CODE,
++    ADMISSION_REJECTED_MESSAGE,
++    SAFE_RESOLVER_ERROR,
++    OpenMedGraphQLContext,
++    schema,
++)
+ from .journey_resources import JourneyAccessPolicy, JourneyResourceCatalog
+ from .runtime import ServiceRuntime
+ 
+@@ -39,6 +46,30 @@ async def process_result(
+                     }
+                 ],
+             }
++        admission_reasons = [
++            error.extensions.get("reason")
++            for error in result.errors or ()
++            if error.extensions.get("code") == ADMISSION_REJECTED_CODE
++        ]
++        if admission_reasons:
++            # Drop partial results so a rejected document is retried whole.
++            reason = (
++                REASON_GLOBAL_LIMIT
++                if REASON_GLOBAL_LIMIT in admission_reasons
++                else admission_reasons[0]
++            )
++            return {
++                "data": None,
++                "errors": [
++                    {
++                        "message": ADMISSION_REJECTED_MESSAGE,
++                        "extensions": {
++                            "code": ADMISSION_REJECTED_CODE,
++                            "reason": reason,
++                        },
++                    }
++                ],
++            }
+         response: dict[str, Any] = {"data": result.data}
+         if result.errors:
+             response["errors"] = [
+diff --git a/openmed/service/graphql_schema.py b/openmed/service/graphql_schema.py
+index a932ab76fc..fb07bd29f3 100644
+--- a/openmed/service/graphql_schema.py
++++ b/openmed/service/graphql_schema.py
+@@ -2,7 +2,8 @@
+ 
+ from __future__ import annotations
+ 
+-from collections.abc import Mapping, Sequence
++import inspect
++from collections.abc import Callable, Mapping, Sequence
+ from enum import Enum
+ from typing import Any, Optional, cast
+ 
+@@ -17,6 +18,14 @@
+ from openmed.core.policy import PolicyProfile, load_policy
+ from openmed.risk import risk_report
+ 
++from .admission import (
++    AUTH_SCOPE_KEY,
++    TRANSPORT_GRAPHQL,
++    AdmissionController,
++    AdmissionRejected,
++    AdmissionSaturated,
++    release_when_settled,
++)
+ from .auth import AuthPrincipal, scopes_satisfy
+ from .journey_resources import (
+     JourneyAccessPolicy,
+@@ -38,6 +47,11 @@
+     "journeyResources": ("journey:read",),
+     "entityTypes": (),
+ }
++# Root fields that start model or heavy work, mirroring the REST route
++# policies of ``/analyze``, ``/pii/deidentify`` and ``/v1/journey/resources``.
++GRAPHQL_ADMITTED_FIELDS = frozenset({"analyze", "deidentify", "journeyResources"})
++ADMISSION_REJECTED_CODE = "OPENMED_ADMISSION_REJECTED"
++ADMISSION_REJECTED_MESSAGE = "Request admission limit reached; retry later."
+ 
+ 
+ class FieldScopeExtension(SchemaExtension):
+@@ -72,6 +86,86 @@ def enter_field(self, node, *_):
+         yield
+ 
+ 
++class RequestAdmissionExtension(SchemaExtension):
++    """Admit each model-backed root field through the shared controller.
++
++    Every selected ``analyze``, ``deidentify`` or ``journeyResources`` field,
++    aliases included, takes one permit from the same principal budget that
++    REST requests use, so batching fields into one document cannot exceed a
++    principal's share. A rejected field fails with a value-free
++    ``OPENMED_ADMISSION_REJECTED`` error, and the HTTP response carries the
++    matching 429 or 503 status and ``Retry-After`` header.
++    """
++
++    def resolve(
++        self,
++        _next: Callable[..., Any],
++        root: Any,
++        info: Any,
++        *args: Any,
++        **kwargs: Any,
++    ) -> Any:
++        """Wrap admitted root fields; pass every other field through."""
++        if (
++            info.field_name not in GRAPHQL_ADMITTED_FIELDS
++            or info.parent_type.name != "Query"
++        ):
++            return _next(root, info, *args, **kwargs)
++        controller = getattr(
++            getattr(info.context, "runtime", None), "admission_controller", None
++        )
++        if not isinstance(controller, AdmissionController) or not controller.enabled:
++            return _next(root, info, *args, **kwargs)
++        return self._admitted(controller, _next, root, info, args, kwargs)
++
++    async def _admitted(
++        self,
++        controller: AdmissionController,
++        _next: Callable[..., Any],
++        root: Any,
++        info: Any,
++        args: tuple[Any, ...],
++        kwargs: dict[str, Any],
++    ) -> Any:
++        request = getattr(info.context, "request", None)
++        scope = getattr(request, "scope", None)
++        principal = scope.get(AUTH_SCOPE_KEY) if isinstance(scope, Mapping) else None
++        try:
++            permit = await controller.acquire(
++                controller.ticket(principal, transport=TRANSPORT_GRAPHQL)
++            )
++        except AdmissionRejected as exc:
++            _mark_admission_rejection(info.context, exc)
++            raise GraphQLError(
++                ADMISSION_REJECTED_MESSAGE,
++                extensions={"code": ADMISSION_REJECTED_CODE, "reason": exc.reason},
++            ) from None
++        settled = False
++        try:
++            result = _next(root, info, *args, **kwargs)
++            if inspect.isawaitable(result):
++                result = await result
++            settled = True
++            return result
++        finally:
++            if settled:
++                permit.release()
++            else:
++                # A failed or timed-out resolver may leave model work running;
++                # keep the unit until the request's tracked work settles.
++                release_when_settled(permit)
++
++
++def _mark_admission_rejection(context: Any, exc: AdmissionRejected) -> None:
++    response = getattr(context, "response", None)
++    if response is None:
++        return
++    # A saturated service (503) outranks a principal over its share (429).
++    if response.status_code != AdmissionSaturated.status_code:
++        response.status_code = exc.status_code
++    response.headers["Retry-After"] = exc.retry_after_header
++
++
+ class OpenMedGraphQLContext(BaseContext):
+     """Request context carrying the service's shared runtime."""
+ 
+@@ -633,7 +727,10 @@ def process_errors(
+         """Suppress Strawberry's default exception logger to protect PHI."""
+ 
+ 
+-schema = PrivacySafeSchema(query=Query, extensions=[FieldScopeExtension])
++schema = PrivacySafeSchema(
++    query=Query,
++    extensions=[FieldScopeExtension, RequestAdmissionExtension],
++)
+ 
+ 
+ async def _run_analyze(
+diff --git a/openmed/service/metrics.py b/openmed/service/metrics.py
+index 4f26b09db9..6ab696b43a 100644
+--- a/openmed/service/metrics.py
++++ b/openmed/service/metrics.py
+@@ -32,6 +32,16 @@
+ ADMISSION_SHED_NAME = "openmed_service_admission_shed_total"
+ ADMISSION_QUEUE_LABELS = frozenset({"analyze", "batch", "pii_extract"})
+ UNKNOWN_ADMISSION_QUEUE_LABEL = "other"
++PRINCIPAL_ADMISSION_INFLIGHT_NAME = "openmed_service_principal_admission_inflight"
++PRINCIPAL_ADMISSION_QUEUED_NAME = "openmed_service_principal_admission_queued"
++PRINCIPAL_ADMISSION_ACTIVE_NAME = (
++    "openmed_service_principal_admission_active_principals"
++)
++PRINCIPAL_ADMISSION_REJECTED_NAME = "openmed_service_principal_admission_rejected_total"
++PRINCIPAL_ADMISSION_REASON_LABELS = frozenset(
++    {"global_limit", "namespace_limit", "principal_limit"}
++)
++PRINCIPAL_ADMISSION_TRANSPORT_LABELS = frozenset({"graphql", "grpc", "rest"})
+ CIRCUIT_BREAKER_CLOSED_NAME = "openmed_service_circuit_breaker_closed"
+ CIRCUIT_BREAKER_OPEN_NAME = "openmed_service_circuit_breaker_open"
+ CIRCUIT_BREAKER_HALF_OPEN_NAME = "openmed_service_circuit_breaker_half_open"
+@@ -128,6 +138,10 @@ def __init__(self, duration_buckets: tuple[float, ...] | None = None) -> None:
+         self._admission_queue_shedding: dict[str, int] = {}
+         self._admission_queue_wait: dict[str, float] = {}
+         self._admission_shed_total: dict[str, int] = {}
++        self._principal_admission_inflight = 0
++        self._principal_admission_queued = 0
++        self._principal_admission_active = 0
++        self._principal_admission_rejected: dict[tuple[str, str], int] = {}
+         self._circuit_breaker_state_counts = {
+             "closed": 0,
+             "open": 0,
+@@ -315,6 +329,38 @@ def record_admission_shed(self, *, queue: str, count: int = 1) -> None:
+                 queue_label, 0
+             ) + int(count)
+ 
++    def record_principal_admission_state(
++        self,
++        *,
++        in_flight: int,
++        queued: int,
++        active_principals: int,
++    ) -> None:
++        """Set aggregate fair-admission gauges without principal identifiers."""
++        with self._lock:
++            self._principal_admission_inflight = _non_negative_int(in_flight)
++            self._principal_admission_queued = _non_negative_int(queued)
++            self._principal_admission_active = _non_negative_int(active_principals)
++
++    def record_principal_admission_rejection(
++        self,
++        *,
++        reason: str,
++        transport: str,
++        count: int = 1,
++    ) -> None:
++        """Count fair-admission rejections by static reason and transport."""
++        if count <= 0:
++            return
++        key = (
++            _closed_label(reason, PRINCIPAL_ADMISSION_REASON_LABELS),
++            _closed_label(transport, PRINCIPAL_ADMISSION_TRANSPORT_LABELS),
++        )
++        with self._lock:
++            self._principal_admission_rejected[key] = (
++                self._principal_admission_rejected.get(key, 0) + int(count)
++            )
++
+     def set_circuit_breaker_state_counts(self, counts: Mapping[str, int]) -> None:
+         """Replace aggregate circuit-breaker state gauges."""
+         with self._lock:
+@@ -424,6 +470,10 @@ def render(self) -> str:
+             admission_queue_shedding = dict(self._admission_queue_shedding)
+             admission_queue_wait = dict(self._admission_queue_wait)
+             admission_shed_total = dict(self._admission_shed_total)
++            principal_admission_inflight = self._principal_admission_inflight
++            principal_admission_queued = self._principal_admission_queued
++            principal_admission_active = self._principal_admission_active
++            principal_admission_rejected = dict(self._principal_admission_rejected)
+             circuit_breaker_state_counts = dict(self._circuit_breaker_state_counts)
+             model_resident_total = self._model_resident_total
+             model_resident_bytes = self._model_resident_bytes
+@@ -602,6 +652,42 @@ def render(self) -> str:
+             labels = _label_suffix({"queue": queue})
+             lines.append(f"{ADMISSION_SHED_NAME}{labels} {value}")
+ 
++        _append_family_header(
++            lines,
++            PRINCIPAL_ADMISSION_INFLIGHT_NAME,
++            "Requests holding a fair-admission permit across all principals.",
++            "gauge",
++        )
++        lines.append(
++            f"{PRINCIPAL_ADMISSION_INFLIGHT_NAME} {principal_admission_inflight}"
++        )
++
++        _append_family_header(
++            lines,
++            PRINCIPAL_ADMISSION_QUEUED_NAME,
++            "Requests waiting for a fair-admission permit across all principals.",
++            "gauge",
++        )
++        lines.append(f"{PRINCIPAL_ADMISSION_QUEUED_NAME} {principal_admission_queued}")
++
++        _append_family_header(
++            lines,
++            PRINCIPAL_ADMISSION_ACTIVE_NAME,
++            "Principals with admitted or waiting requests.",
++            "gauge",
++        )
++        lines.append(f"{PRINCIPAL_ADMISSION_ACTIVE_NAME} {principal_admission_active}")
++
++        _append_family_header(
++            lines,
++            PRINCIPAL_ADMISSION_REJECTED_NAME,
++            "Requests rejected by fair admission, by static reason and transport.",
++            "counter",
++        )
++        for (reason, transport), value in sorted(principal_admission_rejected.items()):
++            labels = _label_suffix({"reason": reason, "transport": transport})
++            lines.append(f"{PRINCIPAL_ADMISSION_REJECTED_NAME}{labels} {value}")
++
+         _append_family_header(
+             lines,
+             CIRCUIT_BREAKER_CLOSED_NAME,
+@@ -864,6 +950,13 @@ def _admission_queue_label(value: object) -> str:
+     return UNKNOWN_ADMISSION_QUEUE_LABEL
+ 
+ 
++def _closed_label(value: object, allowed: frozenset[str]) -> str:
++    normalized = str(value).strip().casefold()
++    if normalized in allowed:
++        return normalized
++    return UNKNOWN_ADMISSION_QUEUE_LABEL
++
++
+ def _non_negative_int(value: object) -> int:
+     try:
+         parsed = int(value)  # type: ignore[arg-type]
+diff --git a/openmed/service/runtime.py b/openmed/service/runtime.py
+index b75a46aa29..5a91a95228 100644
+--- a/openmed/service/runtime.py
++++ b/openmed/service/runtime.py
+@@ -13,6 +13,21 @@
+ from openmed.mlx.lm import PagedKVCacheConfig
+ from openmed.utils.validation import validate_batch_size, validate_model_name
+ 
++from .admission import (
++    ADMISSION_MAX_CONCURRENCY_ENV_VAR,
++    ADMISSION_MAX_QUEUE_ENV_VAR,
++    ADMISSION_NAMESPACE_CLAIM_ENV_VAR,
++    ADMISSION_NAMESPACE_MAX_CONCURRENCY_ENV_VAR,
++    ADMISSION_NAMESPACE_MAX_QUEUE_ENV_VAR,
++    ADMISSION_PRINCIPAL_MAX_CONCURRENCY_ENV_VAR,
++    ADMISSION_PRINCIPAL_MAX_QUEUE_ENV_VAR,
++    ADMISSION_QUEUE_TIMEOUT_ENV_VAR,
++    ADMISSION_RETRY_AFTER_ENV_VAR,
++    DEFAULT_ADMISSION_QUEUE_TIMEOUT_SECONDS,
++    DEFAULT_ADMISSION_RETRY_AFTER_SECONDS,
++    AdmissionConfig,
++    AdmissionController,
++)
+ from .keep_alive import parse_keep_alive
+ from .resilience import ResilienceManager, ServiceResilienceConfig
+ from .warm_pool import (
+@@ -119,6 +134,7 @@
+     "gi": 1024**3,
+     "gib": 1024**3,
+ }
++_ADMISSION_CLAIM_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+ _THROTTLE_KEY_ALIASES = {
+     "global": "global",
+     "process": "global",
+@@ -612,6 +628,51 @@ def parse_service_coalescing_config() -> ServiceCoalescingConfig:
+     )
+ 
+ 
++def parse_service_admission_config() -> AdmissionConfig:
++    """Read fair request-admission ceilings from the current environment."""
++    ceilings = {
++        name: _parse_non_negative_int(
++            os.getenv(env_var),
++            env_var=env_var,
++            default=0,
++        )
++        for name, env_var in (
++            ("max_concurrency", ADMISSION_MAX_CONCURRENCY_ENV_VAR),
++            ("max_queue", ADMISSION_MAX_QUEUE_ENV_VAR),
++            ("principal_max_concurrency", ADMISSION_PRINCIPAL_MAX_CONCURRENCY_ENV_VAR),
++            ("principal_max_queue", ADMISSION_PRINCIPAL_MAX_QUEUE_ENV_VAR),
++            ("namespace_max_concurrency", ADMISSION_NAMESPACE_MAX_CONCURRENCY_ENV_VAR),
++            ("namespace_max_queue", ADMISSION_NAMESPACE_MAX_QUEUE_ENV_VAR),
++        )
++    }
++    waits = {}
++    for name, env_var, default in (
++        (
++            "queue_timeout_seconds",
++            ADMISSION_QUEUE_TIMEOUT_ENV_VAR,
++            DEFAULT_ADMISSION_QUEUE_TIMEOUT_SECONDS,
++        ),
++        (
++            "retry_after_seconds",
++            ADMISSION_RETRY_AFTER_ENV_VAR,
++            DEFAULT_ADMISSION_RETRY_AFTER_SECONDS,
++        ),
++    ):
++        value = _parse_non_negative_float(
++            os.getenv(env_var), env_var=env_var, default=default
++        )
++        if not 0 < value < float("inf"):
++            raise ValueError(f"{env_var} must be a positive finite number")
++        waits[name] = value
++    claim = (os.getenv(ADMISSION_NAMESPACE_CLAIM_ENV_VAR) or "").strip() or None
++    if claim is not None and _ADMISSION_CLAIM_PATTERN.fullmatch(claim) is None:
++        raise ValueError(
++            f"{ADMISSION_NAMESPACE_CLAIM_ENV_VAR} must be a claim name of at most "
++            "64 letters, digits, '_', '-', '.' or ':'"
++        )
++    return AdmissionConfig(**ceilings, namespace_claim=claim, **waits)
++
++
+ def parse_service_mlx_paged_kv_cache_config() -> PagedKVCacheConfig | None:
+     """Read optional MLX-LM paged KV-cache settings from the environment."""
+     budget_bytes = parse_memory_budget_bytes(
+@@ -746,6 +807,7 @@ class ServiceRuntime:
+     batching: ServiceBatchingConfig = field(default_factory=ServiceBatchingConfig)
+     coalescing: ServiceCoalescingConfig = field(default_factory=ServiceCoalescingConfig)
+     throttle: ServiceThrottleConfig = field(default_factory=ServiceThrottleConfig)
++    admission: AdmissionConfig = field(default_factory=AdmissionConfig, kw_only=True)
+     paged_kv_cache: PagedKVCacheConfig | None = None
+     resilience_config: ServiceResilienceConfig = field(
+         default_factory=ServiceResilienceConfig
+@@ -761,6 +823,11 @@ class ServiceRuntime:
+         init=False,
+         repr=False,
+     )
++    _admission_controller: Optional[AdmissionController] = field(
++        default=None,
++        init=False,
++        repr=False,
++    )
+ 
+     metrics: Optional[Any] = None
+ 
+@@ -794,6 +861,7 @@ def from_env(cls, *, metrics: Optional[Any] = None) -> "ServiceRuntime":
+         batching = parse_service_batching_config()
+         coalescing = parse_service_coalescing_config()
+         throttle = parse_service_throttle_config()
++        admission = parse_service_admission_config()
+         paged_kv_cache = parse_service_mlx_paged_kv_cache_config()
+         resilience_config = parse_service_resilience_config()
+         return cls(
+@@ -820,6 +888,7 @@ def from_env(cls, *, metrics: Optional[Any] = None) -> "ServiceRuntime":
+             batching=batching,
+             coalescing=coalescing,
+             throttle=throttle,
++            admission=admission,
+             paged_kv_cache=paged_kv_cache,
+             resilience_config=resilience_config,
+             _loader_factory=ModelLoader,
+@@ -856,6 +925,22 @@ def get_loader(self) -> WarmPool:
+                     )
+         return self._warm_pool
+ 
++    @property
++    def admission_controller(self) -> AdmissionController:
++        """Return the fair-admission controller shared by every transport.
++
++        REST, GraphQL and any other transport given this runtime draw on one
++        principal, namespace and global budget.
++        """
++        if self._admission_controller is None:
++            with self._loader_lock:
++                if self._admission_controller is None:
++                    self._admission_controller = AdmissionController(
++                        self.admission,
++                        metrics=self.metrics,
++                    )
++        return self._admission_controller
++
+     def get_resilience(self) -> ResilienceManager:
+         """Return the shared retry and circuit-breaker manager."""
+         if self._resilience is None:
+diff --git a/tests/integration/service/test_fair_admission_transports.py b/tests/integration/service/test_fair_admission_transports.py
+new file mode 100644
+index 0000000000..c825e642e7
+--- /dev/null
++++ b/tests/integration/service/test_fair_admission_transports.py
+@@ -0,0 +1,457 @@
++"""Fair admission shared by REST and GraphQL on one service runtime."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import threading
++from datetime import datetime
++from typing import Any
++
++import httpx
++import pytest
++
++import openmed
++from openmed.processing.outputs import PredictionResult
++from openmed.service import runtime as service_runtime
++from openmed.service.admission import AdmissionStats
++from openmed.service.app import create_app
++from openmed.service.auth import hash_api_key
++
++pytestmark = pytest.mark.integration
++
++LOOPBACK_BASE_URL = "http://127.0.0.1"
++# Bounds waits on worker threads and queue transitions; passing runs return
++# as soon as the awaited state is reached.
++_WAIT_SECONDS = 5
++_API_KEYS = {"noisy": "synthetic-noisy-key", "quiet": "synthetic-quiet-key"}
++_PRINCIPALS = {
++    "noisy": "SYNTHETIC_NOISY_PRINCIPAL",
++    "quiet": "SYNTHETIC_QUIET_PRINCIPAL",
++}
++_ANALYZE_QUERY_FIELD = "f{index}: analyze(input: $i{index}) {{ modelName }}"
++_SERVICE_ENV_VARS = (
++    "OPENMED_SERVICE_PRELOAD_MODELS",
++    "OPENMED_SERVICE_KEEP_ALIVE",
++    "OPENMED_SERVICE_MAX_RESIDENT_MODELS",
++    "OPENMED_SERVICE_MODEL_MEMORY_BUDGET_BYTES",
++    "OPENMED_SERVICE_DEFAULT_MODEL_FOOTPRINT_BYTES",
++    "OPENMED_SERVICE_MODEL_ADMISSION_WAIT_SECONDS",
++    "OPENMED_SERVICE_MAX_TEXT_LENGTH",
++    "OPENMED_SERVICE_CORS_ORIGINS",
++    "OPENMED_SERVICE_TRUSTED_HOSTS",
++    "OPENMED_SERVICE_BATCHING_ENABLED",
++    "OPENMED_SERVICE_COALESCING_ENABLED",
++    "OPENMED_SERVICE_RATE_LIMIT_RPS",
++    "OPENMED_SERVICE_RATE_LIMIT_BURST",
++    "OPENMED_SERVICE_RATE_LIMIT_MAX_CONCURRENCY",
++    "OPENMED_SERVICE_THROTTLE_KEY",
++    "OPENMED_SERVICE_CONCURRENCY_WAIT_SECONDS",
++    "OPENMED_SERVICE_RETRY_MAX_ATTEMPTS",
++    "OPENMED_SERVICE_AUTH_JWKS",
++    "OPENMED_SERVICE_AUTH_JWKS_FILE",
++    "OPENMED_SERVICE_AUTH_ROUTE_SCOPES",
++    "OPENMED_SERVICE_MTLS_ENABLED",
++    "OPENMED_SERVICE_ADMISSION_MAX_CONCURRENCY",
++    "OPENMED_SERVICE_ADMISSION_MAX_QUEUE",
++    "OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_CONCURRENCY",
++    "OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_QUEUE",
++    "OPENMED_SERVICE_ADMISSION_NAMESPACE_MAX_CONCURRENCY",
++    "OPENMED_SERVICE_ADMISSION_NAMESPACE_MAX_QUEUE",
++    "OPENMED_SERVICE_ADMISSION_NAMESPACE_CLAIM",
++    "OPENMED_SERVICE_ADMISSION_QUEUE_TIMEOUT_SECONDS",
++    "OPENMED_SERVICE_ADMISSION_RETRY_AFTER_SECONDS",
++)
++
++
++class FakeLoader:
++    """Model loader double; the analyze function below does the work."""
++
++    def __init__(self, config: Any) -> None:
++        self.config = config
++
++    def resolve_model_name(self, model_name: str) -> str:
++        return model_name
++
++    def create_pipeline(self, model_name: str, **_: Any) -> object:
++        del model_name
++        return object()
++
++    def loaded_models(self) -> dict[str, Any]:
++        return {}
++
++
++class GatedModel:
++    """Deterministic fake work that blocks selected synthetic inputs."""
++
++    def __init__(self) -> None:
++        self.calls: list[str] = []
++        self._lock = threading.Lock()
++        self._gates: dict[str, threading.Event] = {}
++        self._started: dict[str, threading.Event] = {}
++
++    def hold(self, *texts: str) -> None:
++        for text in texts:
++            self._gates[text] = threading.Event()
++            self._started[text] = threading.Event()
++
++    async def started(self, text: str) -> None:
++        assert await asyncio.to_thread(self._started[text].wait, _WAIT_SECONDS)
++
++    def release(self, text: str) -> None:
++        self._gates[text].set()
++
++    def release_all(self) -> None:
++        for gate in self._gates.values():
++            gate.set()
++
++    def __call__(self, text: str, **_: Any) -> PredictionResult:
++        with self._lock:
++            self.calls.append(text)
++        if text in self._started:
++            self._started[text].set()
++            assert self._gates[text].wait(_WAIT_SECONDS)
++        return PredictionResult(
++            text=text,
++            entities=[],
++            model_name="disease_detection_superclinical",
++            timestamp=datetime.now().isoformat(),
++            processing_time=0.01,
++        )
++
++
++@pytest.fixture(autouse=True)
++def service_env(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("OPENMED_PROFILE", "test")
++    for name in _SERVICE_ENV_VARS:
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.setattr(service_runtime, "ModelLoader", FakeLoader)
++    monkeypatch.setenv("OPENMED_SERVICE_METRICS_ENABLED", "true")
++    monkeypatch.setenv("OPENMED_SERVICE_AUTH_ENABLED", "true")
++    monkeypatch.setenv(
++        "OPENMED_SERVICE_AUTH_API_KEYS",
++        json.dumps(
++            [
++                {
++                    "key_id": name,
++                    "key_hash": hash_api_key(_API_KEYS[name]),
++                    "principal": _PRINCIPALS[name],
++                    "scopes": ["analyze:*"],
++                }
++                for name in ("noisy", "quiet")
++            ]
++        ),
++    )
++
++
++@pytest.fixture
++def model(monkeypatch: pytest.MonkeyPatch) -> GatedModel:
++    gated = GatedModel()
++    monkeypatch.setattr(openmed, "analyze_text", gated)
++    return gated
++
++
++def _headers(who: str) -> dict[str, str]:
++    return {"X-API-Key": _API_KEYS[who]}
++
++
++async def _rest(client: httpx.AsyncClient, who: str, text: str) -> httpx.Response:
++    return await client.post("/analyze", json={"text": text}, headers=_headers(who))
++
++
++async def _graphql(client: httpx.AsyncClient, who: str, *texts: str) -> httpx.Response:
++    variables = ", ".join(f"$i{index}: AnalyzeInput!" for index in range(len(texts)))
++    fields = " ".join(
++        _ANALYZE_QUERY_FIELD.format(index=index) for index in range(len(texts))
++    )
++    return await client.post(
++        "/graphql",
++        json={
++            "query": f"query({variables}) {{ {fields} }}",
++            "variables": {
++                f"i{index}": {"text": text} for index, text in enumerate(texts)
++            },
++        },
++        headers=_headers(who),
++    )
++
++
++def _assert_rest_rejection(
++    response: httpx.Response, status: int, code: str, reason: str
++) -> None:
++    assert response.status_code == status
++    assert response.headers["Retry-After"] == "1"
++    error = response.json()["error"]
++    assert error["code"] == code
++    assert error["details"] == {"reason": reason, "retry_after_seconds": 1.0}
++
++
++def _assert_graphql_rejection(
++    response: httpx.Response, status: int, reason: str
++) -> None:
++    assert response.status_code == status
++    assert response.headers["Retry-After"] == "1"
++    assert response.json() == {
++        "data": None,
++        "errors": [
++            {
++                "message": "Request admission limit reached; retry later.",
++                "extensions": {
++                    "code": "OPENMED_ADMISSION_REJECTED",
++                    "reason": reason,
++                },
++            }
++        ],
++    }
++
++
++async def _until(predicate: Any) -> None:
++    async def poll() -> None:
++        while not predicate():
++            await asyncio.sleep(0.001)
++
++    await asyncio.wait_for(poll(), _WAIT_SECONDS)
++
++
++def _run(app: Any, scenario: Any) -> None:
++    async def main() -> None:
++        async with app.router.lifespan_context(app):
++            app.state.runtime.config.timeout = 0
++            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
++            async with httpx.AsyncClient(
++                transport=transport, base_url=LOOPBACK_BASE_URL
++            ) as client:
++                await scenario(client, app.state.runtime.admission_controller)
++
++    asyncio.run(main())
++
++
++def test_admission_is_off_unless_configured(model: GatedModel) -> None:
++    app = create_app()
++
++    async def scenario(client: httpx.AsyncClient, controller: Any) -> None:
++        assert controller.enabled is False
++        assert (await _rest(client, "noisy", "plain")).status_code == 200
++        assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++    _run(app, scenario)
++    assert model.calls == ["plain"]
++
++
++def test_rest_and_graphql_draw_on_one_principal_budget(
++    monkeypatch: pytest.MonkeyPatch, model: GatedModel
++) -> None:
++    monkeypatch.setenv("OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_CONCURRENCY", "1")
++    model.hold("held-rest")
++    app = create_app()
++
++    async def scenario(client: httpx.AsyncClient, controller: Any) -> None:
++        held = asyncio.create_task(_rest(client, "noisy", "held-rest"))
++        try:
++            await model.started("held-rest")
++
++            _assert_graphql_rejection(
++                await _graphql(client, "noisy", "noisy-graphql"),
++                429,
++                "principal_limit",
++            )
++            _assert_rest_rejection(
++                await _rest(client, "noisy", "noisy-rest"),
++                429,
++                "admission_limited",
++                "principal_limit",
++            )
++            quiet_graphql = await _graphql(client, "quiet", "quiet-graphql")
++            assert quiet_graphql.status_code == 200
++            assert "errors" not in quiet_graphql.json()
++            assert (await _rest(client, "quiet", "quiet-rest")).status_code == 200
++            catalog = await client.post(
++                "/graphql",
++                json={"query": "{ entityTypes { label } }"},
++                headers=_headers("noisy"),
++            )
++            assert catalog.status_code == 200
++            assert "errors" not in catalog.json()
++        finally:
++            model.release_all()
++        assert (await held).status_code == 200
++        await _until(lambda: controller.snapshot() == AdmissionStats(0, 0, 0))
++
++        recovered = await _graphql(client, "noisy", "noisy-after")
++        assert recovered.status_code == 200
++        assert "errors" not in recovered.json()
++
++        metrics = (await client.get("/metrics")).text
++        assert (
++            "openmed_service_principal_admission_rejected_total"
++            '{reason="principal_limit",transport="graphql"} 1'
++        ) in metrics
++        assert (
++            "openmed_service_principal_admission_rejected_total"
++            '{reason="principal_limit",transport="rest"} 1'
++        ) in metrics
++        assert "SYNTHETIC" not in metrics
++
++    _run(app, scenario)
++    assert model.calls == ["held-rest", "quiet-graphql", "quiet-rest", "noisy-after"]
++
++
++def test_each_graphql_field_takes_a_unit_of_the_rest_budget(
++    monkeypatch: pytest.MonkeyPatch, model: GatedModel
++) -> None:
++    monkeypatch.setenv("OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_CONCURRENCY", "2")
++    model.hold("held-a", "held-b")
++    app = create_app()
++
++    async def scenario(client: httpx.AsyncClient, controller: Any) -> None:
++        held = asyncio.create_task(_graphql(client, "noisy", "held-a", "held-b"))
++        try:
++            await model.started("held-a")
++            await model.started("held-b")
++            assert controller.snapshot().in_flight == 2
++            _assert_rest_rejection(
++                await _rest(client, "noisy", "over-share"),
++                429,
++                "admission_limited",
++                "principal_limit",
++            )
++            assert (await _rest(client, "quiet", "quiet-rest")).status_code == 200
++        finally:
++            model.release_all()
++        response = await held
++        assert response.status_code == 200
++        assert set(response.json()["data"]) == {"f0", "f1"}
++        await _until(lambda: controller.snapshot() == AdmissionStats(0, 0, 0))
++
++        # Batching more model fields than the share into one document is
++        # rejected as a whole instead of slipping past the ceiling.
++        _assert_graphql_rejection(
++            await _graphql(client, "noisy", "batch-0", "batch-1", "batch-2"),
++            429,
++            "principal_limit",
++        )
++        await _until(lambda: controller.snapshot() == AdmissionStats(0, 0, 0))
++
++    _run(app, scenario)
++    assert "over-share" not in model.calls
++    assert "batch-2" not in model.calls
++
++
++def test_global_cap_returns_503_on_every_transport(
++    monkeypatch: pytest.MonkeyPatch, model: GatedModel
++) -> None:
++    monkeypatch.setenv("OPENMED_SERVICE_ADMISSION_MAX_CONCURRENCY", "1")
++    model.hold("held")
++    app = create_app()
++
++    async def scenario(client: httpx.AsyncClient, controller: Any) -> None:
++        held = asyncio.create_task(_rest(client, "noisy", "held"))
++        try:
++            await model.started("held")
++            _assert_rest_rejection(
++                await _rest(client, "quiet", "quiet-rest"),
++                503,
++                "admission_saturated",
++                "global_limit",
++            )
++            _assert_graphql_rejection(
++                await _graphql(client, "quiet", "quiet-graphql"),
++                503,
++                "global_limit",
++            )
++        finally:
++            model.release_all()
++        assert (await held).status_code == 200
++        await _until(lambda: controller.snapshot() == AdmissionStats(0, 0, 0))
++
++    _run(app, scenario)
++    assert model.calls == ["held"]
++
++
++def test_fair_queue_serves_a_quiet_principal_before_a_noisy_backlog(
++    monkeypatch: pytest.MonkeyPatch, model: GatedModel
++) -> None:
++    for name, value in (
++        ("OPENMED_SERVICE_ADMISSION_MAX_CONCURRENCY", "1"),
++        ("OPENMED_SERVICE_ADMISSION_MAX_QUEUE", "4"),
++        ("OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_CONCURRENCY", "1"),
++        ("OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_QUEUE", "3"),
++        ("OPENMED_SERVICE_ADMISSION_QUEUE_TIMEOUT_SECONDS", "30"),
++    ):
++        monkeypatch.setenv(name, value)
++    model.hold("noisy-1", "noisy-2", "noisy-3", "quiet-1")
++    app = create_app()
++
++    async def scenario(client: httpx.AsyncClient, controller: Any) -> None:
++        requests = [asyncio.create_task(_rest(client, "noisy", "noisy-1"))]
++        try:
++            await model.started("noisy-1")
++            # Arrivals across both transports: two noisy requests queue before
++            # the quiet one.
++            for queued, request in enumerate(
++                (
++                    _rest(client, "noisy", "noisy-2"),
++                    _graphql(client, "noisy", "noisy-3"),
++                    _graphql(client, "quiet", "quiet-1"),
++                ),
++                start=1,
++            ):
++                requests.append(asyncio.create_task(request))
++                await _until(lambda q=queued: controller.snapshot().queued == q)
++
++            for current, following in (
++                ("noisy-1", "noisy-2"),
++                ("noisy-2", "quiet-1"),
++                ("quiet-1", "noisy-3"),
++            ):
++                model.release(current)
++                await model.started(following)
++        finally:
++            model.release_all()
++        responses = await asyncio.gather(*requests)
++        assert [response.status_code for response in responses] == [200] * 4
++        await _until(lambda: controller.snapshot() == AdmissionStats(0, 0, 0))
++
++    _run(app, scenario)
++    # FIFO would run noisy-3 before quiet-1.
++    assert model.calls == ["noisy-1", "noisy-2", "quiet-1", "noisy-3"]
++
++
++def test_cancelled_requests_release_permits_once_work_settles(
++    monkeypatch: pytest.MonkeyPatch, model: GatedModel
++) -> None:
++    for name, value in (
++        ("OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_CONCURRENCY", "1"),
++        ("OPENMED_SERVICE_ADMISSION_PRINCIPAL_MAX_QUEUE", "1"),
++        ("OPENMED_SERVICE_ADMISSION_QUEUE_TIMEOUT_SECONDS", "30"),
++    ):
++        monkeypatch.setenv(name, value)
++    model.hold("held")
++    app = create_app()
++
++    async def scenario(client: httpx.AsyncClient, controller: Any) -> None:
++        held = asyncio.create_task(_rest(client, "noisy", "held"))
++        try:
++            await model.started("held")
++            queued = asyncio.create_task(_rest(client, "noisy", "queued"))
++            await _until(lambda: controller.snapshot().queued == 1)
++
++            queued.cancel()
++            with pytest.raises(asyncio.CancelledError):
++                await queued
++            await _until(lambda: controller.snapshot() == AdmissionStats(1, 0, 1))
++
++            # Cancelling the HTTP wait leaves the model running; its unit stays
++            # taken until that work settles.
++            held.cancel()
++            with pytest.raises(asyncio.CancelledError):
++                await held
++            assert controller.snapshot() == AdmissionStats(1, 0, 1)
++        finally:
++            model.release_all()
++        await _until(lambda: controller.snapshot() == AdmissionStats(0, 0, 0))
++        assert (await _rest(client, "noisy", "after")).status_code == 200
++        await _until(lambda: controller.snapshot() == AdmissionStats(0, 0, 0))
++
++    _run(app, scenario)
++    assert model.calls == ["held", "after"]
+diff --git a/tests/unit/service/test_fair_admission.py b/tests/unit/service/test_fair_admission.py
+new file mode 100644
+index 0000000000..15c920f331
+--- /dev/null
++++ b/tests/unit/service/test_fair_admission.py
+@@ -0,0 +1,674 @@
++"""Unit tests for fair, bounded principal admission."""
++
++from __future__ import annotations
++
++import asyncio
++import threading
++from dataclasses import dataclass, field
++from typing import Any
++
++import pytest
++
++from openmed.service.admission import (
++    ADMISSION_MAX_CONCURRENCY_ENV_VAR,
++    ADMISSION_MAX_QUEUE_ENV_VAR,
++    ADMISSION_NAMESPACE_CLAIM_ENV_VAR,
++    ADMISSION_NAMESPACE_MAX_CONCURRENCY_ENV_VAR,
++    ADMISSION_NAMESPACE_MAX_QUEUE_ENV_VAR,
++    ADMISSION_PRINCIPAL_MAX_CONCURRENCY_ENV_VAR,
++    ADMISSION_PRINCIPAL_MAX_QUEUE_ENV_VAR,
++    ADMISSION_QUEUE_TIMEOUT_ENV_VAR,
++    ADMISSION_RETRY_AFTER_ENV_VAR,
++    ANONYMOUS_PRINCIPAL,
++    AdmissionCancelled,
++    AdmissionConfig,
++    AdmissionController,
++    AdmissionPermit,
++    AdmissionSaturated,
++    AdmissionStats,
++    AdmissionTicket,
++    PrincipalAdmissionLimited,
++)
++from openmed.service.metrics import PrometheusMetricsRegistry
++from openmed.service.runtime import ServiceRuntime, parse_service_admission_config
++
++_ADMISSION_ENV_VARS = (
++    ADMISSION_MAX_CONCURRENCY_ENV_VAR,
++    ADMISSION_MAX_QUEUE_ENV_VAR,
++    ADMISSION_PRINCIPAL_MAX_CONCURRENCY_ENV_VAR,
++    ADMISSION_PRINCIPAL_MAX_QUEUE_ENV_VAR,
++    ADMISSION_NAMESPACE_MAX_CONCURRENCY_ENV_VAR,
++    ADMISSION_NAMESPACE_MAX_QUEUE_ENV_VAR,
++    ADMISSION_NAMESPACE_CLAIM_ENV_VAR,
++    ADMISSION_QUEUE_TIMEOUT_ENV_VAR,
++    ADMISSION_RETRY_AFTER_ENV_VAR,
++)
++# Waits in these tests end by explicit release; the timeout only bounds a hang.
++_LONG_WAIT = 30.0
++
++
++@dataclass(frozen=True)
++class _Principal:
++    subject: str
++    claims: dict[str, Any] = field(default_factory=dict)
++
++
++def _ticket(
++    subject: str | None,
++    *,
++    namespace: str | None = None,
++    transport: str = "rest",
++) -> AdmissionTicket:
++    principal = None
++    if subject is not None:
++        principal = _Principal(subject, {"tenant": namespace} if namespace else {})
++    return AdmissionTicket.for_principal(
++        principal, transport=transport, namespace_claim="tenant"
++    )
++
++
++async def _spin(turns: int = 10) -> None:
++    for _ in range(turns):
++        await asyncio.sleep(0)
++
++
++@pytest.fixture(autouse=True)
++def clean_admission_env(monkeypatch: pytest.MonkeyPatch) -> None:
++    for name in _ADMISSION_ENV_VARS:
++        monkeypatch.delenv(name, raising=False)
++
++
++def test_admission_is_disabled_by_default() -> None:
++    config = parse_service_admission_config()
++    controller = AdmissionController(config)
++
++    permit = asyncio.run(controller.acquire(_ticket("svc-a")))
++
++    assert config == AdmissionConfig()
++    assert controller.enabled is False
++    assert permit.release() is True
++    assert permit.release() is False
++    assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++
++def test_admission_config_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
++    for name, value in (
++        (ADMISSION_MAX_CONCURRENCY_ENV_VAR, "8"),
++        (ADMISSION_MAX_QUEUE_ENV_VAR, "16"),
++        (ADMISSION_PRINCIPAL_MAX_CONCURRENCY_ENV_VAR, "2"),
++        (ADMISSION_PRINCIPAL_MAX_QUEUE_ENV_VAR, "4"),
++        (ADMISSION_NAMESPACE_MAX_CONCURRENCY_ENV_VAR, "4"),
++        (ADMISSION_NAMESPACE_MAX_QUEUE_ENV_VAR, "6"),
++        (ADMISSION_NAMESPACE_CLAIM_ENV_VAR, " tenant "),
++        (ADMISSION_QUEUE_TIMEOUT_ENV_VAR, "2.5"),
++        (ADMISSION_RETRY_AFTER_ENV_VAR, "3"),
++    ):
++        monkeypatch.setenv(name, value)
++
++    config = parse_service_admission_config()
++    runtime = ServiceRuntime.from_env()
++
++    assert config == AdmissionConfig(
++        max_concurrency=8,
++        max_queue=16,
++        principal_max_concurrency=2,
++        principal_max_queue=4,
++        namespace_max_concurrency=4,
++        namespace_max_queue=6,
++        namespace_claim="tenant",
++        queue_timeout_seconds=2.5,
++        retry_after_seconds=3.0,
++    )
++    assert config.enabled and config.namespaces_enabled
++    assert runtime.admission == config
++    assert runtime.admission_controller is runtime.admission_controller
++    assert runtime.admission_controller.config == config
++
++
++@pytest.mark.parametrize(
++    ("env_var", "raw_value"),
++    [
++        (ADMISSION_PRINCIPAL_MAX_CONCURRENCY_ENV_VAR, "-1"),
++        (ADMISSION_MAX_QUEUE_ENV_VAR, "SYNTHETIC_SECRET_VALUE"),
++        (ADMISSION_QUEUE_TIMEOUT_ENV_VAR, "0"),
++        (ADMISSION_RETRY_AFTER_ENV_VAR, "inf"),
++        (ADMISSION_NAMESPACE_CLAIM_ENV_VAR, "SYNTHETIC SECRET claim!"),
++    ],
++)
++def test_invalid_admission_env_is_rejected_without_echoing_values(
++    monkeypatch: pytest.MonkeyPatch, env_var: str, raw_value: str
++) -> None:
++    monkeypatch.setenv(env_var, raw_value)
++
++    with pytest.raises(ValueError) as excinfo:
++        parse_service_admission_config()
++
++    assert env_var in str(excinfo.value)
++    assert raw_value.strip() not in str(excinfo.value)
++
++
++def test_tickets_use_opaque_keys_and_pool_anonymous_callers() -> None:
++    first = _ticket("SYNTHETIC_PRINCIPAL_SUBJECT", namespace="SYNTHETIC_TENANT")
++    second = _ticket("SYNTHETIC_PRINCIPAL_SUBJECT", namespace="SYNTHETIC_TENANT")
++    other = _ticket("another-subject")
++    literal = _ticket(ANONYMOUS_PRINCIPAL)
++
++    assert first == second
++    assert first.principal != other.principal
++    assert "SYNTHETIC" not in repr(first)
++    assert first.namespace is not None and first.namespace.startswith("n:")
++    assert _ticket(None) == _ticket("") == AdmissionTicket(transport="rest")
++    assert _ticket(None).principal == ANONYMOUS_PRINCIPAL
++    assert literal.principal != ANONYMOUS_PRINCIPAL
++    assert _ticket("svc", transport="soap").transport == "other"
++    assert (
++        AdmissionTicket.for_principal(
++            _Principal("svc", {"tenant": "x" * 129}),
++            transport="grpc",
++            namespace_claim="tenant",
++        ).namespace
++        is None
++    )
++
++
++def test_anonymous_callers_share_one_bucket() -> None:
++    controller = AdmissionController(AdmissionConfig(principal_max_concurrency=1))
++
++    async def scenario() -> None:
++        held = await controller.acquire(_ticket(None))
++        with pytest.raises(PrincipalAdmissionLimited):
++            await controller.acquire(_ticket(""))
++        named = await controller.acquire(_ticket("svc-a"))
++        assert controller.snapshot() == AdmissionStats(2, 0, 2)
++        held.release()
++        named.release()
++
++    asyncio.run(scenario())
++    assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++
++def test_noisy_neighbour_cannot_take_a_quiet_principals_headroom() -> None:
++    controller = AdmissionController(
++        AdmissionConfig(
++            max_concurrency=4,
++            max_queue=8,
++            principal_max_concurrency=2,
++            principal_max_queue=2,
++            queue_timeout_seconds=_LONG_WAIT,
++        )
++    )
++    noisy, quiet = _ticket("noisy"), _ticket("quiet")
++
++    async def scenario() -> None:
++        held = [await controller.acquire(noisy) for _ in range(2)]
++        queued = [asyncio.create_task(controller.acquire(noisy)) for _ in range(2)]
++        await _spin()
++        with pytest.raises(PrincipalAdmissionLimited) as excinfo:
++            await controller.acquire(noisy)
++        assert excinfo.value.status_code == 429
++        assert excinfo.value.reason == "principal_limit"
++
++        quiet_permit = await controller.acquire(quiet)
++        assert controller.snapshot() == AdmissionStats(3, 2, 2)
++
++        quiet_permit.release()
++        for permit in held:
++            permit.release()
++        for permit in await asyncio.gather(*queued):
++            permit.release()
++
++    asyncio.run(scenario())
++    assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++
++def test_round_robin_bounds_how_long_a_queued_principal_waits() -> None:
++    controller = AdmissionController(
++        AdmissionConfig(
++            max_concurrency=1,
++            max_queue=16,
++            principal_max_concurrency=1,
++            principal_max_queue=8,
++            queue_timeout_seconds=_LONG_WAIT,
++        )
++    )
++    order: list[str] = []
++
++    async def wait_for(name: str) -> AdmissionPermit:
++        permit = await controller.acquire(_ticket(name.split("-")[0]))
++        order.append(name)
++        return permit
++
++    async def scenario() -> None:
++        current = await controller.acquire(_ticket("noisy"))
++        tasks = [asyncio.create_task(wait_for(f"noisy-{index}")) for index in range(6)]
++        await _spin()
++        tasks += [asyncio.create_task(wait_for(name)) for name in ("quiet", "calm")]
++        await _spin()
++        assert controller.snapshot().queued == 8
++
++        for _ in range(len(tasks)):
++            granted = len(order)
++            current.release()
++            await _spin()
++            assert len(order) == granted + 1
++            current = next(
++                task.result()
++                for task in tasks
++                if task.done() and not task.result().released
++            )
++        current.release()
++
++    asyncio.run(scenario())
++
++    # FIFO would serve all six noisy requests first. Rotation serves each
++    # waiting principal within (principals waiting - 1) grants.
++    assert order[:3] == ["noisy-0", "quiet", "calm"]
++    assert order[3:] == [f"noisy-{index}" for index in range(1, 6)]
++    assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++
++def test_queue_bounds_reject_over_share_with_429_and_saturation_with_503() -> None:
++    controller = AdmissionController(
++        AdmissionConfig(
++            max_concurrency=2,
++            max_queue=2,
++            principal_max_concurrency=2,
++            principal_max_queue=2,
++            queue_timeout_seconds=_LONG_WAIT,
++            retry_after_seconds=1.5,
++        )
++    )
++    noisy, quiet = _ticket("noisy"), _ticket("quiet")
++
++    async def scenario() -> None:
++        held = [await controller.acquire(noisy) for _ in range(2)]
++        queued = [asyncio.create_task(controller.acquire(noisy)) for _ in range(2)]
++        await _spin()
++
++        with pytest.raises(PrincipalAdmissionLimited) as over_share:
++            await controller.acquire(noisy)
++        with pytest.raises(AdmissionSaturated) as saturated:
++            await controller.acquire(quiet)
++
++        assert over_share.value.to_details() == {
++            "reason": "principal_limit",
++            "retry_after_seconds": 1.5,
++        }
++        assert saturated.value.status_code == 503
++        assert saturated.value.error_code == "admission_saturated"
++        assert saturated.value.to_details() == {
++            "reason": "global_limit",
++            "retry_after_seconds": 1.5,
++        }
++        assert saturated.value.retry_after_header == "2"
++        assert controller.snapshot() == AdmissionStats(2, 2, 1)
++
++        for permit in held:
++            permit.release()
++        for permit in await asyncio.gather(*queued):
++            permit.release()
++
++    asyncio.run(scenario())
++    assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++
++def test_namespace_ceiling_is_shared_by_its_principals_only() -> None:
++    controller = AdmissionController(
++        AdmissionConfig(
++            principal_max_concurrency=2,
++            namespace_max_concurrency=2,
++            namespace_claim="tenant",
++        )
++    )
++    first = _ticket("a1", namespace="tenant-a")
++    second = _ticket("a2", namespace="tenant-a")
++    other = _ticket("b1", namespace="tenant-b")
++
++    async def scenario() -> None:
++        held = [await controller.acquire(first), await controller.acquire(second)]
++        with pytest.raises(PrincipalAdmissionLimited) as excinfo:
++            await controller.acquire(second)
++        assert excinfo.value.reason == "namespace_limit"
++        held += [await controller.acquire(other), await controller.acquire(other)]
++        for permit in held:
++            permit.release()
++
++    asyncio.run(scenario())
++    assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++
++def test_namespace_is_ignored_without_a_configured_claim() -> None:
++    controller = AdmissionController(
++        AdmissionConfig(principal_max_concurrency=2, namespace_max_concurrency=1)
++    )
++
++    async def scenario() -> None:
++        held = [
++            await controller.acquire(_ticket("a1", namespace="tenant-a")),
++            await controller.acquire(_ticket("a2", namespace="tenant-a")),
++        ]
++        for permit in held:
++            permit.release()
++
++    asyncio.run(scenario())
++
++
++def test_cancelled_waiters_release_queue_slots_and_granted_units_once() -> None:
++    controller = AdmissionController(
++        AdmissionConfig(
++            max_concurrency=1,
++            max_queue=4,
++            queue_timeout_seconds=_LONG_WAIT,
++        )
++    )
++
++    async def scenario() -> None:
++        held = await controller.acquire(_ticket("svc-a"))
++        cancelled_while_queued = asyncio.create_task(
++            controller.acquire(_ticket("svc-b"))
++        )
++        await _spin()
++        cancelled_while_queued.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await cancelled_while_queued
++        assert controller.snapshot() == AdmissionStats(1, 0, 1)
++
++        granted_then_cancelled = asyncio.create_task(
++            controller.acquire(_ticket("svc-b"))
++        )
++        next_in_line = asyncio.create_task(controller.acquire(_ticket("svc-c")))
++        await _spin()
++        assert controller.snapshot().queued == 2
++        # The release grants svc-b's unit before its task can resume; the
++        # cancellation must hand that unit on instead of leaking it.
++        assert held.release() is True
++        granted_then_cancelled.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await granted_then_cancelled
++        survivor = await next_in_line
++        assert controller.snapshot() == AdmissionStats(1, 0, 1)
++
++        assert held.release() is False
++        assert survivor.release() is True
++        assert survivor.release() is False
++
++    asyncio.run(scenario())
++    assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++
++def test_expired_waiters_are_rejected_by_the_level_that_blocked_them() -> None:
++    controller = AdmissionController(
++        AdmissionConfig(
++            max_concurrency=2,
++            max_queue=4,
++            principal_max_concurrency=1,
++            principal_max_queue=2,
++        )
++    )
++
++    async def scenario() -> None:
++        own = await controller.acquire(_ticket("svc-a"))
++        with pytest.raises(PrincipalAdmissionLimited) as own_share:
++            await controller.acquire(_ticket("svc-a"), timeout=0)
++        other = await controller.acquire(_ticket("svc-b"))
++        with pytest.raises(AdmissionSaturated) as shared:
++            await controller.acquire(_ticket("svc-c"), timeout=0)
++        assert own_share.value.reason == "principal_limit"
++        assert shared.value.reason == "global_limit"
++        assert controller.snapshot() == AdmissionStats(2, 0, 2)
++        own.release()
++        other.release()
++
++    asyncio.run(scenario())
++    assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++
++def test_worker_failure_inside_admit_releases_the_permit() -> None:
++    controller = AdmissionController(
++        AdmissionConfig(
++            max_concurrency=1, max_queue=1, queue_timeout_seconds=_LONG_WAIT
++        )
++    )
++
++    async def failing_work() -> None:
++        async with controller.admit(_ticket("svc-a")):
++            await asyncio.sleep(0)
++            raise RuntimeError("synthetic worker failure")
++
++    async def scenario() -> None:
++        waiter = asyncio.create_task(failing_work())
++        await _spin(1)
++        follower = asyncio.create_task(controller.acquire(_ticket("svc-b")))
++        with pytest.raises(RuntimeError):
++            await waiter
++        (await follower).release()
++
++    asyncio.run(scenario())
++    assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++
++def test_noisy_flood_never_rejects_quiet_principals_within_their_share() -> None:
++    config = AdmissionConfig(
++        max_concurrency=3,
++        max_queue=6,
++        principal_max_concurrency=2,
++        principal_max_queue=2,
++        queue_timeout_seconds=_LONG_WAIT,
++    )
++    peaks = {"in_flight": 0, "queued": 0}
++
++    class Recorder:
++        def record_principal_admission_state(self, **state: int) -> None:
++            peaks["in_flight"] = max(peaks["in_flight"], state["in_flight"])
++            peaks["queued"] = max(peaks["queued"], state["queued"])
++
++        def record_principal_admission_rejection(self, **_: str) -> None:
++            pass
++
++    controller = AdmissionController(config, metrics=Recorder())
++    active: dict[str, int] = {}
++    completed: dict[str, int] = {}
++    noisy_outcomes: dict[str, int] = {}
++
++    async def unit_of_work(name: str, *, fail: bool = False) -> None:
++        async with controller.admit(_ticket(name)):
++            active[name] = active.get(name, 0) + 1
++            assert active[name] <= config.principal_max_concurrency
++            try:
++                await _spin(2)
++                if fail:
++                    raise RuntimeError("synthetic worker failure")
++            finally:
++                active[name] -= 1
++        completed[name] = completed.get(name, 0) + 1
++
++    async def noisy_request(index: int) -> None:
++        try:
++            await unit_of_work("noisy", fail=index % 7 == 0)
++            outcome = "completed"
++        except PrincipalAdmissionLimited as exc:
++            outcome = exc.reason
++        except RuntimeError:
++            outcome = "failed"
++        noisy_outcomes[outcome] = noisy_outcomes.get(outcome, 0) + 1
++
++    async def quiet_client(name: str) -> None:
++        # A sequential client stays within its share; it must never be shed.
++        for _ in range(10):
++            await unit_of_work(name)
++
++    async def noisy_flood() -> None:
++        requests = []
++        for index in range(80):
++            requests.append(asyncio.create_task(noisy_request(index)))
++            await asyncio.sleep(0)
++        await asyncio.gather(*requests)
++
++    async def scenario() -> None:
++        await asyncio.gather(
++            noisy_flood(), *(quiet_client(f"quiet-{index}") for index in range(3))
++        )
++
++    asyncio.run(scenario())
++
++    assert {name: completed[name] for name in completed if name != "noisy"} == {
++        "quiet-0": 10,
++        "quiet-1": 10,
++        "quiet-2": 10,
++    }
++    assert noisy_outcomes["completed"] >= 1
++    assert noisy_outcomes["failed"] >= 1
++    assert noisy_outcomes["principal_limit"] >= 1
++    assert sum(noisy_outcomes.values()) == 80
++    assert set(noisy_outcomes) <= {"completed", "failed", "principal_limit"}
++    assert peaks["in_flight"] <= config.max_concurrency
++    assert 0 < peaks["queued"] <= config.max_queue
++    assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++
++def test_blocking_adapter_shares_the_budget_with_async_callers() -> None:
++    controller = AdmissionController(
++        AdmissionConfig(
++            max_concurrency=4,
++            max_queue=4,
++            principal_max_concurrency=1,
++            principal_max_queue=1,
++            queue_timeout_seconds=_LONG_WAIT,
++        )
++    )
++    rest_ticket = _ticket("svc-a", transport="rest")
++    grpc_ticket = _ticket("svc-a", transport="grpc")
++    results: list[AdmissionPermit] = []
++
++    def blocking_call() -> None:
++        results.append(controller.acquire_blocking(grpc_ticket))
++
++    async def scenario() -> None:
++        held = await controller.acquire(rest_ticket)
++        worker = threading.Thread(target=blocking_call)
++        worker.start()
++        for _ in range(10_000):
++            if controller.snapshot().queued == 1:
++                break
++            await asyncio.sleep(0.001)
++        assert controller.snapshot() == AdmissionStats(1, 1, 1)
++
++        with pytest.raises(PrincipalAdmissionLimited) as excinfo:
++            await controller.acquire(_ticket("svc-a", transport="graphql"))
++        assert excinfo.value.grpc_status == "RESOURCE_EXHAUSTED"
++        assert excinfo.value.grpc_trailing_metadata() == (
++            ("retry-after", "1"),
++            ("openmed-admission-reason", "principal_limit"),
++        )
++
++        held.release()
++        await asyncio.to_thread(worker.join, _LONG_WAIT)
++        assert not worker.is_alive()
++
++    asyncio.run(scenario())
++    assert len(results) == 1
++    assert controller.snapshot() == AdmissionStats(1, 0, 1)
++    with controller.admit_blocking(_ticket("svc-b", transport="grpc")):
++        assert controller.snapshot().in_flight == 2
++    assert results[0].release() is True
++    assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++
++def test_blocking_waiter_cancellation_and_saturation() -> None:
++    controller = AdmissionController(
++        AdmissionConfig(
++            max_concurrency=1, max_queue=1, queue_timeout_seconds=_LONG_WAIT
++        )
++    )
++    held = controller.acquire_blocking(_ticket("svc-a", transport="grpc"))
++
++    with pytest.raises(AdmissionCancelled):
++        controller.acquire_blocking(
++            _ticket("svc-b", transport="grpc"), cancelled=lambda: True
++        )
++    assert controller.snapshot() == AdmissionStats(1, 0, 1)
++    with pytest.raises(AdmissionSaturated) as excinfo:
++        controller.acquire_blocking(_ticket("svc-b", transport="grpc"), timeout=0)
++    assert excinfo.value.grpc_status == "UNAVAILABLE"
++
++    held.release()
++    assert controller.snapshot() == AdmissionStats(0, 0, 0)
++
++
++def test_metrics_and_errors_carry_no_principal_identifiers() -> None:
++    registry = PrometheusMetricsRegistry()
++    controller = AdmissionController(
++        AdmissionConfig(
++            principal_max_concurrency=1,
++            namespace_max_concurrency=4,
++            namespace_claim="tenant",
++        ),
++        metrics=registry,
++    )
++    ticket = _ticket(
++        "SYNTHETIC_PRINCIPAL_SECRET",
++        namespace="SYNTHETIC_TENANT_SECRET",
++        transport="graphql",
++    )
++
++    async def scenario() -> PrincipalAdmissionLimited:
++        held = await controller.acquire(ticket)
++        try:
++            await controller.acquire(ticket)
++        except PrincipalAdmissionLimited as exc:
++            rendered_while_held.append(registry.render())
++            held.release()
++            return exc
++        raise AssertionError("second acquisition should be rejected")
++
++    rendered_while_held: list[str] = []
++    rejection = asyncio.run(scenario())
++    rendered = rendered_while_held[0]
++
++    assert "openmed_service_principal_admission_inflight 1" in rendered
++    assert "openmed_service_principal_admission_queued 0" in rendered
++    assert "openmed_service_principal_admission_active_principals 1" in rendered
++    assert (
++        "openmed_service_principal_admission_rejected_total"
++        '{reason="principal_limit",transport="graphql"} 1'
++    ) in rendered
++    assert "openmed_service_principal_admission_inflight 0" in registry.render()
++    surfaces = [
++        rendered,
++        registry.render(),
++        str(rejection),
++        repr(rejection.to_details()),
++        repr(rejection.grpc_trailing_metadata()),
++        repr(controller.snapshot()),
++        repr(ticket),
++    ]
++    for surface in surfaces:
++        assert "SYNTHETIC" not in surface
++
++
++def test_rejection_metrics_only_use_closed_label_sets() -> None:
++    registry = PrometheusMetricsRegistry()
++
++    registry.record_principal_admission_rejection(
++        reason="SYNTHETIC_REASON", transport="SYNTHETIC_TRANSPORT"
++    )
++
++    rendered = registry.render()
++    assert 'reason="other",transport="other"' in rendered
++    assert "SYNTHETIC" not in rendered
++
++
++@pytest.mark.parametrize(
++    "overrides",
++    [
++        {"max_concurrency": -1},
++        {"principal_max_queue": True},
++        {"queue_timeout_seconds": 0},
++        {"retry_after_seconds": float("nan")},
++    ],
++)
++def test_admission_config_validates_programmatic_values(
++    overrides: dict[str, Any],
++) -> None:
++    with pytest.raises(ValueError):
++        AdmissionConfig(**overrides)

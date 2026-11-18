@@ -1,0 +1,348 @@
+diff --git a/packages/server/src/admin/invite.test.ts b/packages/server/src/admin/invite.test.ts
+index 966c1fda6e3..f4ba36cd4c1 100644
+--- a/packages/server/src/admin/invite.test.ts
++++ b/packages/server/src/admin/invite.test.ts
+@@ -651,6 +651,7 @@ describe('Admin Invite', () => {
+     expect(res2).toHaveStatus(200);
+     expect(mockSESv2Client.send.callCount).toBe(1);
+     expect(res2.body.issue?.[0].details.text).toBe('Could not send email. Make sure you have AWS SES set up.');
++    expect(res2.body.issue?.[0].diagnostics).toBeUndefined();
+   });
+ 
+   test('Super admin invite to different project', async () => {
+diff --git a/packages/server/src/admin/invite.ts b/packages/server/src/admin/invite.ts
+index d8e56ceb090..bf8ef804b1a 100644
+--- a/packages/server/src/admin/invite.ts
++++ b/packages/server/src/admin/invite.ts
+@@ -582,6 +582,7 @@ async function sendInviteEmail(
+   try {
+     await sendEmail(systemRepo, options, request.project);
+   } catch (err) {
++    getLogger().warn('Invite email failed', { projectId: request.project.id, err: normalizeErrorString(err) });
+     // A common error for new self-hosted Medplum servers is that SES is not configured.
+     // A long time ago, we made the mistake of establishing a convention of HTTP 200 + OperationOutcome for this case.
+     // To preserve this behavior, we throw an OperationOutcomeError with allOk ID.
+@@ -595,7 +596,6 @@ async function sendInviteEmail(
+           details: {
+             text: 'Could not send email. Make sure you have AWS SES set up.',
+           },
+-          diagnostics: normalizeErrorString(err),
+         },
+       ],
+     });
+diff --git a/packages/server/src/email/email.test.ts b/packages/server/src/email/email.test.ts
+index e8320d3f209..2601ed21a17 100644
+--- a/packages/server/src/email/email.test.ts
++++ b/packages/server/src/email/email.test.ts
+@@ -17,6 +17,7 @@ import { globalLogger } from '../logger';
+ import { getBinaryStorage } from '../storage/loader';
+ import { withTestContext } from '../test.setup';
+ import { sendEmail } from './email';
++import { PROJECT_SMTP_SOCKET_TIMEOUT_MS, PROJECT_SMTP_TIMEOUT_MS } from './utils';
+ 
+ const { mockCreateTransport, mockSendMail } = vi.hoisted(() => {
+   const mockSendMail = vi.fn().mockResolvedValue({ messageId: '123' });
+@@ -336,7 +337,11 @@ describe('Email', () => {
+         text: 'Hello Alice',
+       });
+ 
+-      expect(mockCreateTransport).toHaveBeenCalledTimes(1);
++      expect(mockCreateTransport).toHaveBeenCalledExactlyOnceWith({
++        host: 'smtp.example.com',
++        port: 587,
++        auth: { user: 'user', pass: 'pass' },
++      });
+       expect(mockSendMail).toHaveBeenCalledTimes(1);
+       expect(mockSESv2Client.send.callCount).toBe(0);
+     } finally {
+@@ -365,6 +370,7 @@ describe('Email', () => {
+ 
+     afterEach(() => {
+       getConfig().allowProjectSmtp = undefined;
++      getConfig().allowUnsafeOutbound = undefined;
+       getConfig().smtp = undefined;
+     });
+ 
+@@ -379,12 +385,24 @@ describe('Email', () => {
+           port: 587,
+           secure: false,
+           auth: { user: 'projectuser', pass: 'projectpass' },
++          getSocket: expect.any(Function),
++          connectionTimeout: PROJECT_SMTP_TIMEOUT_MS,
++          greetingTimeout: PROJECT_SMTP_TIMEOUT_MS,
++          socketTimeout: PROJECT_SMTP_SOCKET_TIMEOUT_MS,
+         })
+       );
+       expect(mockSendMail).toHaveBeenCalledTimes(1);
+       expect(mockSESv2Client.send.callCount).toBe(0);
+     });
+ 
++    test('allowUnsafeOutbound uses the default project SMTP socket', async () => {
++      getConfig().allowUnsafeOutbound = true;
++      const project = makeProject(baseSecrets);
++      await sendEmail(systemRepo, { to: 'alice@example.com', subject: 'Hello', text: 'Hello Alice' }, project);
++
++      expect(mockCreateTransport).toHaveBeenCalledWith(expect.not.objectContaining({ getSocket: expect.anything() }));
++    });
++
+     test('Infers secure for port 465', async () => {
+       const project = makeProject([
+         { name: 'smtpHost', valueString: 'smtp.project.example.com' },
+diff --git a/packages/server/src/email/email.ts b/packages/server/src/email/email.ts
+index 03fa73eabc6..7c3aaf93d8b 100644
+--- a/packages/server/src/email/email.ts
++++ b/packages/server/src/email/email.ts
+@@ -5,13 +5,22 @@ import { EMPTY, normalizeErrorString } from '@medplum/core';
+ import type { Binary, Project } from '@medplum/fhirtypes';
+ import { createTransport } from 'nodemailer';
+ import type Mail from 'nodemailer/lib/mailer';
++import type SMTPTransport from 'nodemailer/lib/smtp-transport';
+ import { sendEmailViaSes } from '../cloud/aws/email';
+ import { getConfig } from '../config/loader';
+ import type { MedplumSmtpConfig } from '../config/types';
+ import type { Repository } from '../fhir/repo';
+ import { globalLogger } from '../logger';
+ import { getBinaryStorage } from '../storage/loader';
+-import { applyFromDisplayName, getFromAddress, getProjectAppName, getProjectSmtpConfig } from './utils';
++import {
++  applyFromDisplayName,
++  getFromAddress,
++  getProjectAppName,
++  getProjectSmtpConfig,
++  getProjectSmtpSocket,
++  PROJECT_SMTP_SOCKET_TIMEOUT_MS,
++  PROJECT_SMTP_TIMEOUT_MS,
++} from './utils';
+ 
+ /**
+  * Sends an email using the AWS SES service.
+@@ -104,7 +113,7 @@ async function sendEmailViaSmtp(
+   options: Mail.Options,
+   projectId?: string
+ ): Promise<void> {
+-  const transport = createTransport({
++  const transportOptions: SMTPTransport.Options = {
+     host: smtpConfig.host,
+     port: smtpConfig.port,
+     secure: smtpConfig.secure,
+@@ -112,7 +121,16 @@ async function sendEmailViaSmtp(
+       user: smtpConfig.username,
+       pass: smtpConfig.password,
+     },
+-  });
++  };
++  if (projectId) {
++    if (!getConfig().allowUnsafeOutbound) {
++      transportOptions.getSocket = getProjectSmtpSocket(projectId);
++    }
++    transportOptions.connectionTimeout = PROJECT_SMTP_TIMEOUT_MS;
++    transportOptions.greetingTimeout = PROJECT_SMTP_TIMEOUT_MS;
++    transportOptions.socketTimeout = PROJECT_SMTP_SOCKET_TIMEOUT_MS;
++  }
++  const transport = createTransport(transportOptions);
+   try {
+     await transport.sendMail(options);
+   } catch (err) {
+diff --git a/packages/server/src/email/utils.test.ts b/packages/server/src/email/utils.test.ts
+index 1f896edc18e..3fc3c46fcff 100644
+--- a/packages/server/src/email/utils.test.ts
++++ b/packages/server/src/email/utils.test.ts
+@@ -2,7 +2,22 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ import type { Project } from '@medplum/fhirtypes';
+-import { addressToString, applyFromDisplayName, getProjectAppName } from './utils';
++import dns from 'node:dns';
++import net from 'node:net';
++import type { SMTPTransportGetSocket } from 'nodemailer/lib/smtp-transport';
++import { vi } from 'vitest';
++import type * as Url from '../util/url';
++import { addressToString, applyFromDisplayName, getProjectAppName, getProjectSmtpSocket } from './utils';
++
++const urlMocks = vi.hoisted(() => ({ allowUnsafeIpAddress: false }));
++
++vi.mock('../util/url', async (importOriginal) => {
++  const actual = await importOriginal<typeof Url>();
++  return {
++    ...actual,
++    isUnsafeIpAddress: (address: string) => !urlMocks.allowUnsafeIpAddress && actual.isUnsafeIpAddress(address),
++  };
++});
+ 
+ describe('Email utils', () => {
+   function projectWithAppName(valueString: string | undefined): Project {
+@@ -48,4 +63,92 @@ describe('Email utils', () => {
+       '"Acme Billing" <noreply@acme.com>'
+     );
+   });
++
++  describe('getProjectSmtpSocket', () => {
++    afterEach(() => {
++      urlMocks.allowUnsafeIpAddress = false;
++      vi.restoreAllMocks();
++    });
++
++    function mockLookup(addresses: dns.LookupAddress[] | Error | undefined): void {
++      vi.spyOn(dns, 'lookup').mockImplementation(((
++        _hostname: string,
++        _options: dns.LookupAllOptions,
++        callback: (err: Error | null, addresses: dns.LookupAddress[]) => void
++      ) => {
++        if (addresses instanceof Error) {
++          callback(addresses, []);
++        } else if (addresses) {
++          callback(null, addresses);
++        }
++      }) as unknown as typeof dns.lookup);
++    }
++
++    function openSocket(
++      getSocket: SMTPTransportGetSocket,
++      host: string,
++      port = 587,
++      connectionTimeout = 1000
++    ): Promise<net.Socket> {
++      return new Promise((resolve, reject) => {
++        getSocket({ host, port, connectionTimeout }, (err, socketOptions) =>
++          err ? reject(err) : resolve((socketOptions as { connection: net.Socket }).connection)
++        );
++      });
++    }
++
++    test.each([
++      ['a private address', 'smtp.project.example.com', [{ address: '10.20.30.40', family: 4 }]],
++      [
++        'a public and a private address',
++        'smtp.project.example.com',
++        [
++          { address: '93.184.215.14', family: 4 },
++          { address: '10.20.30.40', family: 4 },
++        ],
++      ],
++      ['no addresses', 'smtp.project.example.com', []],
++      ['an unsafe IP literal', '10.20.30.40', undefined],
++    ])('Rejects a project SMTP host with %s', async (_label, host, addresses) => {
++      mockLookup(addresses);
++      await expect(openSocket(getProjectSmtpSocket('p1'), host)).rejects.toThrow(
++        'Project SMTP configuration is incomplete or invalid'
++      );
++    });
++
++    test('Connects through any resolved address', async () => {
++      const server = net.createServer((socket) => socket.end());
++      await new Promise<void>((resolve) => {
++        server.listen(0, '127.0.0.1', resolve);
++      });
++      const { port } = server.address() as net.AddressInfo;
++      urlMocks.allowUnsafeIpAddress = true;
++      mockLookup([
++        { address: '::1', family: 6 },
++        { address: '127.0.0.1', family: 4 },
++      ]);
++
++      try {
++        const socket = await openSocket(getProjectSmtpSocket('p1'), 'smtp.project.example.com', port);
++        expect(socket.remoteAddress).toBe('127.0.0.1');
++        socket.destroy();
++      } finally {
++        server.close();
++      }
++    });
++
++    test('Passes through lookup errors', async () => {
++      mockLookup(Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }));
++      await expect(openSocket(getProjectSmtpSocket('p1'), 'smtp.project.example.com')).rejects.toMatchObject({
++        code: 'ENOTFOUND',
++      });
++    });
++
++    test('Times out when resolving and connecting take too long', async () => {
++      mockLookup(undefined);
++      await expect(openSocket(getProjectSmtpSocket('p1'), 'smtp.project.example.com', 587, 50)).rejects.toMatchObject({
++        code: 'ETIMEDOUT',
++      });
++    });
++  });
+ });
+diff --git a/packages/server/src/email/utils.ts b/packages/server/src/email/utils.ts
+index 0a2b2c34072..bba2b7415af 100644
+--- a/packages/server/src/email/utils.ts
++++ b/packages/server/src/email/utils.ts
+@@ -3,11 +3,18 @@
+ import type { WithId } from '@medplum/core';
+ import { OperationOutcomeError, badRequest } from '@medplum/core';
+ import type { Project } from '@medplum/fhirtypes';
++import dns from 'node:dns';
++import net from 'node:net';
+ import type { Address, SendMailOptions } from 'nodemailer';
+ import MailComposer from 'nodemailer/lib/mail-composer';
++import type { SMTPTransportGetSocket } from 'nodemailer/lib/smtp-transport';
+ import { getConfig } from '../config/loader';
+ import type { MedplumSmtpConfig } from '../config/types';
+ import { getLogger } from '../logger';
++import { isUnsafeIpAddress } from '../util/url';
++
++export const PROJECT_SMTP_TIMEOUT_MS = 20_000;
++export const PROJECT_SMTP_SOCKET_TIMEOUT_MS = 120_000;
+ 
+ export interface ProjectSmtpConfig extends MedplumSmtpConfig {
+   fromAddress: string;
+@@ -62,6 +69,58 @@ export function getProjectSmtpConfig(project: WithId<Project>): ProjectSmtpConfi
+   };
+ }
+ 
++/**
++ * Returns a nodemailer `getSocket` hook that opens the connection to the project SMTP host.
++ * Every address the host resolves to must be allowed; the connection may use any of them.
++ * Resolving and connecting must finish within the transport's `connectionTimeout`.
++ * @param projectId - The project ID, for logging.
++ * @returns The `getSocket` hook.
++ */
++export function getProjectSmtpSocket(projectId: string): SMTPTransportGetSocket {
++  const invalidHost = (): OperationOutcomeError => {
++    getLogger().warn('Project SMTP is misconfigured', { projectId, invalid: 'smtpHost' });
++    return new OperationOutcomeError(badRequest('Project SMTP configuration is incomplete or invalid'));
++  };
++
++  // autoSelectFamily makes net.connect() request every address and try them in turn
++  const lookup: net.LookupFunction = (hostname, options, callback) => {
++    dns.lookup(hostname, { ...options, all: true }, (err, addresses) => {
++      if (err) {
++        callback(err, []);
++      } else if (addresses.length === 0 || addresses.some(({ address }) => isUnsafeIpAddress(address))) {
++        callback(invalidHost(), []);
++      } else {
++        callback(null, addresses);
++      }
++    });
++  };
++
++  return (options, callback) => {
++    const host = options.host ?? '';
++    // net.connect() skips the lookup for IP literals
++    if (net.isIP(host) && isUnsafeIpAddress(host)) {
++      callback(invalidHost());
++      return;
++    }
++
++    const socket = net.connect({ host, port: Number(options.port), lookup, autoSelectFamily: true });
++    const timer = setTimeout(
++      () => socket.destroy(Object.assign(new Error('Connection timeout'), { code: 'ETIMEDOUT' })),
++      options.connectionTimeout ?? PROJECT_SMTP_TIMEOUT_MS
++    );
++    const onError = (err: Error): void => {
++      clearTimeout(timer);
++      callback(err);
++    };
++    socket.once('error', onError);
++    socket.once('connect', () => {
++      clearTimeout(timer);
++      socket.removeListener('error', onError);
++      callback(null, { connection: socket });
++    });
++  };
++}
++
+ /**
+  * Returns true if email sending is configured on this server (SMTP or AWS SES).
+  * @returns True if email is configured.

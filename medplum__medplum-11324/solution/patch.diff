@@ -1,0 +1,587 @@
+diff --git a/packages/docs/docs/api/fhir/operations/user-update-email.md b/packages/docs/docs/api/fhir/operations/user-update-email.md
+index 39500d0f566..8517b4ba454 100644
+--- a/packages/docs/docs/api/fhir/operations/user-update-email.md
++++ b/packages/docs/docs/api/fhir/operations/user-update-email.md
+@@ -27,6 +27,8 @@ This operation requires **Project Admin** privileges
+ 
+ In Medplum, the `User.email` field controls authentication and login, while the profile resource's `telecom` field displays contact information. If you update only the profile resource email, users will not be able to log in with the new email address. Use this operation to update both atomically.
+ 
++Use this operation rather than editing `User.email` directly, so that the related account changes described under [Output](#output) are applied.
++
+ :::
+ 
+ ## Parameters
+@@ -47,6 +49,8 @@ The operation returns the updated [`User`](/docs/api/fhir/medplum/user) resource
+ - `email` set to the new email address
+ - `emailVerified` set to `false` (unless verification was skipped)
+ 
++Any outstanding invite, password reset, and email verification requests for the user are invalidated, and the user is signed out of all active sessions. A user who has not yet set a password can do so with "Forgot password" and the new email address.
++
+ If `updateProfileTelecom` is `true`:
+ 
+ - Adds the new email to the profile's `telecom` array with `use: 'work'`
+diff --git a/packages/server/src/auth/securityrequest.ts b/packages/server/src/auth/securityrequest.ts
+index 8343671fe54..d4d0567d86c 100644
+--- a/packages/server/src/auth/securityrequest.ts
++++ b/packages/server/src/auth/securityrequest.ts
+@@ -3,7 +3,6 @@
+ import type { WithId } from '@medplum/core';
+ import {
+   badRequest,
+-  EMPTY,
+   getReferenceString,
+   getStatus,
+   isOperationOutcome,
+@@ -14,14 +13,6 @@ import type { User, UserSecurityRequest } from '@medplum/fhirtypes';
+ import { USER_SECURITY_REQUEST_EXPIRATION_MS } from '../constants';
+ import type { SystemRepository } from '../fhir/repo';
+ 
+-/**
+- * How many of a user's most recent security requests are examined when superseding prior requests.
+- *
+- * Only unexpired requests are worth superseding, and expiration bounds how many of those can
+- * exist, so there is no need to walk a user's entire history.
+- */
+-const MAX_SUPERSEDED_REQUESTS = 100;
+-
+ /**
+  * Returns how long a request of the given type stays valid, in milliseconds.
+  * @param type - The request type, absent on requests created before the field existed.
+@@ -98,22 +89,7 @@ export async function supersedePriorSecurityRequests(
+   user: WithId<User>,
+   type: UserSecurityRequest['type']
+ ): Promise<void> {
+-  const priorRequests = await systemRepo.search<UserSecurityRequest>({
+-    resourceType: 'UserSecurityRequest',
+-    count: MAX_SUPERSEDED_REQUESTS,
+-    sortRules: [{ code: '_lastUpdated', descending: true }],
+-    filters: [{ code: 'user', operator: Operator.EQUALS, value: getReferenceString(user) }],
+-  });
+-
+-  for (const entry of priorRequests.entry ?? EMPTY) {
+-    const priorRequest = entry.resource as WithId<UserSecurityRequest>;
+-    if (priorRequest.type === type && !priorRequest.used) {
+-      // Patch rather than update, so that a request being consumed concurrently is not clobbered
+-      await systemRepo.patchResource<UserSecurityRequest>('UserSecurityRequest', priorRequest.id, [
+-        { op: 'add', path: '/used', value: true },
+-      ]);
+-    }
+-  }
++  await retireSecurityRequests(systemRepo, user, (securityRequest) => securityRequest.type === type);
+ }
+ 
+ /**
+diff --git a/packages/server/src/fhir/operations/update-user-email.test.ts b/packages/server/src/fhir/operations/update-user-email.test.ts
+index 0f781a43c03..30dd05b49db 100644
+--- a/packages/server/src/fhir/operations/update-user-email.test.ts
++++ b/packages/server/src/fhir/operations/update-user-email.test.ts
+@@ -3,7 +3,15 @@
+ import { SendEmailCommand, SESv2Client } from '@aws-sdk/client-sesv2';
+ import type { WithId } from '@medplum/core';
+ import { ContentType, createReference, getReferenceString, Operator } from '@medplum/core';
+-import type { ContactPoint, Parameters, Practitioner, Project, User, UserSecurityRequest } from '@medplum/fhirtypes';
++import type {
++  ContactPoint,
++  Login,
++  Parameters,
++  Practitioner,
++  Project,
++  User,
++  UserSecurityRequest,
++} from '@medplum/fhirtypes';
+ import type { AwsClientStub } from 'aws-sdk-client-mock';
+ import { mockClient } from 'aws-sdk-client-mock';
+ import express from 'express';
+@@ -63,12 +71,15 @@ describe('User/$update-email', () => {
+     return user;
+   }
+ 
+-  async function findVerifyEmailRequest(user: WithId<User>): Promise<UserSecurityRequest | undefined> {
++  async function findSecurityRequest(
++    user: WithId<User>,
++    type: UserSecurityRequest['type']
++  ): Promise<UserSecurityRequest | undefined> {
+     const requests = await repo.searchResources<UserSecurityRequest>({
+       resourceType: 'UserSecurityRequest',
+       filters: [{ code: 'user', operator: Operator.EQUALS, value: getReferenceString(user) }],
+     });
+-    return requests.find((r) => r.type === 'verify-email');
++    return requests.find((r) => r.type === type);
+   }
+ 
+   test('Updates user email and profile email', async () => {
+@@ -94,7 +105,7 @@ describe('User/$update-email', () => {
+       .send({
+         resourceType: 'Parameters',
+         parameter: [
+-          { name: 'email', valueString: newEmail },
++          { name: 'email', valueString: newEmail.toUpperCase() },
+           { name: 'skipEmailVerification', valueBoolean: true },
+         ],
+       } satisfies Parameters);
+@@ -118,23 +129,24 @@ describe('User/$update-email', () => {
+     });
+ 
+     const newEmail = `user+${randomUUID()}@example.com`;
+-    const res = await request(app)
+-      .post(`/fhir/R4/User/${user.id}/$update-email`)
+-      .set('Authorization', 'Bearer ' + accessToken)
+-      .set('Content-Type', ContentType.FHIR_JSON)
+-      .set('X-Medplum', 'extended')
+-      .send({
+-        resourceType: 'Parameters',
+-        parameter: [
+-          { name: 'email', valueString: newEmail },
+-          { name: 'updateProfileTelecom', valueBoolean: true },
+-          { name: 'skipEmailVerification', valueBoolean: true },
+-        ],
+-      } satisfies Parameters);
+-    expect(res).toHaveStatus(200);
+-    const updated = res.body as User;
+-
+-    expect(updated.email).toStrictEqual(newEmail);
++    // Repeating the same email leaves the profile as it was after the first call
++    for (let i = 0; i < 2; i++) {
++      const res = await request(app)
++        .post(`/fhir/R4/User/${user.id}/$update-email`)
++        .set('Authorization', 'Bearer ' + accessToken)
++        .set('Content-Type', ContentType.FHIR_JSON)
++        .set('X-Medplum', 'extended')
++        .send({
++          resourceType: 'Parameters',
++          parameter: [
++            { name: 'email', valueString: newEmail },
++            { name: 'updateProfileTelecom', valueBoolean: true },
++            { name: 'skipEmailVerification', valueBoolean: true },
++          ],
++        } satisfies Parameters);
++      expect(res).toHaveStatus(200);
++      expect((res.body as User).email).toStrictEqual(newEmail);
++    }
+ 
+     const practitioner = await repo.readResource<Practitioner>('Practitioner', profile.id);
+     expect(practitioner.telecom).toStrictEqual(
+@@ -294,6 +306,12 @@ describe('User/$update-email', () => {
+ 
+   test('Sends verification email by default', async () => {
+     const user = await inviteTestUser();
++    const login = await repo.getSystemRepo().createResource<Login>({
++      resourceType: 'Login',
++      user: createReference(user),
++      authMethod: 'password',
++      authTime: new Date().toISOString(),
++    });
+     const newEmail = `user+${randomUUID()}@example.com`;
+     const res = await request(app)
+       .post(`/fhir/R4/User/${user.id}/$update-email`)
+@@ -306,15 +324,36 @@ describe('User/$update-email', () => {
+     expect(res).toHaveStatus(200);
+     expect((res.body as User).emailVerified).toBe(false);
+ 
+-    const securityRequest = await findVerifyEmailRequest(user);
++    const securityRequest = await findSecurityRequest(user, 'verify-email');
+     expect(securityRequest).toBeDefined();
+     expect(securityRequest?.used).toBeFalsy();
++    expect((await findSecurityRequest(user, 'invite'))?.used).toBe(true);
++    expect((await repo.getSystemRepo().readResource<Login>('Login', login.id)).revoked).toBe(true);
+ 
+     expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(1);
+     const input = mockSESv2Client.commandCalls(SendEmailCommand)[0].args[0].input;
+     expect(input.Destination?.ToAddresses).toStrictEqual([newEmail]);
+   });
+ 
++  test('Reports a send failure after the email is updated', async () => {
++    mockSESv2Client.on(SendEmailCommand).rejects(new Error('SES unavailable'));
++    const user = await inviteTestUser();
++    const newEmail = `user+${randomUUID()}@example.com`;
++    const res = await request(app)
++      .post(`/fhir/R4/User/${user.id}/$update-email`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .send({
++        resourceType: 'Parameters',
++        parameter: [{ name: 'email', valueString: newEmail }],
++      } satisfies Parameters);
++    expect(res).toHaveStatus(500);
++    expect(res.body.issue[0].details.text).toBe('Email updated, but the verification email could not be sent');
++
++    expect((await repo.readResource<User>('User', user.id)).email).toBe(newEmail);
++    expect((await findSecurityRequest(user, 'verify-email'))?.used).toBeFalsy();
++  });
++
+   test('Creates verification request without sending email when sendEmail is false', async () => {
+     const user = await inviteTestUser();
+     const newEmail = `user+${randomUUID()}@example.com`;
+@@ -332,7 +371,7 @@ describe('User/$update-email', () => {
+     expect(res).toHaveStatus(200);
+     expect((res.body as User).emailVerified).toBe(false);
+ 
+-    const securityRequest = await findVerifyEmailRequest(user);
++    const securityRequest = await findSecurityRequest(user, 'verify-email');
+     expect(securityRequest).toBeDefined();
+     expect(securityRequest?.used).toBeFalsy();
+ 
+@@ -355,7 +394,8 @@ describe('User/$update-email', () => {
+       } satisfies Parameters);
+     expect(res).toHaveStatus(200);
+ 
+-    expect(await findVerifyEmailRequest(user)).toBeUndefined();
++    expect(await findSecurityRequest(user, 'verify-email')).toBeUndefined();
++    expect((await findSecurityRequest(user, 'invite'))?.used).toBe(true);
+     expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(0);
+   });
+ });
+diff --git a/packages/server/src/fhir/operations/update-user-email.ts b/packages/server/src/fhir/operations/update-user-email.ts
+index 3f055347311..4519f54eac7 100644
+--- a/packages/server/src/fhir/operations/update-user-email.ts
++++ b/packages/server/src/fhir/operations/update-user-email.ts
+@@ -8,15 +8,19 @@ import {
+   concatUrls,
+   forbidden,
+   getReferenceString,
++  normalizeErrorString,
+   OperationOutcomeError,
+   Operator,
+ } from '@medplum/core';
+ import type { FhirRequest, FhirResponse } from '@medplum/fhir-router';
+ import type { Project, ProjectMembership, ResourceType, User } from '@medplum/fhirtypes';
++import { retireAllSecurityRequests } from '../../auth/securityrequest';
++import { revokeUserLogins } from '../../auth/setpassword';
+ import { verifyEmail } from '../../auth/verifyemail';
+ import { getConfig } from '../../config/loader';
+ import { getAuthenticatedContext } from '../../context';
+ import { sendEmail } from '../../email/email';
++import { getLogger } from '../../logger';
+ import { membershipProfileTypes, readMembershipReference } from '../projectmembership';
+ import type { Repository } from '../repo';
+ import { getGlobalSystemRepo, getProjectSystemRepo } from '../repo';
+@@ -96,9 +100,9 @@ export async function updateUserEmailOperation(req: FhirRequest): Promise<FhirRe
+   return [allOk, user];
+ }
+ 
+-async function updateUser(userId: string, params: InputParams, project: WithId<Project>): Promise<User> {
++async function updateUser(userId: string, params: InputParams, project: WithId<Project>): Promise<WithId<User>> {
+   const systemRepo = await getProjectSystemRepo(project);
+-  return systemRepo.withTransaction(
++  const { user: updatedUser, verification } = await systemRepo.withTransaction(
+     async (txRepo) => {
+       let user = await txRepo.readResource<User>('User', userId);
+       if (!project.superAdmin && user.project?.reference !== getReferenceString(project)) {
+@@ -109,17 +113,15 @@ async function updateUser(userId: string, params: InputParams, project: WithId<P
+       }
+ 
+       const oldEmail = user.email;
+-      user.email = params.email;
++      const newEmail = params.email.toLowerCase();
++      user.email = newEmail;
+       user.emailVerified = false;
+       user = await txRepo.updateResource(user);
+ 
+-      if (!params.skipEmailVerification) {
+-        const { id, secret } = await verifyEmail(txRepo, user);
+-        // sendEmail: false lets the caller send its own email, e.g. from a Bot subscribed to UserSecurityRequest
+-        if (params.sendEmail !== false) {
+-          await sendVerificationEmail(id, secret, user, project, txRepo);
+-        }
+-      }
++      await retireAllSecurityRequests(txRepo, user); // existing requests were issued for previous address
++      await revokeUserLogins(txRepo, user);
++
++      const verification = params.skipEmailVerification ? undefined : await verifyEmail(txRepo, user);
+ 
+       if (params.updateProfileTelecom && user.project?.reference) {
+         // Get membership for Project-scoped User
+@@ -134,18 +136,39 @@ async function updateUser(userId: string, params: InputParams, project: WithId<P
+         if (membership) {
+           const profile = await readMembershipReference(txRepo, membership, membership.profile, membershipProfileTypes);
+           if (profileTypesWithTelecom.includes(profile.resourceType)) {
+-            await updateProfileTelecom(txRepo, profile as WithId<ProfileResource>, oldEmail, params.email);
++            await updateProfileTelecom(txRepo, profile as WithId<ProfileResource>, oldEmail, newEmail);
+           }
+         }
+       }
+ 
+-      return user;
++      return { user, verification };
+     },
+     {
+-      resourceTypes: ['ProjectMembership', 'User', 'UserSecurityRequest', ...profileTypesWithTelecom],
++      resourceTypes: ['Login', 'ProjectMembership', 'User', 'UserSecurityRequest', ...profileTypesWithTelecom],
+       source: 'updateUserEmail.updateUser',
+     }
+   );
++
++  // After commit, because the transaction may be retried or rolled back.
++  if (verification && params.sendEmail !== false) {
++    try {
++      await sendVerificationEmail(verification.id, verification.secret, updatedUser, project, systemRepo);
++    } catch (err) {
++      // The change is already committed, so say so rather than surface a bare send error
++      getLogger().warn('Verification email failed', { userId: updatedUser.id, err: normalizeErrorString(err) });
++      throw new OperationOutcomeError({
++        resourceType: 'OperationOutcome',
++        issue: [
++          {
++            severity: 'error',
++            code: 'exception',
++            details: { text: 'Email updated, but the verification email could not be sent' },
++          },
++        ],
++      });
++    }
++  }
++  return updatedUser;
+ }
+ 
+ async function updateProfileTelecom(
+@@ -161,7 +184,7 @@ async function updateProfileTelecom(
+   }
+ 
+   // Mark instances of the previous email as old
+-  if (oldEmail) {
++  if (oldEmail && oldEmail !== newEmail) {
+     for (const contact of telecom) {
+       if (contact.system === 'email' && contact.value === oldEmail) {
+         contact.use = 'old';
+diff --git a/packages/server/src/scim/routes.test.ts b/packages/server/src/scim/routes.test.ts
+index 7e6e4663183..c44d6758707 100644
+--- a/packages/server/src/scim/routes.test.ts
++++ b/packages/server/src/scim/routes.test.ts
+@@ -1,8 +1,16 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+ import type { WithId } from '@medplum/core';
+-import { ContentType, createReference } from '@medplum/core';
+-import type { AccessPolicy, Project, User } from '@medplum/fhirtypes';
++import { ContentType, createReference, Operator } from '@medplum/core';
++import type {
++  AccessPolicy,
++  Login,
++  Project,
++  ProjectMembership,
++  Reference,
++  User,
++  UserSecurityRequest,
++} from '@medplum/fhirtypes';
+ import { randomUUID } from 'crypto';
+ import express from 'express';
+ import request from 'supertest';
+@@ -53,6 +61,27 @@ describe('SCIM Routes', () => {
+     await shutdownApp();
+   });
+ 
++  async function getUserAndSecurityRequest(
++    membershipId: string
++  ): Promise<{ user: WithId<User>; securityRequest: UserSecurityRequest | undefined }> {
++    const membership = await systemRepo.readResource<ProjectMembership>('ProjectMembership', membershipId);
++    const user = await systemRepo.readReference<User>(membership.user as Reference<User>);
++    const securityRequest = await systemRepo.searchOne<UserSecurityRequest>({
++      resourceType: 'UserSecurityRequest',
++      filters: [{ code: 'user', operator: Operator.EQUALS, value: membership.user?.reference as string }],
++    });
++    return { user, securityRequest };
++  }
++
++  async function createLogin(user: WithId<User>): Promise<WithId<Login>> {
++    return systemRepo.createResource<Login>({
++      resourceType: 'Login',
++      user: createReference(user),
++      authMethod: 'password',
++      authTime: new Date().toISOString(),
++    });
++  }
++
+   test('Search users', async () => {
+     const res = await request(app)
+       .get(`/scim/v2/Users`)
+@@ -94,6 +123,8 @@ describe('SCIM Routes', () => {
+     const searchCheck = searchResponse.body.Resources.find((user: any) => user.id === res1.body.id);
+     expect(searchCheck).toBeDefined();
+ 
++    const login = await createLogin((await getUserAndSecurityRequest(res1.body.id)).user);
++
+     const updateResponse = await request(app)
+       .put(`/scim/v2/Users/${res1.body.id}`)
+       .set('Authorization', 'Bearer ' + accessToken)
+@@ -101,9 +132,12 @@ describe('SCIM Routes', () => {
+       .send({
+         ...res1.body,
+         externalId: randomUUID(),
++        emails: [{ value: res1.body.emails[0].value.toUpperCase() }],
+       });
+     expect(updateResponse).toHaveStatus(200);
+     expect(updateResponse.body.externalId).toBeDefined();
++    expect((await getUserAndSecurityRequest(res1.body.id)).securityRequest?.used).toBeFalsy();
++    expect((await systemRepo.readResource<Login>('Login', login.id)).revoked).toBeFalsy();
+ 
+     const deleteResponse = await request(app)
+       .delete(`/scim/v2/Users/${res1.body.id}`)
+@@ -150,6 +184,11 @@ describe('SCIM Routes', () => {
+     const searchCheck = searchResponse.body.Resources.find((user: any) => user.id === res1.body.id);
+     expect(searchCheck).toBeDefined();
+ 
++    const { user } = await getUserAndSecurityRequest(res1.body.id);
++    await systemRepo.patchResource<User>('User', user.id, [{ op: 'add', path: '/emailVerified', value: true }]);
++    const login = await createLogin(user);
++
++    const newEmail = randomUUID() + '@example.com';
+     const patchResponse = await request(app)
+       .patch(`/scim/v2/Users/${res1.body.id}`)
+       .set('Authorization', 'Bearer ' + accessToken)
+@@ -161,12 +200,19 @@ describe('SCIM Routes', () => {
+             op: 'replace',
+             value: {
+               active: false,
++              emails: [{ value: newEmail }],
+             },
+           },
+         ],
+       });
+     expect(patchResponse).toHaveStatus(200);
+     expect(patchResponse.body.active).toBe(false);
++    expect(patchResponse.body.emails).toStrictEqual([{ value: newEmail }]);
++
++    const after = await getUserAndSecurityRequest(res1.body.id);
++    expect(after.user.emailVerified).toBe(false);
++    expect(after.securityRequest?.used).toBe(true);
++    expect((await systemRepo.readResource<Login>('Login', login.id)).revoked).toBe(true);
+   });
+ 
+   test('Create, missing medplum user type, creates a Practitioner', async () => {
+@@ -240,6 +286,17 @@ describe('SCIM Routes', () => {
+       });
+     expect(patchResponse).toHaveStatus(403);
+ 
++    // The same email in a different case is not a change
++    const sameEmailResponse = await request(app)
++      .patch(`/scim/v2/Users/${membership.id}`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .set('Content-Type', ContentType.SCIM_JSON)
++      .send({
++        schemas: ['urn:ietf:params:scim:api:messages:2.0:PatchOp'],
++        Operations: [{ op: 'replace', value: { emails: [{ value: bobEmail.toUpperCase() }] } }],
++      });
++    expect(sameEmailResponse).toHaveStatus(200);
++
+     // Bob's login email is unchanged
+     const bobUser = await getGlobalSystemRepo().readResource<User>('User', bob.user.id);
+     expect(bobUser.email).toBe(bobEmail);
+diff --git a/packages/server/src/scim/utils.ts b/packages/server/src/scim/utils.ts
+index 52714cceb83..dcbba8fb43d 100644
+--- a/packages/server/src/scim/utils.ts
++++ b/packages/server/src/scim/utils.ts
+@@ -11,6 +11,8 @@ import {
+ } from '@medplum/core';
+ import type { Project, ProjectMembership, Reference, User } from '@medplum/fhirtypes';
+ import { inviteUser } from '../admin/invite';
++import { retireAllSecurityRequests } from '../auth/securityrequest';
++import { revokeUserLogins } from '../auth/setpassword';
+ import { getConfig } from '../config/loader';
+ import type { SystemRepository } from '../fhir/repo';
+ import { patchObject } from '../util/patch';
+@@ -185,13 +187,9 @@ export async function updateScimUser(
+   );
+ 
+   // Copy the updated properties from the SCIM user to the Medplum user and membership
+-  scimUserToUserAndMembership(scimUser, user, membership, userWritable);
++  const emailChanged = scimUserToUserAndMembership(scimUser, user, membership, userWritable);
+ 
+-  // Save the updated user and membership
+-  const updatedUser = userWritable ? await systemRepo.updateResource(user) : user;
+-  const updatedMembership = await systemRepo.updateResource(membership);
+-
+-  return convertToScimUser(updatedUser, updatedMembership);
++  return saveScimUser(systemRepo, user, membership, userWritable, emailChanged);
+ }
+ 
+ /**
+@@ -221,13 +219,42 @@ export async function patchScimUser(
+   patchObject(scimUser, convertScimToJsonPatch(request));
+ 
+   // Copy the updated properties from the SCIM user to the Medplum user and membership
+-  scimUserToUserAndMembership(scimUser, user, membership, userWritable);
++  const emailChanged = scimUserToUserAndMembership(scimUser, user, membership, userWritable);
+ 
+-  // Save the updated user and membership
+-  const updatedUser = userWritable ? await systemRepo.updateResource(user) : user;
+-  const updatedMembership = await systemRepo.updateResource(membership);
++  return saveScimUser(systemRepo, user, membership, userWritable, emailChanged);
++}
+ 
+-  return convertToScimUser(updatedUser, updatedMembership);
++/**
++ * Saves the User and membership after a SCIM write.
++ *
++ * One transaction, so that if any step fails the email change rolls back too, and the client's
++ * retry still sees the change and repeats every step.
++ * @param systemRepo - The system repository.
++ * @param user - The updated Medplum user.
++ * @param membership - The updated Medplum project membership.
++ * @param userWritable - Whether the caller's project owns the User.
++ * @param emailChanged - Whether the User's login email changed.
++ * @returns The saved SCIM user.
++ */
++async function saveScimUser(
++  systemRepo: SystemRepository,
++  user: WithId<User>,
++  membership: WithId<ProjectMembership>,
++  userWritable: boolean,
++  emailChanged: boolean
++): Promise<ScimUser> {
++  return systemRepo.withTransaction(
++    async (txRepo) => {
++      const updatedUser = userWritable ? await txRepo.updateResource(user) : user;
++      if (userWritable && emailChanged) {
++        await retireAllSecurityRequests(txRepo, updatedUser);
++        await revokeUserLogins(txRepo, updatedUser);
++      }
++      const updatedMembership = await txRepo.updateResource(membership);
++      return convertToScimUser(updatedUser, updatedMembership);
++    },
++    { resourceTypes: ['Login', 'ProjectMembership', 'User', 'UserSecurityRequest'], source: 'scim.saveScimUser' }
++  );
+ }
+ 
+ /**
+@@ -303,22 +330,29 @@ export function convertToScimUser(user: User, membership: ProjectMembership): Sc
+  * @param user - The output Medplum user.
+  * @param membership - The output Medplum project membership.
+  * @param userWritable - Whether the caller's project owns the User.
++ * @returns True if the User's login email changed.
+  */
+ function scimUserToUserAndMembership(
+   scimUser: ScimUser,
+   user: User,
+   membership: ProjectMembership,
+   userWritable: boolean
+-): void {
++): boolean {
++  let emailChanged = false;
+   if (userWritable) {
+     user.firstName = scimUser.name?.givenName as string;
+     user.lastName = scimUser.name?.familyName as string;
+     user.externalId = scimUser.externalId;
+ 
+-    if (scimUser.emails?.[0]?.value) {
+-      user.email = scimUser.emails[0]?.value;
++    const email = scimUser.emails?.[0]?.value?.toLowerCase();
++    if (email) {
++      emailChanged = email !== user.email;
++      user.email = email;
++      if (emailChanged) {
++        user.emailVerified = false;
++      }
+     }
+-  } else if (scimUser.emails?.[0]?.value && scimUser.emails[0].value !== user.email) {
++  } else if (scimUser.emails?.[0]?.value && scimUser.emails[0].value.toLowerCase() !== user.email) {
+     // The login email of a User owned by another project is not the caller's to change.
+     // The other User fields are treated as read-only and ignored.
+     throw new OperationOutcomeError(forbidden);
+@@ -329,6 +363,7 @@ function scimUserToUserAndMembership(
+   }
+ 
+   membership.externalId = scimUser.externalId;
++  return emailChanged;
+ }
+ 
+ /**

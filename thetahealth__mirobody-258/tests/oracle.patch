@@ -1,0 +1,273 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2dd02bba..c8f4cda0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -234,6 +234,22 @@
+   activation that chose "none", the link's row in `th_personal_mcp_url` has
+   `revoked_by = 'care_circle'`, and raising the switch leaves it refused.
+ 
++- **A family member's personal MCP link survives the account it reads being
++  merged.** When a person took over a managed account by signing in to one
++  they already had, or bound an address that belonged to another account, the
++  two accounts were merged but `th_personal_mcp_url` was not: a link someone
++  made to read the closed account still named it. It was refused even when
++  the person chose to keep sharing, still listed as live to the person who
++  made it, and missing from the person's own list of links that read their
++  record, where they would revoke it (#232). The merge now moves such a link
++  to the surviving account, where every use is checked against the care
++  circle as before, so choosing "none" revokes it as it does without a merge.
++  Links the closed account made, and the surviving account's links to the
++  closed one, are revoked; if one person held links to both records, the one
++  that expires later is kept. How to tell: after the merge the link's
++  `subject_id` is the surviving account, and revoked rows read
++  `revoked_by = 'account_merge'`.
++
+ - **A provider that answers nothing is no longer logged as a bug in this
+   repo.** The OpenAI client returns `None`, without raising, when an endpoint
+   answers HTTP 200 with a JSON `null` body. On 1.5.10 a 587 s `deepseek-utils`
+diff --git a/docs/answers.md b/docs/answers.md
+index 3e071fad..00e6b397 100644
+--- a/docs/answers.md
++++ b/docs/answers.md
+@@ -110,8 +110,10 @@ row for each record the circle lets you read. The link belongs to the pair
+ (creator, subject) and lives 10 days from when it is made, unextended by use
+ (`MCP_URL_TTL_DAYS`). Stopping the share, leaving the circle, or the member
+ taking the account over and choosing not to share revokes it, and sharing again
+-does not revive the old URL; deleting either account ends it at once. A link
+-never outlives the access that allowed it.
++does not revive the old URL; deleting either account ends it at once. A member
++who takes the account over by signing in to one they already had merges the
++two, and the link moves with the record to the account they keep, under the
++same rules. A link never outlives the access that allowed it.
+ 
+ Genetic region queries accept `build=GRCh37|GRCh38|raw`. The explicit `raw`
+ choice reads the file's original coordinates without asserting an assembly;
+diff --git a/mirobody/tests/test_postgres_regressions.py b/mirobody/tests/test_postgres_regressions.py
+index 8aa0c5e9..ce3d89e2 100644
+--- a/mirobody/tests/test_postgres_regressions.py
++++ b/mirobody/tests/test_postgres_regressions.py
+@@ -10,6 +10,7 @@
+ import importlib
+ import os
+ import statistics
++from contextlib import asynccontextmanager
+ from datetime import UTC, datetime
+ from pathlib import Path
+ from unittest.mock import AsyncMock
+@@ -742,6 +743,114 @@ async def test_choosing_not_to_share_at_activation_revokes_the_creators_link(dat
+     assert await personal_mcp.authorize(secret) == ""
+ 
+ 
++@asynccontextmanager
++async def _merge_pool(database):
++    """A psycopg pool on the fixture's schema: `merge_accounts` takes a pool,
++    not the engine `execute_query` runs on."""
++    from psycopg_pool import AsyncConnectionPool
++    from sqlalchemy.engine import make_url
++
++    [row] = await database("SELECT current_schema() AS s", log_sql=False)
++    pool = AsyncConnectionPool(make_url(DSN).set(drivername="postgresql").render_as_string(hide_password=False),
++                               kwargs={"options": f"-c search_path={row['s']}"}, min_size=1, open=False)
++    await pool.open()
++    try:
++        yield pool
++    finally:
++        await pool.close()
++
++
++async def _account(database, email: str, managed_by: int | None = None) -> int:
++    [row] = await database("INSERT INTO health_app_user(is_del,email,tz,managed_by) VALUES (false,:e,'UTC',:m)"
++                           " RETURNING id", {"e": email, "m": managed_by}, log_sql=False)
++    return int(row["id"])
++
++
++@pytest.mark.parametrize("access", ["view", "none"])
++async def test_activation_into_an_existing_account_carries_the_creators_link(database, access):
++    """#232: a person who takes over a managed account by signing in to one
++    they already had merges the two, and the creator's link went on naming the
++    deleted account. It was refused even when they kept sharing, still listed
++    as live, and missing from their own list of links that read their record.
++    The link now follows the record, and their choice applies to it as it does
++    when there is no account to merge into."""
++    from mirobody.user import activation, personal_mcp
++    from mirobody.user import care_circle as cc
++
++    await database("CREATE FUNCTION gen_salt(text, integer) RETURNS text LANGUAGE SQL AS $$SELECT $1$$")
++    await database("CREATE FUNCTION crypt(text, text) RETURNS text LANGUAGE SQL AS $$SELECT $1$$")
++    creator_id = await _account(database, "creator@example.invalid")
++    member_id = await _account(database, "managed@example.invalid", managed_by=creator_id)
++    mom_id = await _account(database, "mom@example.invalid")
++    circle = await cc.create_circle(creator_id)
++    await cc.force_accept_managed_member(circle, member_id)
++    secret, _ = await personal_mcp.mint(str(creator_id), str(member_id))
++
++    taken = activation.Activation(id=1, member_id=member_id, email="mom@example.invalid", created_by=creator_id,
++                                  member_name="", creator_name="", expires_at=datetime.now(UTC))
++    choice = cc.ACCESS_VIEW if access == "view" else cc.ACCESS_NONE
++    async with _merge_pool(database) as pool:
++        assert await activation.hand_over(pool, taken, into=mom_id, password="", access=choice) == mom_id
++
++    [link] = await database("SELECT subject_id, revoked_by FROM th_personal_mcp_url", log_sql=False)
++    assert link["subject_id"] == str(mom_id)
++    if access == "view":
++        assert link["revoked_by"] is None
++        assert await personal_mcp.authorize(secret) == str(mom_id)
++        assert [r["subject_id"] for r in (await personal_mcp.listed(str(creator_id)))["made"]] == [str(mom_id)]
++        assert [r["creator_id"] for r in (await personal_mcp.listed(str(mom_id)))["holders"]] == [str(creator_id)]
++    else:
++        assert link["revoked_by"] == "care_circle"
++        assert await personal_mcp.authorize(secret) == ""
++        assert await cc.set_health_access(mom_id, circle, cc.ACCESS_VIEW)
++        assert await personal_mcp.authorize(secret) == ""
++
++
++async def test_account_merge_keeps_one_unrevoked_link_per_creator_and_record(database):
++    """`th_personal_mcp_url` allows one unrevoked link per (creator, subject),
++    expired or not. A creator holding links to both records keeps the one that
++    expires later; links the closed account made, and the surviving account's
++    link to the closed one, are revoked and stay where they were."""
++    from mirobody.user import personal_mcp
++    from mirobody.user import care_circle as cc
++    from mirobody.user.account_merge import merge_accounts
++
++    creator_id = await _account(database, "creator@example.invalid")
++    member_id = await _account(database, "managed@example.invalid", managed_by=creator_id)
++    mom_id = await _account(database, "mom@example.invalid")
++    circle = await cc.create_circle(creator_id)
++    await cc.force_accept_managed_member(circle, member_id)
++    await database("INSERT INTO care_circle_members (care_circle_id, user_id, role, status, health_access)"
++                   " VALUES (:c, :u, :role, :status, :access)",
++                   {"c": circle, "u": mom_id, "role": cc.ROLE_MEMBER, "status": cc.STATUS_ACCEPTED,
++                    "access": cc.ACCESS_VIEW}, log_sql=False)
++    kept, _ = await personal_mcp.mint(str(creator_id), str(member_id))
++    await personal_mcp.mint(str(creator_id), str(mom_id))
++    await database("UPDATE th_personal_mcp_url SET expires_at = now() - interval '1 day' WHERE subject_id = :s",
++                   {"s": str(mom_id)}, log_sql=False)
++    await personal_mcp.mint(str(member_id), str(member_id))
++    await personal_mcp.mint(str(member_id), str(creator_id))
++    await personal_mcp.mint(str(mom_id), str(member_id))
++
++    async with _merge_pool(database) as pool:
++        affected, err = await merge_accounts(pool, losing_user_id=member_id, winning_user_id=mom_id,
++                                             reason="activation")
++    assert err is None
++    assert affected["th_personal_mcp_url"] == 5
++
++    rows = await database("SELECT creator_id, subject_id, revoked_by FROM th_personal_mcp_url ORDER BY id",
++                          log_sql=False)
++    c, m, w = str(creator_id), str(member_id), str(mom_id)
++    assert [(r["creator_id"], r["subject_id"], r["revoked_by"]) for r in rows] == [
++        (c, w, None),
++        (c, w, "account_merge"),
++        (m, m, "account_merge"),
++        (m, c, "account_merge"),
++        (w, m, "account_merge"),
++    ]
++    assert await personal_mcp.authorize(kept) == w
++
++
+ async def test_a_chinese_request_names_coded_readings_in_chinese(database):
+     """#231: a Chinese report's readings were coded, and the indicator list then
+     named them in English only. The list's rows keep `indicator` (what callers
+diff --git a/mirobody/user/account_merge.py b/mirobody/user/account_merge.py
+index fecb0685..8d2a8644 100644
+--- a/mirobody/user/account_merge.py
++++ b/mirobody/user/account_merge.py
+@@ -183,6 +183,65 @@ async def _merge_care_circle_members(cur, losing_id: int, winning_id: int) -> in
+     return total
+ 
+ 
++async def _merge_personal_mcp_links(cur, losing_str: str, winning_str: str) -> int:
++    """th_personal_mcp_url has a partial UNIQUE (creator_id, subject_id) on unrevoked rows.
++
++    A link someone made to read the losing account follows the record to the
++    winning one, as that person's circle membership does, and every use still
++    asks the circle (`personal_mcp.authorize`). Left behind, it named a deleted
++    account: an activation into an address that already had an account
++    refused the creator's link even when the person chose to keep sharing,
++    kept it listed as live, and kept it off the person's own list of links
++    that read their record (#232). The no-merge path keeps the account id, so
++    the link already behaved this way there.
++
++    Links the losing account made are revoked rather than moved: the account
++    that made them is closed, `authorize` already refuses them, and the person
++    makes new ones from the account they keep. A link the winning account made
++    to read the losing one would become a second "own" link, so it is revoked
++    too. If a creator holds unrevoked links to both records, the one that
++    expires later is kept; expired rows count, because the index does.
++    """
++    if not await _table_exists(cur, "th_personal_mcp_url"):
++        return 0
++
++    ids = {"losing": losing_str, "winning": winning_str}
++    await cur.execute(
++        """
++        UPDATE th_personal_mcp_url SET revoked_at = now(), revoked_by = 'account_merge'
++         WHERE revoked_at IS NULL
++           AND (creator_id = %(losing)s OR (creator_id = %(winning)s AND subject_id = %(losing)s));
++        """,
++        ids,
++    )
++    total = cur.rowcount or 0
++
++    await cur.execute(
++        """
++        UPDATE th_personal_mcp_url l SET revoked_at = now(), revoked_by = 'account_merge'
++          FROM th_personal_mcp_url k
++         WHERE l.revoked_at IS NULL AND k.revoked_at IS NULL
++           AND k.creator_id = l.creator_id
++           AND l.subject_id IN (%(losing)s, %(winning)s)
++           AND k.subject_id IN (%(losing)s, %(winning)s)
++           AND k.subject_id <> l.subject_id
++           AND (l.expires_at, l.id) < (k.expires_at, k.id);
++        """,
++        ids,
++    )
++    total += cur.rowcount or 0
++
++    # Revoked rows stay on the account they read: they are history, and the
++    # index does not cover them.
++    await cur.execute(
++        "UPDATE th_personal_mcp_url SET subject_id = %(winning)s"
++        " WHERE subject_id = %(losing)s AND revoked_at IS NULL;",
++        ids,
++    )
++    total += cur.rowcount or 0
++    return total
++
++
+ async def _merge_observations(cur, losing_str: str, winning_str: str) -> int:
+     """The observation tables, through their one writer."""
+     if not await _table_exists(cur, "th_observation"):
+@@ -271,6 +330,10 @@ async def merge_accounts(
+                     if n:
+                         affected["care_circle_members"] = n
+ 
++                    n = await _merge_personal_mcp_links(cur, losing_str, winning_str)
++                    if n:
++                        affected["th_personal_mcp_url"] = n
++
+                     n = await _merge_th_user_avatar_managed(cur, losing_str, winning_str)
+                     if n:
+                         affected["th_user_avatar_managed"] = n
+diff --git a/mirobody/user/personal_mcp.py b/mirobody/user/personal_mcp.py
+index 4d419866..94724b46 100644
+--- a/mirobody/user/personal_mcp.py
++++ b/mirobody/user/personal_mcp.py
+@@ -15,9 +15,13 @@
+   the creator read the subject, the same `resolve_subject` the REST routes
+   ask. Unsharing, removal from a circle, deleting an account and taking one
+   back therefore end the link without anyone revoking it.
+-* Unsharing and removal also revoke it (`revoke_unshared`, called by
+-  `care_circle`), so sharing again later does not bring an old link back: the
+-  person stopped sharing for a reason, and a leaked link is one of them.
++* Unsharing, removal and an activation that shares nothing also revoke it
++  (`revoke_unshared`, through `care_circle.end_links`), so sharing again later
++  does not bring an old link back: the person stopped sharing for a reason,
++  and a leaked link is one of them.
++* Merging two accounts moves a link that reads the closed one to the one kept,
++  where these checks go on applying, and revokes the links the closed account
++  made (`account_merge._merge_personal_mcp_links`).
+ * A link lives a fixed number of days from when it was made and is never
+   extended by use. Making a new one for the same creator and subject revokes
+   the old one in the same transaction.

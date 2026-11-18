@@ -1,0 +1,247 @@
+diff --git a/backend/app/api/routes/v1/outgoing_webhooks.py b/backend/app/api/routes/v1/outgoing_webhooks.py
+index 46f2653c36..c4de344033 100644
+--- a/backend/app/api/routes/v1/outgoing_webhooks.py
++++ b/backend/app/api/routes/v1/outgoing_webhooks.py
+@@ -71,8 +71,7 @@ def create_endpoint(body: EndpointCreateRequest, app_id: SvixAppId) -> EndpointR
+ 
+ @router.get("/endpoints")
+ def list_endpoints(app_id: SvixAppId) -> list[EndpointResponse]:
+-    result = svix_service.list_endpoints(app_id)
+-    return [_ep_to_response(ep) for ep in result.data]
++    return [_ep_to_response(ep) for ep in svix_service.iter_endpoints(app_id)]
+ 
+ 
+ @router.get("/endpoints/{endpoint_id}")
+diff --git a/backend/app/services/outgoing_webhooks/svix.py b/backend/app/services/outgoing_webhooks/svix.py
+index c3ac1f1424..5b8c9be368 100644
+--- a/backend/app/services/outgoing_webhooks/svix.py
++++ b/backend/app/services/outgoing_webhooks/svix.py
+@@ -12,6 +12,7 @@
+ from __future__ import annotations
+ 
+ import logging
++from collections.abc import Callable, Iterator
+ from typing import Any
+ from uuid import UUID
+ 
+@@ -28,7 +29,6 @@
+     EventTypeIn,
+     EventTypeListOptions,
+     EventTypePatch,
+-    ListResponseEndpointOut,
+     ListResponseMessageAttemptOut,
+     ListResponseMessageOut,
+     MessageAttemptListByEndpointOptions,
+@@ -62,6 +62,19 @@
+ _PAYLOAD_DELETE_BATCH_SIZE = 100
+ 
+ 
++def _walk_pages(fetch_page: Callable[[str | None], Any], listing: str) -> Iterator[Any]:
++    """Every item of a Svix list, fetched page by page from the previous page's iterator."""
++    iterator: str | None = None
++    while True:
++        page = fetch_page(iterator)
++        yield from page.data
++        if page.done or not page.iterator:
++            return
++        if page.iterator == iterator:
++            raise RuntimeError(f"Svix returned the same iterator twice while listing {listing}")
++        iterator = page.iterator
++
++
+ def _user_channels(user_id: UUID | None) -> list[str] | None:
+     if user_id is None:
+         return None
+@@ -135,15 +148,15 @@ def register_event_types() -> bool:
+     # List existing types once (paginated) so a steady-state startup makes a single
+     # call instead of a create+update round-trip per type. If Svix is still coming up,
+     # skip without crashing app startup — the sync is idempotent and reruns next boot.
+-    existing: dict[str, str] = {}
+-    iterator: str | None = None
++    client = _client
+     try:
+-        while True:
+-            page = _client.event_type.list(EventTypeListOptions(limit=250, iterator=iterator))
+-            existing.update({et.name: et.description for et in page.data})
+-            if page.done:
+-                break
+-            iterator = page.iterator
++        existing = {
++            et.name: et.description
++            for et in _walk_pages(
++                lambda iterator: client.event_type.list(EventTypeListOptions(limit=250, iterator=iterator)),
++                "event types",
++            )
++        }
+     except Exception:
+         logger.warning("Svix unreachable during startup — skipping event-type sync (reruns next boot).")
+         return False
+@@ -270,10 +283,14 @@ def create_endpoint(
+     )
+ 
+ 
+-def list_endpoints(app_id: str, *, iterator: str | None = None) -> ListResponseEndpointOut:
+-    """One page of endpoints. Pass the previous response's `iterator` to walk the rest."""
++def iter_endpoints(app_id: str) -> Iterator[EndpointOut]:
++    """Every endpoint of an application, across Svix's pages."""
+     assert _client is not None
+-    return _client.endpoint.list(app_id, EndpointListOptions(iterator=iterator))
++    client = _client
++    return _walk_pages(
++        lambda iterator: client.endpoint.list(app_id, EndpointListOptions(iterator=iterator)),
++        f"endpoints of app {app_id}",
++    )
+ 
+ 
+ def get_endpoint(app_id: str, endpoint_id: str) -> EndpointOut:
+@@ -372,19 +389,16 @@ def delete_user_message_payloads(app_id: str, user_id: UUID) -> int:
+     assert _client is not None
+     channel = f"{_USER_CHANNEL_PREFIX}{user_id}"
+ 
+-    msg_ids: list[str] = []
+-    iterator: str | None = None
+-    while True:
+-        page = _client.message.list(
+-            app_id,
+-            MessageListOptions(limit=_MESSAGE_LIST_PAGE_SIZE, iterator=iterator, channel=channel),
++    client = _client
++    msg_ids = [
++        msg.id
++        for msg in _walk_pages(
++            lambda iterator: client.message.list(
++                app_id, MessageListOptions(limit=_MESSAGE_LIST_PAGE_SIZE, iterator=iterator, channel=channel)
++            ),
++            f"messages of app {app_id}",
+         )
+-        msg_ids.extend(msg.id for msg in page.data)
+-        if page.done or not page.iterator:
+-            break
+-        if page.iterator == iterator:
+-            raise RuntimeError(f"Svix returned the same message list iterator twice for app {app_id}")
+-        iterator = page.iterator
++    ]
+ 
+     deleted = 0
+     for start in range(0, len(msg_ids), _PAYLOAD_DELETE_BATCH_SIZE):
+diff --git a/backend/scripts/data_migrations/rename_energy_webhook_event.py b/backend/scripts/data_migrations/rename_energy_webhook_event.py
+index 043d56268d..d040a1dcb3 100644
+--- a/backend/scripts/data_migrations/rename_energy_webhook_event.py
++++ b/backend/scripts/data_migrations/rename_energy_webhook_event.py
+@@ -31,7 +31,6 @@
+ import argparse
+ import sys
+ import time
+-from collections.abc import Iterator
+ 
+ from app.database import SessionLocal
+ from app.models import Developer
+@@ -54,17 +53,6 @@ def _target_filters(current: list[str], phase: str) -> list[str] | None:
+     return [f for f in current if f != OLD_EVENT] or None
+ 
+ 
+-def _iter_endpoints(app_id: str) -> Iterator:
+-    """Every endpoint of an application, following Svix's pagination."""
+-    iterator = None
+-    while True:
+-        page = svix.list_endpoints(app_id, iterator=iterator)
+-        yield from page.data
+-        if page.done or not page.iterator:
+-            return
+-        iterator = page.iterator
+-
+-
+ def main(phase: str, dry_run: bool, sleep: float) -> int:
+     if not svix.is_enabled():
+         print("Svix is disabled — nothing to migrate.")
+@@ -77,7 +65,7 @@ def main(phase: str, dry_run: bool, sleep: float) -> int:
+     scanned = patched = skipped_last_filter = failed = 0
+     for app_id in developer_ids:
+         try:
+-            endpoints = list(_iter_endpoints(app_id))
++            endpoints = list(svix.iter_endpoints(app_id))
+         except Exception as exc:  # noqa: BLE001 - a missing app must not abort the run
+             print(f"  ! {app_id}: cannot list endpoints ({exc})")
+             failed += 1
+diff --git a/backend/tests/api/v1/test_outgoing_webhooks.py b/backend/tests/api/v1/test_outgoing_webhooks.py
+index f34e4d3f80..f0881a1ef8 100644
+--- a/backend/tests/api/v1/test_outgoing_webhooks.py
++++ b/backend/tests/api/v1/test_outgoing_webhooks.py
+@@ -406,12 +406,10 @@ def test_list_endpoints(
+ 
+         token = create_access_token(developer.id)
+ 
+-        list_resp = MagicMock()
+-        list_resp.data = [
++        mock_svix.iter_endpoints.return_value = [
+             MagicMock(id="ep_1", url="https://a.com/wh", description="a", filter_types=None),
+             MagicMock(id="ep_2", url="https://b.com/wh", description="b", filter_types=["workout.created"]),
+         ]
+-        mock_svix.list_endpoints.return_value = list_resp
+ 
+         resp = client.get(
+             "/api/v1/webhooks/endpoints",
+@@ -877,3 +875,64 @@ def test_writes_without_a_run_keep_the_original_key_format(self, mock_task: Magi
+ 
+         expected = f"timeseries.{uid}.garmin.heart_rate.2019-03-14T06_00_00_00_00.2019-03-14T06_05_00_00_00"
+         assert keys == [f"{expected}.heart_rate.created", f"{expected}.series.heart_rate.created"]
++
++
++class TestIterEndpoints:
++    """Svix lists endpoints a page at a time; the walk must reach every page and stop."""
++
++    @pytest.fixture
++    def svix_client(self) -> Generator[MagicMock, None, None]:
++        client = MagicMock()
++        with patch("app.services.outgoing_webhooks.svix._client", client):
++            yield client
++
++    @staticmethod
++    def _endpoint(n: int) -> MagicMock:
++        return MagicMock(id=f"ep_{n}")
++
++    def test_follows_the_iterator_across_pages(self, svix_client: MagicMock) -> None:
++        svix_client.endpoint.list.side_effect = [
++            MagicMock(data=[self._endpoint(1), self._endpoint(2)], done=False, iterator="it_1"),
++            MagicMock(data=[self._endpoint(3)], done=True, iterator=None),
++        ]
++
++        endpoints = list(svix_service.iter_endpoints("app_1"))
++
++        assert [ep.id for ep in endpoints] == ["ep_1", "ep_2", "ep_3"]
++        assert [c.args[1].iterator for c in svix_client.endpoint.list.call_args_list] == [None, "it_1"]
++
++    def test_raises_on_a_repeated_iterator_instead_of_looping(self, svix_client: MagicMock) -> None:
++        svix_client.endpoint.list.return_value = MagicMock(data=[], done=False, iterator="it_1")
++
++        with pytest.raises(RuntimeError, match="same iterator twice while listing endpoints of app app_1"):
++            list(svix_service.iter_endpoints("app_1"))
++
++
++# conftest replaces register_event_types for every test; this is the real one.
++_register_event_types = svix_service.register_event_types
++
++
++def _event_types(registered: list[WebhookEventType]) -> list[MagicMock]:
++    """Svix event types as already registered, with their current descriptions."""
++    types = []
++    for evt in registered:
++        event_type = MagicMock(description=EVENT_TYPE_DESCRIPTIONS.get(evt, ""))
++        event_type.name = evt.value  # `name` is a MagicMock constructor argument, so set it after
++        types.append(event_type)
++    return types
++
++
++def test_event_type_sync_reads_every_page_before_deciding_what_to_create() -> None:
++    registered = list(WebhookEventType)
++    client = MagicMock()
++    client.event_type.list.side_effect = [
++        MagicMock(data=_event_types(registered[:10]), done=False, iterator="it_1"),
++        MagicMock(data=_event_types(registered[10:]), done=True, iterator=None),
++    ]
++
++    with patch("app.services.outgoing_webhooks.svix._client", client):
++        assert _register_event_types() is True
++
++    assert [c.args[0].iterator for c in client.event_type.list.call_args_list] == [None, "it_1"]
++    client.event_type.create.assert_not_called()
++    client.event_type.patch.assert_not_called()

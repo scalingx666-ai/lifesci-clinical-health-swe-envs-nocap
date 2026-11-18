@@ -1,0 +1,234 @@
+diff --git a/erpnext/controllers/stock_controller.py b/erpnext/controllers/stock_controller.py
+index 5d503fe04402..6f6a46316022 100644
+--- a/erpnext/controllers/stock_controller.py
++++ b/erpnext/controllers/stock_controller.py
+@@ -2280,7 +2280,7 @@ def add_gl_entry(
+ 	def update_stock_reservation_entries(self):
+ 		from erpnext.controllers.selling_controller import get_delivered_serial_batch_for_reservation
+ 
+-		def get_sre_list():
++		def get_sre_list(item):
+ 			table = frappe.qb.DocType("Stock Reservation Entry")
+ 			query = (
+ 				frappe.qb.from_(table)
+@@ -2344,9 +2344,14 @@ def get_data_map():
+ 		):
+ 			data_map = get_data_map()
+ 
++			if purpose == "Send to Subcontractor" and self._action == "cancel":
++				rows = {item.sco_rm_detail: item for item in self.items if item.sco_rm_detail}
++				self.rebuild_subcontracting_transfers({row: get_sre_list(item) for row, item in rows.items()})
++				return
++
+ 			field = data_map[purpose or self.doctype]["field"]
+ 			for item in self.get(data_map[purpose or self.doctype]["table_name"]):
+-				sre_list = get_sre_list()
++				sre_list = get_sre_list(item)
+ 
+ 				if not sre_list:
+ 					continue
+@@ -2418,6 +2423,63 @@ def get_data_map():
+ 
+ 					qty -= working_qty
+ 
++	def rebuild_subcontracting_transfers(self, sre_lists: dict[str, list[str]]):
++		transfers = self.get_subcontracting_transfers(list(sre_lists))
++		for sco_rm_detail, sre_list in sre_lists.items():
++			transfer = transfers.get(sco_rm_detail) or new_reservation_transfer()
++			for sre in sre_list:
++				sre_doc = frappe.get_doc("Stock Reservation Entry", sre)
++				if sre_doc.reservation_based_on == "Serial and Batch":
++					transferred_qty = match_transferred_serial_batch(sre_doc, transfer)
++				else:
++					transferred_qty = min(sre_doc.reserved_qty, transfer.qty)
++
++				transfer.qty -= transferred_qty
++				sre_doc.transferred_qty = flt(transferred_qty, sre_doc.precision("transferred_qty"))
++				sre_doc.db_update()
++				sre_doc.update_reserved_qty_in_voucher()
++				sre_doc.update_status()
++				sre_doc.update_reserved_stock_in_bin()
++
++	def get_subcontracting_transfers(self, sco_rm_details: list[str]) -> dict:
++		stock_entry = frappe.qb.DocType("Stock Entry")
++		detail = frappe.qb.DocType("Stock Entry Detail")
++		bundle_entry = frappe.qb.DocType("Serial and Batch Entry")
++		rows = (
++			frappe.qb.from_(detail)
++			.join(stock_entry)
++			.on(stock_entry.name == detail.parent)
++			.left_join(bundle_entry)
++			.on(bundle_entry.parent == detail.serial_and_batch_bundle)
++			.select(
++				detail.name,
++				detail.sco_rm_detail,
++				detail.transfer_qty,
++				bundle_entry.serial_no,
++				bundle_entry.batch_no,
++				bundle_entry.qty,
++			)
++			.where(
++				(stock_entry.docstatus == 1)
++				& (stock_entry.purpose == "Send to Subcontractor")
++				& (stock_entry.subcontracting_order == self.subcontracting_order)
++				& detail.sco_rm_detail.isin(sco_rm_details)
++			)
++		).run(as_dict=True)
++
++		transfers, counted_rows = {}, set()
++		for row in rows:
++			transfer = transfers.setdefault(row.sco_rm_detail, new_reservation_transfer())
++			if row.name not in counted_rows:
++				counted_rows.add(row.name)
++				transfer.qty += flt(row.transfer_qty)
++			if row.serial_no:
++				transfer.serial_nos.add(row.serial_no)
++			if row.batch_no:
++				transfer.batch_qty[row.batch_no] += abs(flt(row.qty))
++
++		return transfers
++
+ 	def check_for_on_hold_or_closed_status(
+ 		self, ref_doctype: str, ref_fieldname: str, exclude_if_field: str | None = None
+ 	) -> None:
+@@ -2986,6 +3048,29 @@ def make_bundle_for_material_transfer(**kwargs):
+ 	return bundle_doc.name
+ 
+ 
++def new_reservation_transfer():
++	return frappe._dict(qty=0, serial_nos=set(), batch_qty=defaultdict(float))
++
++
++def match_transferred_serial_batch(sre_doc, transfer) -> float:
++	matched_qty = 0
++	for entry in sre_doc.sb_entries:
++		if sre_doc.has_serial_no:
++			delivered_qty = 1 if entry.serial_no in transfer.serial_nos else 0
++			transfer.serial_nos.discard(entry.serial_no)
++		else:
++			delivered_qty = min(entry.qty, transfer.batch_qty[entry.batch_no])
++			transfer.batch_qty[entry.batch_no] -= delivered_qty
++
++		delivered_qty = flt(delivered_qty, entry.precision("delivered_qty"))
++		if flt(entry.delivered_qty) != delivered_qty:
++			entry.delivered_qty = delivered_qty
++			entry.db_update()
++		matched_qty += delivered_qty
++
++	return matched_qty
++
++
+ def set_entries_total_qty(entries, total_qty):
+ 	"""Let the last entry take the difference, so the entries add up to the stock qty the voucher posts."""
+ 	entries[-1].qty = abs(flt(total_qty)) - sum(abs(flt(row.qty)) for row in entries[:-1])
+diff --git a/erpnext/stock/doctype/stock_entry/stock_entry.py b/erpnext/stock/doctype/stock_entry/stock_entry.py
+index 64ad96939bf5..821513e1a68c 100644
+--- a/erpnext/stock/doctype/stock_entry/stock_entry.py
++++ b/erpnext/stock/doctype/stock_entry/stock_entry.py
+@@ -813,6 +813,7 @@ def on_cancel(self):
+ 		self.update_work_order()
+ 		self.update_disassembled_order()
+ 		self.cancel_stock_reservation_entries_for_inward()
++		self.cancel_stock_reservation_entries_for_subcontracting()
+ 		self.update_stock_ledger()
+ 
+ 		self.ignore_linked_doctypes = (
+@@ -3266,6 +3267,16 @@ def reserve_stock_for_subcontracting(self):
+ 				items=items.values(), stock_entry=self.name
+ 			)
+ 
++	def cancel_stock_reservation_entries_for_subcontracting(self):
++		from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
++			cancel_stock_reservation_entries,
++		)
++
++		if self.purpose == "Send to Subcontractor":
++			cancel_stock_reservation_entries(
++				from_voucher_type="Stock Entry", from_voucher_no=self.name, notify=False
++			)
++
+ 	def cancel_stock_reserve_for_wip_and_fg(self):
+ 		if self.is_stock_reserve_for_work_order():
+ 			pro_doc = frappe.get_doc("Work Order", self.work_order)
+diff --git a/erpnext/subcontracting/doctype/subcontracting_order/test_subcontracting_order.py b/erpnext/subcontracting/doctype/subcontracting_order/test_subcontracting_order.py
+index ca35e403fb07..bd899a3480bb 100644
+--- a/erpnext/subcontracting/doctype/subcontracting_order/test_subcontracting_order.py
++++ b/erpnext/subcontracting/doctype/subcontracting_order/test_subcontracting_order.py
+@@ -1429,6 +1429,48 @@ def test_transfer_from_another_warehouse_uses_the_order_reservation(self):
+ 		self.assertEqual(reservation.transferred_qty, 4)
+ 		self.assertEqual(reservation.status, "Closed")
+ 
++	@ERPNextTestSuite.change_settings(
++		"Stock Settings",
++		{"enable_stock_reservation": 1, "auto_reserve_serial_and_batch": 1, "allow_partial_reservation": 1},
++	)
++	def test_transfer_cancel_reopens_the_reservations_of_the_remaining_transfers(self):
++		sco = make_reserving_order_with_new_items(
++			"Batch Cancel",
++			qty=10,
++			rm_properties={"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "SCOBC-.####"},
++		)
++		row = sco.supplied_items[0]
++		rm_items = get_rm_items(sco.supplied_items)
++		rm_items[0]["qty"] = 6
++		batch_no = next(iter(make_stock_in_entry(rm_items=rm_items)[row.rm_item_code].batch_no))
++		sco.submit()
++		make_stock_entry(
++			item_code=row.rm_item_code, qty=4, to_warehouse=row.reserve_warehouse, batch_no=batch_no, rate=100
++		)
++		sco.reserve_raw_materials(
++			items=[{"name": row.name, "qty_to_reserve": 4, "warehouse": row.reserve_warehouse}]
++		)
++
++		itemwise_details = {
++			row.rm_item_code: frappe._dict(
++				{"qty": 10, "serial_no": [], "batch_no": defaultdict(float, {batch_no: 10})}
++			)
++		}
++		make_stock_transfer_entry(sco_no=sco.name, rm_items=rm_items, itemwise_details=itemwise_details)
++		rm_items[0]["qty"] = 4
++		make_stock_transfer_entry(
++			sco_no=sco.name, rm_items=rm_items, itemwise_details=itemwise_details
++		).cancel()
++
++		reservations = frappe.get_all(
++			"Stock Reservation Entry",
++			filters={"voucher_no": sco.name, "docstatus": 1, "warehouse": row.reserve_warehouse},
++			fields=["reserved_qty", "transferred_qty"],
++			order_by="creation",
++			as_list=True,
++		)
++		self.assertEqual([tuple(reservation) for reservation in reservations], [(6, 6), (4, 0)])
++
+ 	@ERPNextTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+ 	def test_reservation_counts_supplied_qty(self):
+ 		service_items = [
+@@ -1659,23 +1701,23 @@ def test_service_cost_backfill_updates_draft_receipt(self):
+ 		)
+ 
+ 
+-def make_reserving_order_with_new_items(suffix):
+-	"""Draft order for 4 of a new subcontracted item using 1 new raw material each, with Reserve Stock on."""
++def make_reserving_order_with_new_items(suffix, qty=4, rm_properties=None):
++	"""Draft order for `qty` of a new subcontracted item using 1 new raw material each, with Reserve Stock on."""
+ 	service_item = make_item(f"Subcontracted Service Item {suffix}", {"is_stock_item": 0}).name
+ 	fg_item = make_item(
+ 		f"Subcontracted FG Item {suffix}", {"is_stock_item": 1, "is_sub_contracted_item": 1}
+ 	).name
+-	rm_item = make_item(f"Subcontracted RM Item {suffix}", {"is_stock_item": 1}).name
++	rm_item = make_item(f"Subcontracted RM Item {suffix}", {"is_stock_item": 1, **(rm_properties or {})}).name
+ 	make_bom(item=fg_item, raw_materials=[rm_item], rate=100, currency="INR")
+ 
+ 	service_items = [
+ 		{
+ 			"warehouse": "_Test Warehouse - _TC",
+ 			"item_code": service_item,
+-			"qty": 4,
++			"qty": qty,
+ 			"rate": 100,
+ 			"fg_item": fg_item,
+-			"fg_item_qty": 4,
++			"fg_item_qty": qty,
+ 		}
+ 	]
+ 	sco = get_subcontracting_order(service_items=service_items, do_not_submit=1)

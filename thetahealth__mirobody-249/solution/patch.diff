@@ -1,0 +1,190 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d5baab89..766f63f3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -149,6 +149,18 @@
+   table already did. How to tell: at 375px, open an indicator read from an
+   uploaded report.
+ 
++- **An Apple Health export from an iPhone set to Chinese imports.** Such a
++  phone names the export `apple_health_export/导出.xml`, and
++  `mirobody import apple` looked only for `export.xml`, so the zip and the
++  unpacked folder were both refused ("no export.xml inside the archive"), and
++  with `--into` the refusal was a traceback (#244). `export.xml` is still
++  tried first; otherwise the export is the `.xml` in the export folder, other
++  than `*_cda.xml`, whose root element is `HealthData`, so the lookup no
++  longer depends on the phone's language. An archive or folder without one is
++  refused in one line, `--into` included. Contributed by Mayuri (#249). How
++  to tell: `mirobody import apple export.zip` on a zip holding
++  `apple_health_export/导出.xml` lists its readings.
++
+ ## 1.5.10
+ 
+ ### Fixed
+diff --git a/mirobody/cli.py b/mirobody/cli.py
+index 99005efe..645b139e 100644
+--- a/mirobody/cli.py
++++ b/mirobody/cli.py
+@@ -559,7 +559,10 @@ def _cmd_import(args: argparse.Namespace) -> None:
+         sys.exit(f"mirobody import: no such file: {args.file}")
+     if args.into:
+         _require_extra("import --into", "app", "sqlalchemy", "the database layer")
+-        stored = asyncio.run(_store_export(args))
++        try:
++            stored = asyncio.run(_store_export(args))
++        except FileNotFoundError as e:
++            sys.exit(f"mirobody import: {e}")
+         print(f"Read {stored['records']} records, {stored['facts']} decoded; record {args.into} gained "
+               f"{stored['added']} readings, daily values included. A re-import adds nothing.")
+         return
+diff --git a/mirobody/kernel/decoders/apple_export.py b/mirobody/kernel/decoders/apple_export.py
+index 1304a1d4..9c110d99 100644
+--- a/mirobody/kernel/decoders/apple_export.py
++++ b/mirobody/kernel/decoders/apple_export.py
+@@ -22,10 +22,12 @@
+ 
+ from .apple import SLEEP_TYPE
+ 
+-#: The path Apple writes inside the archive. Apple documents neither this nor
+-#: the `export.zip` filename, so the archive is searched by content: any
+-#: member whose name ends this way is the export.
++#: The path Apple writes inside the archive on an English phone. Apple
++#: documents neither this nor the `export.zip` filename, and a phone set to
++#: another language localizes it (Chinese writes `导出.xml`), so this name is
++#: only tried first: the export is the XML document whose root is `HealthData`.
+ _MEMBER = "apple_health_export/export.xml"
++_ROOT = "HealthData"
+ 
+ #: Attributes copied from a `Record` element. The DTD makes `value` and
+ #: `unit` optional, so a record can legitimately carry neither.
+@@ -46,23 +48,50 @@ def _item(elem: ET.Element) -> dict:
+     return {k: elem.get(k) for k in _FIELDS if elem.get(k) is not None}
+ 
+ 
++def _is_candidate(name: str) -> bool:
++    # The clinical records sit next to the export as `*_cda.xml`.
++    return name.lower().endswith(".xml") and not name.lower().endswith("_cda.xml")
++
++
++def _has_health_root(handle: IO[bytes]) -> bool:
++    with handle:
++        try:
++            for _event, elem in ET.iterparse(handle, events=("start",)):
++                return elem.tag == _ROOT
++        except ET.ParseError:
++            return False
++    return False
++
++
+ def open_export(path: str | Path) -> tuple[IO[bytes], zipfile.ZipFile | None]:
+-    """A binary handle on `export.xml`, whether `path` is the zip, the
++    """A binary handle on the export document, whether `path` is the zip, the
+     unpacked directory, or the file itself. The second element is the archive
+     to close when the caller is done, or None."""
+     p = Path(path)
+     if p.is_dir():
+-        found = p / _MEMBER
+-        if not found.exists():
+-            found = p / "export.xml"
+-        return found.open("rb"), None
++        named = [p / _MEMBER, p / "export.xml"]
++        others = sorted(
++            f
++            for d in (p / "apple_health_export", p)
++            if d.is_dir()
++            for f in d.iterdir()
++            if f.is_file() and _is_candidate(f.name)
++        )
++        for found in dict.fromkeys(f for f in named + others if f.is_file()):
++            if _has_health_root(found.open("rb")):
++                return found.open("rb"), None
++        raise FileNotFoundError(f"{p}: no Apple Health export inside the directory")
+     if zipfile.is_zipfile(p):
+         zf = zipfile.ZipFile(p)
+-        names = [n for n in zf.namelist() if n.endswith((_MEMBER, "/export.xml"))]
+-        if not names:
+-            zf.close()
+-            raise FileNotFoundError(f"{p}: no export.xml inside the archive")
+-        return zf.open(names[0]), zf
++        names = zf.namelist()
++        named = [n for n in names if n.endswith((_MEMBER, "/export.xml")) or n == "export.xml"]
++        # Only the export folder itself: the routes and ECGs live in subfolders.
++        others = [n for n in names if n.count("/") <= 1 and _is_candidate(n) and n not in named]
++        for name in named + others:
++            if _has_health_root(zf.open(name)):
++                return zf.open(name), zf
++        zf.close()
++        raise FileNotFoundError(f"{p}: no Apple Health export inside the archive")
+     return p.open("rb"), None
+ 
+ 
+diff --git a/mirobody/tests/test_apple_export_lookup.py b/mirobody/tests/test_apple_export_lookup.py
+new file mode 100644
+index 00000000..8175eabe
+--- /dev/null
++++ b/mirobody/tests/test_apple_export_lookup.py
+@@ -0,0 +1,64 @@
++"""Finding the Health export inside an archive or directory by content.
++
++An iPhone set to Chinese names the export `导出.xml`, not `export.xml`
++(Discussion #233), so the lookup must not depend on the English name.
++"""
++
++import zipfile
++
++import pytest
++
++from mirobody.kernel.decoders import apple_export
++
++HEALTH = b"""<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE HealthData [
++<!ELEMENT HealthData (Record*)>
++]>
++<HealthData locale="zh_CN">
++ <Record type="HKQuantityTypeIdentifierStepCount" sourceName="iPhone" unit="count"
++  startDate="2026-10-01 08:00:00 +0800" endDate="2026-10-01 08:10:00 +0800" value="120"/>
++</HealthData>
++"""
++CDA = b"""<?xml version="1.0" encoding="UTF-8"?>
++<ClinicalDocument xmlns="urn:hl7-org:v3"/>
++"""
++
++
++def _kinds(path):
++    return [kind for kind, _item in apple_export.iter_items(path)]
++
++
++@pytest.mark.parametrize("name", ["export.xml", "导出.xml"])
++def test_zip_export_is_found_by_content(tmp_path, name):
++    archive = tmp_path / "export.zip"
++    with zipfile.ZipFile(archive, "w") as zf:
++        zf.writestr("apple_health_export/export_cda.xml", CDA)
++        zf.writestr(f"apple_health_export/{name}", HEALTH)
++
++    assert _kinds(archive) == ["HKQuantityTypeIdentifierStepCount"]
++
++
++@pytest.mark.parametrize("name", ["export.xml", "导出.xml"])
++def test_directory_export_is_found_by_content(tmp_path, name):
++    folder = tmp_path / "apple_health_export"
++    folder.mkdir()
++    (folder / "export_cda.xml").write_bytes(CDA)
++    (folder / name).write_bytes(HEALTH)
++
++    assert _kinds(tmp_path) == ["HKQuantityTypeIdentifierStepCount"]
++
++
++def test_zip_without_health_data_is_refused(tmp_path):
++    archive = tmp_path / "export.zip"
++    with zipfile.ZipFile(archive, "w") as zf:
++        zf.writestr("apple_health_export/export_cda.xml", CDA)
++
++    with pytest.raises(FileNotFoundError, match="no Apple Health export"):
++        apple_export.open_export(archive)
++
++
++def test_directory_without_health_data_is_refused(tmp_path):
++    (tmp_path / "notes.xml").write_bytes(CDA)
++
++    with pytest.raises(FileNotFoundError, match="no Apple Health export"):
++        apple_export.open_export(tmp_path)

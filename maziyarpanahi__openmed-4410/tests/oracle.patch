@@ -1,0 +1,1733 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ffe1f08f25..5fd4f13ddf 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Record actual DICOM decoding and display transforms in reproducible digest chains, bind downstream image regions and local VLM evidence to their pixels, and reject stale or unreproducible evidence (#2801).
++
+ - Redact ECG fields and rendered annotations together, with source-bound review, cross-surface identifier matching, verified in-memory PNG export, unchanged waveforms and refusal on residual identifiers or unknown coverage (#2811).
+ 
+ - Keep ambient speaker-role hypotheses separate from aliases and require exact-source reviewer decisions before role-sensitive extraction and note finalization, with explicit provisional drafts and stale-attribution rejection (#2817).
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index 3d74fae191..db2f7ec30c 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -562,6 +562,7 @@ classification:
+     - multimodal/dicom-sr-provenance.md
+     - multimodal/dicom-transfer-syntax-preflight.md
+     - multimodal/vision/dicom-series-sampling.md
++    - multimodal/vision/dicom-pixel-provenance.md
+     - evaluation/model-provenance-diff.md
+     - evaluation/nli-calibration.md
+     - service/outbound-privacy-filter.md
+diff --git a/docs/multimodal/vision/dicom-pixel-provenance.md b/docs/multimodal/vision/dicom-pixel-provenance.md
+new file mode 100644
+index 0000000000..75d415a96a
+--- /dev/null
++++ b/docs/multimodal/vision/dicom-pixel-provenance.md
+@@ -0,0 +1,98 @@
++# DICOM pixel provenance
++
++`openmed.multimodal.vision.dicom.pixel_provenance` executes a bounded local DICOM display pipeline and records the actual intermediate pixels. It tracks transfer syntax, frame selection, decoding, rescaling, windowing, color conversion, orientation, resizing and PNG encoding. A record is accepted for downstream reuse only after the source is rendered again and the complete chain matches.
++
++This is reproducibility evidence, not a diagnostic renderer, PHI redactor, cryptographic signature or proof that a model's interpretation is correct. Source bytes, rendered images, prompts and generated text remain protected in memory. Reports contain hashes and whitelisted numeric/enum parameters; they exclude patient tags, instance/series UIDs, filenames, OCR text and pixel values. Hashes and coordinates remain linkage metadata requiring appropriate access and retention controls.
++
++## Actual operations and canonical records
++
++`render_dicom_frame(source, spec=...)` returns a `ProvenancedFrame` containing an existing `ImageInput` and a `PixelProvenance` record. Each `PixelStage` binds its operation, parameter digest, actual output digest and predecessor digest. Operations that are identities are still recorded, so omitted transformations cannot masquerade as an equivalent workflow.
++
++| Stage | Bound evidence |
++| --- | --- |
++| `transfer_syntax` | Complete original source digest, accepted syntax, explicit decoder and runtime fingerprint |
++| `frame` | Actual native frame bytes or encapsulated frame payload, zero-based index, declared count and source-frame reference |
++| `decode` | Decoded array after the selected decoder's unpacking, reshaping, subsampling and signedness handling |
++| `rescale` | Executed slope/intercept pair and resulting array, or explicit color-image identity |
++| `window` | Caller-supplied window and actual quantized output, or explicit color-image identity |
++| `color` | Photometric conversion into RGB, including MONOCHROME1 inversion |
++| `orientation` | Actual clockwise quarter turn in stored pixel coordinates |
++| `resize` | Requested size, exact filter and actual RGB output |
++| `encode` | Fresh PNG bytes, verified against the final decoded RGB pixels |
++
++Array digests include dtype, shape and contiguous little-endian bytes. The runtime fingerprint binds the installed pydicom, NumPy, Pillow, JPEG codec and zlib versions without reporting arbitrary backend strings. `PixelProvenance.to_json()` includes the executed specification, whitelisted header parameters, stage chain and final pixel/image digests. It never serializes an arbitrary source dataset.
++
++`reproduce_dicom_frame(source, provenance)` re-executes all operations and compares the entire record. Changes to source bytes, frame index, parameters, intermediate pixels, runtime fingerprint or encoded output reject reproduction. A decoder change is detected even if a later window clips both results to the same final image. Dependency upgrades require a new receipt; matching output pixels alone do not establish an identical execution history.
++
++## Explicit local decoding and display choices
++
++| `PixelDecoder` | Supported source path |
++| --- | --- |
++| `NATIVE` | Explicit or implicit VR little-endian; 8/16-bit monochrome, or unsigned 8-bit RGB/YBR_FULL/YBR_FULL_422 |
++| `RLE` | DICOM RLE Lossless through pydicom's explicit local decoder; monochrome or supported 8-bit color |
++| `JPEG` | Baseline 8-bit grayscale JPEG through the explicit local Pillow decoder |
++
++No decoder is downloaded, auto-installed or selected by fallback. Source/header/frame/output limits are checked before work; RLE segment expansion and JPEG dimensions are checked before decompression. Other compressed syntaxes, color JPEG, unsupported sample layouts and ambiguous transforms fail closed. These are cooperative checks, not a native decoder sandbox; hard time/memory isolation belongs to the qualified runtime.
++
++Monochrome input requires `DisplayWindow(center=..., width=...)`. The pipeline first resolves one complete rescale pair from the selected per-frame macro, shared macro or root dataset, in that order. Missing pairs default to identity; partial pairs are rejected. It then executes `floor(clip((value - (center - width/2)) / width, 0, 1) * 255)`. The caller's explicit window replaces any implicit selection of DICOM VOI presets. This is not the standard's default `LINEAR` center/width interpretation; DICOM distinguishes multiple [VOI functions](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.11.2.html). Modality/presentation LUT sequences and inverse presentation LUT shapes are unsupported and rejected.
++
++Color input requires `window=None` and identity rescale. Native planar RGB/YBR and native YBR_FULL_422 are normalized by the decoder, followed by explicit YBR-to-RGB conversion. Monochrome pixels become three equal RGB channels after any MONOCHROME1 inversion. The [pydicom pixel-array API](https://pydicom.github.io/pydicom/stable/reference/generated/pydicom.pixels.pixel_array.html) documents the processing performed even with `raw=True`; the recorded decode stage includes those effects.
++
++`PageRotation` executes only lossless clockwise quarter turns. Patient orientation tags do not silently rotate the image. `output_size=(width, height)` applies the declared `ResizeFilter.NEAREST` or `BILINEAR` filter after rotation. No physical measurement or anatomical orientation is inferred from resized display pixels. Decoder correctness needs separate qualification; pydicom also documents [compressed-pixel limitations](https://pydicom.github.io/pydicom/stable/guides/user/image_data_handlers.html).
++
++## Executable synthetic example
++
++This example constructs synthetic DICOM bytes, renders them, attaches a downstream region and verifies it by decoding the source again. All work stays in memory.
++
++```python
++from io import BytesIO
++from pydicom import dcmwrite
++from pydicom.dataset import Dataset, FileMetaDataset
++from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian
++from openmed.multimodal.vision.dicom.series_sampler import DisplayWindow
++from openmed.multimodal.vision.dicom.pixel_provenance import (
++    PixelRenderSpec, bind_region_provenance, render_dicom_frame,
++    reproduce_dicom_frame, verify_region_provenance,
++)
++from openmed.multimodal.vision.providers.base import ImageRegion
++
++ds = Dataset()
++ds.file_meta = FileMetaDataset()
++ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
++ds.SOPClassUID = CTImageStorage
++ds.SOPInstanceUID = "1.2.826.0.1.3680043.10.543.2801"
++ds.Rows = ds.Columns = 2
++ds.SamplesPerPixel = 1
++ds.BitsAllocated = ds.BitsStored = 8
++ds.HighBit = 7
++ds.PixelRepresentation = 0
++ds.PhotometricInterpretation = "MONOCHROME2"
++ds.PixelData = bytes([0, 64, 128, 255])
++buffer = BytesIO()
++dcmwrite(buffer, ds, enforce_file_format=True)
++source = buffer.getvalue()
++
++frame = render_dicom_frame(
++    source,
++    spec=PixelRenderSpec(
++        frame_index=0, window=DisplayWindow(center=127.5, width=255),
++    ),
++)
++region = ImageRegion(
++    image_digest=frame.image.digest, x0=0, y0=0, x1=1, y1=2,
++)
++bindings = bind_region_provenance(source, frame.provenance, (region,))
++assert verify_region_provenance(source, frame.provenance, bindings) == (region,)
++assert reproduce_dicom_frame(source, frame.provenance).image == frame.image
++report = frame.provenance.to_json()  # Hashes and display parameters only.
++```
++
++## Downstream regions and local model evidence
++
++`bind_region_provenance` accepts existing `ImageRegion` objects in the rendered image's coordinate space. It reproduces the source and records each actual crop's pixel digest plus the complete provenance digest. `verify_region_provenance` rerenders and compares chain, image, geometry and crop content before returning the verified regions. A structurally plausible or relinked hash chain is insufficient. Records are not signatures: they prove reproducibility, not who originally authored a region.
++
++`run_provenanced_dicom_vlm(source, provider, prompt, spec=..., regions=...)` renders the image, calls the existing qualified local VLM contract and binds the provider's actual `VisualEvidence`. Optional regions restrict evidence to explicit rendered-space boxes. The result's `require_evidence(source)` revalidates pixels before exposing those evidence links and rejects model abstentions. `to_json()` includes only value-free model metadata, the chain and regional bindings; generated text remains in the protected `result` object and retains the existing human-review requirement.
++
++The `frame_reference` uses the same source-digest/frame-index binding as the [DICOM series sampler](dicom-series-sampling.md). Join it to `SourceFrame.reference` when consuming a sampling manifest. This single-frame renderer does not claim that a series is complete or that an unselected frame was already examined. Series sampling policy and clinical adequacy remain separate from reproducing one explicitly selected frame.
++
++Install the existing multimodal dependencies locally before use. The feature adds no dependencies or network calls. Run `python -m pytest tests/unit/multimodal/vision/dicom/test_pixel_provenance.py -q` for synthetic native/RLE/JPEG, transform, privacy and evidence-reproduction controls.
+diff --git a/mkdocs.yml b/mkdocs.yml
+index bdb2f30c99..737aec7d3d 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -502,6 +502,7 @@ nav:
+       - DICOM-SR provenance mapping: multimodal/dicom-sr-provenance.md
+       - DICOM transfer-syntax preflight: multimodal/dicom-transfer-syntax-preflight.md
+       - DICOM series sampling: multimodal/vision/dicom-series-sampling.md
++      - DICOM pixel provenance: multimodal/vision/dicom-pixel-provenance.md
+       - Model-provenance diff reports: evaluation/model-provenance-diff.md
+       - Clinical NLI threshold calibration: evaluation/nli-calibration.md
+       - Outbound request privacy filter: service/outbound-privacy-filter.md
+diff --git a/openmed/multimodal/vision/dicom/pixel_provenance.py b/openmed/multimodal/vision/dicom/pixel_provenance.py
+new file mode 100644
+index 0000000000..0d775a54cb
+--- /dev/null
++++ b/openmed/multimodal/vision/dicom/pixel_provenance.py
+@@ -0,0 +1,971 @@
++"""Reproducible DICOM display pixels and source-bound local visual evidence.
++
++This is a bounded display pipeline, not a diagnostic renderer, de-identification
++step or assertion that a model's clinical interpretation is correct.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++import math
++from collections.abc import Callable
++from contextlib import contextmanager
++from dataclasses import asdict, dataclass, field
++from enum import Enum
++from io import BytesIO
++from typing import Any, TypeVar
++
++from ...dicom_transfer_syntax import TransferSyntaxOutcome, read_dicom_transfer_syntax
++from ...page_rotation import PageRotation
++from ..providers.base import (
++    EdgeVLMProvider,
++    ImageInput,
++    ImageRegion,
++    Prompt,
++    VisualEvidence,
++    VLMRequest,
++    VLMResult,
++    run_local_vlm,
++)
++from .series_sampler import (
++    DisplayWindow,
++    _Header,
++    _header_integer,
++    _quiet_parser,
++    _QuietParser,
++)
++
++_SCHEMA = "openmed.dicom.pixel-provenance.v1"
++_OPERATIONS = (
++    "transfer_syntax",
++    "frame",
++    "decode",
++    "rescale",
++    "window",
++    "color",
++    "orientation",
++    "resize",
++    "encode",
++)
++_NATIVE = ("1.2.840.10008.1.2", "1.2.840.10008.1.2.1")
++_RLE = "1.2.840.10008.1.2.5"
++_JPEG = "1.2.840.10008.1.2.4.50"
++_PHOTOS = ("MONOCHROME1", "MONOCHROME2", "RGB", "YBR_FULL", "YBR_FULL_422")
++_TAGS = [
++    "Rows",
++    "Columns",
++    "NumberOfFrames",
++    "SamplesPerPixel",
++    "BitsAllocated",
++    "BitsStored",
++    "HighBit",
++    "PixelRepresentation",
++    "PhotometricInterpretation",
++    "PlanarConfiguration",
++    "RescaleSlope",
++    "RescaleIntercept",
++    "ModalityLUTSequence",
++    "PresentationLUTShape",
++    "PresentationLUTSequence",
++    "SharedFunctionalGroupsSequence",
++    "PerFrameFunctionalGroupsSequence",
++]
++T = TypeVar("T")
++Box = tuple[int, int, int, int]
++
++__all__ = [
++    "PixelDecoder",
++    "PixelHeader",
++    "PixelProvenance",
++    "PixelProvenanceError",
++    "PixelProvenanceLimits",
++    "PixelRenderSpec",
++    "PixelStage",
++    "ProvenancedFrame",
++    "ProvenancedInference",
++    "RegionProvenance",
++    "ResizeFilter",
++    "bind_region_provenance",
++    "render_dicom_frame",
++    "reproduce_dicom_frame",
++    "run_provenanced_dicom_vlm",
++    "verify_region_provenance",
++]
++
++
++class PixelProvenanceError(ValueError):
++    """Fixed-message rejection with no source, decoder or provider exception context."""
++
++
++def _require(condition: bool) -> None:
++    if not condition:
++        raise PixelProvenanceError("dicom_pixel_provenance_rejected")
++
++
++def _safe(call: Callable[[], T]) -> T:
++    result = None
++    failed = False
++    try:
++        result = call()
++    except Exception:
++        failed = True
++    if failed:
++        raise PixelProvenanceError("dicom_pixel_provenance_rejected")
++    return result  # type: ignore[return-value]
++
++
++def _json(value: Any) -> str:
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
++
++
++def _hash(value: Any) -> str:
++    return hashlib.sha256(_json(value).encode()).hexdigest()
++
++
++def _digest(value: str) -> None:
++    _require(
++        type(value) is str
++        and len(value) == 64
++        and all(c in "0123456789abcdef" for c in value)
++    )
++
++
++def _int(value: int, low: int, high: int) -> None:
++    _require(type(value) is int and low <= value <= high)
++
++
++def _finite(value: float, limit: float) -> None:
++    _require(
++        type(value) in (float, int) and math.isfinite(value) and abs(value) <= limit
++    )
++
++
++class PixelDecoder(str, Enum):
++    """Explicit locally installed decoder; never automatic plugin fallback."""
++
++    NATIVE = "pydicom_native"
++    RLE = "pydicom_rle"
++    JPEG = "pillow_grayscale_jpeg_baseline"
++
++
++class ResizeFilter(str, Enum):
++    """Executed Pillow resize filter recorded in the digest chain."""
++
++    NEAREST = "nearest"
++    BILINEAR = "bilinear"
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class PixelRenderSpec:
++    """Explicit frame, display window, stored-pixel rotation and resize request.
++
++    Args:
++        frame_index: Zero-based source frame; no implicit representative frame.
++        window: Required for monochrome; explicit linear clipping after rescale.
++            Must be None for RGB/YBR input. DICOM VOI presets are not selected.
++        decoder: Exact native/RLE/grayscale-JPEG implementation to execute.
++        rotation: Clockwise quarter turn; never inferred patient orientation.
++        output_size: Optional (width, height) after rotation; None preserves size.
++        resize_filter: Explicit filter, retained even for an identity resize.
++    """
++
++    frame_index: int
++    window: DisplayWindow | None = None
++    decoder: PixelDecoder = PixelDecoder.NATIVE
++    rotation: PageRotation = PageRotation.ROTATE_0
++    output_size: tuple[int, int] | None = None
++    resize_filter: ResizeFilter = ResizeFilter.NEAREST
++
++    def __post_init__(self) -> None:
++        _int(self.frame_index, 0, 4095)
++        _require(self.window is None or type(self.window) is DisplayWindow)
++        if self.window is not None:
++            self.window.__post_init__()
++        _require(
++            type(self.decoder) is PixelDecoder and type(self.rotation) is PageRotation
++        )
++        _require(type(self.resize_filter) is ResizeFilter)
++        if self.output_size is not None:
++            _require(type(self.output_size) is tuple and len(self.output_size) == 2)
++            for value in self.output_size:
++                _int(value, 1, 65535)
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class PixelProvenanceLimits:
++    """Cooperative budgets, not a native codec process sandbox.
++
++    Args:
++        max_source_bytes: Maximum complete encoded DICOM input size.
++        max_header_bytes: Maximum parser position before pixel data.
++        max_frame_pixels: Maximum source or resized output frame area.
++        max_frames: Maximum declared source frame count.
++        max_output_bytes: Maximum fresh encoded PNG size.
++    """
++
++    max_source_bytes: int = 64 * 1024 * 1024
++    max_header_bytes: int = 1024 * 1024
++    max_frame_pixels: int = 4_000_000
++    max_frames: int = 512
++    max_output_bytes: int = 32 * 1024 * 1024
++
++    def __post_init__(self) -> None:
++        for value, low, high in (
++            (self.max_source_bytes, 132, 256 * 1024 * 1024),
++            (self.max_header_bytes, 132, 8 * 1024 * 1024),
++            (self.max_frame_pixels, 1, 16_000_000),
++            (self.max_frames, 1, 4096),
++            (self.max_output_bytes, 1, 32 * 1024 * 1024),
++        ):
++            _int(value, low, high)
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class PixelHeader:
++    """Whitelisted numeric/enum source properties actually used by the renderer."""
++
++    transfer_syntax: str
++    rows: int
++    columns: int
++    frames: int
++    samples: int
++    bits_allocated: int
++    bits_stored: int
++    signed: int
++    photometric: str
++    planar_configuration: int
++    slope: float
++    intercept: float
++
++    def __post_init__(self) -> None:
++        _require(
++            type(self.transfer_syntax) is str
++            and self.transfer_syntax in (*_NATIVE, _RLE, _JPEG)
++        )
++        for value in (self.rows, self.columns):
++            _int(value, 1, 65535)
++        _int(self.frames, 1, 4096)
++        _require(self.samples in (1, 3) and type(self.samples) is int)
++        _require(self.bits_allocated in (8, 16) and type(self.bits_allocated) is int)
++        _int(self.bits_stored, 1, self.bits_allocated)
++        _int(self.signed, 0, 1)
++        _int(self.planar_configuration, 0, 1)
++        _require(type(self.photometric) is str and self.photometric in _PHOTOS)
++        _finite(self.slope, 1e6)
++        _finite(self.intercept, 1e9)
++        _require(self.slope != 0)
++
++
++@dataclass(frozen=True, slots=True)
++class PixelStage:
++    """One executed operation, with parameter/output hashes and predecessor link."""
++
++    operation: str
++    parameters_digest: str
++    output_digest: str
++    previous_digest: str
++
++    def __post_init__(self) -> None:
++        _require(type(self.operation) is str and self.operation in _OPERATIONS)
++        for value in (self.parameters_digest, self.output_digest, self.previous_digest):
++            _digest(value)
++
++    @property
++    def digest(self) -> str:
++        """Bind operation, parameters, actual output and preceding stage."""
++        self.__post_init__()
++        return _hash([_SCHEMA, *asdict(self).values()])
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class PixelProvenance:
++    """Canonical receipt for the actual source, runtime, operations and PNG.
++
++    This is reproducibility evidence, not a signature or clinical certification.
++    Reuse requires reproduce_dicom_frame or verify_region_provenance, which
++    reconstruct the pixels instead of trusting this receipt's declarations.
++    """
++
++    source_digest: str
++    frame_reference: str
++    spec: PixelRenderSpec
++    header: PixelHeader
++    runtime_digest: str
++    stages: tuple[PixelStage, ...]
++    size: tuple[int, int]
++    pixels_digest: str
++    image_digest: str
++
++    def __post_init__(self) -> None:
++        for value in (
++            self.source_digest,
++            self.frame_reference,
++            self.runtime_digest,
++            self.pixels_digest,
++            self.image_digest,
++        ):
++            _digest(value)
++        _require(
++            type(self.spec) is PixelRenderSpec and type(self.header) is PixelHeader
++        )
++        self.spec.__post_init__()
++        self.header.__post_init__()
++        _require(
++            self.frame_reference == _hash([self.source_digest, self.spec.frame_index])
++        )
++        _require(self.spec.frame_index < self.header.frames)
++        _require(type(self.stages) is tuple and len(self.stages) == len(_OPERATIONS))
++        previous = self.source_digest
++        for stage, operation in zip(self.stages, _OPERATIONS, strict=True):
++            _require(type(stage) is PixelStage)
++            stage.__post_init__()
++            _require(stage.operation == operation and stage.previous_digest == previous)
++            previous = stage.digest
++        _require(self.stages[-1].output_digest == self.image_digest)
++        _require(self.stages[-2].output_digest == self.pixels_digest)
++        _require(type(self.size) is tuple and len(self.size) == 2)
++        for coordinate in self.size:
++            _int(coordinate, 1, 65535)
++
++    @property
++    def digest(self) -> str:
++        """Bind the complete receipt, including explicit no-op operations."""
++        return hashlib.sha256(self.to_json().encode()).hexdigest()
++
++    def to_json(self) -> str:
++        """Serialize only whitelisted numeric/enum metadata and hashes."""
++        self.__post_init__()
++        return _json({"schema_version": _SCHEMA, **asdict(self)})
++
++
++@dataclass(frozen=True, slots=True)
++class ProvenancedFrame:
++    """Protected PNG and its executed pixel history; no source tags are retained."""
++
++    provenance: PixelProvenance
++    image: ImageInput = field(repr=False)
++
++
++@dataclass(frozen=True, slots=True)
++class RegionProvenance:
++    """Existing image-space region bound to the full chain and actual crop pixels."""
++
++    provenance_digest: str
++    region: ImageRegion
++    pixels_digest: str
++
++    def __post_init__(self) -> None:
++        _digest(self.provenance_digest)
++        _digest(self.pixels_digest)
++        _require(type(self.region) is ImageRegion)
++        self.region.__post_init__()
++
++
++@dataclass(frozen=True, slots=True)
++class ProvenancedInference:
++    """Actual local provider result and region bindings, with guarded evidence reuse."""
++
++    provenance: PixelProvenance
++    regions: tuple[RegionProvenance, ...]
++    result: VLMResult = field(repr=False)
++
++    def require_evidence(
++        self, source: bytes, *, limits: PixelProvenanceLimits = PixelProvenanceLimits()
++    ) -> tuple[VisualEvidence, ...]:
++        """Reproduce source pixels and bindings before exposing non-abstained evidence.
++
++        Args:
++            source: Exact original protected DICOM bytes.
++            limits: Current execution limits; no receipt can override them.
++        """
++
++        def verify():
++            _require(type(self.result) is VLMResult)
++            self.result.__post_init__()
++            _require(self.result.abstention is None)
++            verified = verify_region_provenance(
++                source, self.provenance, self.regions, limits=limits
++            )
++            _require(verified == tuple(item.region for item in self.result.evidence))
++            return self.result.evidence
++
++        return _safe(verify)
++
++    def to_json(self) -> str:
++        """Return chain and region evidence without pixels, prompts or generated text."""
++        self.provenance.__post_init__()
++        _require(type(self.regions) is tuple and len(self.regions) <= 256)
++        for region in self.regions:
++            _require(type(region) is RegionProvenance)
++            region.__post_init__()
++        return _json(
++            {
++                "schema_version": _SCHEMA,
++                "provenance": json.loads(self.provenance.to_json()),
++                "regions": [asdict(region) for region in self.regions],
++                "result": json.loads(self.result.to_json()),
++                "notice": self.result.notice,
++            }
++        )
++
++
++@contextmanager
++def _quiet_decoders():
++    from PIL import Image
++
++    Image.init()
++    guard = _QuietParser()
++    loggers = [
++        logger
++        for name, logger in logging.Logger.manager.loggerDict.copy().items()
++        if (name == "PIL" or name.startswith("PIL."))
++        and isinstance(logger, logging.Logger)
++    ]
++    with _quiet_parser():
++        for logger in loggers:
++            logger.addFilter(guard)
++        try:
++            yield
++            _require(not guard.warned)
++        finally:
++            for logger in loggers:
++                logger.removeFilter(guard)
++
++
++def _array_digest(array):
++    import numpy as np
++
++    _require(array.dtype.kind in ("i", "u", "f") and array.dtype.itemsize in (1, 2, 8))
++    canonical = np.asarray(array, dtype=array.dtype.newbyteorder("<"), order="C")
++    digest = hashlib.sha256(
++        _json(["openmed.pixel-array.v1", canonical.dtype.str, canonical.shape]).encode()
++    )
++    digest.update(b"\x00")
++    digest.update(canonical.tobytes())
++    return digest.hexdigest()
++
++
++def _runtime_digest():
++    import zlib
++
++    import numpy
++    import PIL
++    import pydicom
++    from PIL import features
++
++    return _hash(
++        [
++            pydicom.__version__,
++            numpy.__version__,
++            PIL.__version__,
++            zlib.ZLIB_RUNTIME_VERSION,
++            features.version_codec("jpg"),
++        ]
++    )
++
++
++def _rescale(ds, count, index):
++    from pydicom.dataset import Dataset
++
++    shared = getattr(ds, "SharedFunctionalGroupsSequence", ())
++    per_frame = getattr(ds, "PerFrameFunctionalGroupsSequence", ())
++    _require(len(shared) <= 1 and len(per_frame) in (0, count))
++    for owner in (
++        per_frame[index] if per_frame else Dataset(),
++        shared[0] if shared else Dataset(),
++        ds,
++    ):
++        _require(not hasattr(owner, "ModalityLUTSequence"))
++        sequence = getattr(owner, "PixelValueTransformationSequence", None)
++        if sequence is not None:
++            _require(len(sequence) == 1)
++            owner = sequence[0]
++            _require(not hasattr(owner, "ModalityLUTSequence"))
++        present = (hasattr(owner, "RescaleSlope"), hasattr(owner, "RescaleIntercept"))
++        if any(present):
++            _require(all(present))
++            slope, intercept = float(owner.RescaleSlope), float(owner.RescaleIntercept)
++            _finite(slope, 1e6)
++            _finite(intercept, 1e9)
++            _require(slope != 0)
++            return slope, intercept
++        _require(sequence is None)
++    return 1.0, 0.0
++
++
++def _header(source, spec, limits):
++    import pydicom
++
++    preflight = read_dicom_transfer_syntax(source, max_bytes=limits.max_header_bytes)
++    syntax = preflight.transfer_syntax_uid
++    _require(
++        preflight.outcome
++        is (
++            TransferSyntaxOutcome.NATIVE
++            if spec.decoder is PixelDecoder.NATIVE
++            else TransferSyntaxOutcome.OPTIONAL_DECODER
++        )
++    )
++    expected = {
++        PixelDecoder.NATIVE: _NATIVE,
++        PixelDecoder.RLE: (_RLE,),
++        PixelDecoder.JPEG: (_JPEG,),
++    }
++    _require(syntax in expected[spec.decoder])
++    ds = pydicom.dcmread(
++        _Header(source, limits.max_header_bytes),
++        stop_before_pixels=True,
++        specific_tags=_TAGS,
++    )
++    _require(str(ds.file_meta.TransferSyntaxUID) == syntax)
++    rows, cols = (
++        _header_integer(getattr(ds, key), 1, 65535) for key in ("Rows", "Columns")
++    )
++    _require(rows * cols <= limits.max_frame_pixels)
++    count = _header_integer(getattr(ds, "NumberOfFrames", 1), 1, limits.max_frames)
++    _require(spec.frame_index < count)
++    bits = _header_integer(ds.BitsAllocated, 8, 16)
++    stored = _header_integer(ds.BitsStored, 1, bits)
++    _require(bits in (8, 16) and _header_integer(ds.HighBit, 0, bits - 1) == stored - 1)
++    samples = _header_integer(ds.SamplesPerPixel, 1, 3)
++    photo = str(ds.PhotometricInterpretation)
++    signed = _header_integer(ds.PixelRepresentation, 0, 1)
++    planar = _header_integer(getattr(ds, "PlanarConfiguration", 0), 0, 1)
++    _require(
++        not hasattr(ds, "ModalityLUTSequence")
++        and not hasattr(ds, "PresentationLUTSequence")
++    )
++    _require(str(getattr(ds, "PresentationLUTShape", "IDENTITY")) == "IDENTITY")
++    slope, intercept = _rescale(ds, count, spec.frame_index)
++    if samples == 1:
++        _require(photo in ("MONOCHROME1", "MONOCHROME2") and spec.window is not None)
++    else:
++        _require(samples == 3 and photo in ("RGB", "YBR_FULL", "YBR_FULL_422"))
++        _require(bits == stored == 8 and signed == 0 and spec.window is None)
++        _require(slope == 1 and intercept == 0 and hasattr(ds, "PlanarConfiguration"))
++        if photo == "YBR_FULL_422":
++            _require(
++                spec.decoder is PixelDecoder.NATIVE and cols % 2 == 0 and planar == 0
++            )
++    if spec.decoder is PixelDecoder.JPEG:
++        _require(samples == 1 and bits == stored == 8 and signed == 0)
++    return PixelHeader(
++        transfer_syntax=syntax,
++        rows=rows,
++        columns=cols,
++        frames=count,
++        samples=samples,
++        bits_allocated=bits,
++        bits_stored=stored,
++        signed=signed,
++        photometric=photo,
++        planar_configuration=planar,
++        slope=slope,
++        intercept=intercept,
++    )
++
++
++def _validate_rle(payload, header):
++    # Bound PackBits expansion before pydicom allocates a decoded segment.
++    _require(len(payload) >= 64)
++    segments = int.from_bytes(payload[:4], "little")
++    _require(segments == header.samples * (header.bits_allocated // 8))
++    offsets = [
++        int.from_bytes(payload[4 + i * 4 : 8 + i * 4], "little")
++        for i in range(segments)
++    ]
++    _require(offsets[0] == 64 and all(a < b for a, b in zip(offsets, offsets[1:])))
++    offsets.append(len(payload))
++    expected = header.rows * header.columns
++    for start, stop in zip(offsets, offsets[1:]):
++        _require(64 <= start < stop <= len(payload))
++        position, expanded = start, 0
++        while position < stop:
++            if expanded == expected and position == stop - 1 and payload[position] == 0:
++                position += 1
++                break
++            control = payload[position]
++            position += 1
++            if control < 128:
++                position += control + 1
++                expanded += control + 1
++            elif control > 128:
++                position += 1
++                expanded += 257 - control
++            _require(position <= stop and expanded <= expected)
++        _require(expanded == expected)
++
++
++def _frame_payload(source, header, spec):
++    import pydicom
++    from PIL import Image
++    from pydicom.encaps import get_frame
++
++    ds = pydicom.dcmread(
++        BytesIO(source),
++        specific_tags=[
++            "PixelData",
++            "ExtendedOffsetTable",
++            "ExtendedOffsetTableLengths",
++        ],
++    )
++    data = ds.PixelData
++    _require(type(data) is bytes)
++    if spec.decoder is PixelDecoder.NATIVE:
++        samples = 2 if header.photometric == "YBR_FULL_422" else header.samples
++        length = header.rows * header.columns * samples * (header.bits_allocated // 8)
++        required = length * header.frames
++        _require(len(data) == required + required % 2)
++        return data[spec.frame_index * length : (spec.frame_index + 1) * length]
++    offsets = None
++    if hasattr(ds, "ExtendedOffsetTable") or hasattr(ds, "ExtendedOffsetTableLengths"):
++        _require(
++            hasattr(ds, "ExtendedOffsetTable")
++            and hasattr(ds, "ExtendedOffsetTableLengths")
++        )
++        offsets = (ds.ExtendedOffsetTable, ds.ExtendedOffsetTableLengths)
++        _require(
++            all(
++                type(value) is bytes and len(value) == header.frames * 8
++                for value in offsets
++            )
++        )
++    payload = get_frame(
++        data, spec.frame_index, number_of_frames=header.frames, extended_offsets=offsets
++    )
++    if spec.decoder is PixelDecoder.RLE:
++        _validate_rle(payload, header)
++    else:
++        with Image.open(BytesIO(payload)) as image:
++            _require(
++                image.format == "JPEG"
++                and image.mode == "L"
++                and image.size == (header.columns, header.rows)
++            )
++    return payload
++
++
++class _Output(BytesIO):
++    def __init__(self, limit):
++        super().__init__()
++        self.limit = limit
++
++    def write(self, data):
++        _require(self.tell() + len(data) <= self.limit)
++        return super().write(data)
++
++
++def _render(source, spec, limits, cancel_check=None):
++    import numpy as np
++    from PIL import Image
++    from pydicom.pixels import convert_color_space, pixel_array
++
++    def cancel():
++        _require(cancel_check is None or not cancel_check())
++
++    _require(
++        type(source) is bytes
++        and type(spec) is PixelRenderSpec
++        and type(limits) is PixelProvenanceLimits
++    )
++    spec.__post_init__()
++    limits.__post_init__()
++    _require(0 < len(source) <= limits.max_source_bytes)
++    if spec.output_size is not None:
++        _require(math.prod(spec.output_size) <= limits.max_frame_pixels)
++    cancel()
++    stages = []
++    source_digest = hashlib.sha256(source).hexdigest()
++    frame_reference = _hash([source_digest, spec.frame_index])
++    runtime = _runtime_digest()
++
++    def stage(operation, parameters, output_digest):
++        cancel()
++        stages.append(
++            PixelStage(
++                operation,
++                _hash(parameters),
++                output_digest,
++                stages[-1].digest if stages else source_digest,
++            )
++        )
++
++    with _quiet_decoders():
++        header = _header(source, spec, limits)
++        stage(
++            "transfer_syntax",
++            [header.transfer_syntax, spec.decoder.value, runtime],
++            source_digest,
++        )
++        payload = _frame_payload(source, header, spec)
++        stage(
++            "frame",
++            [spec.frame_index, header.frames, frame_reference],
++            hashlib.sha256(payload).hexdigest(),
++        )
++        plugin = {
++            PixelDecoder.NATIVE: "",
++            PixelDecoder.RLE: "pydicom",
++            PixelDecoder.JPEG: "pillow",
++        }[spec.decoder]
++        array = pixel_array(
++            BytesIO(source), index=spec.frame_index, raw=True, decoding_plugin=plugin
++        )
++        expected = (header.rows, header.columns) + ((3,) if header.samples == 3 else ())
++        _require(
++            array.shape == expected
++            and array.dtype.kind in ("i", "u")
++            and array.dtype.itemsize == header.bits_allocated // 8
++        )
++        _require((array.dtype.kind == "i") == bool(header.signed))
++        stage(
++            "decode",
++            [asdict(header), plugin, "raw_unpack_reshape_subsampling_signedness"],
++            _array_digest(array),
++        )
++        if header.samples == 1:
++            array = array.astype(np.float64) * header.slope + header.intercept
++        stage(
++            "rescale",
++            [header.slope, header.intercept, header.samples == 1],
++            _array_digest(array),
++        )
++        if spec.window is not None:
++            window = spec.window
++            array = np.floor(
++                np.clip(
++                    (array - (window.center - window.width / 2)) / window.width, 0, 1
++                )
++                * 255
++            ).astype("uint8")
++        stage(
++            "window",
++            [asdict(spec.window) if spec.window else None, "linear_clip_floor_uint8"],
++            _array_digest(array),
++        )
++        if header.samples == 1:
++            if header.photometric == "MONOCHROME1":
++                array = 255 - array
++            array = np.repeat(array[:, :, None], 3, axis=2)
++        elif header.photometric in ("YBR_FULL", "YBR_FULL_422"):
++            array = convert_color_space(array, "YBR_FULL", "RGB")
++        stage("color", [header.photometric, "RGB"], _array_digest(array))
++        array = np.rot90(array, k=-(int(spec.rotation) // 90))
++        stage(
++            "orientation",
++            [int(spec.rotation), "stored_pixels_clockwise"],
++            _array_digest(array),
++        )
++        with Image.fromarray(array) as image:
++            size = spec.output_size or image.size
++            mode = (
++                Image.Resampling.NEAREST
++                if spec.resize_filter is ResizeFilter.NEAREST
++                else Image.Resampling.BILINEAR
++            )
++            with image.resize(size, mode) as resized:
++                pixels_digest = _array_digest(np.asarray(resized))
++                stage("resize", [size, spec.resize_filter.value], pixels_digest)
++                with _Output(limits.max_output_bytes) as stream:
++                    resized.save(stream, format="PNG", optimize=False)
++                    content = stream.getvalue()
++        with Image.open(BytesIO(content)) as decoded:
++            _require(
++                decoded.mode == "RGB" and decoded.size == size and not decoded.info
++            )
++            _require(_array_digest(np.asarray(decoded)) == pixels_digest)
++        image = ImageInput(
++            data=content, media_type="image/png", width=size[0], height=size[1]
++        )
++        stage("encode", ["PNG", "RGB", "fresh_no_metadata"], image.digest)
++    provenance = PixelProvenance(
++        source_digest=source_digest,
++        frame_reference=frame_reference,
++        spec=spec,
++        header=header,
++        runtime_digest=runtime,
++        stages=tuple(stages),
++        size=size,
++        pixels_digest=pixels_digest,
++        image_digest=image.digest,
++    )
++    cancel()
++    return ProvenancedFrame(provenance, image)
++
++
++def render_dicom_frame(
++    source: bytes,
++    *,
++    spec: PixelRenderSpec,
++    limits: PixelProvenanceLimits = PixelProvenanceLimits(),
++    cancel_check: Callable[[], bool] | None = None,
++) -> ProvenancedFrame:
++    """Execute the declared local pipeline and record actual intermediate hashes.
++
++    Args:
++        source: Complete protected DICOM bytes; never a filename or URL.
++        spec: Explicit source frame, decoder and display transformations.
++        limits: Resource ceilings checked before allocation and output encoding.
++        cancel_check: Cooperative cancellation between stages; not codec preemption.
++
++    Returns:
++        Fresh protected RGB PNG with a canonical, value-free digest chain.
++
++    Raises:
++        PixelProvenanceError: Unsupported encoding, ambiguous transforms, invalid
++            geometry, resource/cancellation failure or decoder/encoder error.
++    """
++    return _safe(lambda: _render(source, spec, limits, cancel_check))
++
++
++def reproduce_dicom_frame(
++    source: bytes,
++    provenance: PixelProvenance,
++    *,
++    limits: PixelProvenanceLimits = PixelProvenanceLimits(),
++) -> ProvenancedFrame:
++    """Re-execute every stage and reject any difference from the recorded chain.
++
++    Args:
++        source: Exact original source bytes, supplied by the caller's protected store.
++        provenance: Previously returned chain, never treated as self-authenticating.
++        limits: Current resource ceilings; insufficient budgets reject reproduction.
++    """
++
++    def reproduce():
++        _require(type(provenance) is PixelProvenance)
++        provenance.__post_init__()
++        actual = _render(source, provenance.spec, limits)
++        _require(actual.provenance == provenance)
++        return actual
++
++    return _safe(reproduce)
++
++
++def _bind(frame, regions):
++    import numpy as np
++    from PIL import Image
++
++    _require(type(regions) is tuple and len(regions) <= 256)
++    bindings = []
++    with Image.open(BytesIO(frame.image.data)) as image:
++        for region in regions:
++            _require(type(region) is ImageRegion)
++            region.__post_init__()
++            _require(
++                region.image_digest == frame.image.digest
++                and region.x1 <= image.width
++                and region.y1 <= image.height
++            )
++            with image.crop((region.x0, region.y0, region.x1, region.y1)) as crop:
++                bindings.append(
++                    RegionProvenance(
++                        frame.provenance.digest, region, _array_digest(np.asarray(crop))
++                    )
++                )
++    return tuple(bindings)
++
++
++def bind_region_provenance(
++    source: bytes,
++    provenance: PixelProvenance,
++    regions: tuple[ImageRegion, ...],
++    *,
++    limits: PixelProvenanceLimits = PixelProvenanceLimits(),
++) -> tuple[RegionProvenance, ...]:
++    """Reproduce actual pixels before attaching the chain to downstream regions.
++
++    Args:
++        source: Protected original source bytes.
++        provenance: Receipt from render_dicom_frame.
++        regions: Existing encoded-image-bound regions in the rendered pixel space.
++        limits: Current reproduction resource ceilings.
++    """
++    return _safe(
++        lambda: _bind(reproduce_dicom_frame(source, provenance, limits=limits), regions)
++    )
++
++
++def verify_region_provenance(
++    source: bytes,
++    provenance: PixelProvenance,
++    regions: tuple[RegionProvenance, ...],
++    *,
++    limits: PixelProvenanceLimits = PixelProvenanceLimits(),
++) -> tuple[ImageRegion, ...]:
++    """Reproduce and compare every chain/image/region/crop binding before reuse.
++
++    Args:
++        source: Protected original source bytes.
++        provenance: Complete expected render receipt.
++        regions: Previously bound downstream regions, in their original order.
++        limits: Current resource ceilings for actual reproduction.
++    """
++
++    def verify():
++        _require(type(regions) is tuple and len(regions) <= 256)
++        for binding in regions:
++            _require(type(binding) is RegionProvenance)
++            binding.__post_init__()
++        frame = reproduce_dicom_frame(source, provenance, limits=limits)
++        plain = tuple(binding.region for binding in regions)
++        _require(_bind(frame, plain) == regions)
++        return plain
++
++    return _safe(verify)
++
++
++def run_provenanced_dicom_vlm(
++    source: bytes,
++    provider: EdgeVLMProvider,
++    prompt: Prompt,
++    *,
++    spec: PixelRenderSpec,
++    regions: tuple[Box, ...] = (),
++    limits: PixelProvenanceLimits = PixelProvenanceLimits(),
++) -> ProvenancedInference:
++    """Infer on actual rendered pixels and attach reproduction-checked evidence.
++
++    Args:
++        source: Protected source bytes for the explicitly selected frame.
++        provider: Qualified, already loaded local VLM adapter.
++        prompt: Protected prompt and generation limits from the existing contract.
++        spec: Actual decode/display operations to execute.
++        regions: Optional half-open rendered-pixel boxes restricting model evidence.
++        limits: Current rendering/reproduction resource ceilings.
++
++    Returns:
++        Protected result plus source/chain/crop bindings for its VisualEvidence.
++        require_evidence revalidates source pixels and rejects model abstentions.
++        Frame references join the sampler's SourceFrame records; this call alone
++        does not claim series sampling coverage or de-identification.
++    """
++
++    def run():
++        frame = _render(source, spec, limits)
++        _require(type(regions) is tuple and len(regions) <= 256)
++        selected = []
++        for box in regions:
++            _require(type(box) is tuple and len(box) == 4)
++            selected.append(
++                ImageRegion(
++                    image_digest=frame.image.digest,
++                    x0=box[0],
++                    y0=box[1],
++                    x1=box[2],
++                    y1=box[3],
++                )
++            )
++        request = VLMRequest(image=frame.image, prompt=prompt, regions=tuple(selected))
++        result = run_local_vlm(provider, request)
++        bindings = bind_region_provenance(
++            source,
++            frame.provenance,
++            tuple(item.region for item in result.evidence),
++            limits=limits,
++        )
++        return ProvenancedInference(frame.provenance, bindings, result)
++
++    return _safe(run)
+diff --git a/tests/unit/multimodal/vision/dicom/test_pixel_provenance.py b/tests/unit/multimodal/vision/dicom/test_pixel_provenance.py
+new file mode 100644
+index 0000000000..fbfc63ada8
+--- /dev/null
++++ b/tests/unit/multimodal/vision/dicom/test_pixel_provenance.py
+@@ -0,0 +1,609 @@
++"""Actual synthetic native/RLE/JPEG bytes and reproducible regional VLM evidence."""
++
++import hashlib
++import io
++import json
++import logging
++import socket
++from dataclasses import replace
++
++import pytest
++
++np = pytest.importorskip("numpy")
++pydicom = pytest.importorskip("pydicom")
++Image = pytest.importorskip("PIL.Image")
++from pydicom.dataset import Dataset, FileMetaDataset
++from pydicom.encaps import encapsulate
++from pydicom.uid import (
++    CTImageStorage,
++    ExplicitVRLittleEndian,
++    ImplicitVRLittleEndian,
++    RLELossless,
++)
++
++from openmed.multimodal.abstention import (
++    AbstentionReason,
++    AbstentionRecord,
++    AbstentionStage,
++)
++from openmed.multimodal.page_rotation import PageRotation
++from openmed.multimodal.vision.dicom.pixel_provenance import (
++    PixelDecoder,
++    PixelProvenanceError,
++    PixelProvenanceLimits,
++    PixelRenderSpec,
++    PixelStage,
++    ResizeFilter,
++    bind_region_provenance,
++    render_dicom_frame,
++    reproduce_dicom_frame,
++    run_provenanced_dicom_vlm,
++    verify_region_provenance,
++)
++from openmed.multimodal.vision.dicom.series_sampler import (
++    DisplayWindow,
++    SamplingPolicy,
++    sample_dicom_series,
++)
++from openmed.multimodal.vision.providers.base import (
++    ImageRegion,
++    LocalProviderMetadata,
++    Prompt,
++    RuntimeBackend,
++    RuntimeMetadata,
++    VisualEvidence,
++    VLMResult,
++)
++
++PRIVATE = "SYNTHETIC-PRIVATE-2801"
++WINDOW = DisplayWindow(center=128, width=256)
++SPEC = PixelRenderSpec(frame_index=0, window=WINDOW)
++
++
++def dataset(
++    *,
++    count=1,
++    signed=False,
++    photo="MONOCHROME2",
++    planar=0,
++    syntax=ExplicitVRLittleEndian,
++):
++    ds = Dataset()
++    ds.file_meta = FileMetaDataset()
++    ds.file_meta.TransferSyntaxUID = syntax
++    ds.SOPClassUID = CTImageStorage
++    ds.SOPInstanceUID = "1.2.826.0.1.3680043.10.543.2801"
++    ds.SeriesInstanceUID = "1.2.826.0.1.3680043.10.543.2802"
++    ds.FrameOfReferenceUID = "1.2.826.0.1.3680043.10.543.2803"
++    ds.PatientName = PRIVATE
++    ds.PatientID = PRIVATE
++    ds.Modality = "CT"
++    ds.ImagePositionPatient = [0, 0, 0]
++    ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
++    ds.PixelSpacing = [1, 1]
++    ds.AcquisitionNumber = 1
++    ds.Rows, ds.Columns = 12, 16
++    color = photo in ("RGB", "YBR_FULL", "YBR_FULL_422")
++    ds.SamplesPerPixel = 3 if color else 1
++    ds.BitsAllocated = ds.BitsStored = 8 if color else 16
++    ds.HighBit = ds.BitsStored - 1
++    ds.PixelRepresentation = int(signed)
++    ds.PhotometricInterpretation = photo
++    dtype = "uint8" if color else "<i2" if signed else "<u2"
++    pixels = np.arange(count * 192, dtype=dtype).reshape(count, 12, 16)
++    if count > 1:
++        ds.NumberOfFrames = count
++    if color:
++        ds.PlanarConfiguration = planar
++        channels = (pixels, np.full_like(pixels, 128), np.full_like(pixels, 128))
++        pixels = np.stack(channels, axis=-1)
++        if photo == "YBR_FULL_422":
++            pixels = np.stack(
++                (
++                    pixels[:, :, ::2, 0],
++                    pixels[:, :, 1::2, 0],
++                    pixels[:, :, ::2, 1],
++                    pixels[:, :, ::2, 2],
++                ),
++                axis=-1,
++            )
++        elif planar:
++            pixels = pixels.transpose(0, 3, 1, 2)
++    ds.PixelData = pixels.tobytes()
++    return ds
++
++
++def encode(ds):
++    stream = io.BytesIO()
++    pydicom.dcmwrite(stream, ds, enforce_file_format=True)
++    return stream.getvalue()
++
++
++def pixels(frame):
++    with Image.open(io.BytesIO(frame.image.data)) as image:
++        assert image.info == {}
++        return np.asarray(image).copy()
++
++
++def region(frame, box=(1, 1, 5, 4)):
++    return ImageRegion(
++        image_digest=frame.image.digest, x0=box[0], y0=box[1], x1=box[2], y1=box[3]
++    )
++
++
++def test_native_pipeline_records_every_actual_step_and_reproduces_exact_bytes():
++    source = encode(dataset())
++    frame = render_dicom_frame(source, spec=SPEC)
++    proof = frame.provenance
++    assert proof.source_digest == hashlib.sha256(source).hexdigest()
++    assert [stage.operation for stage in proof.stages] == [
++        "transfer_syntax",
++        "frame",
++        "decode",
++        "rescale",
++        "window",
++        "color",
++        "orientation",
++        "resize",
++        "encode",
++    ]
++    previous = proof.source_digest
++    for stage in proof.stages:
++        assert stage.previous_digest == previous
++        previous = stage.digest
++    expected = np.floor(np.arange(192).reshape(12, 16) / 256 * 255).astype("uint8")
++    np.testing.assert_array_equal(
++        pixels(frame), np.repeat(expected[:, :, None], 3, axis=2)
++    )
++    assert reproduce_dicom_frame(source, proof) == frame
++    assert json.loads(proof.to_json())["spec"]["frame_index"] == 0
++    assert PRIVATE not in proof.to_json() + repr(frame)
++    assert PRIVATE.encode() not in frame.image.data
++
++
++@pytest.mark.parametrize("syntax", [ExplicitVRLittleEndian, ImplicitVRLittleEndian])
++def test_native_transfer_syntax_and_selected_frame_are_independently_bound(syntax):
++    ds = dataset(count=2, syntax=syntax)
++    source = encode(ds)
++    first = render_dicom_frame(source, spec=SPEC)
++    second = render_dicom_frame(source, spec=replace(SPEC, frame_index=1))
++    assert first.provenance.header.transfer_syntax == syntax
++    assert first.provenance.frame_reference != second.provenance.frame_reference
++    assert (
++        first.provenance.stages[1].output_digest
++        != second.provenance.stages[1].output_digest
++    )
++    assert first.provenance.pixels_digest != second.provenance.pixels_digest
++
++
++def test_frame_reference_joins_actual_sampler_records_without_patient_uids():
++    source = encode(dataset())
++    sampled = sample_dicom_series(
++        (source,), window=WINDOW, policy=SamplingPolicy(max_selected=1)
++    )
++    frame = render_dicom_frame(source, spec=SPEC)
++    assert frame.provenance.frame_reference == sampled.frames[0].reference
++    assert frame.provenance.source_digest == sampled.frames[0].source_digest
++
++
++def test_per_frame_rescale_overrides_shared_and_root_as_one_complete_pair():
++    ds = dataset(count=2, signed=True)
++    ds.RescaleSlope, ds.RescaleIntercept = 9, 10
++    shared, shared_scale = Dataset(), Dataset()
++    shared_scale.RescaleSlope, shared_scale.RescaleIntercept = 2, -4
++    shared.PixelValueTransformationSequence = [shared_scale]
++    ds.SharedFunctionalGroupsSequence = [shared]
++    first, second, second_scale = Dataset(), Dataset(), Dataset()
++    second_scale.RescaleSlope, second_scale.RescaleIntercept = 0.5, 3
++    second.PixelValueTransformationSequence = [second_scale]
++    ds.PerFrameFunctionalGroupsSequence = [first, second]
++    source = encode(ds)
++    a = render_dicom_frame(source, spec=SPEC)
++    b = render_dicom_frame(source, spec=replace(SPEC, frame_index=1))
++    assert (a.provenance.header.slope, a.provenance.header.intercept) == (2, -4)
++    assert (b.provenance.header.slope, b.provenance.header.intercept) == (0.5, 3)
++    assert (
++        a.provenance.stages[3].parameters_digest
++        != b.provenance.stages[3].parameters_digest
++    )
++    del second_scale.RescaleIntercept
++    with pytest.raises(PixelProvenanceError):
++        render_dicom_frame(encode(ds), spec=replace(SPEC, frame_index=1))
++
++
++def test_signed_stored_bits_and_monochrome_one_inversion_are_recorded():
++    ds = dataset(signed=True, photo="MONOCHROME1")
++    ds.BitsStored, ds.HighBit = 12, 11
++    ds.RescaleSlope, ds.RescaleIntercept = 1, 128
++    values = np.arange(-96, 96, dtype="<i2").reshape(12, 16)
++    ds.PixelData = values.tobytes()
++    frame = render_dicom_frame(encode(ds), spec=SPEC)
++    expected = 255 - np.floor((values + 128) / 256 * 255).astype("uint8")
++    np.testing.assert_array_equal(pixels(frame)[:, :, 0], expected)
++    assert frame.provenance.header.bits_stored == 12
++    assert frame.provenance.header.signed == 1
++
++
++@pytest.mark.parametrize(
++    "photo,planar",
++    [("RGB", 0), ("RGB", 1), ("YBR_FULL", 0), ("YBR_FULL", 1), ("YBR_FULL_422", 0)],
++)
++def test_color_conversion_and_planar_subsampling_are_actual_pixel_operations(
++    photo, planar
++):
++    frame = render_dicom_frame(
++        encode(dataset(photo=photo, planar=planar)), spec=PixelRenderSpec(frame_index=0)
++    )
++    actual = pixels(frame)
++    ramp = np.arange(192, dtype="uint8").reshape(12, 16)
++    np.testing.assert_array_equal(actual[:, :, 0], ramp)
++    if photo != "RGB":
++        np.testing.assert_array_equal(actual[:, :, 1], ramp)
++        np.testing.assert_array_equal(actual[:, :, 2], ramp)
++    else:
++        assert (actual[:, :, 1:] == 128).all()
++
++
++@pytest.mark.parametrize("rotation", list(PageRotation))
++@pytest.mark.parametrize("filter", list(ResizeFilter))
++def test_rotation_and_noninteger_resize_match_actual_declared_renderer(
++    rotation, filter
++):
++    source = encode(dataset())
++    base = render_dicom_frame(source, spec=SPEC)
++    spec = replace(SPEC, rotation=rotation, output_size=(19, 7), resize_filter=filter)
++    frame = render_dicom_frame(source, spec=spec)
++    with Image.fromarray(np.rot90(pixels(base), k=-int(rotation) // 90)) as oriented:
++        method = (
++            Image.Resampling.NEAREST
++            if filter is ResizeFilter.NEAREST
++            else Image.Resampling.BILINEAR
++        )
++        with oriented.resize((19, 7), method) as expected:
++            np.testing.assert_array_equal(pixels(frame), np.asarray(expected))
++    assert reproduce_dicom_frame(source, frame.provenance) == frame
++    assert frame.provenance.size == (19, 7)
++
++
++def test_real_rle_decompression_reproduces_native_pixels_and_records_different_chain():
++    ds = dataset(count=2)
++    native = render_dicom_frame(encode(ds), spec=replace(SPEC, frame_index=1))
++    ds.compress(RLELossless, generate_instance_uid=False)
++    source = encode(ds)
++    frame = render_dicom_frame(
++        source, spec=replace(SPEC, frame_index=1, decoder=PixelDecoder.RLE)
++    )
++    np.testing.assert_array_equal(pixels(frame), pixels(native))
++    assert frame.provenance.digest != native.provenance.digest
++    assert (
++        frame.provenance.stages[1].output_digest
++        != native.provenance.stages[1].output_digest
++    )
++    assert reproduce_dicom_frame(source, frame.provenance) == frame
++    with pytest.raises(PixelProvenanceError):
++        render_dicom_frame(source, spec=SPEC)
++
++
++def jpeg_source(*, size=(16, 12)):
++    ds = dataset()
++    ds.BitsAllocated = ds.BitsStored = 8
++    ds.HighBit = 7
++    with Image.fromarray(
++        np.arange(size[0] * size[1], dtype="uint8").reshape(size[1], size[0])
++    ) as image:
++        stream = io.BytesIO()
++        image.save(stream, format="JPEG", quality=91)
++    payload = stream.getvalue()
++    ds.file_meta.TransferSyntaxUID = "1.2.840.10008.1.2.4.50"
++    ds.PixelData = encapsulate([payload])
++    return encode(ds), payload
++
++
++def test_real_grayscale_jpeg_decoder_is_explicit_and_reproduced():
++    source, payload = jpeg_source()
++    frame = render_dicom_frame(source, spec=replace(SPEC, decoder=PixelDecoder.JPEG))
++    with Image.open(io.BytesIO(payload)) as decoded:
++        expected = np.floor(np.asarray(decoded).astype(float) / 256 * 255).astype(
++            "uint8"
++        )
++    np.testing.assert_array_equal(pixels(frame)[:, :, 0], expected)
++    assert reproduce_dicom_frame(source, frame.provenance) == frame
++
++
++def test_compressed_dimensions_and_rle_expansion_are_checked_before_decoder(
++    monkeypatch,
++):
++    calls = []
++
++    def forbidden(*args, **kwargs):
++        calls.append(1)
++        raise AssertionError("decoder must not run")
++
++    monkeypatch.setattr(pydicom.pixels, "pixel_array", forbidden)
++    source, _ = jpeg_source(size=(32, 32))
++    with pytest.raises(PixelProvenanceError):
++        render_dicom_frame(source, spec=replace(SPEC, decoder=PixelDecoder.JPEG))
++    ds = dataset()
++    ds.BitsAllocated = ds.BitsStored = 8
++    ds.HighBit = 7
++    ds.file_meta.TransferSyntaxUID = RLELossless
++    # One segment claiming 256 expanded pixels when the declared frame has 192.
++    payload = (
++        (1).to_bytes(4, "little")
++        + (64).to_bytes(4, "little")
++        + bytes(56)
++        + bytes([129, 1, 129, 1])
++    )
++    ds.PixelData = encapsulate([payload])
++    with pytest.raises(PixelProvenanceError):
++        render_dicom_frame(encode(ds), spec=replace(SPEC, decoder=PixelDecoder.RLE))
++    assert not calls
++
++
++def test_region_bindings_require_reproduction_and_exact_crop_pixels():
++    source = encode(dataset())
++    frame = render_dicom_frame(source, spec=SPEC)
++    regions = (region(frame), region(frame, (6, 3, 9, 8)))
++    bound = bind_region_provenance(source, frame.provenance, regions)
++    assert verify_region_provenance(source, frame.provenance, bound) == regions
++    for bad in (
++        replace(bound[0], pixels_digest="0" * 64),
++        replace(bound[0], provenance_digest="0" * 64),
++        replace(bound[0], region=replace(regions[0], image_digest="0" * 64)),
++        replace(bound[0], region=replace(regions[0], x0=2)),
++    ):
++        with pytest.raises(PixelProvenanceError):
++            verify_region_provenance(source, frame.provenance, (bad,))
++
++
++def test_relinked_forged_chain_and_stale_source_are_rejected_by_actual_reproduction():
++    ds = dataset()
++    source = encode(ds)
++    frame = render_dicom_frame(source, spec=SPEC)
++    stages = []
++    previous = frame.provenance.source_digest
++    for old in frame.provenance.stages:
++        stage = PixelStage(
++            old.operation,
++            "f" * 64 if old.operation == "window" else old.parameters_digest,
++            old.output_digest,
++            previous,
++        )
++        stages.append(stage)
++        previous = stage.digest
++    forged = replace(frame.provenance, stages=tuple(stages))
++    with pytest.raises(PixelProvenanceError):
++        reproduce_dicom_frame(source, forged)
++    ds.PatientName = "OTHER-SYNTHETIC"
++    with pytest.raises(PixelProvenanceError):
++        reproduce_dicom_frame(encode(ds), frame.provenance)
++
++
++def test_decoder_drift_is_detected_even_when_window_clips_to_identical_final_pixels(
++    monkeypatch,
++):
++    source = encode(dataset())
++    spec = replace(SPEC, window=DisplayWindow(center=10000, width=1))
++    frame = render_dicom_frame(source, spec=spec)
++    original = pydicom.pixels.pixel_array
++
++    def changed(*args, **kwargs):
++        return original(*args, **kwargs) + 1
++
++    monkeypatch.setattr(pydicom.pixels, "pixel_array", changed)
++    new = render_dicom_frame(source, spec=spec)
++    assert new.image.data == frame.image.data
++    with pytest.raises(PixelProvenanceError):
++        reproduce_dicom_frame(source, frame.provenance)
++
++
++class Provider:
++    metadata = LocalProviderMetadata(
++        backend=RuntimeBackend.SYNTHETIC,
++        model_digest="a" * 64,
++        preprocessing_digest="b" * 64,
++    )
++
++    def __init__(self):
++        self.requests = []
++        self.abstain = False
++        self.fail = False
++
++    def infer(self, request):
++        self.requests.append(request)
++        if self.fail:
++            raise RuntimeError(PRIVATE)
++        selected = (
++            request.regions[0]
++            if request.regions
++            else ImageRegion(image_digest=request.image.digest, x0=0, y0=0, x1=4, y1=4)
++        )
++        return VLMResult(
++            request_digest=request.digest,
++            runtime=RuntimeMetadata(
++                provider=self.metadata,
++                duration_ms=1,
++                output_tokens=0 if self.abstain else 1,
++            ),
++            text="" if self.abstain else PRIVATE,
++            evidence=()
++            if self.abstain
++            else (VisualEvidence(region=selected, start=0, end=4),),
++            abstention=AbstentionRecord(
++                AbstentionStage.INFERENCE, AbstentionReason.LOW_QUALITY
++            )
++            if self.abstain
++            else None,
++        )
++
++
++def test_actual_local_vlm_evidence_is_bound_and_reproduction_guards_later_access():
++    source = encode(dataset())
++    provider = Provider()
++    result = run_provenanced_dicom_vlm(
++        source, provider, Prompt(text=PRIVATE), spec=SPEC, regions=((1, 2, 5, 6),)
++    )
++    assert len(provider.requests) == 1
++    assert result.require_evidence(source) == result.result.evidence
++    assert result.regions[0].region == provider.requests[0].regions[0]
++    assert result.regions[0].provenance_digest == result.provenance.digest
++    assert PRIVATE not in repr(result) + result.to_json()
++    with pytest.raises(PixelProvenanceError):
++        result.require_evidence(encode(dataset(photo="MONOCHROME1")))
++    provider.abstain = True
++    abstained = run_provenanced_dicom_vlm(
++        source, provider, Prompt(text=PRIVATE), spec=SPEC
++    )
++    with pytest.raises(PixelProvenanceError):
++        abstained.require_evidence(source)
++
++
++@pytest.mark.parametrize(
++    "limits",
++    [
++        PixelProvenanceLimits(max_source_bytes=132),
++        PixelProvenanceLimits(max_header_bytes=132),
++        PixelProvenanceLimits(max_frame_pixels=10),
++        PixelProvenanceLimits(max_output_bytes=1),
++    ],
++)
++def test_resource_limits_reject_without_partial_output(limits):
++    with pytest.raises(PixelProvenanceError):
++        render_dicom_frame(encode(dataset()), spec=SPEC, limits=limits)
++
++
++def test_offline_fixed_errors_and_decoder_log_privacy(monkeypatch, caplog):
++    source = encode(dataset())
++
++    def forbidden(*args, **kwargs):
++        raise AssertionError(PRIVATE)
++
++    monkeypatch.setattr(socket.socket, "connect", forbidden)
++    monkeypatch.setattr(socket, "create_connection", forbidden)
++    with caplog.at_level(logging.DEBUG):
++        frame = render_dicom_frame(source, spec=SPEC)
++        assert reproduce_dicom_frame(source, frame.provenance) == frame
++    assert PRIVATE not in caplog.text
++    monkeypatch.setattr(pydicom.pixels, "pixel_array", forbidden)
++    with pytest.raises(PixelProvenanceError) as caught:
++        render_dicom_frame(source, spec=SPEC)
++    assert str(caught.value) == "dicom_pixel_provenance_rejected"
++    assert caught.value.__context__ is None
++
++
++def test_cancellation_and_provider_failure_return_no_partial_evidence():
++    source = encode(dataset())
++    with pytest.raises(PixelProvenanceError):
++        render_dicom_frame(source, spec=SPEC, cancel_check=lambda: True)
++    provider = Provider()
++    provider.fail = True
++    with pytest.raises(PixelProvenanceError) as caught:
++        run_provenanced_dicom_vlm(source, provider, Prompt(text=PRIVATE), spec=SPEC)
++    assert caught.value.__context__ is None and PRIVATE not in str(caught.value)
++
++
++def test_readable_syntax_uid_does_not_bypass_a_failed_file_meta_preflight(monkeypatch):
++    from openmed.multimodal.dicom_transfer_syntax import read_dicom_transfer_syntax
++
++    source = bytearray(encode(dataset()))
++    assert source[132:138] == b"\x02\x00\x00\x00UL"
++    declared_length = int.from_bytes(source[140:144], "little")
++    source[140:144] = (declared_length + 2).to_bytes(4, "little")
++    source = bytes(source)
++    preflight = read_dicom_transfer_syntax(source)
++    assert not preflight.ok
++    calls = []
++
++    def forbidden(*args, **kwargs):
++        calls.append(1)
++        raise AssertionError("preflight must stop decoding")
++
++    monkeypatch.setattr(pydicom.pixels, "pixel_array", forbidden)
++    with pytest.raises(PixelProvenanceError):
++        render_dicom_frame(source, spec=SPEC)
++    assert not calls
++
++
++@pytest.mark.parametrize("photo", ["RGB", "YBR_FULL"])
++def test_real_color_rle_preserves_declared_conversion(photo):
++    ds = dataset(photo=photo)
++    spec = PixelRenderSpec(frame_index=0)
++    native = render_dicom_frame(encode(ds), spec=spec)
++    ds.compress(RLELossless, generate_instance_uid=False)
++    source = encode(ds)
++    compressed = render_dicom_frame(
++        source, spec=replace(spec, decoder=PixelDecoder.RLE)
++    )
++    np.testing.assert_array_equal(pixels(compressed), pixels(native))
++    assert reproduce_dicom_frame(source, compressed.provenance) == compressed
++
++
++@pytest.mark.parametrize(
++    "change",
++    [
++        "lut",
++        "presentation",
++        "partial_rescale",
++        "bad_frame",
++        "missing_window",
++        "color_window",
++        "bad_dtype",
++    ],
++)
++def test_ambiguous_or_unsupported_display_requests_fail_before_inference(change):
++    ds = dataset()
++    spec = SPEC
++    if change == "lut":
++        ds.ModalityLUTSequence = [Dataset()]
++    elif change == "presentation":
++        ds.PresentationLUTShape = "INVERSE"
++    elif change == "partial_rescale":
++        ds.RescaleSlope = 2
++    elif change == "bad_frame":
++        spec = replace(spec, frame_index=1)
++    elif change == "missing_window":
++        spec = replace(spec, window=None)
++    elif change == "color_window":
++        ds = dataset(photo="RGB")
++    else:
++        ds.BitsAllocated = 32
++    provider = Provider()
++    with pytest.raises(PixelProvenanceError):
++        run_provenanced_dicom_vlm(encode(ds), provider, Prompt(text=PRIVATE), spec=spec)
++    assert not provider.requests
++
++
++def test_declared_frame_and_target_allocation_limits_are_enforced():
++    with pytest.raises(PixelProvenanceError):
++        render_dicom_frame(
++            encode(dataset(count=2)),
++            spec=SPEC,
++            limits=PixelProvenanceLimits(max_frames=1),
++        )
++    with pytest.raises(PixelProvenanceError):
++        render_dicom_frame(
++            encode(dataset()), spec=replace(SPEC, output_size=(5000, 5000))
++        )
++
++
++def test_runtime_fingerprint_changes_require_a_new_receipt(monkeypatch):
++    import openmed.multimodal.vision.dicom.pixel_provenance as module
++
++    source = encode(dataset())
++    frame = render_dicom_frame(source, spec=SPEC)
++    monkeypatch.setattr(module, "_runtime_digest", lambda: "0" * 64)
++    assert render_dicom_frame(source, spec=SPEC).image.data == frame.image.data
++    with pytest.raises(PixelProvenanceError):
++        reproduce_dicom_frame(source, frame.provenance)
++
++
++def test_mutated_model_evidence_cannot_reuse_another_region_binding():
++    source = encode(dataset())
++    result = run_provenanced_dicom_vlm(
++        source, Provider(), Prompt(text=PRIVATE), spec=SPEC
++    )
++    visual = result.result.evidence[0]
++    changed = replace(visual, region=replace(visual.region, x0=1))
++    mismatched = replace(result, result=replace(result.result, evidence=(changed,)))
++    with pytest.raises(PixelProvenanceError):
++        mismatched.require_evidence(source)

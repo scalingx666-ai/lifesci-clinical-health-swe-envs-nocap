@@ -1,0 +1,2194 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 63a25660be..0b8eeb2184 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Add fail-closed required audit for declared service operations: durable intent/commit receipts on the action ledger, denied or reconcile-required outcomes when audit storage fails, and exactly-once reconciliation that never re-runs a committed effect (#3708).
++
+ - Add deterministic edge-VLM execution memory plans with explicit device budgets, bounded preprocessing estimates and local-only abstention before allocation (#2792).
+ 
+ - Define an offline edge-VLM provider contract with bounded image/prompt inputs, source-linked evidence, model/preprocessing digests, shared abstentions, content-free reports and explicit human review for non-diagnostic drafts (#2791).
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index 5564f57d04..f5dcffda1e 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -585,6 +585,7 @@ classification:
+     - privacy/trace-recovery.md
+     - security/tamper-evident-audit-log.md
+     - security/audit-retention.md
++    - security/required-audit.md
+     - security/redaction-diff.md
+     - security/policy-composition.md
+     - security/evidence-integrity.md
+diff --git a/docs/security/required-audit.md b/docs/security/required-audit.md
+new file mode 100644
+index 0000000000..61562747a0
+--- /dev/null
++++ b/docs/security/required-audit.md
+@@ -0,0 +1,173 @@
++# Fail-closed required audit
++
++`openmed.service.required_audit` defines what a service does when audit
++evidence that is required for a state-changing operation cannot be recorded.
++The rule: a declared operation never returns a fully evidenced success unless
++its required audit records are durable and acknowledged. If an effect may
++already have committed, the receipt stays reconcile-required with pending
++evidence. The service never retries the effect blindly.
++
++The module is local-first and adds no new audit backend. Required evidence goes
++to the existing hash-chained [action ledger](../agent/action-ledger.md) through
++`ActionLedgerAuditStore`. Reconciliation uses the same `ObservationState`
++vocabulary as workflow effect recovery.
++
++## Declare the operations that need required audit
++
++```python
++from openmed.agent.audit.action_ledger import ActionLedger
++from openmed.agent.correlation import RunId
++from openmed.service.required_audit import (
++    ActionLedgerAuditStore,
++    CommitBoundary,
++    RequiredAuditCoordinator,
++    RequiredAuditPolicy,
++)
++
++policy = RequiredAuditPolicy(
++    {
++        "fhir.write_back": CommitBoundary.INVOCATION,
++        "omop.local_batch": CommitBoundary.ACKNOWLEDGED,
++    },
++    max_open_receipts=64,
++)
++store = ActionLedgerAuditStore(
++    ActionLedger("private-state/required-audit"),
++    run_id=RunId.generate(),
++    operations=policy.operations,
++)
++coordinator = RequiredAuditCoordinator(policy, store)
++
++receipt = coordinator.perform(
++    "fhir.write_back",
++    request_key=client_idempotency_token,
++    operation_digest=payload_digest,
++    effect=apply_write,  # called once with an opaque "idem_..." key
++)
++if not receipt.fully_evidenced:
++    ...  # report receipt.outcome and receipt.reason; never claim success
++```
++
++The ledger directory is private state. Keep it on storage you back up together
++with the effect sink. A deployment should reuse one `run_id` for the life of a
++ledger directory, because the action ledger binds every entry to one run.
++
++- Operations that are not declared are denied before anything is recorded.
++- A declared operation has no optional mode. Without a required store, every
++  declared operation is denied with `required_audit_unconfigured`.
++- `request_key` is a caller-chosen opaque token of 16 to 128 characters from
++  `[A-Za-z0-9_-]`. Only its digest goes into the receipt identifier. It must
++  not encode a patient, encounter, or other identifier.
++- `operation_digest` is a `sha256:` digest of the value-free payload. If the
++  same request key comes back with a different digest, the request is denied
++  with `idempotency_conflict`.
++
++## Commit boundary
++
++For each receipt, the coordinator appends these required records, in order:
++
++| Stage | Ledger state | When |
++|-------|--------------|------|
++| `intent` | `proposed` | Admission, before anything else |
++| `attempt` | `attempted` | Immediately before the effect is invoked |
++| `commit` | `committed` | After the effect returns |
++| `abort` | `rejected` | When the effect is known not to have committed |
++
++The commit boundary is the effect invocation. A fault before the boundary
++cannot have changed state, so the outcome is `denied`. After the boundary, the
++outcome is `reconcile_required` unless the commit record is durable. The
++declared `CommitBoundary` only says how much an adapter failure can be trusted:
++
++- `INVOCATION`: an exception from the effect adapter means the outcome is
++  unknown. The receipt becomes `reconcile_required` with
++  `effect_outcome_unknown`.
++- `ACKNOWLEDGED`: the adapter commits atomically when it returns, so an
++  exception means nothing was committed. The coordinator records `abort` and
++  returns `denied` with `effect_not_committed`.
++
++| Fault | During `intent` or `attempt` | During `commit` |
++|-------|------------------------------|-----------------|
++| Storage full (`audit_storage_full`) | `denied` | `reconcile_required` |
++| Rejected append (`audit_append_rejected`) | `denied` | `reconcile_required` |
++| Interrupted acknowledgment (`audit_unavailable`) | `denied`, evidence pending | `reconcile_required` |
++
++Stores raise `audit_storage_full` or `audit_append_rejected` only when the
++record is known not to be durable. Any fault whose durability is unknown is
++`audit_unavailable`. That includes a write that landed but whose
++acknowledgment was lost, for example when the ledger directory sync fails after
++the entry is linked. A store acknowledgment that is not a `sha256:` digest is
++treated as unavailable.
++
++The receipt's `evidence` field reports `complete`, `pending`, or `none`.
++`fully_evidenced` is true only for a `completed` receipt whose `commit` record
++is durable. In that case `evidence_digest` is the ledger entry digest of the
++commit record.
++
++## Reconcile without retrying the effect
++
++`reconcile()` takes no effect adapter, so it cannot re-run an effect. It reads
++the required store first:
++
++- If a terminal record is already durable, for example after an interrupted
++  acknowledgment, the receipt is returned as `reconciled_existing`. Nothing is
++  appended and the observer is not queried.
++- If only `intent` is durable, the effect was never invoked. The coordinator
++  records `abort` without querying the observer.
++- If `attempt` is durable, the read-only observer is queried by the opaque
++  effect key. `committed` appends the missing `commit` record once. `absent`
++  appends `abort`. `ambiguous`, an observer failure, or an invalid answer
++  leaves the receipt `reconcile_required`.
++
++The action ledger refuses a second terminal record, and a failed closing append
++is followed by a re-read. Repeated or concurrent reconciliation therefore
++completes the same receipt exactly once and returns the same `evidence_digest`
++every time. A retry of `perform()` with the same request key never invokes the
++effect again. It returns the recorded receipt or `reconcile_pending`.
++
++After a restart, `open_receipts()` rebuilds open receipts from the required
++store alone. `reconcile_open(observer=...)` closes them:
++
++```python
++for result in coordinator.reconcile_open(observer=effect_sink):
++    print(result.receipt_id, result.outcome.value, result.reason.value)
++```
++
++Only reconcile a receipt after its original attempt has finished or its
++process has stopped. An in-process claim prevents concurrent use of the same
++receipt within one coordinator.
++
++## Bounded open evidence
++
++`max_open_receipts` (1 to 4096, default 64) limits how many receipts may have
++open required evidence. When the limit is reached, new admissions are denied
++with `reconcile_backlog_full` until reconciliation closes receipts. A store
++that cannot be read denies admission with `audit_read_failed`. The same
++happens when the ledger contains an operation the current policy no longer
++declares.
++
++## Diagnostics are not evidence
++
++`diagnostics=` accepts an optional `AuditSink` such as
++`openmed.compliance.audit_chain.HashChainAuditLog`. It receives one value-free
++outcome event per call, on a best-effort basis. A diagnostics failure never
++changes an outcome. A diagnostics record never upgrades evidence, and
++reconciliation never reads diagnostics. A diagnostics sink cannot be installed
++as the required store.
++
++## Privacy
++
++Receipts, ledger entries, diagnostics, and errors contain only fixed codes,
++opaque `rcpt_`, `act_`, and `idem_` identifiers, and `sha256:` digests.
++Exceptions raised by effect adapters and observers are discarded, never
++copied. Error messages are fixed codes that never echo inputs.
++
++## Validation
++
++```console
++.venv/bin/python -m pytest tests/unit/service/test_required_audit.py \
++  tests/integration/service/test_required_audit_faults.py -q
++```
++
++The integration tests inject `ENOSPC` into ledger entry writes and an
++interrupted directory sync after an entry is linked. They then rebuild the
++coordinator and check that reconciliation completes the receipt exactly once.
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 13b54bcc94..ed76e92d3b 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -526,6 +526,7 @@ nav:
+       - Transactional Trace Recovery: privacy/trace-recovery.md
+       - Tamper-evident Audit Log: security/tamper-evident-audit-log.md
+       - Audit-artifact Retention: security/audit-retention.md
++      - Fail-closed Required Audit: security/required-audit.md
+       - Policy-aware Redaction Diffs: security/redaction-diff.md
+       - Privacy Policy Composition: security/policy-composition.md
+       - Evidence-bundle Integrity: security/evidence-integrity.md
+diff --git a/openmed/service/required_audit.py b/openmed/service/required_audit.py
+new file mode 100644
+index 0000000000..699a7f4c95
+--- /dev/null
++++ b/openmed/service/required_audit.py
+@@ -0,0 +1,1119 @@
++"""Fail-closed required audit for declared state-changing service operations.
++
++A declared operation may change state only after its required audit intent is
++durable, and it is reported as a fully evidenced success only after its
++required commit record is durable and acknowledged. When required audit storage
++is full, rejects an append, or loses an acknowledgment, the outcome follows the
++operation's commit boundary: a fault before the effect is invoked is a denial,
++and a fault after the effect is invoked is a reconcile-required receipt whose
++evidence stays pending. Reconciliation never invokes the effect again. It reads
++the required store, queries an injected observer by opaque effect key, and
++appends the missing closing record exactly once.
++
++Required evidence is persisted through the existing hash-chained
++:class:`~openmed.agent.audit.action_ledger.ActionLedger` via
++:class:`ActionLedgerAuditStore`. Optional diagnostics, such as a
++:class:`~openmed.compliance.audit_chain.AuditSink`, observe outcomes on a best
++effort basis and can never substitute for required evidence.
++
++Receipts, records, diagnostics and errors carry only fixed codes, opaque
++identifiers and digests. Request keys are hashed and never persisted.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import threading
++from collections.abc import Iterable, Iterator, Mapping
++from contextlib import contextmanager
++from dataclasses import dataclass, replace
++from enum import Enum
++from types import MappingProxyType
++from typing import Any, Final, Protocol, runtime_checkable
++
++from openmed.agent.audit.action_ledger import (
++    ActionLedger,
++    ActionLedgerError,
++    ActionState,
++)
++from openmed.agent.correlation import ActionId, RunId
++from openmed.agent.workflows.recovery import ObservationState
++from openmed.compliance.audit_chain import AuditSink
++
++__all__ = [
++    "ActionLedgerAuditStore",
++    "AuditReceipt",
++    "AuditStage",
++    "CommitBoundary",
++    "DEFAULT_MAX_OPEN_RECEIPTS",
++    "EffectObserver",
++    "EvidenceState",
++    "MAX_OPEN_RECEIPTS_LIMIT",
++    "REQUIRED_AUDIT_SCHEMA_VERSION",
++    "RequiredAuditCoordinator",
++    "RequiredAuditEffect",
++    "RequiredAuditError",
++    "RequiredAuditOutcome",
++    "RequiredAuditPolicy",
++    "RequiredAuditReason",
++    "RequiredAuditRecord",
++    "RequiredAuditStore",
++    "RequiredAuditStoreError",
++    "StoredAuditRecord",
++    "derive_receipt_id",
++]
++
++REQUIRED_AUDIT_SCHEMA_VERSION: Final = "openmed.service.required_audit.v1"
++DIAGNOSTIC_EVENT_TYPE: Final = "openmed.service.required_audit.outcome"
++DEFAULT_MAX_OPEN_RECEIPTS: Final = 64
++MAX_OPEN_RECEIPTS_LIMIT: Final = 4096
++DEFAULT_ACTOR_ROLE: Final = "role:openmed.service/required-audit"
++
++_OPERATION_RE = re.compile(r"[a-z][a-z0-9_.-]{0,63}")
++_REQUEST_KEY_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
++_RECEIPT_RE = re.compile(r"rcpt_[0-9a-f]{32}")
++_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
++_EFFECT_KEY_RE = re.compile(r"idem_[0-9a-f]{64}")
++_ROLE_RE = re.compile(r"role:[a-z][a-z0-9.-]{0,62}/[a-z][a-z0-9-]{0,63}")
++
++_STORE_ERROR_CODES: Final = frozenset(
++    {
++        "audit_storage_full",
++        "audit_append_rejected",
++        "audit_unavailable",
++        "audit_read_failed",
++    }
++)
++_NOT_WRITTEN_CODES: Final = frozenset({"audit_storage_full", "audit_append_rejected"})
++
++
++class RequiredAuditError(ValueError):
++    """Configuration or argument failure carrying only a fixed code.
++
++    Args:
++        code: Stable machine-readable failure code. Submitted values are never
++            included in the message.
++    """
++
++    def __init__(self, code: str) -> None:
++        self.code = code
++        super().__init__(code)
++
++
++class RequiredAuditStoreError(RuntimeError):
++    """Required audit store failure carrying only a closed code.
++
++    Stores raise ``audit_storage_full`` or ``audit_append_rejected`` only when
++    the record is known not to be durable. Any failure whose durability is
++    unknown, including an interrupted acknowledgment, is ``audit_unavailable``.
++
++    Args:
++        code: One of the closed store failure codes. Unknown codes collapse to
++            ``audit_unavailable`` so arbitrary text never escapes.
++    """
++
++    def __init__(self, code: str) -> None:
++        self.code = code if code in _STORE_ERROR_CODES else "audit_unavailable"
++        super().__init__(self.code)
++
++    @property
++    def not_written(self) -> bool:
++        """Return whether the store guarantees the record was not persisted."""
++        return self.code in _NOT_WRITTEN_CODES
++
++
++class CommitBoundary(str, Enum):
++    """Declared trust in an effect adapter failure at the commit boundary.
++
++    Every declared operation crosses its commit boundary when the effect
++    adapter is invoked. ``INVOCATION`` treats any adapter failure as an
++    effect whose outcome is unknown. ``ACKNOWLEDGED`` declares that the adapter
++    commits atomically on return, so a raised failure proves no commit.
++    """
++
++    INVOCATION = "invocation"
++    ACKNOWLEDGED = "acknowledged"
++
++
++class AuditStage(str, Enum):
++    """Closed lifecycle of required audit records for one receipt."""
++
++    INTENT = "intent"
++    ATTEMPT = "attempt"
++    COMMIT = "commit"
++    ABORT = "abort"
++
++
++class RequiredAuditOutcome(str, Enum):
++    """Caller-visible outcome of a declared operation."""
++
++    COMPLETED = "completed"
++    DENIED = "denied"
++    RECONCILE_REQUIRED = "reconcile_required"
++
++
++class EvidenceState(str, Enum):
++    """Durability of the required audit evidence behind a receipt."""
++
++    COMPLETE = "complete"
++    PENDING = "pending"
++    NONE = "none"
++
++
++class RequiredAuditReason(str, Enum):
++    """Closed reason codes for receipts."""
++
++    COMMITTED = "committed"
++    ALREADY_RECORDED = "already_recorded"
++    OPERATION_UNDECLARED = "operation_undeclared"
++    REQUIRED_AUDIT_UNCONFIGURED = "required_audit_unconfigured"
++    AUDIT_READ_FAILED = "audit_read_failed"
++    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
++    RECONCILE_BACKLOG_FULL = "reconcile_backlog_full"
++    RECONCILE_PENDING = "reconcile_pending"
++    RECEIPT_IN_FLIGHT = "receipt_in_flight"
++    INTENT_NOT_DURABLE = "intent_not_durable"
++    ATTEMPT_NOT_DURABLE = "attempt_not_durable"
++    EFFECT_NOT_COMMITTED = "effect_not_committed"
++    EFFECT_OUTCOME_UNKNOWN = "effect_outcome_unknown"
++    COMMIT_NOT_DURABLE = "commit_not_durable"
++    ABORT_NOT_DURABLE = "abort_not_durable"
++    RECONCILED_EXISTING = "reconciled_existing"
++    RECONCILED_COMMIT = "reconciled_commit"
++    RECONCILED_ABSENT = "reconciled_absent"
++    RECONCILED_NOT_ATTEMPTED = "reconciled_not_attempted"
++    NO_DURABLE_INTENT = "no_durable_intent"
++    EFFECT_AMBIGUOUS = "effect_ambiguous"
++    OBSERVER_UNAVAILABLE = "observer_unavailable"
++    EVIDENCE_MISMATCH = "evidence_mismatch"
++
++
++_VALID_SEQUENCES: Final = frozenset(
++    {
++        (AuditStage.INTENT,),
++        (AuditStage.INTENT, AuditStage.ABORT),
++        (AuditStage.INTENT, AuditStage.ATTEMPT),
++        (AuditStage.INTENT, AuditStage.ATTEMPT, AuditStage.COMMIT),
++        (AuditStage.INTENT, AuditStage.ATTEMPT, AuditStage.ABORT),
++    }
++)
++_TERMINAL: Final = frozenset({AuditStage.COMMIT, AuditStage.ABORT})
++
++
++def _digest(payload: Mapping[str, Any]) -> str:
++    serialized = json.dumps(
++        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
++    )
++    return hashlib.sha256(serialized.encode("ascii")).hexdigest()
++
++
++def _require_operation(operation: object) -> str:
++    if type(operation) is not str or _OPERATION_RE.fullmatch(operation) is None:
++        raise RequiredAuditError("invalid_operation")
++    return operation
++
++
++def _require_receipt_id(receipt_id: object) -> str:
++    if type(receipt_id) is not str or _RECEIPT_RE.fullmatch(receipt_id) is None:
++        raise RequiredAuditError("invalid_receipt_id")
++    return receipt_id
++
++
++def _require_digest(value: object, code: str) -> str:
++    if type(value) is not str or _DIGEST_RE.fullmatch(value) is None:
++        raise RequiredAuditError(code)
++    return value
++
++
++def derive_receipt_id(operation: str, request_key: str) -> str:
++    """Derive the stable opaque receipt identifier for one logical request.
++
++    Args:
++        operation: Declared operation code.
++        request_key: Caller-chosen opaque idempotency token (16 to 128 ASCII
++            letters, digits, ``_`` or ``-``). It must not encode identifiers;
++            only its digest contributes to the receipt.
++
++    Returns:
++        A ``rcpt_`` identifier with 32 lowercase hex characters.
++
++    Raises:
++        RequiredAuditError: If the operation or request key is malformed.
++    """
++    _require_operation(operation)
++    if type(request_key) is not str or _REQUEST_KEY_RE.fullmatch(request_key) is None:
++        raise RequiredAuditError("invalid_request_key")
++    token = _digest(
++        {
++            "schema": REQUIRED_AUDIT_SCHEMA_VERSION,
++            "operation": operation,
++            "request_key": request_key,
++        }
++    )
++    return "rcpt_" + token[:32]
++
++
++def _effect_key(receipt_id: str) -> str:
++    token = _digest({"schema": REQUIRED_AUDIT_SCHEMA_VERSION, "receipt_id": receipt_id})
++    return "idem_" + token
++
++
++def _binding_digest(operation: str, operation_digest: str) -> str:
++    token = _digest(
++        {
++            "schema": REQUIRED_AUDIT_SCHEMA_VERSION,
++            "operation": operation,
++            "operation_digest": operation_digest,
++        }
++    )
++    return "sha256:" + token
++
++
++@dataclass(frozen=True, slots=True)
++class RequiredAuditPolicy:
++    """Explicit declaration of operations whose audit evidence is required.
++
++    Undeclared operations are denied. There is no optional mode for a declared
++    operation: diagnostics never satisfy the requirement.
++
++    Args:
++        operations: Mapping from declared operation code to its commit
++            boundary.
++        max_open_receipts: Maximum number of receipts whose required evidence
++            may remain open before new admissions are denied.
++
++    Raises:
++        RequiredAuditError: If the declaration is empty or malformed.
++    """
++
++    operations: Mapping[str, CommitBoundary]
++    max_open_receipts: int = DEFAULT_MAX_OPEN_RECEIPTS
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.operations, Mapping):
++            raise RequiredAuditError("invalid_policy")
++        if not self.operations:
++            raise RequiredAuditError("empty_policy")
++        declared: dict[str, CommitBoundary] = {}
++        for operation, boundary in self.operations.items():
++            _require_operation(operation)
++            if type(boundary) is not CommitBoundary:
++                raise RequiredAuditError("invalid_commit_boundary")
++            declared[operation] = boundary
++        if (
++            type(self.max_open_receipts) is not int
++            or not 1 <= self.max_open_receipts <= MAX_OPEN_RECEIPTS_LIMIT
++        ):
++            raise RequiredAuditError("invalid_open_receipt_bound")
++        object.__setattr__(
++            self, "operations", MappingProxyType(dict(sorted(declared.items())))
++        )
++
++    def boundary_for(self, operation: str) -> CommitBoundary | None:
++        """Return the declared commit boundary, or ``None`` when undeclared.
++
++        Args:
++            operation: Operation code to look up.
++
++        Returns:
++            The declared boundary, or ``None``.
++        """
++        return self.operations.get(operation)
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the value-free policy declaration."""
++        return {
++            "schema_version": REQUIRED_AUDIT_SCHEMA_VERSION,
++            "operations": {op: b.value for op, b in self.operations.items()},
++            "max_open_receipts": self.max_open_receipts,
++        }
++
++
++@dataclass(frozen=True, slots=True)
++class RequiredAuditRecord:
++    """One value-free required audit record for a receipt stage.
++
++    Args:
++        receipt_id: Opaque receipt identifier.
++        operation: Declared operation code.
++        stage: Lifecycle stage being recorded.
++        binding_digest: Digest binding the operation to its payload digest.
++
++    Raises:
++        RequiredAuditError: If any field is malformed.
++    """
++
++    receipt_id: str
++    operation: str
++    stage: AuditStage
++    binding_digest: str
++
++    def __post_init__(self) -> None:
++        _require_receipt_id(self.receipt_id)
++        _require_operation(self.operation)
++        if type(self.stage) is not AuditStage:
++            raise RequiredAuditError("invalid_stage")
++        _require_digest(self.binding_digest, "invalid_binding_digest")
++
++
++@dataclass(frozen=True, slots=True)
++class StoredAuditRecord:
++    """A durable record together with the store's digest for it.
++
++    Args:
++        record: The persisted record.
++        record_digest: Store-assigned ``sha256:`` digest of the durable entry.
++    """
++
++    record: RequiredAuditRecord
++    record_digest: str
++
++    def __post_init__(self) -> None:
++        if type(self.record) is not RequiredAuditRecord:
++            raise RequiredAuditError("invalid_record")
++        _require_digest(self.record_digest, "invalid_record_digest")
++
++
++@runtime_checkable
++class RequiredAuditStore(Protocol):
++    """Durable required audit store port.
++
++    Implementations must make ``append`` durable before returning, enforce the
++    stage lifecycle, reject a second terminal record, and raise
++    :class:`RequiredAuditStoreError` for every failure.
++    """
++
++    def append(self, record: RequiredAuditRecord) -> str:
++        """Persist one record and return its durable digest."""
++        ...
++
++    def history(self, receipt_id: str) -> tuple[StoredAuditRecord, ...]:
++        """Return durable records for one receipt in append order."""
++        ...
++
++    def open_receipt_ids(self) -> tuple[str, ...]:
++        """Return receipts whose required evidence has no terminal record."""
++        ...
++
++
++class RequiredAuditEffect(Protocol):
++    """Effect adapter invoked at most once per receipt by the coordinator."""
++
++    def __call__(self, effect_key: str) -> None:
++        """Apply the effect idempotently under the opaque effect key."""
++        ...
++
++
++class EffectObserver(Protocol):
++    """Read-only effect sink query used during reconciliation."""
++
++    def observe(self, operation: str, effect_key: str) -> ObservationState:
++        """Report whether the effect for ``effect_key`` is committed."""
++        ...
++
++
++@dataclass(frozen=True, slots=True)
++class AuditReceipt:
++    """Value-free receipt for one declared operation request.
++
++    Args:
++        receipt_id: Opaque receipt identifier.
++        operation: Declared operation code.
++        boundary: Commit boundary declared for the operation, if declared.
++        outcome: Caller-visible outcome.
++        evidence: Durability of required evidence.
++        reason: Closed reason code.
++        binding_digest: Digest binding the operation to its payload digest.
++        effect_key: Opaque idempotency key handed to the effect adapter.
++        recorded_stages: Stages known to be durable and acknowledged.
++        evidence_digest: Required-store digest of the terminal record, when
++            the evidence is complete.
++    """
++
++    receipt_id: str
++    operation: str
++    boundary: CommitBoundary | None
++    outcome: RequiredAuditOutcome
++    evidence: EvidenceState
++    reason: RequiredAuditReason
++    binding_digest: str
++    effect_key: str
++    recorded_stages: tuple[AuditStage, ...] = ()
++    evidence_digest: str | None = None
++
++    def __post_init__(self) -> None:
++        _require_receipt_id(self.receipt_id)
++        _require_operation(self.operation)
++        if self.boundary is not None and type(self.boundary) is not CommitBoundary:
++            raise RequiredAuditError("invalid_commit_boundary")
++        if (
++            type(self.outcome) is not RequiredAuditOutcome
++            or type(self.evidence) is not EvidenceState
++            or type(self.reason) is not RequiredAuditReason
++        ):
++            raise RequiredAuditError("invalid_receipt")
++        _require_digest(self.binding_digest, "invalid_binding_digest")
++        if type(self.effect_key) is not str or not _EFFECT_KEY_RE.fullmatch(
++            self.effect_key
++        ):
++            raise RequiredAuditError("invalid_effect_key")
++        if type(self.recorded_stages) is not tuple or any(
++            type(stage) is not AuditStage for stage in self.recorded_stages
++        ):
++            raise RequiredAuditError("invalid_recorded_stages")
++        if self.evidence_digest is not None:
++            _require_digest(self.evidence_digest, "invalid_evidence_digest")
++
++    @property
++    def fully_evidenced(self) -> bool:
++        """Return whether this is a success backed by durable required audit."""
++        return (
++            self.outcome is RequiredAuditOutcome.COMPLETED
++            and self.evidence is EvidenceState.COMPLETE
++            and self.evidence_digest is not None
++            and self.recorded_stages[-1:] == (AuditStage.COMMIT,)
++        )
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return canonical value-free receipt fields."""
++        return {
++            "schema_version": REQUIRED_AUDIT_SCHEMA_VERSION,
++            "receipt_id": self.receipt_id,
++            "operation": self.operation,
++            "boundary": None if self.boundary is None else self.boundary.value,
++            "outcome": self.outcome.value,
++            "evidence": self.evidence.value,
++            "reason": self.reason.value,
++            "binding_digest": self.binding_digest,
++            "effect_key": self.effect_key,
++            "recorded_stages": [stage.value for stage in self.recorded_stages],
++            "evidence_digest": self.evidence_digest,
++            "fully_evidenced": self.fully_evidenced,
++        }
++
++
++_LEDGER_STATES: Final = {
++    AuditStage.INTENT: ActionState.PROPOSED,
++    AuditStage.ATTEMPT: ActionState.ATTEMPTED,
++    AuditStage.COMMIT: ActionState.COMMITTED,
++    AuditStage.ABORT: ActionState.REJECTED,
++}
++_LEDGER_STAGES: Final = {state: stage for stage, state in _LEDGER_STATES.items()}
++_LEDGER_REJECTIONS: Final = frozenset(
++    {
++        "append_conflict",
++        "invalid_transition",
++        "missing_proposal",
++        "action_metadata_changed",
++    }
++)
++
++
++def _operation_digest(operation: str) -> str:
++    return "sha256:" + _digest(
++        {"schema": REQUIRED_AUDIT_SCHEMA_VERSION, "operation": operation}
++    )
++
++
++class ActionLedgerAuditStore:
++    """Required audit store backed by the existing hash-chained action ledger.
++
++    Each receipt maps to one ledger action: intent, attempt, commit and abort
++    map to ``proposed``, ``attempted``, ``committed`` and ``rejected``. The
++    ledger enforces the transition lifecycle and rejects a second terminal
++    record. The operation code is bound as the grant digest and the payload
++    binding as the tool digest, so no plaintext enters the ledger.
++
++    Args:
++        ledger: Durable action ledger in a dedicated private directory.
++        run_id: Opaque run identifier shared by all entries in the ledger.
++        operations: Declared operation codes whose records may be read back.
++        actor_role: Governed role code recorded on every entry.
++
++    Raises:
++        RequiredAuditError: If any argument is malformed.
++    """
++
++    def __init__(
++        self,
++        ledger: ActionLedger,
++        *,
++        run_id: RunId,
++        operations: Iterable[str],
++        actor_role: str = DEFAULT_ACTOR_ROLE,
++    ) -> None:
++        if not isinstance(ledger, ActionLedger):
++            raise RequiredAuditError("invalid_ledger")
++        if type(run_id) is not RunId:
++            raise RequiredAuditError("invalid_run_id")
++        if type(actor_role) is not str or _ROLE_RE.fullmatch(actor_role) is None:
++            raise RequiredAuditError("invalid_actor_role")
++        names = tuple(operations)
++        if not names:
++            raise RequiredAuditError("empty_policy")
++        self._ledger = ledger
++        self._run_id = run_id
++        self._actor_role = actor_role
++        self._operations = {
++            _operation_digest(_require_operation(name)): name for name in names
++        }
++
++    def append(self, record: RequiredAuditRecord) -> str:
++        """Persist one record as the next ledger transition.
++
++        Args:
++            record: Required audit record to persist.
++
++        Returns:
++            The ledger entry digest.
++
++        Raises:
++            RequiredAuditStoreError: ``audit_append_rejected`` when the ledger
++                refuses the transition, otherwise ``audit_unavailable``.
++        """
++        if type(record) is not RequiredAuditRecord:
++            raise RequiredAuditStoreError("audit_append_rejected")
++        try:
++            entry = self._ledger.record(
++                run_id=self._run_id,
++                action_id=ActionId("act_" + record.receipt_id[5:]),
++                state=_LEDGER_STATES[record.stage],
++                actor_role=self._actor_role,
++                grant_digest=_operation_digest(record.operation),
++                tool_digest=record.binding_digest,
++            )
++        except ActionLedgerError as error:
++            code = error.code
++            if code in _LEDGER_REJECTIONS:
++                raise RequiredAuditStoreError("audit_append_rejected") from None
++            raise RequiredAuditStoreError("audit_unavailable") from None
++        except Exception:
++            raise RequiredAuditStoreError("audit_unavailable") from None
++        return entry.entry_digest
++
++    def _grouped(self) -> dict[str, list[StoredAuditRecord]]:
++        try:
++            entries = self._ledger.load()
++        except Exception:
++            raise RequiredAuditStoreError("audit_read_failed") from None
++        grouped: dict[str, list[StoredAuditRecord]] = {}
++        for entry in entries:
++            operation = self._operations.get(entry.grant_digest)
++            if entry.run_id != self._run_id or operation is None:
++                raise RequiredAuditStoreError("audit_read_failed")
++            receipt_id = "rcpt_" + entry.action_id.serialize()[4:]
++            stored = StoredAuditRecord(
++                RequiredAuditRecord(
++                    receipt_id,
++                    operation,
++                    _LEDGER_STAGES[entry.state],
++                    entry.tool_digest,
++                ),
++                entry.entry_digest,
++            )
++            grouped.setdefault(receipt_id, []).append(stored)
++        return grouped
++
++    def history(self, receipt_id: str) -> tuple[StoredAuditRecord, ...]:
++        """Return verified ledger records for one receipt.
++
++        Args:
++            receipt_id: Opaque receipt identifier.
++
++        Returns:
++            Durable records in append order.
++
++        Raises:
++            RequiredAuditStoreError: ``audit_read_failed`` if the ledger cannot
++                be read or verified.
++        """
++        _require_receipt_id(receipt_id)
++        return tuple(self._grouped().get(receipt_id, ()))
++
++    def open_receipt_ids(self) -> tuple[str, ...]:
++        """Return receipts without a terminal record, in first-append order.
++
++        Returns:
++            Opaque receipt identifiers.
++
++        Raises:
++            RequiredAuditStoreError: ``audit_read_failed`` if the ledger cannot
++                be read or verified.
++        """
++        return tuple(
++            receipt_id
++            for receipt_id, records in self._grouped().items()
++            if records[-1].record.stage not in _TERMINAL
++        )
++
++
++class RequiredAuditCoordinator:
++    """Coordinate admission, commit and reconciliation for declared operations.
++
++    Args:
++        policy: Explicit required-audit policy.
++        store: Durable required audit store. ``None`` denies every declared
++            operation, even when diagnostics are configured.
++        diagnostics: Optional best-effort sink for value-free outcome events.
++            Its failures are ignored and its records are never evidence.
++
++    Raises:
++        RequiredAuditError: If the policy or store is invalid.
++    """
++
++    def __init__(
++        self,
++        policy: RequiredAuditPolicy,
++        store: RequiredAuditStore | None,
++        *,
++        diagnostics: AuditSink | None = None,
++    ) -> None:
++        if type(policy) is not RequiredAuditPolicy:
++            raise RequiredAuditError("invalid_policy")
++        if store is not None and (
++            not isinstance(store, RequiredAuditStore) or store is diagnostics
++        ):
++            raise RequiredAuditError("invalid_required_store")
++        self._policy = policy
++        self._store = store
++        self._diagnostics = diagnostics
++        self._lock = threading.Lock()
++        self._in_flight: set[str] = set()
++
++    @property
++    def policy(self) -> RequiredAuditPolicy:
++        """Return the active required-audit policy."""
++        return self._policy
++
++    def perform(
++        self,
++        operation: str,
++        *,
++        request_key: str,
++        operation_digest: str,
++        effect: RequiredAuditEffect,
++    ) -> AuditReceipt:
++        """Run one declared operation under required audit.
++
++        The effect is invoked at most once per receipt and only after the
++        intent and attempt records are durable. A request key that already
++        has a receipt never invokes the effect again.
++
++        Args:
++            operation: Declared operation code.
++            request_key: Caller-chosen opaque idempotency token.
++            operation_digest: ``sha256:`` digest of the value-free operation
++                payload, binding the request key to one payload.
++            effect: Adapter that applies the effect under the effect key.
++
++        Returns:
++            A receipt whose outcome is completed only with complete evidence.
++
++        Raises:
++            RequiredAuditError: If any argument is malformed.
++        """
++        receipt_id = derive_receipt_id(operation, request_key)
++        _require_digest(operation_digest, "invalid_operation_digest")
++        if not callable(effect):
++            raise RequiredAuditError("invalid_effect")
++        boundary = self._policy.boundary_for(operation)
++        base = AuditReceipt(
++            receipt_id=receipt_id,
++            operation=operation,
++            boundary=boundary,
++            outcome=RequiredAuditOutcome.DENIED,
++            evidence=EvidenceState.NONE,
++            reason=RequiredAuditReason.OPERATION_UNDECLARED,
++            binding_digest=_binding_digest(operation, operation_digest),
++            effect_key=_effect_key(receipt_id),
++        )
++        if boundary is None:
++            return self._emit(base)
++        if self._store is None:
++            return self._emit(
++                replace(base, reason=RequiredAuditReason.REQUIRED_AUDIT_UNCONFIGURED)
++            )
++        with self._claim(receipt_id) as claimed:
++            if not claimed:
++                return self._emit(
++                    replace(
++                        base,
++                        outcome=RequiredAuditOutcome.RECONCILE_REQUIRED,
++                        evidence=EvidenceState.PENDING,
++                        reason=RequiredAuditReason.RECEIPT_IN_FLIGHT,
++                    )
++                )
++            return self._emit(self._perform(base, effect))
++
++    def _perform(self, base: AuditReceipt, effect: RequiredAuditEffect) -> AuditReceipt:
++        history = self._read(base.receipt_id)
++        open_count = 0
++        if history is not None and not history:
++            try:
++                open_count = len(self._required_store().open_receipt_ids())
++            except Exception:
++                history = None
++        if history is None:
++            return replace(
++                base,
++                evidence=EvidenceState.PENDING,
++                reason=RequiredAuditReason.AUDIT_READ_FAILED,
++            )
++        if history:
++            if any(r.record.binding_digest != base.binding_digest for r in history):
++                return replace(base, reason=RequiredAuditReason.IDEMPOTENCY_CONFLICT)
++            rebuilt = self._from_history(base, history)
++            if rebuilt is None:
++                return self._mismatch(base)
++            reason = (
++                RequiredAuditReason.ALREADY_RECORDED
++                if rebuilt.evidence is EvidenceState.COMPLETE
++                else RequiredAuditReason.RECONCILE_PENDING
++            )
++            return replace(rebuilt, reason=reason)
++        if open_count >= self._policy.max_open_receipts:
++            return replace(base, reason=RequiredAuditReason.RECONCILE_BACKLOG_FULL)
++
++        stages: list[AuditStage] = []
++        _, error = self._append(base, AuditStage.INTENT, stages)
++        if error is not None:
++            return replace(
++                base,
++                evidence=(
++                    EvidenceState.NONE if error.not_written else EvidenceState.PENDING
++                ),
++                reason=RequiredAuditReason.INTENT_NOT_DURABLE,
++            )
++        if self._append(base, AuditStage.ATTEMPT, stages)[1] is not None:
++            return replace(
++                base,
++                evidence=EvidenceState.PENDING,
++                reason=RequiredAuditReason.ATTEMPT_NOT_DURABLE,
++                recorded_stages=tuple(stages),
++            )
++
++        # Commit boundary: from here on the effect may have committed.
++        try:
++            effect(base.effect_key)
++        except Exception:
++            if base.boundary is CommitBoundary.ACKNOWLEDGED:
++                return self._close_denied(
++                    base, stages, RequiredAuditReason.EFFECT_NOT_COMMITTED
++                )
++            return replace(
++                base,
++                outcome=RequiredAuditOutcome.RECONCILE_REQUIRED,
++                evidence=EvidenceState.PENDING,
++                reason=RequiredAuditReason.EFFECT_OUTCOME_UNKNOWN,
++                recorded_stages=tuple(stages),
++            )
++        digest, _ = self._append(base, AuditStage.COMMIT, stages)
++        if digest is None:
++            return replace(
++                base,
++                outcome=RequiredAuditOutcome.RECONCILE_REQUIRED,
++                evidence=EvidenceState.PENDING,
++                reason=RequiredAuditReason.COMMIT_NOT_DURABLE,
++                recorded_stages=tuple(stages),
++            )
++        return replace(
++            base,
++            outcome=RequiredAuditOutcome.COMPLETED,
++            evidence=EvidenceState.COMPLETE,
++            reason=RequiredAuditReason.COMMITTED,
++            recorded_stages=tuple(stages),
++            evidence_digest=digest,
++        )
++
++    def reconcile(
++        self, receipt: AuditReceipt, *, observer: EffectObserver
++    ) -> AuditReceipt:
++        """Close a receipt's required evidence without re-invoking its effect.
++
++        A terminal record already in the required store is returned as is, so
++        repeated reconciliation completes the same receipt exactly once. An
++        attempted effect is resolved only through the read-only observer;
++        ambiguous or unavailable observations stay reconcile-required.
++
++        Args:
++            receipt: Receipt returned by :meth:`perform` or
++                :meth:`open_receipts`.
++            observer: Read-only effect sink query.
++
++        Returns:
++            The updated receipt for the same receipt identifier.
++
++        Raises:
++            RequiredAuditError: If ``receipt`` is not an :class:`AuditReceipt`.
++        """
++        if type(receipt) is not AuditReceipt:
++            raise RequiredAuditError("invalid_receipt")
++        if self._store is None:
++            return self._emit(
++                replace(receipt, reason=RequiredAuditReason.REQUIRED_AUDIT_UNCONFIGURED)
++            )
++        with self._claim(receipt.receipt_id) as claimed:
++            if not claimed:
++                return self._emit(
++                    replace(receipt, reason=RequiredAuditReason.RECEIPT_IN_FLIGHT)
++                )
++            return self._emit(self._reconcile(receipt, observer))
++
++    def _reconcile(
++        self, receipt: AuditReceipt, observer: EffectObserver
++    ) -> AuditReceipt:
++        history = self._read(receipt.receipt_id)
++        if history is None:
++            return replace(receipt, reason=RequiredAuditReason.AUDIT_READ_FAILED)
++        if not history:
++            return replace(
++                receipt,
++                outcome=RequiredAuditOutcome.DENIED,
++                evidence=EvidenceState.NONE,
++                reason=RequiredAuditReason.NO_DURABLE_INTENT,
++                recorded_stages=(),
++                evidence_digest=None,
++            )
++        rebuilt = self._from_history(receipt, history)
++        if (
++            rebuilt is None
++            or receipt.effect_key != _effect_key(receipt.receipt_id)
++            or any(
++                r.record.binding_digest != receipt.binding_digest
++                or r.record.operation != receipt.operation
++                for r in history
++            )
++        ):
++            return self._mismatch(receipt)
++        stages = list(rebuilt.recorded_stages)
++        if stages[-1] in _TERMINAL:
++            return replace(rebuilt, reason=RequiredAuditReason.RECONCILED_EXISTING)
++        if stages[-1] is AuditStage.INTENT:
++            return self._close_denied(
++                rebuilt, stages, RequiredAuditReason.RECONCILED_NOT_ATTEMPTED
++            )
++        try:
++            observation = observer.observe(receipt.operation, receipt.effect_key)
++        except Exception:
++            observation = None
++        if type(observation) is not ObservationState:
++            return replace(rebuilt, reason=RequiredAuditReason.OBSERVER_UNAVAILABLE)
++        if observation is ObservationState.AMBIGUOUS:
++            return replace(rebuilt, reason=RequiredAuditReason.EFFECT_AMBIGUOUS)
++        if observation is ObservationState.ABSENT:
++            return self._close_denied(
++                rebuilt, stages, RequiredAuditReason.RECONCILED_ABSENT
++            )
++        digest, _ = self._append(rebuilt, AuditStage.COMMIT, stages)
++        if digest is None:
++            return self._after_failed_close(
++                rebuilt, RequiredAuditReason.COMMIT_NOT_DURABLE
++            )
++        return replace(
++            rebuilt,
++            outcome=RequiredAuditOutcome.COMPLETED,
++            evidence=EvidenceState.COMPLETE,
++            reason=RequiredAuditReason.RECONCILED_COMMIT,
++            recorded_stages=tuple(stages),
++            evidence_digest=digest,
++        )
++
++    def open_receipts(self) -> tuple[AuditReceipt, ...]:
++        """Rebuild receipts with open required evidence from the store.
++
++        Returns:
++            Receipts reconstructed only from the required store, for example
++            after a restart. Returns an empty tuple when no store is set.
++
++        Raises:
++            RequiredAuditStoreError: If the store cannot be read.
++        """
++        if self._store is None:
++            return ()
++        receipts = []
++        for receipt_id in self._store.open_receipt_ids():
++            history = self._read(receipt_id)
++            if history is None:
++                raise RequiredAuditStoreError("audit_read_failed")
++            if not history:
++                continue
++            first = history[0].record
++            base = AuditReceipt(
++                receipt_id=receipt_id,
++                operation=first.operation,
++                boundary=self._policy.boundary_for(first.operation),
++                outcome=RequiredAuditOutcome.RECONCILE_REQUIRED,
++                evidence=EvidenceState.PENDING,
++                reason=RequiredAuditReason.RECONCILE_PENDING,
++                binding_digest=first.binding_digest,
++                effect_key=_effect_key(receipt_id),
++            )
++            rebuilt = self._from_history(base, history)
++            receipts.append(rebuilt if rebuilt is not None else base)
++        return tuple(receipts)
++
++    def reconcile_open(self, *, observer: EffectObserver) -> tuple[AuditReceipt, ...]:
++        """Reconcile every receipt whose required evidence is still open.
++
++        Args:
++            observer: Read-only effect sink query.
++
++        Returns:
++            Reconciled receipts in store order.
++
++        Raises:
++            RequiredAuditStoreError: If the store cannot be read.
++        """
++        return tuple(
++            self.reconcile(receipt, observer=observer)
++            for receipt in self.open_receipts()
++        )
++
++    # Internal helpers -------------------------------------------------------
++
++    @contextmanager
++    def _claim(self, receipt_id: str) -> Iterator[bool]:
++        with self._lock:
++            if receipt_id in self._in_flight:
++                claimed = False
++            else:
++                self._in_flight.add(receipt_id)
++                claimed = True
++        try:
++            yield claimed
++        finally:
++            if claimed:
++                with self._lock:
++                    self._in_flight.discard(receipt_id)
++
++    def _read(self, receipt_id: str) -> tuple[StoredAuditRecord, ...] | None:
++        try:
++            history = tuple(self._required_store().history(receipt_id))
++        except Exception:
++            return None
++        if any(
++            type(r) is not StoredAuditRecord or r.record.receipt_id != receipt_id
++            for r in history
++        ):
++            return None
++        return history
++
++    def _required_store(self) -> RequiredAuditStore:
++        if self._store is None:
++            raise RequiredAuditError("required_audit_unconfigured")
++        return self._store
++
++    def _append(
++        self, receipt: AuditReceipt, stage: AuditStage, stages: list[AuditStage]
++    ) -> tuple[str | None, RequiredAuditStoreError | None]:
++        """Append one stage; return its digest or a closed store error."""
++        record = RequiredAuditRecord(
++            receipt.receipt_id, receipt.operation, stage, receipt.binding_digest
++        )
++        try:
++            digest = self._required_store().append(record)
++        except RequiredAuditStoreError as error:
++            return None, error
++        except Exception:
++            return None, RequiredAuditStoreError("audit_unavailable")
++        if type(digest) is not str or _DIGEST_RE.fullmatch(digest) is None:
++            return None, RequiredAuditStoreError("audit_unavailable")
++        stages.append(stage)
++        return digest, None
++
++    def _close_denied(
++        self,
++        receipt: AuditReceipt,
++        stages: list[AuditStage],
++        reason: RequiredAuditReason,
++    ) -> AuditReceipt:
++        digest, _ = self._append(receipt, AuditStage.ABORT, stages)
++        if digest is None:
++            return self._after_failed_close(
++                replace(
++                    receipt,
++                    outcome=RequiredAuditOutcome.DENIED,
++                    recorded_stages=tuple(stages),
++                ),
++                RequiredAuditReason.ABORT_NOT_DURABLE,
++            )
++        return replace(
++            receipt,
++            outcome=RequiredAuditOutcome.DENIED,
++            evidence=EvidenceState.COMPLETE,
++            reason=reason,
++            recorded_stages=tuple(stages),
++            evidence_digest=digest,
++        )
++
++    def _after_failed_close(
++        self, receipt: AuditReceipt, reason: RequiredAuditReason
++    ) -> AuditReceipt:
++        """Re-read after a failed closing append; a terminal record wins."""
++        history = self._read(receipt.receipt_id)
++        if history:
++            rebuilt = self._from_history(receipt, history)
++            if (
++                rebuilt is not None
++                and rebuilt.recorded_stages
++                and rebuilt.recorded_stages[-1] in _TERMINAL
++            ):
++                return replace(rebuilt, reason=RequiredAuditReason.RECONCILED_EXISTING)
++        return replace(receipt, evidence=EvidenceState.PENDING, reason=reason)
++
++    def _from_history(
++        self, base: AuditReceipt, history: tuple[StoredAuditRecord, ...]
++    ) -> AuditReceipt | None:
++        stages = tuple(r.record.stage for r in history)
++        if stages not in _VALID_SEQUENCES or any(
++            r.record.operation != history[0].record.operation
++            or r.record.binding_digest != history[0].record.binding_digest
++            for r in history
++        ):
++            return None
++        last = stages[-1]
++        if last is AuditStage.COMMIT:
++            outcome, evidence = RequiredAuditOutcome.COMPLETED, EvidenceState.COMPLETE
++        elif last is AuditStage.ABORT:
++            outcome, evidence = RequiredAuditOutcome.DENIED, EvidenceState.COMPLETE
++        elif last is AuditStage.INTENT:
++            outcome, evidence = RequiredAuditOutcome.DENIED, EvidenceState.PENDING
++        else:
++            outcome = RequiredAuditOutcome.RECONCILE_REQUIRED
++            evidence = EvidenceState.PENDING
++        return replace(
++            base,
++            outcome=outcome,
++            evidence=evidence,
++            recorded_stages=stages,
++            evidence_digest=(history[-1].record_digest if last in _TERMINAL else None),
++        )
++
++    @staticmethod
++    def _mismatch(receipt: AuditReceipt) -> AuditReceipt:
++        return replace(
++            receipt,
++            outcome=RequiredAuditOutcome.RECONCILE_REQUIRED,
++            evidence=EvidenceState.PENDING,
++            reason=RequiredAuditReason.EVIDENCE_MISMATCH,
++            evidence_digest=None,
++        )
++
++    def _emit(self, receipt: AuditReceipt) -> AuditReceipt:
++        if self._diagnostics is not None:
++            try:
++                self._diagnostics.append(
++                    DIAGNOSTIC_EVENT_TYPE,
++                    {
++                        "receipt_id": receipt.receipt_id,
++                        "operation": receipt.operation,
++                        "outcome": receipt.outcome.value,
++                        "evidence": receipt.evidence.value,
++                        "reason": receipt.reason.value,
++                    },
++                )
++            except Exception:
++                pass  # Diagnostics are optional and never change outcomes.
++        return receipt
+diff --git a/tests/integration/service/test_required_audit_faults.py b/tests/integration/service/test_required_audit_faults.py
+new file mode 100644
+index 0000000000..3cd43b4de4
+--- /dev/null
++++ b/tests/integration/service/test_required_audit_faults.py
+@@ -0,0 +1,164 @@
++"""Synthetic OS-level faults against the durable action-ledger audit store."""
++
++from __future__ import annotations
++
++import errno
++import os
++import tempfile
++
++import pytest
++
++from openmed.agent.audit.action_ledger import ActionLedger, ActionState
++from openmed.agent.correlation import RunId
++from openmed.agent.workflows.recovery import ObservationState
++from openmed.service.required_audit import (
++    ActionLedgerAuditStore,
++    CommitBoundary,
++    EvidenceState,
++    RequiredAuditCoordinator,
++    RequiredAuditOutcome,
++    RequiredAuditPolicy,
++    RequiredAuditReason,
++)
++
++pytestmark = pytest.mark.integration
++
++RUN = RunId("run_" + "7" * 32)
++OP = "fhir.write_back"
++KEY = "SYNTHETICrequestKEY0001"
++DIGEST = "sha256:" + "9" * 64
++POLICY = RequiredAuditPolicy({OP: CommitBoundary.INVOCATION})
++LEDGER_MODULE = "openmed.agent.audit.action_ledger.os"
++
++
++def build(tmp_path):
++    store = ActionLedgerAuditStore(
++        ActionLedger(tmp_path / "ledger"), run_id=RUN, operations=POLICY.operations
++    )
++    return RequiredAuditCoordinator(POLICY, store)
++
++
++class Sink:
++    """Synthetic idempotent effect sink keyed only by opaque effect keys."""
++
++    def __init__(self):
++        self.applied: list[str] = []
++
++    def apply(self, effect_key):
++        self.applied.append(effect_key)
++
++    def observe(self, operation, effect_key):
++        if effect_key in self.applied:
++            return ObservationState.COMMITTED
++        return ObservationState.ABSENT
++
++
++def disk_full_after(monkeypatch, entries_allowed):
++    """Fail ledger entry writes with ENOSPC after ``entries_allowed`` entries."""
++    real_write = os.write
++    real_mkstemp = tempfile.mkstemp
++    ordinals: dict[int, int] = {}
++    created = {"count": 0}
++
++    def mkstemp(*args, **kwargs):
++        descriptor, name = real_mkstemp(*args, **kwargs)
++        if kwargs.get("prefix") == ".entry-":
++            ordinals[descriptor] = created["count"]
++            created["count"] += 1
++        return descriptor, name
++
++    def write(descriptor, data):
++        if ordinals.get(descriptor, -1) >= entries_allowed:
++            raise OSError(errno.ENOSPC, "synthetic")
++        return real_write(descriptor, data)
++
++    monkeypatch.setattr(f"{LEDGER_MODULE}.write", write)
++    monkeypatch.setattr("openmed.agent.audit.action_ledger.tempfile.mkstemp", mkstemp)
++
++
++def test_disk_full_on_intent_denies_and_leaves_no_entry(tmp_path, monkeypatch):
++    coord = build(tmp_path)
++    sink = Sink()
++    disk_full_after(monkeypatch, 0)
++
++    receipt = coord.perform(
++        OP, request_key=KEY, operation_digest=DIGEST, effect=sink.apply
++    )
++
++    assert receipt.outcome is RequiredAuditOutcome.DENIED
++    assert receipt.reason is RequiredAuditReason.INTENT_NOT_DURABLE
++    assert sink.applied == []
++    monkeypatch.undo()
++    assert ActionLedger(tmp_path / "ledger").load() == ()
++
++
++def test_disk_full_after_effect_then_restart_completes_once(tmp_path, monkeypatch):
++    coord = build(tmp_path)
++    sink = Sink()
++    disk_full_after(monkeypatch, 2)  # intent and attempt fit, commit does not
++
++    receipt = coord.perform(
++        OP, request_key=KEY, operation_digest=DIGEST, effect=sink.apply
++    )
++
++    assert receipt.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert receipt.evidence is EvidenceState.PENDING
++    assert len(sink.applied) == 1
++    monkeypatch.undo()
++
++    restarted = build(tmp_path)
++    retried = restarted.perform(
++        OP, request_key=KEY, operation_digest=DIGEST, effect=sink.apply
++    )
++    assert retried.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert len(sink.applied) == 1
++
++    first = restarted.reconcile_open(observer=sink)
++    second = restarted.reconcile(receipt, observer=sink)
++
++    assert [r.outcome for r in first] == [RequiredAuditOutcome.COMPLETED]
++    assert first[0].receipt_id == receipt.receipt_id
++    assert second.reason is RequiredAuditReason.RECONCILED_EXISTING
++    assert second.evidence_digest == first[0].evidence_digest
++    states = [entry.state for entry in ActionLedger(tmp_path / "ledger").load()]
++    assert states == [
++        ActionState.PROPOSED,
++        ActionState.ATTEMPTED,
++        ActionState.COMMITTED,
++    ]
++    assert len(sink.applied) == 1
++
++
++def test_interrupted_directory_sync_is_reconciled_from_ledger(tmp_path, monkeypatch):
++    coord = build(tmp_path)
++    sink = Sink()
++    ledger_dir = str(tmp_path / "ledger")
++    real_open = os.open
++    seen = {"count": 0}
++
++    def open_(path, flags, *args, **kwargs):
++        if str(path) == ledger_dir:
++            seen["count"] += 1
++            if seen["count"] == 3:  # commit entry linked, ack interrupted
++                raise OSError(errno.EIO, "synthetic")
++        return real_open(path, flags, *args, **kwargs)
++
++    monkeypatch.setattr(f"{LEDGER_MODULE}.open", open_)
++
++    receipt = coord.perform(
++        OP, request_key=KEY, operation_digest=DIGEST, effect=sink.apply
++    )
++    monkeypatch.undo()
++
++    assert receipt.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert receipt.reason is RequiredAuditReason.COMMIT_NOT_DURABLE
++    result = build(tmp_path).reconcile(receipt, observer=sink)
++    assert result.outcome is RequiredAuditOutcome.COMPLETED
++    assert result.reason is RequiredAuditReason.RECONCILED_EXISTING
++    assert result.fully_evidenced
++    entries = ActionLedger(tmp_path / "ledger").load()
++    assert [e.state for e in entries].count(ActionState.COMMITTED) == 1
++    assert result.evidence_digest == entries[-1].entry_digest
++    assert KEY not in "".join(
++        p.read_text() for p in (tmp_path / "ledger").glob("*.json")
++    )
+diff --git a/tests/unit/service/test_required_audit.py b/tests/unit/service/test_required_audit.py
+new file mode 100644
+index 0000000000..8cc33f0a09
+--- /dev/null
++++ b/tests/unit/service/test_required_audit.py
+@@ -0,0 +1,677 @@
++"""Synthetic offline tests for fail-closed required audit at effect boundaries."""
++
++from __future__ import annotations
++
++import json
++from dataclasses import replace
++from pathlib import Path
++
++import pytest
++
++from openmed.agent.audit.action_ledger import ActionLedger, ActionState
++from openmed.agent.correlation import RunId
++from openmed.agent.workflows.recovery import ObservationState
++from openmed.compliance.audit_chain import HashChainAuditLog
++from openmed.service.required_audit import (
++    ActionLedgerAuditStore,
++    AuditStage,
++    CommitBoundary,
++    EvidenceState,
++    RequiredAuditCoordinator,
++    RequiredAuditError,
++    RequiredAuditOutcome,
++    RequiredAuditPolicy,
++    RequiredAuditReason,
++    RequiredAuditRecord,
++    RequiredAuditStoreError,
++    derive_receipt_id,
++)
++
++RUN = RunId("run_" + "4" * 32)
++OP = "jobs.terminal_state"
++ACK_OP = "omop.local_batch"
++SENTINEL = "SENTINELmrn4417SYNTHETIC"
++DIGEST = "sha256:" + "d" * 64
++OTHER_DIGEST = "sha256:" + "e" * 64
++POLICY = RequiredAuditPolicy(
++    {OP: CommitBoundary.INVOCATION, ACK_OP: CommitBoundary.ACKNOWLEDGED}
++)
++
++
++class FaultyStore:
++    """Wrap a durable store and inject faults at chosen audit stages."""
++
++    def __init__(self, inner, faults=None):
++        self.inner = inner
++        self.faults = dict(faults or {})
++        self.read_fault = False
++
++    def append(self, record):
++        fault = self.faults.pop(record.stage, None)
++        if fault == "disk_full":
++            raise RequiredAuditStoreError("audit_storage_full")
++        if fault == "rejected":
++            raise RequiredAuditStoreError("audit_append_rejected")
++        digest = self.inner.append(record)
++        if fault == "ack_interrupted":
++            raise RequiredAuditStoreError("audit_unavailable")
++        return digest
++
++    def history(self, receipt_id):
++        if self.read_fault:
++            raise RequiredAuditStoreError("audit_read_failed")
++        return self.inner.history(receipt_id)
++
++    def open_receipt_ids(self):
++        if self.read_fault:
++            raise RequiredAuditStoreError("audit_read_failed")
++        return self.inner.open_receipt_ids()
++
++
++class Effect:
++    """Count invocations of one synthetic effect and optionally fail."""
++
++    def __init__(self, error=None):
++        self.calls = []
++        self.error = error
++
++    def __call__(self, effect_key):
++        self.calls.append(effect_key)
++        if self.error is not None:
++            raise self.error
++
++
++class Observer:
++    """Return one configured observation and count queries."""
++
++    def __init__(self, state=ObservationState.COMMITTED):
++        self.state = state
++        self.calls = []
++
++    def observe(self, operation, effect_key):
++        self.calls.append((operation, effect_key))
++        if isinstance(self.state, Exception):
++            raise self.state
++        return self.state
++
++
++def ledger_store(tmp_path: Path, policy=POLICY) -> ActionLedgerAuditStore:
++    return ActionLedgerAuditStore(
++        ActionLedger(tmp_path / "ledger"), run_id=RUN, operations=policy.operations
++    )
++
++
++def coordinator(tmp_path, faults=None, policy=POLICY, diagnostics=None):
++    store = FaultyStore(ledger_store(tmp_path, policy), faults)
++    return RequiredAuditCoordinator(policy, store, diagnostics=diagnostics), store
++
++
++def perform(coord, effect, *, operation=OP, key=SENTINEL, digest=DIGEST):
++    return coord.perform(
++        operation, request_key=key, operation_digest=digest, effect=effect
++    )
++
++
++def ledger_states(tmp_path):
++    return [entry.state for entry in ActionLedger(tmp_path / "ledger").load()]
++
++
++# Policy and configuration -------------------------------------------------
++
++
++def test_policy_rejects_invalid_declarations_with_fixed_codes():
++    with pytest.raises(RequiredAuditError) as error:
++        RequiredAuditPolicy({})
++    assert str(error.value) == "empty_policy"
++    with pytest.raises(RequiredAuditError) as error:
++        RequiredAuditPolicy({SENTINEL + " ": CommitBoundary.INVOCATION})
++    assert str(error.value) == "invalid_operation"
++    assert SENTINEL not in repr(error.value)
++    with pytest.raises(RequiredAuditError):
++        RequiredAuditPolicy({OP: "invocation"})
++    with pytest.raises(RequiredAuditError) as error:
++        RequiredAuditPolicy({OP: CommitBoundary.INVOCATION}, max_open_receipts=0)
++    assert str(error.value) == "invalid_open_receipt_bound"
++    with pytest.raises(RequiredAuditError):
++        RequiredAuditPolicy({OP: CommitBoundary.INVOCATION}, max_open_receipts=5000)
++    assert POLICY.boundary_for(ACK_OP) is CommitBoundary.ACKNOWLEDGED
++    assert POLICY.boundary_for("undeclared.op") is None
++
++
++def test_unconfigured_required_store_denies_even_with_diagnostics(tmp_path):
++    diagnostics = HashChainAuditLog()
++    coord = RequiredAuditCoordinator(POLICY, None, diagnostics=diagnostics)
++    effect = Effect()
++
++    receipt = perform(coord, effect)
++
++    assert receipt.outcome is RequiredAuditOutcome.DENIED
++    assert receipt.reason is RequiredAuditReason.REQUIRED_AUDIT_UNCONFIGURED
++    assert receipt.evidence is EvidenceState.NONE
++    assert not receipt.fully_evidenced
++    assert effect.calls == []
++    assert diagnostics.records  # diagnostics may observe, never substitute
++
++
++def test_diagnostic_sink_cannot_be_installed_as_required_store():
++    with pytest.raises(RequiredAuditError) as error:
++        RequiredAuditCoordinator(POLICY, HashChainAuditLog())
++    assert str(error.value) == "invalid_required_store"
++
++
++def test_undeclared_operation_is_denied_before_any_record(tmp_path):
++    coord, _ = coordinator(tmp_path)
++    effect = Effect()
++
++    receipt = perform(coord, effect, operation="undeclared.op")
++
++    assert receipt.outcome is RequiredAuditOutcome.DENIED
++    assert receipt.reason is RequiredAuditReason.OPERATION_UNDECLARED
++    assert effect.calls == []
++    assert ledger_states(tmp_path) == []
++
++
++def test_invalid_arguments_raise_value_free_codes(tmp_path):
++    coord, _ = coordinator(tmp_path)
++    with pytest.raises(RequiredAuditError) as error:
++        perform(coord, Effect(), key="short")
++    assert str(error.value) == "invalid_request_key"
++    with pytest.raises(RequiredAuditError) as error:
++        perform(coord, Effect(), digest=SENTINEL)
++    assert str(error.value) == "invalid_operation_digest"
++    assert SENTINEL not in str(error.value)
++    with pytest.raises(RequiredAuditError):
++        coord.perform(OP, request_key=SENTINEL, operation_digest=DIGEST, effect=None)
++
++
++# Success and idempotent replay ---------------------------------------------
++
++
++def test_success_is_fully_evidenced_by_the_required_store(tmp_path):
++    diagnostics = HashChainAuditLog()
++    coord, _ = coordinator(tmp_path, diagnostics=diagnostics)
++    effect = Effect()
++
++    receipt = perform(coord, effect)
++
++    assert receipt.outcome is RequiredAuditOutcome.COMPLETED
++    assert receipt.reason is RequiredAuditReason.COMMITTED
++    assert receipt.evidence is EvidenceState.COMPLETE
++    assert receipt.fully_evidenced
++    assert receipt.recorded_stages == (
++        AuditStage.INTENT,
++        AuditStage.ATTEMPT,
++        AuditStage.COMMIT,
++    )
++    assert effect.calls == [receipt.effect_key]
++    assert receipt.receipt_id == derive_receipt_id(OP, SENTINEL)
++    entries = ActionLedger(tmp_path / "ledger").load()
++    assert [entry.state for entry in entries] == [
++        ActionState.PROPOSED,
++        ActionState.ATTEMPTED,
++        ActionState.COMMITTED,
++    ]
++    assert receipt.evidence_digest == entries[-1].entry_digest
++
++
++def test_same_request_key_replays_receipt_without_new_effect(tmp_path):
++    coord, _ = coordinator(tmp_path)
++    effect = Effect()
++    first = perform(coord, effect)
++
++    second = perform(coord, effect)
++
++    assert effect.calls == [first.effect_key]
++    assert second.outcome is RequiredAuditOutcome.COMPLETED
++    assert second.reason is RequiredAuditReason.ALREADY_RECORDED
++    assert second.evidence_digest == first.evidence_digest
++    assert len(ledger_states(tmp_path)) == 3
++
++
++def test_reused_request_key_with_different_payload_is_denied(tmp_path):
++    coord, _ = coordinator(tmp_path)
++    effect = Effect()
++    perform(coord, effect)
++
++    conflict = perform(coord, effect, digest=OTHER_DIGEST)
++
++    assert conflict.outcome is RequiredAuditOutcome.DENIED
++    assert conflict.reason is RequiredAuditReason.IDEMPOTENCY_CONFLICT
++    assert len(effect.calls) == 1
++
++
++# Fault matrix: before the commit boundary -> denied -------------------------
++
++
++@pytest.mark.parametrize("fault", ["disk_full", "rejected", "ack_interrupted"])
++@pytest.mark.parametrize("stage", [AuditStage.INTENT, AuditStage.ATTEMPT])
++@pytest.mark.parametrize("operation", [OP, ACK_OP])
++def test_faults_before_effect_boundary_deny_without_invoking(
++    tmp_path, fault, stage, operation
++):
++    coord, _ = coordinator(tmp_path, {stage: fault})
++    effect = Effect()
++
++    receipt = perform(coord, effect, operation=operation)
++
++    assert receipt.outcome is RequiredAuditOutcome.DENIED
++    expected = (
++        RequiredAuditReason.INTENT_NOT_DURABLE
++        if stage is AuditStage.INTENT
++        else RequiredAuditReason.ATTEMPT_NOT_DURABLE
++    )
++    assert receipt.reason is expected
++    assert effect.calls == []
++    assert not receipt.fully_evidenced
++    definitive = stage is AuditStage.INTENT and fault != "ack_interrupted"
++    assert receipt.evidence is (
++        EvidenceState.NONE if definitive else EvidenceState.PENDING
++    )
++
++
++# Fault matrix: after the commit boundary -> reconcile required --------------
++
++
++@pytest.mark.parametrize("fault", ["disk_full", "rejected", "ack_interrupted"])
++@pytest.mark.parametrize("operation", [OP, ACK_OP])
++def test_commit_record_faults_after_effect_require_reconcile(
++    tmp_path, fault, operation
++):
++    coord, _ = coordinator(tmp_path, {AuditStage.COMMIT: fault})
++    effect = Effect()
++
++    receipt = perform(coord, effect, operation=operation)
++
++    assert receipt.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert receipt.reason is RequiredAuditReason.COMMIT_NOT_DURABLE
++    assert receipt.evidence is EvidenceState.PENDING
++    assert not receipt.fully_evidenced
++    assert receipt.evidence_digest is None
++    assert len(effect.calls) == 1
++
++
++def test_invocation_boundary_treats_adapter_failure_as_uncertain(tmp_path):
++    coord, _ = coordinator(tmp_path)
++    effect = Effect(RuntimeError(SENTINEL))
++
++    receipt = perform(coord, effect)
++
++    assert receipt.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert receipt.reason is RequiredAuditReason.EFFECT_OUTCOME_UNKNOWN
++    assert ledger_states(tmp_path) == [ActionState.PROPOSED, ActionState.ATTEMPTED]
++    assert SENTINEL not in json.dumps(receipt.to_dict())
++
++
++def test_acknowledged_boundary_records_abort_for_adapter_failure(tmp_path):
++    coord, _ = coordinator(tmp_path)
++    effect = Effect(RuntimeError(SENTINEL))
++
++    receipt = perform(coord, effect, operation=ACK_OP)
++
++    assert receipt.outcome is RequiredAuditOutcome.DENIED
++    assert receipt.reason is RequiredAuditReason.EFFECT_NOT_COMMITTED
++    assert receipt.evidence is EvidenceState.COMPLETE
++    assert ledger_states(tmp_path)[-1] is ActionState.REJECTED
++
++
++def test_acknowledged_abort_fault_leaves_pending_denial(tmp_path):
++    coord, _ = coordinator(tmp_path, {AuditStage.ABORT: "disk_full"})
++
++    receipt = perform(coord, Effect(RuntimeError("x")), operation=ACK_OP)
++
++    assert receipt.outcome is RequiredAuditOutcome.DENIED
++    assert receipt.reason is RequiredAuditReason.ABORT_NOT_DURABLE
++    assert receipt.evidence is EvidenceState.PENDING
++
++
++# Committed effects are never retried blindly --------------------------------
++
++
++def test_retry_after_commit_fault_never_reinvokes_effect(tmp_path):
++    coord, _ = coordinator(tmp_path, {AuditStage.COMMIT: "disk_full"})
++    effect = Effect()
++    first = perform(coord, effect)
++
++    retried = perform(coord, effect)
++
++    assert len(effect.calls) == 1
++    assert retried.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert retried.reason is RequiredAuditReason.RECONCILE_PENDING
++    assert retried.receipt_id == first.receipt_id
++
++
++def test_reconcile_has_no_effect_port_and_ambiguity_stays_pending(tmp_path):
++    coord, _ = coordinator(tmp_path, {AuditStage.COMMIT: "rejected"})
++    effect = Effect()
++    receipt = perform(coord, effect)
++    observer = Observer(ObservationState.AMBIGUOUS)
++
++    result = coord.reconcile(receipt, observer=observer)
++
++    assert result.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert result.reason is RequiredAuditReason.EFFECT_AMBIGUOUS
++    assert observer.calls == [(OP, receipt.effect_key)]
++    assert len(effect.calls) == 1
++
++
++@pytest.mark.parametrize("failure", [RuntimeError(SENTINEL), "not-a-state"])
++def test_observer_failure_stays_reconcile_required(tmp_path, failure):
++    coord, _ = coordinator(tmp_path, {AuditStage.COMMIT: "disk_full"})
++    receipt = perform(coord, Effect())
++
++    result = coord.reconcile(receipt, observer=Observer(failure))
++
++    assert result.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert result.reason is RequiredAuditReason.OBSERVER_UNAVAILABLE
++    assert SENTINEL not in json.dumps(result.to_dict())
++
++
++# Recovery completes the same receipt exactly once ---------------------------
++
++
++def test_reconcile_after_disk_full_completes_same_receipt_once(tmp_path):
++    coord, _ = coordinator(tmp_path, {AuditStage.COMMIT: "disk_full"})
++    effect = Effect()
++    pending = perform(coord, effect)
++    observer = Observer(ObservationState.COMMITTED)
++
++    first = coord.reconcile(pending, observer=observer)
++    second = coord.reconcile(pending, observer=observer)
++
++    assert first.receipt_id == pending.receipt_id
++    assert first.outcome is RequiredAuditOutcome.COMPLETED
++    assert first.reason is RequiredAuditReason.RECONCILED_COMMIT
++    assert first.fully_evidenced
++    assert second.reason is RequiredAuditReason.RECONCILED_EXISTING
++    assert second.evidence_digest == first.evidence_digest
++    assert ledger_states(tmp_path).count(ActionState.COMMITTED) == 1
++    assert len(observer.calls) == 1
++    assert len(effect.calls) == 1
++
++
++def test_interrupted_ack_reconciles_without_duplicate_record(tmp_path):
++    coord, _ = coordinator(tmp_path, {AuditStage.COMMIT: "ack_interrupted"})
++    pending = perform(coord, Effect())
++    observer = Observer(ObservationState.ABSENT)
++
++    result = coord.reconcile(pending, observer=observer)
++
++    assert result.outcome is RequiredAuditOutcome.COMPLETED
++    assert result.reason is RequiredAuditReason.RECONCILED_EXISTING
++    assert observer.calls == []  # durable commit record wins over observation
++    assert ledger_states(tmp_path).count(ActionState.COMMITTED) == 1
++
++
++def test_reconcile_absent_effect_records_abort(tmp_path):
++    coord, _ = coordinator(tmp_path)
++    pending = perform(coord, Effect(RuntimeError("x")))
++
++    result = coord.reconcile(pending, observer=Observer(ObservationState.ABSENT))
++
++    assert result.outcome is RequiredAuditOutcome.DENIED
++    assert result.reason is RequiredAuditReason.RECONCILED_ABSENT
++    assert result.evidence is EvidenceState.COMPLETE
++    assert ledger_states(tmp_path)[-1] is ActionState.REJECTED
++
++
++def test_reconcile_intent_only_closes_without_observation(tmp_path):
++    coord, _ = coordinator(tmp_path, {AuditStage.ATTEMPT: "rejected"})
++    pending = perform(coord, Effect())
++    observer = Observer()
++
++    result = coord.reconcile(pending, observer=observer)
++
++    assert result.outcome is RequiredAuditOutcome.DENIED
++    assert result.reason is RequiredAuditReason.RECONCILED_NOT_ATTEMPTED
++    assert observer.calls == []
++    assert ledger_states(tmp_path) == [ActionState.PROPOSED, ActionState.REJECTED]
++
++
++def test_reconcile_with_no_durable_intent_reports_nothing_recorded(tmp_path):
++    coord, _ = coordinator(tmp_path, {AuditStage.INTENT: "disk_full"})
++    pending = perform(coord, Effect())
++
++    result = coord.reconcile(pending, observer=Observer())
++
++    assert result.outcome is RequiredAuditOutcome.DENIED
++    assert result.reason is RequiredAuditReason.NO_DURABLE_INTENT
++    assert result.evidence is EvidenceState.NONE
++
++
++def test_reconcile_commit_fault_is_retried_only_as_audit_append(tmp_path):
++    coord, store = coordinator(tmp_path, {AuditStage.COMMIT: "disk_full"})
++    effect = Effect()
++    pending = perform(coord, effect)
++    store.faults[AuditStage.COMMIT] = "disk_full"
++
++    still = coord.reconcile(pending, observer=Observer())
++    done = coord.reconcile(still, observer=Observer())
++
++    assert still.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert still.reason is RequiredAuditReason.COMMIT_NOT_DURABLE
++    assert done.outcome is RequiredAuditOutcome.COMPLETED
++    assert len(effect.calls) == 1
++
++
++def test_reconcile_read_failure_keeps_outcome(tmp_path):
++    coord, store = coordinator(tmp_path, {AuditStage.COMMIT: "disk_full"})
++    pending = perform(coord, Effect())
++    store.read_fault = True
++
++    result = coord.reconcile(pending, observer=Observer())
++
++    assert result.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert result.reason is RequiredAuditReason.AUDIT_READ_FAILED
++
++
++def test_reconcile_rejects_receipt_for_other_payload(tmp_path):
++    coord, _ = coordinator(tmp_path, {AuditStage.COMMIT: "disk_full"})
++    pending = perform(coord, Effect())
++    tampered = replace(pending, binding_digest=OTHER_DIGEST)
++
++    result = coord.reconcile(tampered, observer=Observer())
++
++    assert result.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert result.reason is RequiredAuditReason.EVIDENCE_MISMATCH
++    assert ledger_states(tmp_path).count(ActionState.COMMITTED) == 0
++
++
++# Bounded open evidence and admission -----------------------------------------
++
++
++def test_open_receipt_bound_denies_new_admission(tmp_path):
++    policy = RequiredAuditPolicy({OP: CommitBoundary.INVOCATION}, max_open_receipts=1)
++    coord, store = coordinator(tmp_path, policy=policy)
++    store.faults[AuditStage.COMMIT] = "disk_full"
++    first = perform(coord, Effect(), key="A" * 16)
++    effect = Effect()
++
++    blocked = perform(coord, effect, key="B" * 16)
++
++    assert first.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert blocked.outcome is RequiredAuditOutcome.DENIED
++    assert blocked.reason is RequiredAuditReason.RECONCILE_BACKLOG_FULL
++    assert effect.calls == []
++    coord.reconcile(first, observer=Observer())
++    assert perform(coord, effect, key="B" * 16).fully_evidenced
++
++
++def test_read_failure_denies_admission(tmp_path):
++    coord, store = coordinator(tmp_path)
++    store.read_fault = True
++    effect = Effect()
++
++    receipt = perform(coord, effect)
++
++    assert receipt.outcome is RequiredAuditOutcome.DENIED
++    assert receipt.reason is RequiredAuditReason.AUDIT_READ_FAILED
++    assert effect.calls == []
++
++
++def test_concurrent_same_receipt_is_not_invoked_twice(tmp_path):
++    coord, _ = coordinator(tmp_path)
++    nested = []
++
++    def effect(effect_key):
++        nested.append(perform(coord, Effect()))
++
++    outer = perform(coord, effect)
++
++    assert outer.outcome is RequiredAuditOutcome.COMPLETED
++    assert nested[0].outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert nested[0].reason is RequiredAuditReason.RECEIPT_IN_FLIGHT
++
++
++def test_open_receipts_are_rebuilt_from_required_store(tmp_path):
++    coord, _ = coordinator(tmp_path, {AuditStage.COMMIT: "disk_full"})
++    pending = perform(coord, Effect())
++
++    restarted = RequiredAuditCoordinator(POLICY, ledger_store(tmp_path))
++    rebuilt = restarted.open_receipts()
++
++    assert [receipt.receipt_id for receipt in rebuilt] == [pending.receipt_id]
++    assert rebuilt[0].effect_key == pending.effect_key
++    assert rebuilt[0].outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    results = restarted.reconcile_open(observer=Observer())
++    assert [result.outcome for result in results] == [RequiredAuditOutcome.COMPLETED]
++    assert restarted.open_receipts() == ()
++
++
++# Diagnostics are optional and never evidence --------------------------------
++
++
++class BrokenSink:
++    def append(self, event_type, payload):
++        raise OSError(SENTINEL)
++
++
++def test_diagnostic_failure_never_changes_required_outcome(tmp_path):
++    coord, _ = coordinator(tmp_path, diagnostics=BrokenSink())
++
++    receipt = perform(coord, Effect())
++
++    assert receipt.fully_evidenced
++
++
++def test_diagnostic_success_cannot_cover_missing_required_record(tmp_path):
++    diagnostics = HashChainAuditLog()
++    coord, _ = coordinator(
++        tmp_path, {AuditStage.COMMIT: "disk_full"}, diagnostics=diagnostics
++    )
++
++    receipt = perform(coord, Effect())
++
++    assert diagnostics.verify() and diagnostics.records
++    assert receipt.outcome is RequiredAuditOutcome.RECONCILE_REQUIRED
++    assert not receipt.fully_evidenced
++    restarted = RequiredAuditCoordinator(POLICY, ledger_store(tmp_path))
++    assert [r.receipt_id for r in restarted.open_receipts()] == [receipt.receipt_id]
++
++
++# Value-free evidence ----------------------------------------------------------
++
++
++def test_sentinel_never_reaches_receipts_ledger_or_diagnostics(tmp_path):
++    diagnostics = HashChainAuditLog()
++    coord, _ = coordinator(
++        tmp_path, {AuditStage.COMMIT: "ack_interrupted"}, diagnostics=diagnostics
++    )
++    receipt = perform(coord, Effect())
++    reconciled = coord.reconcile(receipt, observer=Observer())
++
++    rendered = [
++        json.dumps(receipt.to_dict()),
++        json.dumps(reconciled.to_dict()),
++        repr(receipt),
++        json.dumps(diagnostics.to_payload()),
++    ]
++    rendered += [
++        path.read_text() for path in sorted((tmp_path / "ledger").glob("*.json"))
++    ]
++    assert all(SENTINEL not in text for text in rendered)
++    assert receipt.to_dict()["schema_version"] == "openmed.service.required_audit.v1"
++
++
++def test_store_error_rejects_unknown_codes():
++    assert str(RequiredAuditStoreError(SENTINEL)) == "audit_unavailable"
++    assert RequiredAuditStoreError("audit_storage_full").not_written
++    assert not RequiredAuditStoreError("audit_unavailable").not_written
++
++
++def test_record_validates_value_free_fields():
++    with pytest.raises(RequiredAuditError):
++        RequiredAuditRecord(SENTINEL, OP, AuditStage.INTENT, DIGEST)
++    with pytest.raises(RequiredAuditError):
++        RequiredAuditRecord(derive_receipt_id(OP, SENTINEL), OP, "intent", DIGEST)
++
++
++def test_reconcile_refuses_forged_effect_key(tmp_path):
++    coord, _ = coordinator(tmp_path, {AuditStage.COMMIT: "disk_full"})
++    pending = perform(coord, Effect())
++    observer = Observer()
++
++    result = coord.reconcile(
++        replace(pending, effect_key="idem_" + "0" * 64), observer=observer
++    )
++
++    assert result.reason is RequiredAuditReason.EVIDENCE_MISMATCH
++    assert observer.calls == []
++
++
++def test_ledger_store_rejects_second_terminal_record(tmp_path):
++    store = ledger_store(tmp_path)
++    receipt_id = derive_receipt_id(OP, SENTINEL)
++    for stage in (AuditStage.INTENT, AuditStage.ATTEMPT, AuditStage.COMMIT):
++        store.append(RequiredAuditRecord(receipt_id, OP, stage, DIGEST))
++
++    for stage in (AuditStage.COMMIT, AuditStage.ABORT):
++        with pytest.raises(RequiredAuditStoreError) as error:
++            store.append(RequiredAuditRecord(receipt_id, OP, stage, DIGEST))
++        assert error.value.code == "audit_append_rejected"
++    assert len(store.history(receipt_id)) == 3
++    assert store.open_receipt_ids() == ()
++
++
++def test_ledger_store_validates_configuration(tmp_path):
++    ledger = ActionLedger(tmp_path / "ledger")
++    with pytest.raises(RequiredAuditError) as error:
++        ActionLedgerAuditStore(ledger, run_id=RUN, operations=[OP], actor_role="x")
++    assert str(error.value) == "invalid_actor_role"
++    with pytest.raises(RequiredAuditError):
++        ActionLedgerAuditStore(ledger, run_id=RUN, operations=[])
++    with pytest.raises(RequiredAuditError):
++        ActionLedgerAuditStore(object(), run_id=RUN, operations=[OP])
++
++
++def test_unknown_operation_in_ledger_fails_closed_on_read(tmp_path):
++    coord, _ = coordinator(tmp_path, {AuditStage.COMMIT: "disk_full"})
++    perform(coord, Effect())
++    narrowed = RequiredAuditPolicy({ACK_OP: CommitBoundary.ACKNOWLEDGED})
++    restarted = RequiredAuditCoordinator(narrowed, ledger_store(tmp_path, narrowed))
++
++    with pytest.raises(RequiredAuditStoreError) as error:
++        restarted.open_receipts()
++    assert error.value.code == "audit_read_failed"
++    effect = Effect()
++    denied = perform(restarted, effect, operation=ACK_OP, key="C" * 16)
++    assert denied.reason is RequiredAuditReason.AUDIT_READ_FAILED
++    assert effect.calls == []
++
++
++class GarbageStore(FaultyStore):
++    def append(self, record):
++        self.inner.append(record)
++        return SENTINEL
++
++
++def test_store_returning_non_digest_ack_is_not_evidence(tmp_path):
++    store = GarbageStore(ledger_store(tmp_path))
++    coord = RequiredAuditCoordinator(POLICY, store)
++    effect = Effect()
++
++    receipt = perform(coord, effect)
++
++    assert receipt.outcome is RequiredAuditOutcome.DENIED
++    assert receipt.reason is RequiredAuditReason.INTENT_NOT_DURABLE
++    assert receipt.evidence is EvidenceState.PENDING
++    assert effect.calls == []

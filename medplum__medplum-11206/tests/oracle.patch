@@ -1,0 +1,103 @@
+diff --git a/packages/server/src/app.test.ts b/packages/server/src/app.test.ts
+index 3c4b4a9cc5f..e70a8da726f 100644
+--- a/packages/server/src/app.test.ts
++++ b/packages/server/src/app.test.ts
+@@ -339,6 +339,34 @@ describe('App', () => {
+       expect(logObj).toMatchObject({ method: 'GET', path: '/fhir/R4/Patient', status: 400 });
+     });
+ 
++    test('Logs caller identity on authentication error', async () => {
++      const { accessToken, login, project, membership } = await createTestProject({
++        withAccessToken: true,
++        withClient: true,
++        membership: { admin: true },
++      });
++      const other = await createTestProject({ withClient: true });
++      const onBehalfOf = getReferenceString(other.membership);
++
++      const res1 = await request(app)
++        .get(`/fhir/R4/Patient`)
++        .set('Authorization', 'Bearer ' + accessToken)
++        .set('X-Medplum-On-Behalf-Of', onBehalfOf);
++      expect(res1).toHaveStatus(400);
++
++      const logObjs = stdOutSpy.mock.calls.map((call) => JSON.parse(call[0]));
++      const callerLog = logObjs.find((obj) => obj.msg === 'Authentication failed for known caller');
++      const servedLog = logObjs.find((obj) => obj.msg === 'Request served');
++      expect(callerLog).toMatchObject({
++        requestId: res1.headers['x-request-id'],
++        login: login.id,
++        project: project.id,
++        membership: membership.id,
++        onBehalfOf,
++      });
++      expect(servedLog).toMatchObject({ requestId: res1.headers['x-request-id'], status: 400 });
++    });
++
+     test('Route parsing error', async () => {
+       const accessToken = await initTestAuth();
+       const res1 = await request(app)
+diff --git a/packages/server/src/context.ts b/packages/server/src/context.ts
+index 5e08e617811..ed075450bfd 100644
+--- a/packages/server/src/context.ts
++++ b/packages/server/src/context.ts
+@@ -178,16 +178,19 @@ export async function attachRequestContext(req: Request, res: Response, next: Ne
+   }
+   const loggerMetadata = logTag ? { logTag } : undefined;
+ 
++  // Authenticate within an unauthenticated context, so that anything logged during authentication
++  // carries the request and trace IDs
++  const unauthenticatedCtx = new RequestContext(requestId, traceId, undefined, loggerMetadata);
+   let ctx: RequestContext | undefined;
+   try {
+-    const result = await authenticateTokenImpl(req);
++    const result = await requestContextStore.run(unauthenticatedCtx, () => authenticateTokenImpl(req));
+     if (result) {
+       const { authState, repo } = result;
+       ctx = new AuthenticatedRequestContext(requestId, traceId, authState, repo, { logTag });
+     }
+   } catch (err: any) {
+     // Ensure next() is called in a request context, so later middleware (e.g. logging) can run correctly
+-    ctx ??= new RequestContext(requestId, traceId, undefined, loggerMetadata);
++    ctx ??= unauthenticatedCtx;
+     requestContextStore.run(ctx, () => {
+       getLogger().error('Authentication error', { err: err.toString(), stack: err.stack });
+       const outcome = badRequest('Authentication error');
+@@ -198,7 +201,7 @@ export async function attachRequestContext(req: Request, res: Response, next: Ne
+     return;
+   }
+ 
+-  ctx ??= new RequestContext(requestId, traceId, undefined, loggerMetadata);
++  ctx ??= unauthenticatedCtx;
+   requestContextStore.run(ctx, () => next());
+ }
+ 
+diff --git a/packages/server/src/oauth/utils.ts b/packages/server/src/oauth/utils.ts
+index 53c2b5c839a..e97baf2e24c 100644
+--- a/packages/server/src/oauth/utils.ts
++++ b/packages/server/src/oauth/utils.ts
+@@ -1308,9 +1308,21 @@ async function makeAuthResult(
+   // Resolve "on behalf of" before building the repository, so that the access policy is built from
+   // the effective membership.  Resolving it afterwards would require a repository to already exist,
+   // which cannot be built for a login whose scopes depend on the on-behalf-of membership.
+-  await tryAddOnBehalfOf(systemRepo, req, authState);
+-  const repo = await getRepoForLogin(authState, extendedMode, opts?.remoteAddress);
+-  return { authState, repo };
++  try {
++    await tryAddOnBehalfOf(systemRepo, req, authState);
++    const repo = await getRepoForLogin(authState, extendedMode, opts?.remoteAddress);
++    return { authState, repo };
++  } catch (err) {
++    // The caller is known here, but the "Authentication error" log line does not include it
++    getLogger().warn('Authentication failed for known caller', {
++      login: login.id,
++      project: project.id,
++      membership: membership.id,
++      profile: membership.profile?.reference,
++      onBehalfOf: req?.headers?.['x-medplum-on-behalf-of'],
++    });
++    throw err;
++  }
+ }
+ 
+ /**

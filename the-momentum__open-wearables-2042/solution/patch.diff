@@ -1,0 +1,484 @@
+diff --git a/backend/app/repositories/refresh_token_repository.py b/backend/app/repositories/refresh_token_repository.py
+index 7d510eb80..085bc7274 100644
+--- a/backend/app/repositories/refresh_token_repository.py
++++ b/backend/app/repositories/refresh_token_repository.py
+@@ -21,9 +21,20 @@ def create(self, db_session: DbSession, token: RefreshToken) -> RefreshToken:
+         db_session.refresh(token)
+         return token
+ 
+-    def get_valid_token(self, db_session: DbSession, token_id: str) -> RefreshToken | None:
+-        """Get a refresh token if it exists and is not revoked."""
+-        stmt = select(self.model).where(self.model.id == token_id, self.model.revoked_at.is_(None))
++    def claim_valid_token(self, db_session: DbSession, token_id: str) -> RefreshToken | None:
++        """Revoke a token that is not revoked yet and return it, or None when there is none.
++
++        The check and the write are one UPDATE, so of concurrent claims only one gets the token.
++        Does not commit: the claim is committed together with the replacement token
++        when that is stored, and the row stays locked until then.
++        """
++        stmt = (
++            update(self.model)
++            .where(self.model.id == token_id, self.model.revoked_at.is_(None))
++            .values(revoked_at=datetime.now(timezone.utc))
++            .returning(self.model)
++            .execution_options(populate_existing=True)
++        )
+         return db_session.execute(stmt).scalar_one_or_none()
+ 
+     def get_by_user_id(self, db_session: DbSession, user_id: UUID) -> list[RefreshToken]:
+@@ -36,13 +47,6 @@ def get_by_developer_id(self, db_session: DbSession, developer_id: UUID) -> list
+         stmt = select(self.model).where(self.model.developer_id == developer_id, self.model.revoked_at.is_(None))
+         return list(db_session.execute(stmt).scalars().all())
+ 
+-    def revoke_token(self, db_session: DbSession, token: RefreshToken) -> RefreshToken:
+-        """Revoke a single refresh token."""
+-        token.revoked_at = datetime.now(timezone.utc)
+-        db_session.commit()
+-        db_session.refresh(token)
+-        return token
+-
+     def revoke_all_for_user(self, db_session: DbSession, user_id: UUID) -> int:
+         """Revoke all refresh tokens for a user. Returns count of revoked tokens."""
+         now = datetime.now(timezone.utc)
+diff --git a/backend/app/repositories/user_invitation_code_repository.py b/backend/app/repositories/user_invitation_code_repository.py
+index 62eb18624..d1dd69c77 100644
+--- a/backend/app/repositories/user_invitation_code_repository.py
++++ b/backend/app/repositories/user_invitation_code_repository.py
+@@ -2,7 +2,7 @@
+ from uuid import UUID
+ 
+ from pydantic import BaseModel
+-from sqlalchemy import select, update
++from sqlalchemy import update
+ 
+ from app.database import DbSession
+ from app.models.user_invitation_code import UserInvitationCode
+@@ -14,24 +14,28 @@ class UserInvitationCodeRepository(CrudRepository[UserInvitationCode, UserInvita
+     def __init__(self, model: type[UserInvitationCode]) -> None:
+         super().__init__(model)
+ 
+-    def get_valid_by_code(self, db_session: DbSession, code: str) -> UserInvitationCode | None:
+-        """Get an invitation code that is not yet redeemed, not revoked, and not expired."""
++    def claim_valid_code(self, db_session: DbSession, code: str) -> UserInvitationCode | None:
++        """Mark a valid code as redeemed and return it, or None when it is not valid.
++
++        The check and the write are one UPDATE, so of concurrent claims only one gets the code.
++        Does not commit: the claim is committed together with the refresh token issued for it
++        when that is stored, and the row stays locked until then.
++        """
+         now = datetime.now(timezone.utc)
+-        stmt = select(self.model).where(
+-            self.model.code == code,
+-            self.model.redeemed_at.is_(None),
+-            self.model.revoked_at.is_(None),
+-            self.model.expires_at > now,
++        stmt = (
++            update(self.model)
++            .where(
++                self.model.code == code,
++                self.model.redeemed_at.is_(None),
++                self.model.revoked_at.is_(None),
++                self.model.expires_at > now,
++            )
++            .values(redeemed_at=now)
++            .returning(self.model)
++            .execution_options(populate_existing=True)
+         )
+         return db_session.execute(stmt).scalar_one_or_none()
+ 
+-    def mark_redeemed(self, db_session: DbSession, invitation_code: UserInvitationCode) -> UserInvitationCode:
+-        """Mark an invitation code as redeemed."""
+-        invitation_code.redeemed_at = datetime.now(timezone.utc)
+-        db_session.commit()
+-        db_session.refresh(invitation_code)
+-        return invitation_code
+-
+     def revoke_active_for_user(self, db_session: DbSession, user_id: UUID) -> None:
+         """Revoke all active invitation codes for a user."""
+         now = datetime.now(timezone.utc)
+diff --git a/backend/app/services/refresh_token_service.py b/backend/app/services/refresh_token_service.py
+index 66be75d60..9541b3569 100644
+--- a/backend/app/services/refresh_token_service.py
++++ b/backend/app/services/refresh_token_service.py
+@@ -153,14 +153,12 @@ def refresh_token(self, db_session: DbSession, refresh_token_str: str) -> TokenR
+         Raises:
+             AuthenticationError: If the refresh token is invalid or revoked
+         """
+-        token = self.repo.get_valid_token(db_session, refresh_token_str)
++        token = self.repo.claim_valid_token(db_session, refresh_token_str)
+         if not token:
+             raise AuthenticationError("Invalid or revoked refresh token")
+ 
+-        # Revoke the old refresh token (rotation)
+-        self.repo.revoke_token(db_session, token)
+-
+-        # Generate new access token and refresh token based on token type
++        # Storing the new refresh token commits the old one's revocation with it, so a failure
++        # before that leaves the old token usable
+         if token.token_type == TokenType.SDK:
+             access_token, new_refresh_token = self.issue_sdk_tokens(
+                 db_session,
+@@ -200,11 +198,11 @@ def revoke_token(self, db_session: DbSession, refresh_token_str: str) -> bool:
+         Raises:
+             NotFoundError: If the refresh token is not found
+         """
+-        token = self.repo.get_valid_token(db_session, refresh_token_str)
++        token = self.repo.claim_valid_token(db_session, refresh_token_str)
+         if not token:
+             raise NotFoundError("Refresh token not found")
+ 
+-        self.repo.revoke_token(db_session, token)
++        db_session.commit()
+         logger.debug(
+             "Revoked refresh token",
+             token_type=str(token.token_type),
+diff --git a/backend/app/services/user_invitation_code_service.py b/backend/app/services/user_invitation_code_service.py
+index 7b5f0a231..f3ab74043 100644
+--- a/backend/app/services/user_invitation_code_service.py
++++ b/backend/app/services/user_invitation_code_service.py
+@@ -52,13 +52,13 @@ def generate(
+ 
+     def redeem(self, db_session: DbSession, code: str) -> InvitationCodeRedeemResponse:
+         """Redeem an invitation code and return SDK tokens."""
+-        invitation_code = self.crud.get_valid_by_code(db_session, code.upper())
++        invitation_code = self.crud.claim_valid_code(db_session, code.upper())
+ 
+         if not invitation_code:
+             raise NotFoundError("Invalid or expired invitation code")
+ 
+-        self.crud.mark_redeemed(db_session, invitation_code)
+-
++        # Storing the new refresh token commits the claim with it, so a failure before that
++        # leaves the code usable
+         access_token, refresh_token = refresh_token_service.issue_sdk_tokens(
+             db_session,
+             user_id=invitation_code.user_id,
+diff --git a/backend/tests/repositories/test_refresh_token_repository.py b/backend/tests/repositories/test_refresh_token_repository.py
+index 6eba0d5cd..e6ab717c6 100644
+--- a/backend/tests/repositories/test_refresh_token_repository.py
++++ b/backend/tests/repositories/test_refresh_token_repository.py
+@@ -38,8 +38,8 @@ def test_create_token(self, db: Session) -> None:
+         assert created.token_type == TokenType.SDK
+         assert created.user_id == user.id
+ 
+-    def test_get_valid_token(self, db: Session) -> None:
+-        """get_valid_token should return token if not revoked."""
++    def test_claim_valid_token_revokes_and_returns_it(self, db: Session) -> None:
++        """claim_valid_token should revoke a live token and return it."""
+         # Arrange
+         user = UserFactory()
+         token = RefreshToken(
+@@ -56,14 +56,16 @@ def test_get_valid_token(self, db: Session) -> None:
+         db.commit()
+ 
+         # Act
+-        result = refresh_token_repository.get_valid_token(db, token.id)
++        result = refresh_token_repository.claim_valid_token(db, token.id)
+ 
+         # Assert
+         assert result is not None
+         assert result.id == token.id
++        assert result.revoked_at is not None
++        assert refresh_token_repository.claim_valid_token(db, token.id) is None
+ 
+-    def test_get_valid_token_returns_none_for_revoked(self, db: Session) -> None:
+-        """get_valid_token should return None if token is revoked."""
++    def test_claim_valid_token_returns_none_for_revoked(self, db: Session) -> None:
++        """claim_valid_token should return None if token is revoked."""
+         # Arrange
+         user = UserFactory()
+         token = RefreshToken(
+@@ -80,7 +82,7 @@ def test_get_valid_token_returns_none_for_revoked(self, db: Session) -> None:
+         db.commit()
+ 
+         # Act
+-        result = refresh_token_repository.get_valid_token(db, token.id)
++        result = refresh_token_repository.claim_valid_token(db, token.id)
+ 
+         # Assert
+         assert result is None
+@@ -142,30 +144,6 @@ def test_get_by_developer_id(self, db: Session) -> None:
+         assert len(result) == 1
+         assert result[0].developer_id == developer.id
+ 
+-    def test_revoke_token(self, db: Session) -> None:
+-        """revoke_token should set revoked_at timestamp."""
+-        # Arrange
+-        user = UserFactory()
+-        token = RefreshToken(
+-            id="rt-torevoke123456789012345678901",
+-            token_type=TokenType.SDK,
+-            user_id=user.id,
+-            origin=SDKTokenOrigin.ADMIN,
+-            developer_id=None,
+-            created_at=datetime.now(timezone.utc),
+-            last_used_at=None,
+-            revoked_at=None,
+-        )
+-        db.add(token)
+-        db.commit()
+-
+-        # Act
+-        refresh_token_repository.revoke_token(db, token)
+-
+-        # Assert
+-        db.refresh(token)
+-        assert token.revoked_at is not None
+-
+     def test_revoke_all_for_user(self, db: Session) -> None:
+         """revoke_all_for_user should revoke all tokens for a user."""
+         # Arrange
+diff --git a/backend/tests/services/test_refresh_token_service.py b/backend/tests/services/test_refresh_token_service.py
+index 9ed3ec9e3..0657bcc19 100644
+--- a/backend/tests/services/test_refresh_token_service.py
++++ b/backend/tests/services/test_refresh_token_service.py
+@@ -2,6 +2,8 @@
+ Unit tests for refresh token service.
+ """
+ 
++from unittest.mock import patch
++
+ import pytest
+ from sqlalchemy.orm import Session
+ 
+@@ -167,6 +169,36 @@ def test_refresh_revokes_old_token(self, db: Session) -> None:
+         assert new_db_token is not None
+         assert new_db_token.revoked_at is None
+ 
++    @pytest.mark.parametrize("token_type", [TokenType.SDK, TokenType.DEVELOPER])
++    def test_refresh_keeps_old_token_usable_when_issuing_tokens_fails(self, db: Session, token_type: TokenType) -> None:
++        """A refresh that fails to issue the new pair must not burn the old token."""
++        # Arrange
++        if token_type == TokenType.SDK:
++            old_refresh_token = refresh_token_service.create_sdk_refresh_token(
++                db, UserFactory().id, SDKTokenOrigin.ADMIN
++            )
++            failing_step = "create_sdk_refresh_token"
++        else:
++            old_refresh_token = refresh_token_service.create_developer_refresh_token(db, DeveloperFactory().id)
++            failing_step = "create_developer_refresh_token"
++
++        # Act
++        with (
++            patch.object(refresh_token_service, failing_step, side_effect=RuntimeError("db down")),
++            pytest.raises(RuntimeError),
++        ):
++            refresh_token_service.refresh_token(db, old_refresh_token)
++        db.rollback()  # what the request's session dependency does on an error
++
++        # Assert
++        old_row = db.get(RefreshToken, old_refresh_token)
++        assert old_row is not None
++        assert old_row.revoked_at is None
++        result = refresh_token_service.refresh_token(db, old_refresh_token)
++        db.refresh(old_row)
++        assert old_row.revoked_at is not None
++        assert db.get(RefreshToken, result.refresh_token) is not None
++
+ 
+ class TestRevokeToken:
+     """Tests for revoke_token method."""
+diff --git a/backend/tests/services/test_token_redemption_concurrency.py b/backend/tests/services/test_token_redemption_concurrency.py
+new file mode 100644
+index 000000000..da176646a
+--- /dev/null
++++ b/backend/tests/services/test_token_redemption_concurrency.py
+@@ -0,0 +1,157 @@
++"""Single-use credentials stay single-use when the same one is sent concurrently.
++
++The regular `db` fixture keeps a test on one connection, so it cannot show a race.
++These tests commit their data and redeem it from separate sessions in parallel threads.
++"""
++
++import threading
++from collections.abc import Callable, Generator
++from concurrent.futures import ThreadPoolExecutor
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from typing import Any
++from uuid import UUID, uuid4
++
++import pytest
++from sqlalchemy import delete, or_
++from sqlalchemy.orm import Session
++
++from app.models import Developer, RefreshToken, User
++from app.models.user_invitation_code import UserInvitationCode
++from app.schemas.auth import SDKTokenOrigin
++from app.services.refresh_token_service import refresh_token_service
++from app.services.user_invitation_code_service import user_invitation_code_service
++from app.utils.exceptions import AppError
++
++CONCURRENT_REQUESTS = 8
++
++
++@dataclass
++class Owners:
++    user_id: UUID
++    developer_id: UUID
++
++
++@pytest.fixture
++def owners(session_factory: Any) -> Generator[Owners, None, None]:
++    """Commit a user and a developer for real, and remove everything they own afterwards."""
++    owners = Owners(user_id=uuid4(), developer_id=uuid4())
++    now = datetime.now(timezone.utc)
++    with session_factory() as session:
++        session.add(User(id=owners.user_id, created_at=now, email=f"{owners.user_id}@example.com"))
++        session.add(
++            Developer(
++                id=owners.developer_id,
++                created_at=now,
++                updated_at=now,
++                email=f"{owners.developer_id}@example.com",
++                hashed_password="hashed_test_password",
++            )
++        )
++        session.commit()
++
++    yield owners
++
++    with session_factory() as session:
++        session.execute(
++            delete(RefreshToken).where(
++                or_(
++                    RefreshToken.user_id == owners.user_id,
++                    RefreshToken.developer_id == owners.developer_id,
++                    RefreshToken.issued_by_developer_id == owners.developer_id,
++                )
++            )
++        )
++        session.execute(delete(UserInvitationCode).where(UserInvitationCode.user_id == owners.user_id))
++        session.execute(delete(User).where(User.id == owners.user_id))
++        session.execute(delete(Developer).where(Developer.id == owners.developer_id))
++        session.commit()
++
++
++def _run_concurrently(session_factory: Any, call: Callable[[Session], object]) -> list[object]:
++    """Run `call` from CONCURRENT_REQUESTS threads at once, each with its own session."""
++    barrier = threading.Barrier(CONCURRENT_REQUESTS, timeout=10)
++
++    def worker() -> object:
++        with session_factory() as session:
++            session.connection()  # connect up front, as a pooled server connection would be
++            barrier.wait()
++            try:
++                return call(session)
++            except AppError as exc:
++                return exc
++
++    with ThreadPoolExecutor(max_workers=CONCURRENT_REQUESTS) as pool:
++        futures = [pool.submit(worker) for _ in range(CONCURRENT_REQUESTS)]
++        return [future.result() for future in futures]
++
++
++def test_concurrent_redeems_of_one_invitation_code_issue_tokens_once(session_factory: Any, owners: Owners) -> None:
++    with session_factory() as session:
++        generated = user_invitation_code_service.generate(session, owners.user_id, owners.developer_id)
++
++    results = _run_concurrently(session_factory, lambda s: user_invitation_code_service.redeem(s, generated.code))
++
++    failures = [r for r in results if isinstance(r, AppError)]
++    assert len(results) - len(failures) == 1
++    assert all(f.status_code == 404 for f in failures)
++    with session_factory() as session:
++        issued = session.query(RefreshToken).filter(RefreshToken.user_id == owners.user_id).count()
++    assert issued == 1
++
++
++def test_concurrent_refreshes_of_one_refresh_token_rotate_it_once(session_factory: Any, owners: Owners) -> None:
++    with session_factory() as session:
++        old_token = refresh_token_service.create_sdk_refresh_token(
++            session,
++            user_id=owners.user_id,
++            origin=SDKTokenOrigin.INVITE,
++            issued_by_developer_id=owners.developer_id,
++        )
++
++    results = _run_concurrently(session_factory, lambda s: refresh_token_service.refresh_token(s, old_token))
++
++    failures = [r for r in results if isinstance(r, AppError)]
++    assert len(results) - len(failures) == 1
++    assert all(f.status_code == 401 for f in failures)
++    with session_factory() as session:
++        live = session.query(RefreshToken).filter(
++            RefreshToken.user_id == owners.user_id, RefreshToken.revoked_at.is_(None)
++        )
++        assert live.count() == 1
++
++
++def test_concurrent_refreshes_of_one_developer_refresh_token_rotate_it_once(
++    session_factory: Any, owners: Owners
++) -> None:
++    with session_factory() as session:
++        old_token = refresh_token_service.create_developer_refresh_token(session, developer_id=owners.developer_id)
++
++    results = _run_concurrently(session_factory, lambda s: refresh_token_service.refresh_token(s, old_token))
++
++    failures = [r for r in results if isinstance(r, AppError)]
++    assert len(results) - len(failures) == 1
++    assert all(f.status_code == 401 for f in failures)
++    with session_factory() as session:
++        live = session.query(RefreshToken).filter(
++            RefreshToken.developer_id == owners.developer_id, RefreshToken.revoked_at.is_(None)
++        )
++        assert live.count() == 1
++
++
++def test_invitation_code_claimed_by_an_unfinished_redeem_is_not_given_to_another(
++    session_factory: Any, owners: Owners
++) -> None:
++    """A second redeem waits for the first; it wins only if the first one rolls back."""
++    with session_factory() as session:
++        code = user_invitation_code_service.generate(session, owners.user_id, owners.developer_id).code
++
++    with session_factory() as first, session_factory() as second:
++        assert user_invitation_code_service.crud.claim_valid_code(first, code) is not None
++
++        with ThreadPoolExecutor(max_workers=1) as pool:
++            pending = pool.submit(user_invitation_code_service.crud.claim_valid_code, second, code)
++            with pytest.raises(TimeoutError):
++                pending.result(timeout=0.5)  # blocked on the row the first session holds
++            first.rollback()
++            assert pending.result(timeout=5) is not None
+diff --git a/backend/tests/services/test_user_invitation_code_service.py b/backend/tests/services/test_user_invitation_code_service.py
+index 3daad30ba..e08d1f95e 100644
+--- a/backend/tests/services/test_user_invitation_code_service.py
++++ b/backend/tests/services/test_user_invitation_code_service.py
+@@ -1,6 +1,7 @@
+ """Unit tests for user invitation code service."""
+ 
+ from datetime import datetime, timedelta, timezone
++from unittest.mock import patch
+ from uuid import uuid4
+ 
+ import pytest
+@@ -9,6 +10,7 @@
+ 
+ from app.config import settings
+ from app.models.user_invitation_code import UserInvitationCode
++from app.services.refresh_token_service import refresh_token_service
+ from app.services.user_invitation_code_service import (
+     CODE_ALPHABET,
+     CODE_LENGTH,
+@@ -210,3 +212,20 @@ def test_redeem_normalizes_to_uppercase(self, db: Session) -> None:
+ 
+         # Assert
+         assert result.user_id == user.id
++
++    def test_redeem_keeps_code_usable_when_issuing_tokens_fails(self, db: Session) -> None:
++        # Arrange
++        developer = DeveloperFactory()
++        user = UserFactory()
++        generated = user_invitation_code_service.generate(db, user.id, developer.id)
++
++        # Act
++        with (
++            patch.object(refresh_token_service, "create_sdk_refresh_token", side_effect=RuntimeError("db down")),
++            pytest.raises(RuntimeError),
++        ):
++            user_invitation_code_service.redeem(db, generated.code)
++        db.rollback()  # what the request's session dependency does on an error
++
++        # Assert
++        assert user_invitation_code_service.redeem(db, generated.code).user_id == user.id

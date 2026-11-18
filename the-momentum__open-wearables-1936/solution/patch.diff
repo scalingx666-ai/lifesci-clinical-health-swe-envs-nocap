@@ -1,0 +1,588 @@
+diff --git a/backend/app/constants/webhooks/test_payloads.py b/backend/app/constants/webhooks/test_payloads.py
+index 0872660117..3d0c33297c 100644
+--- a/backend/app/constants/webhooks/test_payloads.py
++++ b/backend/app/constants/webhooks/test_payloads.py
+@@ -46,6 +46,7 @@ def _ts_payload(event_type: str, series_type: str, provider: str, unit: str, sam
+                     "unit": unit,
+                     "source": source,
+                     "is_daily_total": None,
++                    "window_seconds": None,
+                 }
+             ],
+         },
+diff --git a/backend/app/repositories/event_record_repository.py b/backend/app/repositories/event_record_repository.py
+index ef15eba1a5..6892801ee9 100644
+--- a/backend/app/repositories/event_record_repository.py
++++ b/backend/app/repositories/event_record_repository.py
+@@ -27,6 +27,7 @@
+ from sqlalchemy.exc import IntegrityError
+ from sqlalchemy.orm import Query, selectinload
+ 
++from app.constants.series_types.workout_detail_stats import WORKOUT_DETAIL_STATS
+ from app.database import DbSession
+ from app.integrations.rollup_queue import mark_dirty_days
+ from app.models import DataSource, EventRecord, EventRecordAggregate, SleepDetails, WorkoutDetails
+@@ -53,6 +54,7 @@
+     EventRecordCreate,
+     EventRecordQueryParams,
+     EventRecordUpdate,
++    StatColumn,
+ )
+ from app.schemas.sync_status import DataTypeKind
+ from app.utils.dates import local_date
+@@ -104,6 +106,42 @@ def _nap_condition(is_nap: bool) -> ColumnElement[bool]:
+ }
+ 
+ 
++def _session_stat(series_type: SeriesType, stat: StatColumn, computed_by: ComputedBy) -> ColumnElement:
++    """One statistic of the outer query's event record, from event_record_aggregate."""
++    return (
++        select(getattr(EventRecordAggregate, stat))
++        .where(
++            EventRecordAggregate.record_id == EventRecord.id,
++            EventRecordAggregate.series_type_definition_id == get_series_type_id(series_type),
++            EventRecordAggregate.computed_by == computed_by,
++        )
++        .scalar_subquery()
++    )
++
++
++def _session_sum(series_type: SeriesType) -> ColumnElement:
++    """A workout's total of a series: the provider's, else ours from the workout's samples."""
++    return func.coalesce(
++        _session_stat(series_type, "sum", ComputedBy.PROVIDER),
++        _session_stat(series_type, "sum", ComputedBy.OPEN_WEARABLES),
++    )
++
++
++def _first(*values: Decimal | None) -> Decimal | None:
++    return next((value for value in values if value is not None), None)
++
++
++def workout_energy() -> ColumnElement:
++    """A workout's calories: the provider's in its declared series, else the provider's figure whose series is
++    not established yet (workout_details.energy_burned), else ours from the workout's own energy samples."""
++    return func.coalesce(
++        _session_stat(SeriesType.total_energy, "sum", ComputedBy.PROVIDER),
++        _session_stat(SeriesType.active_energy, "sum", ComputedBy.PROVIDER),
++        WorkoutDetails.energy_burned,
++        _session_stat(SeriesType.active_energy, "sum", ComputedBy.OPEN_WEARABLES),
++    )
++
++
+ class EventRecordRepository(
+     CrudRepository[EventRecord, EventRecordCreate, EventRecordUpdate],
+ ):
+@@ -583,8 +621,8 @@ def get_workout_totals(
+             db_session.query(
+                 func.count(EventRecord.id),
+                 func.coalesce(func.sum(EventRecord.duration_seconds), 0),
+-                func.sum(WorkoutDetails.energy_burned),
+-                func.sum(WorkoutDetails.distance),
++                func.sum(workout_energy()),
++                func.sum(_session_sum(SeriesType.distance)),
+             )
+             .select_from(EventRecord)
+             .join(DataSource, EventRecord.data_source_id == DataSource.id)
+@@ -594,6 +632,45 @@ def get_workout_totals(
+         )
+         return int(row[0]), int(row[1] or 0), row[2], row[3]
+ 
++    def get_workout_statistics(
++        self, db_session: DbSession, record_ids: list[UUID]
++    ) -> dict[UUID, dict[str, Decimal | None]]:
++        """Per workout, every workout_details statistic from event_record_aggregate (the provider's, else ours),
++        plus ``provider_energy`` in the provider's declared series and ``own_energy`` from the workout's samples."""
++        if not record_ids:
++            return {}
++        # Only the series a statistic is read from: a workout's speed, power or elevation stream is not.
++        needed = {get_series_type_id(series_type) for series_type, _ in WORKOUT_DETAIL_STATS.values()} | {
++            get_series_type_id(SeriesType.total_energy),
++            get_series_type_id(SeriesType.active_energy),
++        }
++        rows = db_session.query(EventRecordAggregate).filter(
++            EventRecordAggregate.record_id.in_(record_ids), EventRecordAggregate.series_type_definition_id.in_(needed)
++        )
++        values: dict[ComputedBy, dict[tuple[UUID, int, str], Decimal]] = {origin: {} for origin in ComputedBy}
++        for row in rows:
++            for stat in ("sum", "avg", "min", "max", "last"):
++                if (value := getattr(row, stat)) is not None:
++                    values[row.computed_by][(row.record_id, row.series_type_definition_id, stat)] = value
++        provider, own = values[ComputedBy.PROVIDER], values[ComputedBy.OPEN_WEARABLES]
++
++        def pick(source: dict, record_id: UUID, series_type: SeriesType, stat: str) -> Decimal | None:
++            return source.get((record_id, get_series_type_id(series_type), stat))
++
++        statistics: dict[UUID, dict[str, Decimal | None]] = {}
++        for record_id in record_ids:
++            workout = {
++                column: _first(pick(provider, record_id, series_type, stat), pick(own, record_id, series_type, stat))
++                for column, (series_type, stat) in WORKOUT_DETAIL_STATS.items()
++            }
++            workout["provider_energy"] = _first(
++                pick(provider, record_id, SeriesType.total_energy, "sum"),
++                pick(provider, record_id, SeriesType.active_energy, "sum"),
++            )
++            workout["own_energy"] = pick(own, record_id, SeriesType.active_energy, "sum")
++            statistics[record_id] = workout
++        return statistics
++
+     def get_sleep_totals(
+         self,
+         db_session: DbSession,
+@@ -1265,11 +1342,11 @@ def get_daily_workout_aggregates(
+                 DataSource.device_model,
+                 DataSource.device_type,
+                 # Sum elevation gain for all workouts on that day
+-                func.sum(WorkoutDetails.total_elevation_gain).label("elevation_sum"),
++                func.sum(_session_sum(SeriesType.elevation_gain)).label("elevation_sum"),
+                 # Sum distance for all workouts
+-                func.sum(WorkoutDetails.distance).label("distance_sum"),
++                func.sum(_session_sum(SeriesType.distance)).label("distance_sum"),
+                 # Sum energy burned
+-                func.sum(WorkoutDetails.energy_burned).label("energy_sum"),
++                func.sum(workout_energy()).label("energy_sum"),
+             )
+             .join(DataSource, self.model.data_source_id == DataSource.id)
+             # Use outerjoin since WorkoutDetails is optional - some workouts may not have details
+diff --git a/backend/app/services/event_record_service.py b/backend/app/services/event_record_service.py
+index 1a5c2a8329..99ab4757f2 100644
+--- a/backend/app/services/event_record_service.py
++++ b/backend/app/services/event_record_service.py
+@@ -1,6 +1,6 @@
+ from collections.abc import Sequence
+ from datetime import date, datetime, time, timedelta, timezone
+-from decimal import Decimal
++from decimal import ROUND_HALF_UP, Decimal
+ from logging import Logger, getLogger
+ from uuid import UUID, uuid4
+ 
+@@ -80,7 +80,7 @@
+ from app.services.scores.sleep_service import sleep_score_service
+ from app.services.services import AppService
+ from app.utils.context import current_sync_payload
+-from app.utils.conversion import as_dict_list, as_float, as_model, minutes_to_seconds
++from app.utils.conversion import as_dict_list, as_float, as_int, as_model, minutes_to_seconds
+ from app.utils.exceptions import handle_exceptions
+ from app.utils.pagination import encode_cursor
+ 
+@@ -116,6 +116,11 @@ def pace_sec_per_km(distance_meters: float | None, seconds: int | None) -> float
+     return round(seconds / (distance_meters / 1000), 1)
+ 
+ 
++def _first_number(*values: Decimal | None) -> float | None:
++    """The first value that is set, so a provider's 0 kcal is kept rather than skipped."""
++    return next((float(value) for value in values if value is not None), None)
++
++
+ class EventRecordService(
+     AppService[EventRecordRepository, EventRecord, EventRecordCreate, EventRecordUpdate],
+ ):
+@@ -135,20 +140,22 @@ def _resolve_avg_hr(
+         self,
+         db_session: DbSession,
+         records: list[EventRecord],
++        statistics: dict[UUID, dict[str, Decimal | None]],
+     ) -> dict[UUID, int | None]:
+         """Return avg HR for each workout record.
+ 
+-        Uses stored heart_rate_avg where available, falls back to a single batch query
+-        against series_sample for records that don't have it: the workout's own source
+-        first, then the other sources of the same writer.
++        Uses the workout's heart rate aggregate (the provider's, else ours from its own samples) where
++        available, falls back to a single batch query against series_sample of the other sources of the
++        same writer.
+         """
+         result: dict[UUID, int | None] = {}
+         missing = []
+ 
+         for r in records:
+-            details = r.workout_detail
+-            if details and details.heart_rate_avg is not None:
+-                result[r.id] = round(details.heart_rate_avg)
++            average = statistics.get(r.id, {}).get("heart_rate_avg")
++            if average is not None:
++                # Half up, as the SQL fallback below rounds: 72.5 is 73 either way.
++                result[r.id] = int(Decimal(average).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+             else:
+                 result[r.id] = None
+                 missing.append(r)
+@@ -918,11 +925,16 @@ def get_workouts(
+                     first_record, _ = records[0]
+                     previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+ 
+-        computed_hr = self._resolve_avg_hr(db_session, [r for r, _ in records])
++        statistics = self.crud.get_workout_statistics(db_session, [r.id for r, _ in records])
++        computed_hr = self._resolve_avg_hr(db_session, [r for r, _ in records], statistics)
+ 
+         data = []
+         for record, data_source in records:
+             details: WorkoutDetails | None = record.workout_detail
++            stats = statistics.get(record.id, {})
++            calories = _first_number(
++                stats.get("provider_energy"), details.energy_burned if details else None, stats.get("own_energy")
++            )
+             moving_seconds = (
+                 details.moving_time_seconds
+                 if details and details.moving_time_seconds is not None
+@@ -939,24 +951,22 @@ def get_workouts(
+                 source=self._map_source(data_source),
+                 entry_source=details.entry_source if details else None,
+                 intensity=details.intensity if details else None,
+-                calories_kcal=float(details.energy_burned) if details and details.energy_burned else None,
+-                distance_meters=float(details.distance) if details and details.distance else None,
++                calories_kcal=calories,
++                distance_meters=as_float(stats.get("distance")),
+                 avg_heart_rate_bpm=computed_hr.get(record.id),
+-                max_heart_rate_bpm=details.heart_rate_max if details else None,
+-                avg_pace_sec_per_km=pace_sec_per_km(as_float(details.distance) if details else None, moving_seconds),
+-                elevation_gain_meters=float(details.total_elevation_gain)
+-                if details and details.total_elevation_gain
+-                else None,
+-                heart_rate_min=details.heart_rate_min if details else None,
+-                steps_count=details.steps_count if details else None,
+-                average_speed=as_float(details.average_speed) if details else None,
+-                max_speed=as_float(details.max_speed) if details else None,
+-                average_cadence=as_float(details.average_cadence) if details else None,
+-                average_watts=as_float(details.average_watts) if details else None,
+-                max_watts=as_float(details.max_watts) if details else None,
++                max_heart_rate_bpm=as_int(stats.get("heart_rate_max")),
++                avg_pace_sec_per_km=pace_sec_per_km(as_float(stats.get("distance")), moving_seconds),
++                elevation_gain_meters=as_float(stats.get("total_elevation_gain")),
++                heart_rate_min=as_int(stats.get("heart_rate_min")),
++                steps_count=as_int(stats.get("steps_count")),
++                average_speed=as_float(stats.get("average_speed")),
++                max_speed=as_float(stats.get("max_speed")),
++                average_cadence=as_float(stats.get("average_cadence")),
++                average_watts=as_float(stats.get("average_watts")),
++                max_watts=as_float(stats.get("max_watts")),
+                 moving_time_seconds=details.moving_time_seconds if details else None,
+-                elev_high=as_float(details.elev_high) if details else None,
+-                elev_low=as_float(details.elev_low) if details else None,
++                elev_high=as_float(stats.get("elev_high")),
++                elev_low=as_float(stats.get("elev_low")),
+                 hr_zones=as_model(HRZones, details.hr_zones) if details and with_zones else None,
+                 power_zones=as_model(PowerZones, details.power_zones) if details and with_zones else None,
+                 segments=as_dict_list(details.segments) if details and with_segments else None,
+diff --git a/backend/app/services/timeseries_service.py b/backend/app/services/timeseries_service.py
+index 5a1eafda98..ff534e6fe9 100644
+--- a/backend/app/services/timeseries_service.py
++++ b/backend/app/services/timeseries_service.py
+@@ -248,6 +248,7 @@ def _emit_timeseries_webhooks(
+                         "unit": unit,
+                         "source": {"provider": provider, "device": s.device_model},
+                         "is_daily_total": s.is_daily_total,
++                        "window_seconds": s.window_seconds,
+                     }
+                     for s in sorted_samples
+                 ]
+diff --git a/backend/tests/factories.py b/backend/tests/factories.py
+index 7a068c8bf3..3f81606001 100644
+--- a/backend/tests/factories.py
++++ b/backend/tests/factories.py
+@@ -18,12 +18,14 @@
+ from factory import LazyAttribute, LazyFunction, Sequence
+ from sqlalchemy.orm import Session
+ 
++from app.constants.series_types.workout_detail_stats import WORKOUT_DETAIL_STATS
+ from app.models import (
+     ApiKey,
+     Application,
+     DataSource,
+     Developer,
+     EventRecord,
++    EventRecordDetail,
+     HealthScore,
+     MealDetails,
+     PersonalRecord,
+@@ -37,10 +39,19 @@
+     WorkoutDetails,
+ )
+ from app.repositories.aggregate_repository import AggregateRepository
++from app.repositories.event_record_detail_repository import EventRecordDetailRepository
+ from app.repositories.series_rollup_repository import SeriesRollupRepository
+ from app.schemas.auth import ConnectionStatus
+-from app.schemas.enums import ComputedBy, HealthScoreCategory, PeriodKind, ProviderName, SeriesType, get_series_type_id
+-from app.schemas.model_crud.activities import CalendarPeriod
++from app.schemas.enums import (
++    ComputedBy,
++    EventCategory,
++    HealthScoreCategory,
++    PeriodKind,
++    ProviderName,
++    SeriesType,
++    get_series_type_id,
++)
++from app.schemas.model_crud.activities import CalendarPeriod, EventRecordDetailCreate
+ from app.utils.security import get_password_hash, hash_api_key
+ 
+ 
+@@ -118,6 +129,16 @@ def get_or_create_total_energy(cls) -> SeriesTypeDefinition:
+                 return existing
+         return cls(id=89, code="total_energy", unit="kcal")
+ 
++    @classmethod
++    def get_or_create_distance(cls) -> SeriesTypeDefinition:
++        """Get the pre-seeded distance series type (ID=185)."""
++        session = cls._meta.sqlalchemy_session
++        if session:
++            existing = session.query(SeriesTypeDefinition).filter(SeriesTypeDefinition.id == 185).first()
++            if existing:
++                return existing
++        return cls(id=185, code="distance", unit="meters")
++
+     @classmethod
+     def get_or_create_distance_walking_running(cls) -> SeriesTypeDefinition:
+         """Get the pre-seeded distance_walking_running series type (ID=100)."""
+@@ -569,7 +590,14 @@ def _create(cls, model_class: type[WorkoutDetails], *args: Any, **kwargs: Any) -
+         if "heart_rate_avg" in kwargs and not isinstance(kwargs["heart_rate_avg"], Decimal):
+             kwargs["heart_rate_avg"] = Decimal(str(kwargs["heart_rate_avg"]))
+ 
+-        return super()._create(model_class, *args, **kwargs)
++        detail = super()._create(model_class, *args, **kwargs)
++        # As the detail save path does: the statistics also land in event_record_aggregate.
++        creator = EventRecordDetailCreate(
++            record_id=detail.record_id, **{column: getattr(detail, column) for column in WORKOUT_DETAIL_STATS}
++        )
++        session = cls._meta.sqlalchemy_session
++        EventRecordDetailRepository(EventRecordDetail)._mirror_workout_stats(session, [creator], EventCategory.WORKOUT)
++        return detail
+ 
+ 
+ class SleepDetailsFactory(BaseFactory):
+diff --git a/backend/tests/repositories/test_aggregate_repository.py b/backend/tests/repositories/test_aggregate_repository.py
+index 4f27ee6a79..3dccc690e6 100644
+--- a/backend/tests/repositories/test_aggregate_repository.py
++++ b/backend/tests/repositories/test_aggregate_repository.py
+@@ -38,6 +38,7 @@
+     CalendarPeriod,
+     EventRecordCreate,
+     EventRecordDetailCreate,
++    EventRecordQueryParams,
+     SessionValue,
+     TimeSeriesSampleCreate,
+ )
+@@ -971,3 +972,83 @@ def test_days_left_over_start_the_next_run_right_away(self, db: Session) -> None
+             roll_up_queued_days()
+ 
+         next_run.assert_called_once_with(countdown=1)
++
++
++class TestWorkoutStatistics:
++    def _workout(self, db: Session, source: object, start: datetime, **detail: object) -> EventRecord:
++        workout = EventRecordFactory(
++            category="workout", data_source=source, start_datetime=start, duration_seconds=1800
++        )
++        EventRecordDetailRepository(EventRecordDetail).bulk_create(
++            db, [EventRecordDetailCreate(record_id=workout.id, **detail)]
++        )
++        return workout
++
++    def test_calories_take_the_declared_series_then_the_providers_figure_then_ours(self, db: Session) -> None:
++        source = DataSourceFactory()
++        energy = SeriesTypeDefinitionFactory.get_or_create_energy()
++        declared = self._workout(
++            db,
++            source,
++            datetime(2099, 1, 1, 8, tzinfo=timezone.utc),
++            energy_burned=Decimal("500"),
++            energy_series=SeriesType.total_energy,
++        )
++        undeclared = self._workout(
++            db, source, datetime(2099, 1, 1, 12, tzinfo=timezone.utc), energy_burned=Decimal("300")
++        )
++        bare = self._workout(db, source, datetime(2099, 1, 1, 16, tzinfo=timezone.utc))
++        DataPointSeriesFactory(
++            mapping=source,
++            series_type=energy,
++            recorded_at=datetime(2099, 1, 1, 16, 10, tzinfo=timezone.utc),
++            value=Decimal("40"),
++        )
++        roll_up_everything(db)
++
++        statistics = EventRecordRepository(EventRecord).get_workout_statistics(
++            db, [declared.id, undeclared.id, bare.id]
++        )
++        _, _, total, _ = EventRecordRepository(EventRecord).get_workout_totals(
++            db, EventRecordQueryParams(), str(source.user_id)
++        )
++
++        assert statistics[declared.id]["provider_energy"] == Decimal("500")
++        assert statistics[undeclared.id]["provider_energy"] is None
++        assert statistics[bare.id]["own_energy"] == Decimal("40")
++        assert total == Decimal("840")
++
++    def test_totals_and_days_take_our_distance_where_the_provider_sent_none(self, db: Session) -> None:
++        source = DataSourceFactory()
++        distance = SeriesTypeDefinitionFactory.get_or_create_distance()
++        declared = self._workout(db, source, datetime(2099, 1, 1, 8, tzinfo=timezone.utc), distance=Decimal("5000"))
++        bare = self._workout(db, source, datetime(2099, 1, 1, 12, tzinfo=timezone.utc))
++        for minute, value in [(5, "300"), (20, "700")]:
++            DataPointSeriesFactory(
++                mapping=source,
++                series_type=distance,
++                recorded_at=bare.start_datetime + timedelta(minutes=minute),
++                value=Decimal(value),
++            )
++        roll_up_everything(db)
++        repo = EventRecordRepository(EventRecord)
++
++        _, _, _, total = repo.get_workout_totals(db, EventRecordQueryParams(), str(source.user_id))
++        (day,) = repo.get_daily_workout_aggregates(
++            db, source.user_id, datetime(2099, 1, 1, tzinfo=timezone.utc), datetime(2099, 1, 2, tzinfo=timezone.utc)
++        )
++
++        assert repo.get_workout_statistics(db, [declared.id, bare.id])[bare.id]["distance"] == Decimal("1000")
++        assert (total, day["distance_meters"]) == (Decimal("6000"), 6000)
++
++    def test_a_workout_without_provider_heart_rate_takes_ours(self, db: Session) -> None:
++        source = DataSourceFactory()
++        start = datetime(2099, 1, 1, 8, tzinfo=timezone.utc)
++        workout = self._workout(db, source, start)
++        for minute, value in [(5, "120"), (20, "150")]:
++            DataPointSeriesFactory(mapping=source, recorded_at=start + timedelta(minutes=minute), value=Decimal(value))
++        roll_up_everything(db)
++
++        stats = EventRecordRepository(EventRecord).get_workout_statistics(db, [workout.id])[workout.id]
++
++        assert (stats["heart_rate_avg"], stats["heart_rate_max"]) == (Decimal("135"), Decimal("150"))
+diff --git a/backend/tests/services/test_event_record_service.py b/backend/tests/services/test_event_record_service.py
+index c9e47006e8..f2695e1b34 100644
+--- a/backend/tests/services/test_event_record_service.py
++++ b/backend/tests/services/test_event_record_service.py
+@@ -1460,7 +1460,17 @@ def _hr(self, data_source: DataSource, value: int) -> None:
+ 
+     def _avg_hr(self, db: Session, workout: EventRecord) -> int | None:
+         db.flush()
+-        return event_record_service._resolve_avg_hr(db, [workout])[workout.id]
++        statistics = event_record_service.crud.get_workout_statistics(db, [workout.id])
++        return event_record_service._resolve_avg_hr(db, [workout], statistics)[workout.id]
++
++    def test_our_average_rounds_half_up_like_the_sql_fallback(self, db: Session) -> None:
++        workout = self._workout(DataSourceFactory())
++
++        resolved = event_record_service._resolve_avg_hr(
++            db, [workout], {workout.id: {"heart_rate_avg": Decimal("72.5")}}
++        )
++
++        assert resolved[workout.id] == 73
+ 
+     def test_own_source_wins_over_writer_siblings(self, db: Session) -> None:
+         user = UserFactory()
+@@ -1531,6 +1541,7 @@ def test_workouts_are_split_into_chunks_without_splitting_a_writer(
+             DataPointSeriesFactory(data_source=dailies, recorded_at=start + timedelta(minutes=10), value=130 + day)
+         db.flush()
+ 
+-        result = event_record_service._resolve_avg_hr(db, workouts)
++        statistics = event_record_service.crud.get_workout_statistics(db, [w.id for w in workouts])
++        result = event_record_service._resolve_avg_hr(db, workouts, statistics)
+ 
+         assert [result[w.id] for w in workouts] == [130, 131, 132]
+diff --git a/docs/api-reference/guides/webhooks.mdx b/docs/api-reference/guides/webhooks.mdx
+index 51103610af..ef35068446 100644
+--- a/docs/api-reference/guides/webhooks.mdx
++++ b/docs/api-reference/guides/webhooks.mdx
+@@ -475,7 +475,8 @@ Each timeseries event carries the full sample array so your backend can act on t
+         "value": 62,
+         "unit": "bpm",
+         "source": { "provider": "garmin", "device": "Forerunner 255" },
+-        "is_daily_total": null
++        "is_daily_total": null,
++        "window_seconds": null
+       },
+       {
+         "timestamp": "2025-12-19T07:35:00+01:00",
+@@ -484,7 +485,8 @@ Each timeseries event carries the full sample array so your backend can act on t
+         "value": 65,
+         "unit": "bpm",
+         "source": { "provider": "garmin", "device": "Forerunner 255" },
+-        "is_daily_total": null
++        "is_daily_total": null,
++        "window_seconds": null
+       },
+       {
+         "timestamp": "2025-12-19T07:40:00+01:00",
+@@ -493,7 +495,8 @@ Each timeseries event carries the full sample array so your backend can act on t
+         "value": 70,
+         "unit": "bpm",
+         "source": { "provider": "garmin", "device": "Forerunner 255" },
+-        "is_daily_total": null
++        "is_daily_total": null,
++        "window_seconds": null
+       }
+     ]
+   }
+@@ -514,6 +517,10 @@ Each entry in `samples` matches the schema returned by `GET /api/v1/users/{user_
+   For non-additive series (heart rate, SpO2, temperature, …) `is_daily_total` is always `null` and can be ignored.
+ </Note>
+ 
++<Note>
++  **`window_seconds`** is the width of a sample reported over a window rather than at an instant: a Garmin 15-minute epoch is `900`, a HealthKit record from 08:00 to 08:05 is `300`. `null` means an instant reading.
++</Note>
++
+ <Note>
+   **Large batches** (exceeding 2 500 samples) are automatically split into consecutive chunk events to stay within Svix's 1 MB payload limit.  Each chunk event includes `chunk_index` (0-based) and `total_chunks` so you can detect and reassemble split deliveries.  The `sample_count` field always reflects the total number of samples across all chunks.
+ </Note>
+diff --git a/docs/api-reference/guides/workout-statistics.mdx b/docs/api-reference/guides/workout-statistics.mdx
+new file mode 100644
+index 0000000000..a49187eac6
+--- /dev/null
++++ b/docs/api-reference/guides/workout-statistics.mdx
+@@ -0,0 +1,45 @@
++---
++title: "Workout Statistics"
++description: "Where the statistics of a workout come from: the provider's own figures first, then values Open Wearables computes from the samples recorded during the workout."
++keywords: ["workout statistics", "workout calories", "workout heart rate", "workout distance", "workout totals"]
++"og:title": "Workout Statistics | Open Wearables"
++"og:description": "Where workout statistics come from: the provider's figures first, then values computed from the workout's own samples."
++"og:url": "https://docs.openwearables.io/api-reference/guides/workout-statistics"
++"og:type": "article"
++"twitter:title": "Workout Statistics | Open Wearables"
++"twitter:description": "Where workout statistics come from: the provider's figures first, then values computed from the workout's own samples."
++"twitter:card": "summary_large_image"
++---
++
++A workout returned by `GET /api/v1/users/{user_id}/events/workouts` carries statistics such as heart rate, distance, calories and elevation gain. Each one is read in this order:
++
++1. **The provider's figure**, when the provider sent one for that workout.
++2. **Ours**, computed by Open Wearables from the samples the same device recorded between the workout's start and end, when the provider sent none. These are computed by the rollup, at most 15 minutes after the samples arrive.
++3. `null`, when neither exists.
++
++A statistic the provider sent as `0` stays `0`: it is the provider's figure, not a missing one.
++
++| Field | Series it is read from | Statistic |
++|---|---|---|
++| `avg_heart_rate_bpm` | `heart_rate` | average; without the provider's or ours, the samples of the same app's other sources during the workout |
++| `max_heart_rate_bpm`, `heart_rate_min` | `heart_rate` | maximum, minimum |
++| `steps_count` | `steps` | sum |
++| `distance_meters`, `avg_pace_sec_per_km` | `distance` | sum |
++| `average_speed`, `max_speed` | `speed` | average, maximum |
++| `average_watts`, `max_watts` | `power` | average, maximum |
++| `average_cadence` | `cadence` | average |
++| `elev_low`, `elev_high` | `elevation` | minimum, maximum |
++| `elevation_gain_meters` | `elevation_gain` | sum |
++| `calories_kcal` | `total_energy` or `active_energy` | sum; see below |
++
++## Calories
++
++`calories_kcal` is the provider's figure in the energy series the provider is known to report for workouts (total or active energy), else the provider's figure whose series is not established yet, else the sum of the workout's own active energy samples.
++
++## Totals and daily summaries
++
++`GET /api/v1/users/{user_id}/events/workouts/totals` and the workout part of `/summaries/activity` (distance, energy, elevation) add up the same per-workout values: the provider's for a workout where it sent one, ours where it did not.
++
++<Note>
++Before this release the fields held only what the provider sent, and `null` otherwise. A client that read `null` as "the provider sent no value" now receives the computed value in the same field.
++</Note>
+diff --git a/docs/docs.json b/docs/docs.json
+index ca7ecdff31..3feed91314 100644
+--- a/docs/docs.json
++++ b/docs/docs.json
+@@ -213,6 +213,7 @@
+               "api-reference/guides/webhooks",
+               "api-reference/guides/provider-webhook-subscriptions",
+               "api-reference/guides/sync-status-stream",
++              "api-reference/guides/workout-statistics",
+               "api-reference/guides/apple-xml-import",
+               "api-reference/guides/provider-setup",
+               "api-reference/guides/error-handling"

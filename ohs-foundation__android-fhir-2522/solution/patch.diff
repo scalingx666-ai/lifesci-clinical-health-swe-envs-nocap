@@ -1,0 +1,216 @@
+diff --git a/datacapture/src/main/java/com/google/android/fhir/datacapture/QuestionnaireViewModel.kt b/datacapture/src/main/java/com/google/android/fhir/datacapture/QuestionnaireViewModel.kt
+index f806f763d2..4343257704 100644
+--- a/datacapture/src/main/java/com/google/android/fhir/datacapture/QuestionnaireViewModel.kt
++++ b/datacapture/src/main/java/com/google/android/fhir/datacapture/QuestionnaireViewModel.kt
+@@ -29,6 +29,7 @@ import com.google.android.fhir.datacapture.enablement.EnablementEvaluator
+ import com.google.android.fhir.datacapture.expressions.EnabledAnswerOptionsEvaluator
+ import com.google.android.fhir.datacapture.extensions.EntryMode
+ import com.google.android.fhir.datacapture.extensions.allItems
++import com.google.android.fhir.datacapture.extensions.calculatedExpression
+ import com.google.android.fhir.datacapture.extensions.copyNestedItemsToChildlessAnswers
+ import com.google.android.fhir.datacapture.extensions.cqfExpression
+ import com.google.android.fhir.datacapture.extensions.createQuestionnaireResponseItem
+@@ -378,7 +379,7 @@ internal class QuestionnaireViewModel(application: Application, state: SavedStat
+       }
+       modifiedQuestionnaireResponseItemSet.add(questionnaireResponseItem)
+ 
+-      updateDependentQuestionnaireResponseItems(questionnaireItem, questionnaireResponseItem)
++      updateAnswerWithAffectedCalculatedExpression(questionnaireItem)
+ 
+       modificationCount.update { it + 1 }
+     }
+@@ -580,13 +581,7 @@ internal class QuestionnaireViewModel(application: Application, state: SavedStat
+       .withIndex()
+       .onEach {
+         if (it.index == 0) {
+-          expressionEvaluator.detectExpressionCyclicDependency(questionnaire.item)
+-          questionnaire.item.flattened().forEach { qItem ->
+-            updateDependentQuestionnaireResponseItems(
+-              qItem,
+-              questionnaireResponse.allItems.find { qrItem -> qrItem.linkId == qItem.linkId },
+-            )
+-          }
++          initializeCalculatedExpressions()
+           modificationCount.update { count -> count + 1 }
+         }
+       }
+@@ -602,14 +597,40 @@ internal class QuestionnaireViewModel(application: Application, state: SavedStat
+           ),
+       )
+ 
+-  private suspend fun updateDependentQuestionnaireResponseItems(
++  /** Travers all [calculatedExpression] within a [Questionnaire] and evaluate them. */
++  private suspend fun initializeCalculatedExpressions() {
++    expressionEvaluator.detectExpressionCyclicDependency(questionnaire.item)
++    val itemsToBeCalculated =
++      questionnaire.item.flattened().filter { qItem -> qItem.calculatedExpression != null }
++    itemsToBeCalculated.forEach { qItem ->
++      // TODO: Traverse the two trees in parallel and match based on the pairs, the current
++      // implementation does not work well with nested items and repeated groups
++      // https://github.com/google/android-fhir/issues/2618
++      val qrItem =
++        questionnaireResponse.allItems.find { qrItem -> qrItem.linkId == qItem.linkId }
++          ?: return@forEach
++      updateAnswerWithCalculatedExpression(qItem, qrItem)
++    }
++  }
++
++  /**
++   * Updates all items that has [calculatedExpression] that reference the given [questionnaireItem]
++   * within their calculations.
++   *
++   * If item X has a [calculatedExpression], but that item does not reference the given
++   * [questionnaireItem], then item X should not be calculated.
++   *
++   * Only items that have not been modified by the user will be updated to prevent any event loops.
++   *
++   * @param questionnaireItem The questionnaire item referenced by other items through
++   *   [calculatedExpression].
++   */
++  private suspend fun updateAnswerWithAffectedCalculatedExpression(
+     questionnaireItem: QuestionnaireItemComponent,
+-    updatedQuestionnaireResponseItem: QuestionnaireResponseItemComponent?,
+   ) {
+     expressionEvaluator
+-      .evaluateCalculatedExpressions(
++      .evaluateAllAffectedCalculatedExpressions(
+         questionnaireItem,
+-        updatedQuestionnaireResponseItem,
+       )
+       .forEach { (questionnaireItem, calculatedAnswers) ->
+         // update all response item with updated values
+@@ -633,6 +654,33 @@ internal class QuestionnaireViewModel(application: Application, state: SavedStat
+       }
+   }
+ 
++  /**
++   * Updates the answer(s) in the questionnaire response item with the evaluation result of the
++   * calculated expression if
++   * - there is a calculated expression in the questionnaire item, and
++   * - there is no user provided answer to the questionnaire response item (user input should always
++   *   take precedence over calculated answers).
++   *
++   * Do nothing, otherwise.
++   */
++  private suspend fun updateAnswerWithCalculatedExpression(
++    questionnaireItem: QuestionnaireItemComponent,
++    questionnaireResponseItem: QuestionnaireResponseItemComponent,
++  ) {
++    if (questionnaireItem.calculatedExpression == null) return
++    if (modifiedQuestionnaireResponseItemSet.contains(questionnaireResponseItem)) return
++    val answers =
++      expressionEvaluator.evaluateCalculatedExpression(
++        questionnaireItem,
++        questionnaireResponseItem,
++      )
++    if (answers.isEmpty()) return
++    if (questionnaireResponseItem.answer.hasDifferentAnswerSet(answers)) {
++      questionnaireResponseItem.answer =
++        answers.map { QuestionnaireResponseItemAnswerComponent().apply { value = it } }
++    }
++  }
++
+   private fun removeDisabledAnswers(
+     questionnaireItem: QuestionnaireItemComponent,
+     questionnaireResponseItem: QuestionnaireResponseItemComponent,
+diff --git a/datacapture/src/main/java/com/google/android/fhir/datacapture/fhirpath/ExpressionEvaluator.kt b/datacapture/src/main/java/com/google/android/fhir/datacapture/fhirpath/ExpressionEvaluator.kt
+index 0fe1056e21..97e74233e6 100644
+--- a/datacapture/src/main/java/com/google/android/fhir/datacapture/fhirpath/ExpressionEvaluator.kt
++++ b/datacapture/src/main/java/com/google/android/fhir/datacapture/fhirpath/ExpressionEvaluator.kt
+@@ -188,9 +188,8 @@ internal class ExpressionEvaluator(
+    * Returns a list of pair of item and the calculated and evaluated value for all items with
+    * calculated expression extension, which is dependent on value of updated response
+    */
+-  suspend fun evaluateCalculatedExpressions(
++  suspend fun evaluateAllAffectedCalculatedExpressions(
+     questionnaireItem: QuestionnaireItemComponent,
+-    updatedQuestionnaireResponseItemComponent: QuestionnaireResponseItemComponent?,
+   ): List<ItemToAnswersPair> {
+     return questionnaire.item
+       .flattened()
+@@ -202,10 +201,13 @@ internal class ExpressionEvaluator(
+             findDependentVariables(item.calculatedExpression!!).isNotEmpty())
+       }
+       .map { item ->
++        // TODO: Pass the questionnaire response item corresponding to the
++        //  questionnaire item with the calculated expression for the FHIRPath supplement
++        //  `%context`.
+         val updatedAnswer =
+           evaluateExpression(
+               item,
+-              updatedQuestionnaireResponseItemComponent,
++              null,
+               item.calculatedExpression!!,
+             )
+             .map { it.castToType(it) }
+@@ -213,6 +215,22 @@ internal class ExpressionEvaluator(
+       }
+   }
+ 
++  /**
++   * Returns the evaluated value of [calculatedExpression] from the given [questionnaireItem]. A
++   * [NullPointerException] will be thrown if [calculatedExpression] is not present.
++   */
++  suspend fun evaluateCalculatedExpression(
++    questionnaireItem: QuestionnaireItemComponent,
++    questionnaireResponseItem: QuestionnaireResponseItemComponent?,
++  ): List<Type> {
++    return evaluateExpression(
++        questionnaireItem,
++        questionnaireResponseItem,
++        questionnaireItem.calculatedExpression!!,
++      )
++      .map { it.castToType(it) }
++  }
++
+   /**
+    * Evaluates variable expression defined at questionnaire item level and returns the evaluated
+    * result.
+diff --git a/datacapture/src/test/java/com/google/android/fhir/datacapture/fhirpath/ExpressionEvaluatorTest.kt b/datacapture/src/test/java/com/google/android/fhir/datacapture/fhirpath/ExpressionEvaluatorTest.kt
+index adee75520c..910cb0e36f 100644
+--- a/datacapture/src/test/java/com/google/android/fhir/datacapture/fhirpath/ExpressionEvaluatorTest.kt
++++ b/datacapture/src/test/java/com/google/android/fhir/datacapture/fhirpath/ExpressionEvaluatorTest.kt
+@@ -686,9 +686,8 @@ class ExpressionEvaluatorTest {
+     val expressionEvaluator = ExpressionEvaluator(questionnaire, questionnaireResponse)
+ 
+     val result =
+-      expressionEvaluator.evaluateCalculatedExpressions(
++      expressionEvaluator.evaluateAllAffectedCalculatedExpressions(
+         questionnaire.item.elementAt(1),
+-        questionnaireResponse.item.elementAt(1),
+       )
+ 
+     assertThat(result.first().second.first().asStringValue())
+@@ -758,9 +757,8 @@ class ExpressionEvaluatorTest {
+       val expressionEvaluator = ExpressionEvaluator(questionnaire, questionnaireResponse)
+ 
+       val result =
+-        expressionEvaluator.evaluateCalculatedExpressions(
++        expressionEvaluator.evaluateAllAffectedCalculatedExpressions(
+           questionnaire.item.elementAt(1),
+-          questionnaireResponse.item.elementAt(1),
+         )
+ 
+       assertThat(result.first().second.first().asStringValue())
+@@ -796,9 +794,8 @@ class ExpressionEvaluatorTest {
+       val expressionEvaluator = ExpressionEvaluator(questionnaire, QuestionnaireResponse())
+ 
+       val result =
+-        expressionEvaluator.evaluateCalculatedExpressions(
++        expressionEvaluator.evaluateAllAffectedCalculatedExpressions(
+           questionnaire.item.elementAt(0),
+-          null,
+         )
+ 
+       assertThat(result.first().second.first().asStringValue()).isEqualTo("Questionnaire A")
+@@ -833,9 +830,8 @@ class ExpressionEvaluatorTest {
+       val expressionEvaluator = ExpressionEvaluator(questionnaire, QuestionnaireResponse())
+ 
+       val result =
+-        expressionEvaluator.evaluateCalculatedExpressions(
++        expressionEvaluator.evaluateAllAffectedCalculatedExpressions(
+           questionnaire.item.elementAt(0),
+-          null,
+         )
+ 
+       assertThat(result.first().second.first().asStringValue()).isEqualTo("Question = Reason")

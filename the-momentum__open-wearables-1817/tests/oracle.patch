@@ -1,0 +1,221 @@
+diff --git a/backend/scripts/data_migrations/split_google_provider.py b/backend/scripts/data_migrations/split_google_provider.py
+index 3ed2315b3e..6d91f1fc79 100644
+--- a/backend/scripts/data_migrations/split_google_provider.py
++++ b/backend/scripts/data_migrations/split_google_provider.py
+@@ -17,8 +17,10 @@
+ ``health_score`` follows its data source.
+ 
+ Runs before ``init_provider_settings.py`` in ``scripts/start/app.sh``: that seeds a
+-``google_health`` row, and ``provider_settings.provider`` is a primary key, so the rename
+-would collide with it.
++``google_health`` row, and ``provider_settings.provider`` is a primary key, so a plain rename
++would collide with it. A failed run does not stop startup, though, so the retry on the next
++start finds that seeded row already there. In that case the legacy row is folded onto the
++seeded one instead of renamed (same for ``provider_priority``, which is unique on provider).
+ 
+ Idempotent: every statement is keyed on ``provider = 'google'``, so re-runs are no-ops once
+ no legacy rows remain. Safe to run on every startup until removed.
+@@ -93,6 +95,19 @@
+ # discriminator first, then the catch-all.
+ _SR_SDK_UPDATE = text("UPDATE sync_run SET provider = :sdk WHERE provider = :legacy AND source = :sdk_source")
+ _SR_UPDATE = text("UPDATE sync_run SET provider = :api WHERE provider = :legacy")
++# On a retry after a failed first run, init_provider_settings.py has already seeded the
++# target row. The legacy row holds what the deployment actually ran with, so it wins over
++# the seeded defaults, then goes. Without a target row this is a no-op and the rename runs.
++_PS_FOLD = text("""
++    UPDATE provider_settings target
++    SET is_enabled = legacy.is_enabled,
++        live_sync_mode = COALESCE(legacy.live_sync_mode, target.live_sync_mode),
++        webhook_secret = COALESCE(legacy.webhook_secret, target.webhook_secret),
++        data_granularity = COALESCE(legacy.data_granularity, target.data_granularity)
++    FROM provider_settings legacy
++    WHERE target.provider = :api AND legacy.provider = :legacy
++""")
++_PS_DELETE_LEGACY = text("DELETE FROM provider_settings WHERE provider = :legacy")
+ _PS_UPDATE = text("UPDATE provider_settings SET provider = :api WHERE provider = :legacy")
+ 
+ # An SDK upload under the old slug left a tokenless connection behind. disconnect() keeps
+@@ -109,6 +124,14 @@
+     WHERE provider = :legacy
+       AND NOT EXISTS (SELECT 1 FROM provider_priority WHERE provider = :sdk)
+ """)
++# Same retry case: init_provider_priorities.py seeds a google_health ranking too.
++_PP_FOLD = text("""
++    UPDATE provider_priority target
++    SET priority = legacy.priority, updated_at = now()
++    FROM provider_priority legacy
++    WHERE target.provider = :api AND legacy.provider = :legacy
++""")
++_PP_DELETE_LEGACY = text("DELETE FROM provider_priority WHERE provider = :legacy")
+ _PP_UPDATE = text("UPDATE provider_priority SET provider = :api WHERE provider = :legacy")
+ 
+ 
+@@ -116,6 +139,13 @@ def _rowcount(db: Session, query: TextClause) -> int:
+     return db.execute(query, _PARAMS).rowcount  # ty: ignore[unresolved-attribute]
+ 
+ 
++def _fold_or_rename(db: Session, fold: TextClause, delete_legacy: TextClause, rename: TextClause) -> int:
++    """Move the single legacy row of a table keyed on provider, folding it if the target exists."""
++    if _rowcount(db, fold):
++        return _rowcount(db, delete_legacy)
++    return _rowcount(db, rename)
++
++
+ def split_google_provider(db: Session, *, dry_run: bool) -> dict[str, int]:
+     """Repoint every ``google`` row at one of the two new providers.
+ 
+@@ -136,9 +166,9 @@ def split_google_provider(db: Session, *, dry_run: bool) -> dict[str, int]:
+     user_connection_api = _rowcount(db, _UC_UPDATE)
+     sync_run = _rowcount(db, _SR_SDK_UPDATE) + _rowcount(db, _SR_UPDATE)
+ 
+-    provider_settings = _rowcount(db, _PS_UPDATE)
++    provider_settings = _fold_or_rename(db, _PS_FOLD, _PS_DELETE_LEGACY, _PS_UPDATE)
+     _rowcount(db, _PP_CLONE_FOR_SDK)  # must copy the legacy ranking before it is renamed
+-    provider_priority = _rowcount(db, _PP_UPDATE)
++    provider_priority = _fold_or_rename(db, _PP_FOLD, _PP_DELETE_LEGACY, _PP_UPDATE)
+ 
+     result = {
+         "data_source_api": data_source_api,
+diff --git a/backend/tests/scripts/test_split_google_provider.py b/backend/tests/scripts/test_split_google_provider.py
+new file mode 100644
+index 0000000000..c6d776399b
+--- /dev/null
++++ b/backend/tests/scripts/test_split_google_provider.py
+@@ -0,0 +1,137 @@
++"""Tests for the legacy ``google`` provider split, focused on the retry after a failed run.
++
++``scripts/start/app.sh`` runs the split before ``init_provider_settings.py`` and
++``init_provider_priorities.py``, but a failed split does not stop startup, so both seeds
++create their ``google_health`` rows. The retry on the next start then finds the target
++rows already there. ``provider_settings.provider`` is the primary key and
++``provider_priority.provider`` is unique, so a plain rename raises and the whole split
++rolls back, connections included. See scripts/data_migrations/split_google_provider.py.
++"""
++
++import importlib.util
++from pathlib import Path
++from types import ModuleType
++
++from sqlalchemy import text
++from sqlalchemy.orm import Session
++
++from tests.factories import UserConnectionFactory
++
++LEGACY = "google"
++API = "google_health"
++
++_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "data_migrations" / "split_google_provider.py"
++
++
++def _load_module() -> ModuleType:
++    spec = importlib.util.spec_from_file_location("split_google_provider", _SCRIPT_PATH)
++    assert spec is not None
++    assert spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++split_google_provider = _load_module().split_google_provider
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++def _add_settings(db: Session, provider: str, *, is_enabled: bool, live_sync_mode: str | None) -> None:
++    db.execute(
++        text("INSERT INTO provider_settings (provider, is_enabled, live_sync_mode) VALUES (:p, :e, :m)"),
++        {"p": provider, "e": is_enabled, "m": live_sync_mode},
++    )
++
++
++def _add_priority(db: Session, provider: str, priority: int) -> None:
++    db.execute(
++        text(
++            "INSERT INTO provider_priority (id, provider, priority, created_at, updated_at)"
++            " VALUES (gen_random_uuid(), :p, :n, now(), now())"
++        ),
++        {"p": provider, "n": priority},
++    )
++
++
++def _legacy_oauth_connection(db: Session) -> str:
++    connection = UserConnectionFactory(provider="garmin")
++    db.execute(text("UPDATE user_connection SET provider = :p WHERE id = :id"), {"p": LEGACY, "id": connection.id})
++    return str(connection.id)
++
++
++def _settings(db: Session) -> dict[str, tuple[bool, str | None]]:
++    rows = db.execute(
++        text("SELECT provider, is_enabled, live_sync_mode FROM provider_settings WHERE provider IN (:l, :a)"),
++        {"l": LEGACY, "a": API},
++    )
++    return {row[0]: (row[1], row[2]) for row in rows}
++
++
++def _priorities(db: Session) -> dict[str, int]:
++    rows = db.execute(
++        text("SELECT provider, priority FROM provider_priority WHERE provider IN (:l, :a)"),
++        {"l": LEGACY, "a": API},
++    )
++    return {row[0]: row[1] for row in rows}
++
++
++# ---------------------------------------------------------------------------
++# Tests
++# ---------------------------------------------------------------------------
++
++
++class TestSplitGoogleProvider:
++    def test_renames_when_no_target_row_exists(self, db: Session) -> None:
++        # Arrange
++        _add_settings(db, LEGACY, is_enabled=False, live_sync_mode="pull")
++        _add_priority(db, LEGACY, 3)
++
++        # Act
++        result = split_google_provider(db, dry_run=False)
++
++        # Assert
++        assert result["provider_settings"] == 1
++        assert result["provider_priority"] == 1
++        assert _settings(db) == {API: (False, "pull")}
++        assert _priorities(db) == {API: 3}
++
++    def test_retry_after_seed_folds_instead_of_colliding(self, db: Session) -> None:
++        """A failed first run is followed by the seeds; the retry must still move everything."""
++        # Arrange
++        _add_settings(db, LEGACY, is_enabled=False, live_sync_mode="pull")
++        _add_settings(db, API, is_enabled=True, live_sync_mode=None)
++        _add_priority(db, LEGACY, 3)
++        _add_priority(db, API, 12)
++        connection_id = _legacy_oauth_connection(db)
++
++        # Act
++        result = split_google_provider(db, dry_run=False)
++
++        # Assert
++        assert result["user_connection_api"] == 1
++        provider = db.execute(
++            text("SELECT provider FROM user_connection WHERE id = :id"), {"id": connection_id}
++        ).scalar_one()
++        assert provider == API
++        # The legacy row is what the deployment ran with; the seeded one only held defaults.
++        assert _settings(db) == {API: (False, "pull")}
++        assert _priorities(db) == {API: 3}
++
++    def test_retry_is_idempotent(self, db: Session) -> None:
++        # Arrange
++        _add_settings(db, LEGACY, is_enabled=False, live_sync_mode="pull")
++        _add_settings(db, API, is_enabled=True, live_sync_mode=None)
++        _add_priority(db, LEGACY, 3)
++        _add_priority(db, API, 12)
++        split_google_provider(db, dry_run=False)
++
++        # Act
++        second = split_google_provider(db, dry_run=False)
++
++        # Assert
++        assert not any(second.values())
++        assert _settings(db) == {API: (False, "pull")}

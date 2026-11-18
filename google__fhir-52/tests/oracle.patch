@@ -1,0 +1,1376 @@
+diff --git a/cc/google/fhir/BUILD b/cc/google/fhir/BUILD
+index df043dd6abd..e03dad7b311 100644
+--- a/cc/google/fhir/BUILD
++++ b/cc/google/fhir/BUILD
+@@ -564,6 +564,8 @@ cc_test(
+     ],
+     deps = [
+         ":fhir_package",
++        "//cc/google/fhir/json:fhir_json",
++        "//cc/google/fhir/json:json_sax_handler",
+         "//proto/google/fhir/proto:annotations_cc_proto",
+         "//proto/google/fhir/proto:profile_config_cc_proto",
+         "//proto/google/fhir/proto/r4/core:datatypes_cc_proto",
+diff --git a/cc/google/fhir/fhir_package.cc b/cc/google/fhir/fhir_package.cc
+index bcb62a5ae5c..a6b089e7e9d 100644
+--- a/cc/google/fhir/fhir_package.cc
++++ b/cc/google/fhir/fhir_package.cc
+@@ -35,15 +35,22 @@ namespace google::fhir {
+ 
+ namespace {
+ 
+-// Adds the resource described by `resource_json` located at `resource_path`
+-// within its FHIR package .zip file to the appropriate ResourceCollection of
+-// the given `fhir_package`, if one applies. Allows the resource to subsequently
+-// be retrieved by its URL from the FhirPackage.
++// Adds the resource described by `resource_json` found within `parent_resource`
++// to the appropriate ResourceCollection of the given `fhir_package`. Allows the
++// resource to subsequently be retrieved by its URL from the FhirPackage.
++// In the case where `resource_json` is located inside a bundle,
++// `parent_resource` will be the bundle containing the resource. Otherwise,
++// `resource_json` and `parent_resource` will be the same JSON object.
+ // If the JSON is not a FHIR resource, or not a resource type tracked by the
+ // PackageManager, does nothing and returns an OK status.
+ absl::Status MaybeAddResourceToFhirPackage(
+-    const internal::FhirJson& resource_json, absl::string_view resource_path,
+-    FhirPackage& fhir_package) {
++    std::shared_ptr<const internal::FhirJson> parent_resource,
++    const internal::FhirJson& resource_json, FhirPackage& fhir_package) {
++  if (!resource_json.isObject()) {
++    // Not a json object - definitly not a resource.
++    return absl::OkStatus();
++  }
++
+   absl::StatusOr<const std::string> resource_type =
+       GetResourceType(resource_json);
+   if (!resource_type.ok()) {
+@@ -53,22 +60,17 @@ absl::Status MaybeAddResourceToFhirPackage(
+                                                     : resource_type.status();
+   }
+   if (*resource_type == "ValueSet") {
+-    FHIR_ASSIGN_OR_RETURN(const std::string resource_url,
+-                          GetResourceUrl(resource_json));
+-    fhir_package.value_sets.AddUriAtPath(resource_url, resource_path);
++    FHIR_RETURN_IF_ERROR(
++        fhir_package.value_sets.Put(parent_resource, resource_json));
+   } else if (*resource_type == "CodeSystem") {
+-    FHIR_ASSIGN_OR_RETURN(const std::string resource_url,
+-                          GetResourceUrl(resource_json));
+-    fhir_package.code_systems.AddUriAtPath(resource_url, resource_path);
++    FHIR_RETURN_IF_ERROR(
++        fhir_package.code_systems.Put(parent_resource, resource_json));
+   } else if (*resource_type == "StructureDefinition") {
+-    FHIR_ASSIGN_OR_RETURN(const std::string resource_url,
+-                          GetResourceUrl(resource_json));
+-    fhir_package.structure_definitions.AddUriAtPath(resource_url,
+-                                                    resource_path);
++    FHIR_RETURN_IF_ERROR(
++        fhir_package.structure_definitions.Put(parent_resource, resource_json));
+   } else if (*resource_type == "SearchParameter") {
+-    FHIR_ASSIGN_OR_RETURN(const std::string resource_url,
+-                          GetResourceUrl(resource_json));
+-    fhir_package.search_parameters.AddUriAtPath(resource_url, resource_path);
++    FHIR_RETURN_IF_ERROR(
++        fhir_package.search_parameters.Put(parent_resource, resource_json));
+   } else if (*resource_type == "Bundle") {
+     FHIR_ASSIGN_OR_RETURN(const internal::FhirJson* entries,
+                           resource_json.get("entry"));
+@@ -79,7 +81,7 @@ absl::Status MaybeAddResourceToFhirPackage(
+       FHIR_ASSIGN_OR_RETURN(const internal::FhirJson* resource,
+                             entry->get("resource"));
+       FHIR_RETURN_IF_ERROR(MaybeAddResourceToFhirPackage(
+-          *resource, resource_path, fhir_package));
++          parent_resource, *resource, fhir_package));
+     }
+   }
+   // We got a resource type, but it's not one of the ones we track.  Ignore.
+@@ -87,15 +89,12 @@ absl::Status MaybeAddResourceToFhirPackage(
+ }
+ 
+ absl::Status MaybeAddResourceToFhirPackage(absl::string_view resource_json,
+-                                           absl::string_view resource_path,
+                                            FhirPackage& fhir_package) {
+-  internal::FhirJson parsed_json;
++  auto parsed_json = std::make_unique<internal::FhirJson>();
+   FHIR_RETURN_IF_ERROR(
+-      internal::ParseJsonValue(std::string(resource_json), parsed_json));
+-  if (!parsed_json.isObject()) {
+-    // Not a json object - definitly not a resource.
+-  }
+-  return MaybeAddResourceToFhirPackage(parsed_json, resource_path,
++      internal::ParseJsonValue(std::string(resource_json), *parsed_json));
++  internal::FhirJson const* parsed_json_ptr = parsed_json.get();
++  return MaybeAddResourceToFhirPackage(std::move(parsed_json), *parsed_json_ptr,
+                                        fhir_package);
+ }
+ }  // namespace
+@@ -134,53 +133,6 @@ absl::StatusOr<const FhirJson*> FindResourceInBundle(
+   return absl::NotFoundError(absl::StrFormat("%s not present in bundle.", uri));
+ }
+ 
+-absl::Status ParseResourceFromZip(absl::string_view zip_file_path,
+-                                  absl::string_view resource_path,
+-                                  FhirJson& json_value) {
+-  int zip_open_error;
+-  zip_t* zip_file =
+-      zip_open(std::string(zip_file_path).c_str(), ZIP_RDONLY, &zip_open_error);
+-  if (zip_file == nullptr) {
+-    return absl::NotFoundError(
+-        absl::StrFormat("Unable to open zip: %s. Error code: %d", zip_file_path,
+-                        zip_open_error));
+-  }
+-
+-  zip_stat_t resource_file_stat;
+-  int zip_stat_error = zip_stat(zip_file, std::string(resource_path).c_str(),
+-                                ZIP_STAT_SIZE, &resource_file_stat);
+-  if (zip_stat_error != 0) {
+-    return absl::NotFoundError(
+-        absl::StrFormat("Unable to stat path %s in zip file %s. The resource "
+-                        ".zip file may have changed on disk.",
+-                        resource_path, zip_file_path));
+-  }
+-
+-  zip_file_t* resource_file =
+-      zip_fopen(zip_file, std::string(resource_path).c_str(), 0);
+-  if (resource_file == nullptr) {
+-    return absl::NotFoundError(
+-        absl::StrFormat("Unable to find path %s in zip file %s. The resource "
+-                        ".zip file may have changed on disk.",
+-                        resource_path, zip_file_path));
+-  }
+-
+-  std::string raw_json(resource_file_stat.size, '\0');
+-  zip_int64_t read =
+-      zip_fread(resource_file, &raw_json[0], resource_file_stat.size);
+-
+-  zip_fclose(resource_file);
+-  zip_close(zip_file);
+-
+-  if (read < resource_file_stat.size) {
+-    return absl::NotFoundError(
+-        absl::StrFormat("Unable to read path %s in zip file %s.", resource_path,
+-                        zip_file_path));
+-  }
+-
+-  return internal::ParseJsonValue(raw_json, json_value);
+-}
+-
+ absl::StatusOr<std::string> GetResourceType(const FhirJson& parsed_json) {
+   FHIR_ASSIGN_OR_RETURN(const internal::FhirJson* resource_type_json,
+                         parsed_json.get("resourceType"));
+@@ -248,8 +200,8 @@ absl::StatusOr<std::unique_ptr<FhirPackage>> FhirPackage::Load(
+     }
+ 
+     if (absl::EndsWith(entry_stat.name, ".json")) {
+-      absl::Status add_status = MaybeAddResourceToFhirPackage(
+-          contents, entry_stat.name, *fhir_package);
++      absl::Status add_status =
++          MaybeAddResourceToFhirPackage(contents, *fhir_package);
+       if (!add_status.ok()) {
+         // Concatenate all errors founds while parsing the package.
+         std::string error_message =
+diff --git a/cc/google/fhir/fhir_package.h b/cc/google/fhir/fhir_package.h
+index c2c208ee597..3b148803dbf 100644
+--- a/cc/google/fhir/fhir_package.h
++++ b/cc/google/fhir/fhir_package.h
+@@ -18,6 +18,8 @@
+ #include <iterator>
+ #include <memory>
+ #include <string>
++#include <utility>
++#include <variant>
+ #include <vector>
+ 
+ #include "glog/logging.h"
+@@ -42,13 +44,6 @@ namespace internal {
+ absl::StatusOr<const FhirJson*> FindResourceInBundle(
+     absl::string_view uri, const FhirJson& bundle_json);
+ 
+-// Parses the resource JSON from the `resource_path` entry within
+-// the .zip file at `zip_file_path` and places result of the parse into
+-// `json_value`.
+-absl::Status ParseResourceFromZip(absl::string_view zip_file_path,
+-                                  absl::string_view resource_path,
+-                                  FhirJson& json_value);
+-
+ absl::StatusOr<std::string> GetResourceType(const FhirJson& parsed_json);
+ absl::StatusOr<std::string> GetResourceUrl(const FhirJson& parsed_json);
+ }  // namespace internal
+@@ -58,14 +53,13 @@ absl::StatusOr<std::string> GetResourceUrl(const FhirJson& parsed_json);
+ // file containing JSON representations of various resources.
+ // Resources are lazily read and parsed from the zip file as requested.
+ // Resources are cached for fast repeated access.
+-// Example:
+-//    auto collection = ResourceCollection<ValueSet>("zip_file_path");
+-//    collection.AddUriAtPath("uri-for-resource",
+-//    "path_within_zip_file_for_resource");
+-//    absl::StatusOr<ValueSet> result =
+-//    collection.GetResource("uri-for-resource");
+ template <typename T>
+ class ResourceCollection {
++ private:
++  using MaybeParsedResource =
++      std::variant<std::unique_ptr<const T>,
++                   std::shared_ptr<const internal::FhirJson>>;
++
+  public:
+   // An iterator over all valid resources contained in the collection. Invalid
+   // resources, such as those with malformed JSON, will not be returned by the
+@@ -78,9 +72,10 @@ class ResourceCollection {
+     using pointer = const T*;
+     using reference = const T&;
+ 
+-    Iterator(ResourceCollection* resource_collection,
+-             absl::flat_hash_map<const std::string, const std::string>::iterator
+-                 uri_iter)
++    Iterator(
++        ResourceCollection* resource_collection,
++        typename absl::flat_hash_map<std::string, MaybeParsedResource>::iterator
++            uri_iter)
+         : resource_collection_(resource_collection), uri_iter_(uri_iter) {
+       // Skip over any initial invalid entries so it is safe to dereference.
+       this->AdvanceUntilValid();
+@@ -88,15 +83,14 @@ class ResourceCollection {
+ 
+     pointer operator->() const {
+       std::string uri = uri_iter_->first;
+-      absl::StatusOr<const T*> resource =
+-          resource_collection_->GetResource(uri);
++      absl::StatusOr<const T*> resource = resource_collection_->Get(uri);
+ 
+       // The AdvanceUntilValid() calls in the constructor and in operator++
+       // should prevent us from attempting to dereference an invalid resource.
+       CHECK(resource.ok()) << absl::StrFormat(
+-          "Attempted to access invalid resource from iterator for JSON entry: "
+-          "%s uri: %s with error: %s",
+-          uri_iter_->second, uri_iter_->first, resource.status().message());
++          "Attempted to access invalid resource from iterator for uri: %s with "
++          "error: %s",
++          uri, resource.status().message());
+ 
+       return *resource;
+     }
+@@ -121,9 +115,8 @@ class ResourceCollection {
+ 
+    private:
+     ResourceCollection* resource_collection_;
+-    absl::flat_hash_map<const std::string, const std::string>::iterator
++    typename absl::flat_hash_map<std::string, MaybeParsedResource>::iterator
+         uri_iter_;
+-
+     // Advances uri_iter_ until it points to a valid, parse-able resource. If it
+     // currently points to a valid resource, does not advance the iterator.
+     void AdvanceUntilValid() {
+@@ -132,13 +125,13 @@ class ResourceCollection {
+           return;
+         }
+         absl::StatusOr<const T*> resource =
+-            resource_collection_->GetResource(uri_iter_->first);
++            resource_collection_->Get(uri_iter_->first);
+         if (resource.ok()) {
+           return;
+         } else {
+           LOG(WARNING) << absl::StrFormat(
+-              "Unhandled JSON entry: %s for uri: %s with error: %s",
+-              uri_iter_->second, uri_iter_->first, resource.status().message());
++              "Unhandled entry for uri: %s with error: %s", uri_iter_->first,
++              resource.status().message());
+           ++uri_iter_;
+         }
+       }
+@@ -151,68 +144,94 @@ class ResourceCollection {
+       // iterator is pointing to a valid resource.
+       return Iterator(this->resource_collection_, this->uri_iter_);
+     }
+-
+     // Indicates if the URIs being iterated over have been exhausted.
+     bool UriIterExhausted() const {
+-      return uri_iter_ == resource_collection_->resource_paths_for_uris_.end();
++      return uri_iter_ == resource_collection_->resources_by_uri_.end();
+     }
+   };
+-  explicit ResourceCollection(absl::string_view zip_file_path)
+-      : zip_file_path_(zip_file_path) {}
+ 
+-  Iterator begin() { return Iterator(this, resource_paths_for_uris_.begin()); }
+-  Iterator end() { return Iterator(this, resource_paths_for_uris_.end()); }
+-  absl::flat_hash_map<const std::string, const std::string>::size_type size() {
+-    return resource_paths_for_uris_.size();
++  ResourceCollection() = default;
++  ResourceCollection(const ResourceCollection& other) = default;
++  ResourceCollection(ResourceCollection&& other) = default;
++
++  ResourceCollection& operator=(const ResourceCollection& other) = default;
++  ResourceCollection& operator=(ResourceCollection&& other) = default;
++
++  Iterator begin() { return Iterator(this, this->resources_by_uri_.begin()); }
++  Iterator end() { return Iterator(this, this->resources_by_uri_.end()); }
++
++  typename absl::flat_hash_map<std::string, MaybeParsedResource>::size_type
++  size() const {
++    return resources_by_uri_.size();
+   }
+ 
+-  // Indicates that the resource for `uri` can be found inside this
+-  // ResourceCollection's zip file. The `uri` is defined by the resource JSON
+-  // file at `path` within the zip file. The path may be to a file containing
+-  // either the uri's resource JSON directly or a Bundle containing the
+-  // resource.
+-  void AddUriAtPath(absl::string_view uri, absl::string_view path) {
+-    resource_paths_for_uris_.insert({std::string(uri), std::string(path)});
++  // Adds the resource represented by `resource_json` into this collection for
++  // subsequent lookup via the Get method.
++  absl::Status Put(std::shared_ptr<const internal::FhirJson> resource_json) {
++    FHIR_ASSIGN_OR_RETURN(std::string resource_url,
++                          GetResourceUrl(*resource_json));
++    resources_by_uri_.try_emplace(std::move(resource_url),
++                                  std::move(resource_json));
++    return absl::OkStatus();
+   }
+ 
+-  // Retrieves the resource for `uri`. Either returns a previously cached proto
+-  // for the resource or reads and parses the resource from the
+-  // ResourceCollection's zip file.
+-  absl::StatusOr<const T*> GetResource(absl::string_view uri) {
+-    const auto cached = parsed_resources_.find(std::string(uri));
+-    if (cached != parsed_resources_.end()) {
+-      return cached->second.get();
+-    }
++  // Adds the resource represented by `resource_json` found inside
++  // `parent_bundle` into this collection for subsequent lookup via the Get
++  // method.
++  absl::Status Put(std::shared_ptr<const internal::FhirJson> parent_bundle,
++                   const internal::FhirJson& resource_json) {
++    FHIR_ASSIGN_OR_RETURN(std::string resource_url,
++                          GetResourceUrl(resource_json));
++    resources_by_uri_.try_emplace(std::move(resource_url),
++                                  std::move(parent_bundle));
++    return absl::OkStatus();
++  }
+ 
+-    const auto path = resource_paths_for_uris_.find(std::string(uri));
+-    if (path == resource_paths_for_uris_.end()) {
++  // Retrieves the resource for `uri`. Parses the JSON supplied in previous
++  // Put calls and returns the resulting proto. The protos are cached, so
++  // re-accessing the same resource will not result in another parse from the
++  // initial JSON.
++  absl::StatusOr<const T*> Get(absl::string_view uri) {
++    const auto itr = resources_by_uri_.find(uri);
++    if (itr == resources_by_uri_.end()) {
+       return absl::NotFoundError(
+           absl::StrFormat("%s not present in collection", uri));
+     }
+ 
+-    FHIR_ASSIGN_OR_RETURN(
+-        std::unique_ptr<const T> parsed,
+-        ParseProtoFromFile(uri, zip_file_path_, path->second));
+-    return CacheParsedResource(uri, std::move(parsed));
++    return ParseResourceIfNotParsed(uri, itr->second);
+   }
+ 
+-  const T* CacheParsedResource(absl::string_view uri,
+-                               std::unique_ptr<const T> resource) {
+-    auto insert =
+-        parsed_resources_.insert({std::string(uri), std::move(resource)});
+-    return insert.first->second.get();
++ private:
++  // If the given resource has already been parsed into a proto, returns a
++  // pointer to that proto. If it has not, mutates the resource by replacing the
++  // JSON representation of the resource with a proto representation.
++  static absl::StatusOr<const T*> ParseResourceIfNotParsed(
++      absl::string_view uri, MaybeParsedResource& resource) {
++    if (std::unique_ptr<const T>* parsed =
++            std::get_if<std::unique_ptr<const T>>(&resource)) {
++      return parsed->get();
++    }
++    return ParseResource(uri, resource);
+   }
+ 
+- private:
+-  // Retrieves the resource JSON for `uri` from `zip_file_path` at
+-  // `resource_path` and parses the JSON into a protocol buffer.
+-  static absl::StatusOr<std::unique_ptr<const T>> ParseProtoFromFile(
+-      absl::string_view uri, absl::string_view zip_file_path,
+-      absl::string_view resource_path) {
+-    internal::FhirJson parsed_json;
+-    FHIR_RETURN_IF_ERROR(internal::ParseResourceFromZip(
+-        zip_file_path, resource_path, parsed_json));
++  // Parses the JSON into a proto and replaces the un-parsed JSON with the
++  // parsed proto representation.
++  static absl::StatusOr<const T*> ParseResource(absl::string_view uri,
++                                                MaybeParsedResource& resource) {
++    FHIR_ASSIGN_OR_RETURN(
++        std::unique_ptr<const T> parsed,
++        ParseProtoFromJson(
++            uri,
++            *std::get<std::shared_ptr<const internal::FhirJson>>(resource)));
++
++    resource = std::move(parsed);
++    return std::get<std::unique_ptr<const T>>(resource).get();
++  }
+ 
++  // Retrieves the resource JSON for `uri` from the given `parsed_json` blob
++  // and parses the JSON into a protocol buffer.
++  static absl::StatusOr<std::unique_ptr<const T>> ParseProtoFromJson(
++      absl::string_view uri, const internal::FhirJson& parsed_json) {
+     FHIR_ASSIGN_OR_RETURN(std::string resource_type,
+                           internal::GetResourceType(parsed_json));
+     std::unique_ptr<T> resource = std::make_unique<T>();
+@@ -236,11 +255,12 @@ class ResourceCollection {
+     return std::move(resource);
+   }
+ 
+-  const std::string zip_file_path_;
+-  absl::flat_hash_map<const std::string, std::unique_ptr<const T>>
+-      parsed_resources_;
+-  absl::flat_hash_map<const std::string, const std::string>
+-      resource_paths_for_uris_;
++  // A map between URIs and the resource for that URI. Elements begin as
++  // JSON and are replaced with protos of type T as they are accessed.
++  // For resources inside bundles, the JSON will be the bundle's JSON rather
++  // than the resource itself. Because bundles can be associated with
++  // multiple resources, we use a shared_ptr.
++  absl::flat_hash_map<std::string, MaybeParsedResource> resources_by_uri_;
+ };
+ 
+ // Struct representing a FHIR Proto package. This is constructed from a zip
+@@ -260,36 +280,32 @@ struct FhirPackage {
+ 
+   absl::StatusOr<const google::fhir::r4::core::StructureDefinition*>
+   GetStructureDefinition(absl::string_view uri) {
+-    return this->structure_definitions.GetResource(uri);
++    return this->structure_definitions.Get(uri);
+   }
+ 
+   absl::StatusOr<const google::fhir::r4::core::SearchParameter*>
+   GetSearchParameter(absl::string_view uri) {
+-    return this->search_parameters.GetResource(uri);
++    return this->search_parameters.Get(uri);
+   }
+ 
+   absl::StatusOr<const google::fhir::r4::core::CodeSystem*> GetCodeSystem(
+       absl::string_view uri) {
+-    return this->code_systems.GetResource(uri);
++    return this->code_systems.Get(uri);
+   }
+ 
+   absl::StatusOr<const google::fhir::r4::core::ValueSet*> GetValueSet(
+       absl::string_view uri) {
+-    return this->value_sets.GetResource(uri);
++    return this->value_sets.Get(uri);
+   }
+ 
+  private:
+   explicit FhirPackage(absl::string_view zip_file_path)
+       : structure_definitions(
+-            ResourceCollection<google::fhir::r4::core::StructureDefinition>(
+-                zip_file_path)),
++            ResourceCollection<google::fhir::r4::core::StructureDefinition>()),
+         search_parameters(
+-            ResourceCollection<google::fhir::r4::core::SearchParameter>(
+-                zip_file_path)),
+-        code_systems(ResourceCollection<google::fhir::r4::core::CodeSystem>(
+-            zip_file_path)),
+-        value_sets(ResourceCollection<google::fhir::r4::core::ValueSet>(
+-            zip_file_path)) {}
++            ResourceCollection<google::fhir::r4::core::SearchParameter>()),
++        code_systems(ResourceCollection<google::fhir::r4::core::CodeSystem>()),
++        value_sets(ResourceCollection<google::fhir::r4::core::ValueSet>()) {}
+ };
+ 
+ namespace internal {
+@@ -310,7 +326,8 @@ absl::StatusOr<T> SearchPackagesForResource(
+       // The resource wasn't found, so let's keep looking.
+       continue;
+     } else {
+-      // An error occurred while looking for the resource, so let's report it.
++      // An error occurred while looking for the resource, so
++      // let's report it.
+       return resource.status();
+     }
+   }
+diff --git a/cc/google/fhir/fhir_package_test.cc b/cc/google/fhir/fhir_package_test.cc
+index b867e1c5052..40200af213c 100644
+--- a/cc/google/fhir/fhir_package_test.cc
++++ b/cc/google/fhir/fhir_package_test.cc
+@@ -26,6 +26,8 @@
+ #include "gtest/gtest.h"
+ #include "absl/status/statusor.h"
+ #include "absl/strings/str_format.h"
++#include "google/fhir/json/fhir_json.h"
++#include "google/fhir/json/json_sax_handler.h"
+ #include "proto/google/fhir/proto/annotations.pb.h"
+ #include "proto/google/fhir/proto/profile_config.pb.h"
+ #include "proto/google/fhir/proto/r4/core/datatypes.pb.h"
+@@ -38,7 +40,7 @@
+ namespace google::fhir {
+ 
+ namespace {
+-using ::testing::UnorderedElementsAreArray;
++using ::testing::UnorderedElementsAre;
+ 
+ // Writes a zip archive to a temporary file containing the given {file_name,
+ // file_contents} pairs.
+@@ -73,15 +75,13 @@ constexpr int kR4ValuesetsCount = 1316;
+ constexpr int kR4SearchParametersCount = 1385;
+ 
+ TEST(FhirPackageTest, LoadSucceeds) {
+-  absl::StatusOr<std::unique_ptr<FhirPackage>> fhir_package =
+-      FhirPackage::Load("spec/fhir_r4_package.zip");
+-  ASSERT_TRUE(fhir_package.ok()) << fhir_package.status().message();
+-
+-  EXPECT_EQ((*fhir_package)->value_sets.size(), kR4ValuesetsCount);
+-  EXPECT_EQ((*fhir_package)->code_systems.size(), kR4CodeSystemsCount);
+-  EXPECT_EQ((*fhir_package)->structure_definitions.size(), kR4DefinitionsCount);
+-  EXPECT_EQ((*fhir_package)->search_parameters.size(),
+-            kR4SearchParametersCount);
++  FHIR_ASSERT_OK_AND_ASSIGN(
++      std::unique_ptr<FhirPackage> fhir_package,
++      FhirPackage::Load("spec/fhir_r4_package.zip"));
++  EXPECT_EQ(fhir_package->value_sets.size(), kR4ValuesetsCount);
++  EXPECT_EQ(fhir_package->code_systems.size(), kR4CodeSystemsCount);
++  EXPECT_EQ(fhir_package->structure_definitions.size(), kR4DefinitionsCount);
++  EXPECT_EQ(fhir_package->search_parameters.size(), kR4SearchParametersCount);
+ }
+ 
+ TEST(FhirPackageTest, LoadAndGetResourceSucceeds) {
+@@ -171,58 +171,52 @@ TEST(FhirPackageTest, LoadAndGetResourceSucceeds) {
+       structure_definition_2, search_parameter_2, code_system_2, value_set_2);
+ 
+   // Put those resources in a FhirPackage.
+-  absl::StatusOr<std::string> temp_name =
++  FHIR_ASSERT_OK_AND_ASSIGN(
++      std::string temp_name,
+       CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+           {"sd1.json", structure_definition_1},
+           {"sp1.json", search_parameter_1},
+           {"cs1.json", code_system_1},
+           {"vs1.json", value_set_1},
+           {"bundle.json", bundle.c_str()},
+-      });
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
+-
+-  absl::StatusOr<std::unique_ptr<FhirPackage>> fhir_package =
+-      FhirPackage::Load(*temp_name);
+-  ASSERT_TRUE(fhir_package.ok()) << fhir_package.status().message();
++      }));
++  FHIR_ASSERT_OK_AND_ASSIGN(std::unique_ptr<FhirPackage> fhir_package,
++                            FhirPackage::Load(temp_name));
+ 
+   // Check that we can retrieve all our resources;
+-  absl::StatusOr<const google::fhir::r4::core::StructureDefinition*> sd_result =
+-      (*fhir_package)->GetStructureDefinition("http://sd1");
+-  EXPECT_TRUE(sd_result.ok());
+-  EXPECT_EQ((*sd_result)->url().value(), "http://sd1");
+-
+-  sd_result = (*fhir_package)->GetStructureDefinition("http://sd2");
+-  EXPECT_TRUE(sd_result.ok());
+-  EXPECT_EQ((*sd_result)->url().value(), "http://sd2");
+-
+-  absl::StatusOr<const google::fhir::r4::core::SearchParameter*> sp_result =
+-      (*fhir_package)->GetSearchParameter("http://sp1");
+-  EXPECT_TRUE(sp_result.ok());
+-  EXPECT_EQ((*sp_result)->url().value(), "http://sp1");
+-
+-  sp_result = (*fhir_package)->GetSearchParameter("http://sp2");
+-  EXPECT_TRUE(sp_result.ok());
+-  EXPECT_EQ((*sp_result)->url().value(), "http://sp2");
+-
+-  absl::StatusOr<const google::fhir::r4::core::CodeSystem*> cs_result =
+-      (*fhir_package)->GetCodeSystem("http://cs1");
+-  EXPECT_TRUE(cs_result.ok());
+-  EXPECT_EQ((*cs_result)->url().value(), "http://cs1");
+-
+-  cs_result = (*fhir_package)->GetCodeSystem("http://cs2");
+-  EXPECT_TRUE(cs_result.ok());
+-  EXPECT_EQ((*cs_result)->url().value(), "http://cs2");
+-
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> vs_result =
+-      (*fhir_package)->GetValueSet("http://vs1");
+-  EXPECT_TRUE(vs_result.ok());
+-  EXPECT_EQ((*vs_result)->url().value(), "http://vs1");
+-
+-  vs_result = (*fhir_package)->GetValueSet("http://vs2");
+-  EXPECT_TRUE(vs_result.ok());
+-  EXPECT_EQ((*vs_result)->url().value(), "http://vs2");
+-
+-  remove(temp_name->c_str());
++  FHIR_ASSERT_OK_AND_ASSIGN(const r4::core::StructureDefinition* sd_result,
++                            fhir_package->GetStructureDefinition("http://sd1"));
++  EXPECT_EQ(sd_result->url().value(), "http://sd1");
++
++  FHIR_ASSERT_OK_AND_ASSIGN(const r4::core::StructureDefinition* sd_result2,
++                            fhir_package->GetStructureDefinition("http://sd2"));
++  EXPECT_EQ(sd_result2->url().value(), "http://sd2");
++
++  FHIR_ASSERT_OK_AND_ASSIGN(const r4::core::SearchParameter* sp_result,
++                            fhir_package->GetSearchParameter("http://sp1"));
++  EXPECT_EQ(sp_result->url().value(), "http://sp1");
++
++  FHIR_ASSERT_OK_AND_ASSIGN(const r4::core::SearchParameter* sp_result2,
++                            fhir_package->GetSearchParameter("http://sp2"));
++  EXPECT_EQ(sp_result2->url().value(), "http://sp2");
++
++  FHIR_ASSERT_OK_AND_ASSIGN(const fhir::r4::core::CodeSystem* cs_result,
++                            fhir_package->GetCodeSystem("http://cs1"));
++  EXPECT_EQ(cs_result->url().value(), "http://cs1");
++
++  FHIR_ASSERT_OK_AND_ASSIGN(const fhir::r4::core::CodeSystem* cs_result2,
++                            fhir_package->GetCodeSystem("http://cs2"));
++  EXPECT_EQ(cs_result2->url().value(), "http://cs2");
++
++  FHIR_ASSERT_OK_AND_ASSIGN(const fhir::r4::core::ValueSet* vs_result,
++                            fhir_package->GetValueSet("http://vs1"));
++  EXPECT_EQ(vs_result->url().value(), "http://vs1");
++
++  FHIR_ASSERT_OK_AND_ASSIGN(const fhir::r4::core::ValueSet* vs_result2,
++                            fhir_package->GetValueSet("http://vs2"));
++  EXPECT_EQ(vs_result2->url().value(), "http://vs2");
++
++  remove(temp_name.c_str());
+ }
+ 
+ TEST(FhirPackageTest, ResourceWithParseErrorFails) {
+@@ -238,41 +232,37 @@ TEST(FhirPackageTest, ResourceWithParseErrorFails) {
+   })";
+ 
+   // Put those resources in a FhirPackage.
+-  absl::StatusOr<std::string> temp_name =
++  FHIR_ASSERT_OK_AND_ASSIGN(
++      std::string temp_name,
+       CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+           {"malformed_struct_def.json", malformed_struct_def},
+-      });
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
+-
+-  absl::StatusOr<std::unique_ptr<FhirPackage>> fhir_package =
+-      FhirPackage::Load(*temp_name);
+-  EXPECT_FALSE(fhir_package.ok());
+-  EXPECT_EQ(fhir_package.status().code(), absl::StatusCode::kInvalidArgument);
+-  remove(temp_name->c_str());
++      }));
++
++  EXPECT_EQ(FhirPackage::Load(temp_name).status().code(),
++            absl::StatusCode::kInvalidArgument);
++  remove(temp_name.c_str());
+ }
+ 
+ TEST(FhirPackageTest, GetResourceForMissingUriFindsNothing) {
+-  absl::StatusOr<std::string> temp_name =
++  FHIR_ASSERT_OK_AND_ASSIGN(
++      std::string temp_name,
+       CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+           {"a_value_set.json",
+-           "{\"resourceType\": \"ValueSet\", \"url\": \"http://value.set/id\", "
+-           "\"id\": \"a-value-set\", \"status\": \"draft\"}"}});
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
++           R"({"resourceType": "ValueSet", "url": "http://value.set/id",
++               "id": "a-value-set", "status": "draft"})"}}));
+ 
+-  absl::StatusOr<std::unique_ptr<FhirPackage>> fhir_package =
+-      FhirPackage::Load(*temp_name);
+-  ASSERT_TRUE(fhir_package.ok()) << fhir_package.status().message();
++  FHIR_ASSERT_OK_AND_ASSIGN(std::unique_ptr<FhirPackage> fhir_package,
++                            FhirPackage::Load(temp_name));
+ 
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result =
+-      (*fhir_package)->GetValueSet("missing");
+-  EXPECT_FALSE(result.ok());
+-  EXPECT_EQ(result.status().code(), absl::StatusCode::kNotFound);
++  EXPECT_EQ(fhir_package->GetValueSet("missing").status().code(),
++            absl::StatusCode::kNotFound);
+ 
+-  remove(temp_name->c_str());
++  remove(temp_name.c_str());
+ }
+ 
+ TEST(FhirPackageTest, UntrackedResourceTypeIgnored) {
+-  absl::StatusOr<std::string> temp_name =
++  FHIR_ASSERT_OK_AND_ASSIGN(
++      std::string temp_name,
+       CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+           {"a_value_set.json",
+            R"({
+@@ -286,20 +276,18 @@ TEST(FhirPackageTest, UntrackedResourceTypeIgnored) {
+             "resourceType": "Patient",
+             "id": "dqd"
+           })"},
+-      });
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
++      }));
+ 
+-  absl::StatusOr<std::unique_ptr<FhirPackage>> fhir_package =
+-      FhirPackage::Load(*temp_name);
+-  ASSERT_TRUE(fhir_package.ok()) << fhir_package.status().message();
++  FHIR_ASSERT_OK_AND_ASSIGN(std::unique_ptr<FhirPackage> fhir_package,
++                            FhirPackage::Load(temp_name));
+ 
+-  EXPECT_TRUE(
+-      (*fhir_package)->GetValueSet("http://value.set/id").status().ok());
+-  remove(temp_name->c_str());
++  EXPECT_TRUE(fhir_package->GetValueSet("http://value.set/id").ok());
++  remove(temp_name.c_str());
+ }
+ 
+ TEST(FhirPackageTest, NonResourceIgnored) {
+-  absl::StatusOr<std::string> temp_name =
++  FHIR_ASSERT_OK_AND_ASSIGN(
++      std::string temp_name,
+       CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+           {"a_value_set.json",
+            R"({
+@@ -313,417 +301,284 @@ TEST(FhirPackageTest, NonResourceIgnored) {
+             "foo": "bar",
+             "baz": "quux"
+           })"},
+-      });
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
++      }));
+ 
+-  absl::StatusOr<std::unique_ptr<FhirPackage>> fhir_package =
+-      FhirPackage::Load(*temp_name);
+-  ASSERT_TRUE(fhir_package.ok()) << fhir_package.status().message();
++  FHIR_ASSERT_OK_AND_ASSIGN(std::unique_ptr<FhirPackage> fhir_package,
++                            FhirPackage::Load(temp_name));
+ 
+-  EXPECT_TRUE(
+-      (*fhir_package)->GetValueSet("http://value.set/id").status().ok());
+-  remove(temp_name->c_str());
++  EXPECT_TRUE(fhir_package->GetValueSet("http://value.set/id").ok());
++  remove(temp_name.c_str());
+ }
+ 
+ TEST(FhirPackageManager, GetResourceForAddedPackagesSucceeds) {
+-  absl::StatusOr<std::string> temp_name =
++  FHIR_ASSERT_OK_AND_ASSIGN(
++      std::string temp_name,
+       CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+           // The deprecated package_info is preserved in tests to ensure its
+           // presence does not break package loading.
+           {"package_info.prototxt", "fhir_version: R4\nproto_package: 'Foo'"},
+           {"a_value_set.json",
+-           "{\"resourceType\": \"ValueSet\", \"url\": "
+-           "\"http://value.set/id-1\", "
+-           "\"id\": \"a-value-set-1\", \"status\": \"draft\"}"}});
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
++           R"({"resourceType": "ValueSet", "url": "http://value.set/id-1",
++               "id": "a-value-set-1", "status": "draft"})"}}));
+ 
+-  absl::StatusOr<std::string> another_temp_name =
++  FHIR_ASSERT_OK_AND_ASSIGN(
++      std::string another_temp_name,
+       CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+           {"package_info.prototxt", "fhir_version: R4\nproto_package: 'Foo'"},
+           {"a_value_set.json",
+-           "{\"resourceType\": \"ValueSet\", \"url\": "
+-           "\"http://value.set/id-2\", "
+-           "\"id\": \"a-value-set-2\", \"status\": \"draft\"}"}});
+-  ASSERT_TRUE(another_temp_name.ok()) << another_temp_name.status().message();
++           R"({"resourceType": "ValueSet", "url": "http://value.set/id-2",
++               "id": "a-value-set-2", "status": "draft"})"}}));
+ 
+-  absl::Status add_package_status;
+   FhirPackageManager package_manager = FhirPackageManager();
++  FHIR_ASSERT_OK(package_manager.AddPackageAtPath(temp_name));
++  FHIR_ASSERT_OK(package_manager.AddPackageAtPath(another_temp_name));
+ 
+-  add_package_status = package_manager.AddPackageAtPath(*temp_name);
+-  ASSERT_TRUE(add_package_status.ok()) << add_package_status.message();
+-
+-  add_package_status = package_manager.AddPackageAtPath(*another_temp_name);
+-  ASSERT_TRUE(add_package_status.ok()) << add_package_status.message();
++  FHIR_ASSERT_OK_AND_ASSIGN(
++      const fhir::r4::core::ValueSet* result1,
++      package_manager.GetValueSet("http://value.set/id-1"))
++  EXPECT_EQ(result1->url().value(), "http://value.set/id-1");
+ 
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result;
++  FHIR_ASSERT_OK_AND_ASSIGN(
++      const fhir::r4::core::ValueSet* result2,
++      package_manager.GetValueSet("http://value.set/id-2"));
++  EXPECT_EQ(result2->url().value(), "http://value.set/id-2");
+ 
+-  result = package_manager.GetValueSet("http://value.set/id-1");
+-  EXPECT_TRUE(result.ok());
+-  EXPECT_EQ((*result)->url().value(), "http://value.set/id-1");
++  EXPECT_EQ(package_manager.GetValueSet("http://missing-uri").status().code(),
++            absl::StatusCode::kNotFound);
+ 
+-  result = package_manager.GetValueSet("http://value.set/id-2");
+-  EXPECT_TRUE(result.ok());
+-  EXPECT_EQ((*result)->url().value(), "http://value.set/id-2");
+-
+-  result = package_manager.GetValueSet("http://missing-uri");
+-  EXPECT_FALSE(result.ok());
+-
+-  remove(temp_name->c_str());
+-  remove(another_temp_name->c_str());
++  remove(temp_name.c_str());
++  remove(another_temp_name.c_str());
+ }
+ 
+ TEST(FhirPackageManager, GetResourceAgainstEmptyManagerReturnsNothing) {
+   FhirPackageManager package_manager = FhirPackageManager();
+-
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result =
+-      package_manager.GetValueSet("http://value.set/id-1");
+-  EXPECT_FALSE(result.ok());
+-  EXPECT_EQ(result.status().code(), absl::StatusCode::kNotFound);
++  EXPECT_EQ(
++      package_manager.GetValueSet("http://value.set/id-1").status().code(),
++      absl::StatusCode::kNotFound);
+ }
+ 
+ TEST(FhirPackageManager, GetResourceWithErrorReturnsError) {
+   // The first package is empty and will return a NotFoundError status when
+   // queried.
+-  absl::StatusOr<std::string> temp_name = CreateZipFileContaining(
+-      std::vector<std::pair<const char*, const char*>>{{"nothing", "{}"}});
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
++  FHIR_ASSERT_OK_AND_ASSIGN(
++      std::string temp_name,
++      CreateZipFileContaining(
++          std::vector<std::pair<const char*, const char*>>{{"nothing", "{}"}}));
+ 
+   // The second package contains a resource missing required fields, which will
+   // return an InvalidArgumentError status when it fails to be parsed into a
+   // proto.
+-  absl::StatusOr<std::string> another_temp_name =
++  FHIR_ASSERT_OK_AND_ASSIGN(
++      std::string another_temp_name,
+       CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+           {"a_value_set.json",
+-           "{\"resourceType\": \"ValueSet\", \"url\": "
+-           "\"http://value.set/id-1\" } "}});
+-  ASSERT_TRUE(another_temp_name.ok()) << another_temp_name.status().message();
++           R"({"resourceType": "ValueSet", "url": "http://value.set/id-1"})"}}));
+ 
+-  absl::Status add_package_status;
+   FhirPackageManager package_manager = FhirPackageManager();
++  FHIR_ASSERT_OK(package_manager.AddPackageAtPath(temp_name));
++  FHIR_ASSERT_OK(package_manager.AddPackageAtPath(another_temp_name));
+ 
+-  add_package_status = package_manager.AddPackageAtPath(*temp_name);
+-  ASSERT_TRUE(add_package_status.ok()) << add_package_status.message();
++  EXPECT_EQ(
++      package_manager.GetValueSet("http://value.set/id-1").status().code(),
++      absl::StatusCode::kInvalidArgument);
+ 
+-  add_package_status = package_manager.AddPackageAtPath(*another_temp_name);
+-  ASSERT_TRUE(add_package_status.ok()) << add_package_status.message();
+-
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result =
+-      package_manager.GetValueSet("http://value.set/id-1");
+-  EXPECT_FALSE(result.ok());
+-  EXPECT_EQ(result.status().code(), absl::StatusCode::kInvalidArgument);
+-
+-  remove(temp_name->c_str());
+-  remove(another_temp_name->c_str());
++  remove(temp_name.c_str());
++  remove(another_temp_name.c_str());
+ }
+ 
+ TEST(ResourceCollectionTest, GetResourceFromCacheSucceeds) {
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>("package.zip");
+-  auto vs = std::make_unique<google::fhir::r4::core::ValueSet>();
+-  vs->mutable_id()->set_value("hello");
+-  collection.CacheParsedResource("http://value.set/id", std::move(vs));
+-
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result =
+-      collection.GetResource("http://value.set/id");
+-  ASSERT_TRUE(result.ok()) << result.status().message();
+-  EXPECT_EQ((*result)->id().value(), "hello");
++  auto parsed_json = std::make_unique<internal::FhirJson>();
++  FHIR_ASSERT_OK(internal::ParseJsonValue(
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id",
++                      "id": "hello", "status": "draft"})",
++      *parsed_json));
++
++  ResourceCollection<r4::core::ValueSet> collection;
++  FHIR_ASSERT_OK(collection.Put(std::move(parsed_json)));
++
++  // Call Get once to cache the resource.
++  FHIR_ASSERT_OK_AND_ASSIGN(const fhir::r4::core::ValueSet* result_uncached,
++                            collection.Get("http://value.set/id"));
++  EXPECT_EQ(result_uncached->id().value(), "hello");
++
++  // Calling Get again should retrieve the cached resource.
++  FHIR_ASSERT_OK_AND_ASSIGN(const fhir::r4::core::ValueSet* result_cached,
++                            collection.Get("http://value.set/id"));
++  EXPECT_EQ(result_cached, result_uncached);
+ }
+ 
+ TEST(ResourceCollectionTest, GetResourceFromCacheHasPointerStability) {
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>("package.zip");
+-  auto vs1 = std::make_unique<google::fhir::r4::core::ValueSet>();
+-  vs1->mutable_id()->set_value("hello");
+-
+-  auto vs2 = std::make_unique<google::fhir::r4::core::ValueSet>();
+-  vs2->mutable_id()->set_value("goodbye");
+-
+-  collection.CacheParsedResource("http://value.set/id1", std::move(vs1));
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result1 =
+-      collection.GetResource("http://value.set/id1");
+-  ASSERT_TRUE(result1.ok()) << result1.status().message();
+-  EXPECT_EQ((*result1)->id().value(), "hello");
+-
+-  collection.CacheParsedResource("http://value.set/id2", std::move(vs2));
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result2 =
+-      collection.GetResource("http://value.set/id2");
+-  ASSERT_TRUE(result2.ok()) << result2.status().message();
+-  EXPECT_EQ((*result2)->id().value(), "goodbye");
++  ResourceCollection<fhir::r4::core::ValueSet> collection;
++
++  auto vs1 = std::make_unique<internal::FhirJson>();
++  FHIR_ASSERT_OK(internal::ParseJsonValue(
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id1",
++                      "id": "hello", "status": "draft"})",
++      *vs1));
++
++  auto vs2 = std::make_unique<internal::FhirJson>();
++  FHIR_ASSERT_OK(internal::ParseJsonValue(
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id2",
++                      "id": "goodbye", "status": "draft"})",
++      *vs2));
++
++  // Insert and retrieve vs1 to have it cached.
++  FHIR_ASSERT_OK(collection.Put(std::move(vs1)));
++  ASSERT_TRUE(collection.Get("http://value.set/id1").ok());
++
++  // Retrieve vs1 from the cache
++  FHIR_ASSERT_OK_AND_ASSIGN(const fhir::r4::core::ValueSet* result1,
++                            collection.Get("http://value.set/id1"));
++  EXPECT_EQ(result1->id().value(), "hello");
++
++  // Insert and retrieve vs2 to have it cached.
++  FHIR_ASSERT_OK(collection.Put(std::move(vs2)));
++  EXPECT_TRUE(collection.Get("http://value.set/id2").ok());
++
++  // Retrieve vs2 from the cache.
++  FHIR_ASSERT_OK_AND_ASSIGN(const fhir::r4::core::ValueSet* result2,
++                            collection.Get("http://value.set/id2"));
++  EXPECT_EQ(result2->id().value(), "goodbye");
+ 
+   // Ensure the vs1 pointer still works.
+-  EXPECT_EQ((*result1)->id().value(), "hello");
++  EXPECT_EQ(result1->id().value(), "hello");
+ }
+ 
+-TEST(ResourceCollectionTest, AddGetResourceSucceeds) {
+-  absl::StatusOr<std::string> temp_name =
+-      CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+-          {"a_value_set.json",
+-           "{\"resourceType\": \"ValueSet\", \"url\": \"http://value.set/id\", "
+-           "\"id\": \"a-value-set\", \"status\": \"draft\"}"}});
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
+-
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>(*temp_name);
+-  collection.AddUriAtPath("http://value.set/id", "a_value_set.json");
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result =
+-      collection.GetResource("http://value.set/id");
+-
+-  remove(temp_name->c_str());
+-  ASSERT_TRUE(result.ok()) << result.status().message();
+-  EXPECT_EQ((*result)->id().value(), "a-value-set");
+-  EXPECT_EQ((*result)->url().value(), "http://value.set/id");
+-}
++TEST(ResourceCollectionTest, PutGetResourceSucceeds) {
++  auto parsed_json = std::make_unique<internal::FhirJson>();
++  FHIR_ASSERT_OK(internal::ParseJsonValue(
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id",
++                      "id": "a-value-set", "status": "draft"})",
++      *parsed_json));
+ 
+-TEST(ResourceCollectionTest, AddGetResourceInBundleSucceeds) {
+-  const char* bundle_contents = R"(
+-{
+-  "resourceType": "Bundle",
+-  "entry": [
+-    {
+-      "resource": {
+-        "resourceType": "Bundle",
+-        "entry": [
+-          {
+-            "resource": {
+-              "resourceType": "ValueSet",
+-              "id": "a-different-value-set",
+-              "url": "http://different-value.set/id",
+-              "status": "draft"
+-            }
+-          },
+-          {
+-            "resource": {
+-              "resourceType": "ValueSet",
+-              "id": "a-value-set",
+-              "url": "http://value.set/id",
+-              "status": "draft"
+-            }
+-          }
+-        ]
+-      }
+-    }
+-  ]
+-})";
+-  absl::StatusOr<std::string> temp_name =
+-      CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+-          {"a_bundle.json", bundle_contents}});
++  ResourceCollection<fhir::r4::core::ValueSet> collection;
++  FHIR_ASSERT_OK(collection.Put(std::move(parsed_json)));
+ 
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
++  FHIR_ASSERT_OK_AND_ASSIGN(const fhir::r4::core::ValueSet* result,
++                            collection.Get("http://value.set/id"));
++  EXPECT_EQ(result->id().value(), "a-value-set");
++  EXPECT_EQ(result->url().value(), "http://value.set/id");
++}
+ 
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>(*temp_name);
+-  collection.AddUriAtPath("http://value.set/id", "a_bundle.json");
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result =
+-      collection.GetResource("http://value.set/id");
++TEST(ResourceCollectionTest, WithValidResourcesIterateSucceeds) {
++  std::vector<std::string> resources = {
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-1",
++          "id": "a-value-set-1", "status": "draft"})",
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-2",
++          "id": "a-value-set-2", "status": "draft"})",
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-3",
++          "id": "a-value-set-3", "status": "draft"})",
++  };
++
++  ResourceCollection<fhir::r4::core::ValueSet> collection;
++  for (const std::string& resource : resources) {
++    auto parsed_json = std::make_unique<internal::FhirJson>();
++    FHIR_ASSERT_OK(internal::ParseJsonValue(resource, *parsed_json));
++    FHIR_ASSERT_OK(collection.Put(std::move(parsed_json)));
++  }
+ 
+-  remove(temp_name->c_str());
+-  ASSERT_TRUE(result.ok()) << result.status().message();
+-  EXPECT_EQ((*result)->id().value(), "a-value-set");
+-  EXPECT_EQ((*result)->url().value(), "http://value.set/id");
++  std::vector<std::string> found;
++  for (const fhir::r4::core::ValueSet& value_set : collection) {
++    found.push_back(value_set.url().value());
++  }
++  EXPECT_THAT(found, UnorderedElementsAre("http://value.set/id-1",
++                                          "http://value.set/id-2",
++                                          "http://value.set/id-3"));
+ }
+ 
+-TEST(ResourceCollectionTest, WithValidResourcesIterateSucceeds) {
+-  absl::StatusOr<std::string> temp_name =
+-      CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+-          {"a_value_set.json",
+-           "{\"resourceType\": \"ValueSet\", \"url\": "
+-           "\"http://value.set/id-1\", "
+-           "\"id\": \"a-value-set-1\", \"status\": \"draft\"}"},
+-          {"another_value_set.json",
+-           "{\"resourceType\": \"ValueSet\", \"url\": "
+-           "\"http://value.set/id-2\", "
+-           "\"id\": \"a-value-set-2\", \"status\": \"draft\"}"},
+-          {"yet_another_value_set.json",
+-           "{\"resourceType\": \"ValueSet\", \"url\": "
+-           "\"http://value.set/id-3\", "
+-           "\"id\": \"a-value-set-3\", \"status\": \"draft\"}"},
+-      });
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
+-
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>(*temp_name);
+-  for (auto& uri_path : std::vector<std::pair<std::string, std::string>>{
+-           {"http://value.set/id-1", "a_value_set.json"},
+-           {"http://value.set/id-2", "another_value_set.json"},
+-           {"http://value.set/id-3", "yet_another_value_set.json"}}) {
+-    collection.AddUriAtPath(uri_path.first, uri_path.second);
++TEST(ResourceCollectionTest, WithValidCachedResourcesIterateSucceeds) {
++  std::vector<std::string> resources = {
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-1",
++          "id": "a-value-set-1", "status": "draft"})",
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-2",
++          "id": "a-value-set-2", "status": "draft"})",
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-3",
++          "id": "a-value-set-3", "status": "draft"})",
++  };
++
++  ResourceCollection<fhir::r4::core::ValueSet> collection;
++  for (const std::string& resource : resources) {
++    auto parsed_json = std::make_unique<internal::FhirJson>();
++    FHIR_ASSERT_OK(internal::ParseJsonValue(resource, *parsed_json));
++    FHIR_ASSERT_OK(collection.Put(std::move(parsed_json)));
+   }
+ 
++  // Get some resources to cache them before iterating.
++  ASSERT_TRUE(collection.Get("http://value.set/id-1").ok());
++  ASSERT_TRUE(collection.Get("http://value.set/id-3").ok());
++
+   std::vector<std::string> found;
+-  for (const google::fhir::r4::core::ValueSet& value_set : collection) {
+-    found.emplace_back(value_set.url().value());
++  for (const fhir::r4::core::ValueSet& value_set : collection) {
++    found.push_back(value_set.url().value());
+   }
+-  EXPECT_THAT(found, UnorderedElementsAreArray(std::vector<std::string>{
+-                         "http://value.set/id-1",
+-                         "http://value.set/id-2",
+-                         "http://value.set/id-3",
+-                     }));
+-  remove(temp_name->c_str());
++  EXPECT_THAT(found, UnorderedElementsAre("http://value.set/id-1",
++                                          "http://value.set/id-2",
++                                          "http://value.set/id-3"));
+ }
+ 
+ TEST(ResourceCollectionTest, WithNoResourcesIterateEmpty) {
+-  absl::StatusOr<std::string> temp_name = CreateZipFileContaining(
+-      std::vector<std::pair<const char*, const char*>>{});
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
++  ResourceCollection<fhir::r4::core::ValueSet> collection;
+ 
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>(*temp_name);
+-
+-  std::vector<google::fhir::r4::core::ValueSet> found;
+-  for (const google::fhir::r4::core::ValueSet& value_set : collection) {
+-    found.emplace_back(value_set);
++  std::vector<fhir::r4::core::ValueSet> found;
++  for (const fhir::r4::core::ValueSet& value_set : collection) {
++    found.push_back(value_set);
+   }
+   EXPECT_EQ(found.size(), 0);
+-  remove(temp_name->c_str());
+ }
+ 
+ TEST(ResourceCollectionTest, WithInvalidResourcesIterateEmpty) {
+-  absl::StatusOr<std::string> temp_name =
+-      CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+-          {"a_value_set.json", "{\"resourceType\": \"invalid"},
+-          {"another_value_set.json", "{\"resourceType\": \"invalid"},
+-          {"yet_another_value_set.json", "{\"resourceType\": \"invalid"},
+-      });
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
+-
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>(*temp_name);
+-  for (auto& uri_path : std::vector<std::pair<std::string, std::string>>{
+-           {"http://value.set/id-1", "a_value_set.json"},
+-           {"http://value.set/id-2", "another_value_set.json"},
+-           {"http://value.set/id-3", "yet_another_value_set.json"}}) {
+-    collection.AddUriAtPath(uri_path.first, uri_path.second);
++  // These resources are invalid due to missing fields.
++  std::vector<std::string> resources = {
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-1"})",
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-2"})",
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-3"})",
++  };
++
++  ResourceCollection<fhir::r4::core::ValueSet> collection;
++  for (const std::string& resource : resources) {
++    auto parsed_json = std::make_unique<internal::FhirJson>();
++    FHIR_ASSERT_OK(internal::ParseJsonValue(resource, *parsed_json));
++    FHIR_ASSERT_OK(collection.Put(std::move(parsed_json)));
+   }
+ 
+-  std::vector<google::fhir::r4::core::ValueSet> found;
+-  for (const google::fhir::r4::core::ValueSet& value_set : collection) {
+-    found.emplace_back(value_set);
++  std::vector<fhir::r4::core::ValueSet> found;
++  for (const fhir::r4::core::ValueSet& value_set : collection) {
++    found.push_back(value_set);
+   }
+   EXPECT_EQ(found.size(), 0);
+-  remove(temp_name->c_str());
+ }
+ 
+ TEST(ResourceCollectionTest, WithValidAndInvalidResourcesIterateSkipsInvalid) {
+-  absl::StatusOr<std::string> temp_name =
+-      CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+-          {"a_bad_value_set.json", "{\"resourceType\": \"invalid"},
+-          {"another_bad_value_set.json", "{\"resourceType\": \"invalid"},
+-          {"yet_bad_another_value_set.json", "{\"resourceType\": \"invalid"},
+-          {"a_value_set.json",
+-           "{\"resourceType\": \"ValueSet\", \"url\": "
+-           "\"http://value.set/id-1\", "
+-           "\"id\": \"a-value-set-1\", \"status\": \"draft\"}"},
+-          {"another_value_set.json",
+-           "{\"resourceType\": \"ValueSet\", \"url\": "
+-           "\"http://value.set/id-2\", "
+-           "\"id\": \"a-value-set-2\", \"status\": \"draft\"}"},
+-      });
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
+-
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>(*temp_name);
+-  for (auto& uri_path : std::vector<std::pair<std::string, std::string>>{
+-           {"http://value.set/id-bad-1", "a_bad_value_set.json"},
+-           {"http://value.set/id-1", "a_value_set.json"},
+-           {"http://value.set/id-bad-2", "another_bad_value_set.json"},
+-           {"http://value.set/id-2", "another_value_set.json"},
+-           {"http://value.set/id-bad-3", "yet_bad_another_value_set.json"},
+-       }) {
+-    collection.AddUriAtPath(uri_path.first, uri_path.second);
++  std::vector<std::string> resources = {
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-invalid-1"})",
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-invalid-2"})",
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-1",
++          "id": "a-value-set-1", "status": "draft"})",
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-invalid-3"})",
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-2",
++          "id": "a-value-set-2", "status": "draft"})",
++      R"({"resourceType": "ValueSet", "url": "http://value.set/id-invalid-4"})",
++  };
++
++  ResourceCollection<fhir::r4::core::ValueSet> collection;
++  for (const std::string& resource : resources) {
++    auto parsed_json = std::make_unique<internal::FhirJson>();
++    FHIR_ASSERT_OK(internal::ParseJsonValue(resource, *parsed_json));
++    FHIR_ASSERT_OK(collection.Put(std::move(parsed_json)));
+   }
+ 
+   std::vector<std::string> found;
+-  for (const google::fhir::r4::core::ValueSet& value_set : collection) {
+-    found.emplace_back(value_set.url().value());
++  for (const fhir::r4::core::ValueSet& value_set : collection) {
++    found.push_back(value_set.url().value());
+   }
+-  EXPECT_THAT(found, UnorderedElementsAreArray(std::vector<std::string>{
+-                         "http://value.set/id-1",
+-                         "http://value.set/id-2",
+-                     }));
+-  remove(temp_name->c_str());
+-}
+-
+-TEST(ResourceCollectionTest, AddGetResourceWithUriMappingFails) {
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>("missing.zip");
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result =
+-      collection.GetResource("http://value.set/id");
+-
+-  ASSERT_FALSE(result.ok());
+-}
+-
+-TEST(ResourceCollectionTest, AddGetResourceWithNoZipFails) {
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>("missing.zip");
+-  collection.AddUriAtPath("http://value.set/id", "a_value_set.json");
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result =
+-      collection.GetResource("http://value.set/id");
+-
+-  ASSERT_FALSE(result.ok());
+-}
+-
+-TEST(ResourceCollectionTest, AddGetResourceWithZipMissingEntryFails) {
+-  absl::StatusOr<std::string> temp_name = CreateZipFileContaining(
+-      std::vector<std::pair<const char*, const char*>>{});
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
+-
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>(*temp_name);
+-  collection.AddUriAtPath("http://value.set/id", "a_value_set.json");
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result =
+-      collection.GetResource("http://value.set/id");
+-
+-  remove(temp_name->c_str());
+-  ASSERT_FALSE(result.ok());
+-}
+-
+-TEST(ResourceCollectionTest, AddGetResourceWithBadResourceJsonFails) {
+-  absl::StatusOr<std::string> temp_name =
+-      CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+-          {"a_value_set.json", "bad_json"}});
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
+-
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>(*temp_name);
+-  collection.AddUriAtPath("http://value.set/id", "a_value_set.json");
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result =
+-      collection.GetResource("http://value.set/id");
+-
+-  remove(temp_name->c_str());
+-  ASSERT_FALSE(result.ok());
++  EXPECT_THAT(found, UnorderedElementsAre("http://value.set/id-1",
++                                          "http://value.set/id-2"));
+ }
+ 
+-TEST(ResourceCollectionTest,
+-     AddGetResourceWithMissingBundleEntryReturnsNotFound) {
+-  const char* bundle_contents = R"(
+-{
+-  "resourceType": "Bundle",
+-  "entry": [
+-    {
+-      "resource": {
+-        "resourceType": "ValueSet",
+-        "id": "a-different-value-set",
+-        "url": "http://different-value.set/id",
+-        "status": "draft"
+-      }
+-    }
+-  ]
+-})";
+-  absl::StatusOr<std::string> temp_name =
+-      CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+-          {"a_bundle.json", bundle_contents}});
+-
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
+-
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>(*temp_name);
+-  collection.AddUriAtPath("http://value.set/id", "a_bundle.json");
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result =
+-      collection.GetResource("http://value.set/id");
+-
+-  remove(temp_name->c_str());
+-  EXPECT_FALSE(result.ok());
+-  EXPECT_EQ(result.status().code(), absl::StatusCode::kNotFound);
++TEST(ResourceCollectionTest, AddGetResourceWithEmptyCollectionReturnsNotFound) {
++  ResourceCollection<fhir::r4::core::ValueSet> collection;
++  EXPECT_EQ(collection.Get("http://value.set/id").status().code(),
++            absl::StatusCode::kNotFound);
+ }
+ 
+ TEST(ResourceCollectionTest,
+@@ -736,28 +591,25 @@ TEST(ResourceCollectionTest,
+   "entry": [
+     {
+       "resource": {
+-        "url": "http://different-value.set/id",
++        "url": "http://value.set/id"
+       }
+     }
+   ]
+ })";
+-  absl::StatusOr<std::string> temp_name =
+-      CreateZipFileContaining(std::vector<std::pair<const char*, const char*>>{
+-          {"a_bundle.json", bundle_contents}});
+-  ASSERT_TRUE(temp_name.ok()) << temp_name.status().message();
++  auto parsed_json = std::make_unique<internal::FhirJson>();
++  FHIR_ASSERT_OK(internal::ParseJsonValue(bundle_contents, *parsed_json));
+ 
+-  auto collection =
+-      ResourceCollection<google::fhir::r4::core::ValueSet>(*temp_name);
+-  collection.AddUriAtPath("http://value.set/id", "a_bundle.json");
+-  absl::StatusOr<const google::fhir::r4::core::ValueSet*> result =
+-      collection.GetResource("http://value.set/id");
++  FHIR_ASSERT_OK_AND_ASSIGN(const internal::FhirJson* entries,
++                            parsed_json->get("entry"));
++  FHIR_ASSERT_OK_AND_ASSIGN(const internal::FhirJson* entry1, entries->get(0));
++  FHIR_ASSERT_OK_AND_ASSIGN(const internal::FhirJson* resource,
++                            entry1->get("resource"));
+ 
+-  EXPECT_FALSE(result.ok());
+-  EXPECT_EQ(result.status().code(), absl::StatusCode::kInvalidArgument);
++  ResourceCollection<fhir::r4::core::ValueSet> collection;
++  FHIR_ASSERT_OK(collection.Put(std::move(parsed_json), *resource));
+ 
+-  remove(temp_name->c_str());
++  EXPECT_FALSE(collection.Get("http://value.set/id").ok());
+ }
+ 
+ }  // namespace
+-
+ }  // namespace google::fhir

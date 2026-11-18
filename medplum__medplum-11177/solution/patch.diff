@@ -1,0 +1,669 @@
+diff --git a/packages/server/src/bots/execute.ts b/packages/server/src/bots/execute.ts
+index cfa1cbf02d3..e865aca0d84 100644
+--- a/packages/server/src/bots/execute.ts
++++ b/packages/server/src/bots/execute.ts
+@@ -14,6 +14,7 @@ import {
+   getBotAccessToken,
+   getBotSecrets,
+   isBotEnabledForProject,
++  logBotCallerSmartScopes,
+   normalizeBotExecutionResult,
+   writeBotInputToStorage,
+ } from './utils';
+@@ -44,6 +45,7 @@ export async function executeBot(request: BotExecutionRequest): Promise<BotExecu
+       await writeBotInputToStorage(request);
+     }
+ 
++    logBotCallerSmartScopes(request);
+     const context: BotExecutionContext = {
+       ...request,
+       accessToken: await getBotAccessToken(bot, runAs),
+diff --git a/packages/server/src/bots/types.ts b/packages/server/src/bots/types.ts
+index ef2eb3c7139..912ba2631cd 100644
+--- a/packages/server/src/bots/types.ts
++++ b/packages/server/src/bots/types.ts
+@@ -7,6 +7,7 @@ import type {
+   ClientApplication,
+   Cron,
+   Device,
++  Login,
+   Patient,
+   Practitioner,
+   Project,
+@@ -21,6 +22,10 @@ export interface BotExecutionRequest {
+   readonly bot: WithId<Bot>;
+   readonly runAs: WithId<ProjectMembership>;
+   readonly runAsProject?: WithId<Project>;
++  /** The caller's login when `runAs` is the caller's own membership */
++  readonly callerLogin?: Login;
++  /** The route a caller invoked the bot through */
++  readonly entryPoint?: 'execute' | 'custom-operation' | 'cds' | 'agent';
+   readonly requester?: Reference<Bot | ClientApplication | Patient | Practitioner | RelatedPerson>;
+   readonly input: any;
+   readonly contentType: string;
+diff --git a/packages/server/src/bots/utils.test.ts b/packages/server/src/bots/utils.test.ts
+index a83d1b7b64d..fe7ef581361 100644
+--- a/packages/server/src/bots/utils.test.ts
++++ b/packages/server/src/bots/utils.test.ts
+@@ -5,15 +5,24 @@ import type { WithId } from '@medplum/core';
+ import { allOk, badRequest, parseJWTPayload, resolveId } from '@medplum/core';
+ import type { Bot, Login, ProjectMembership } from '@medplum/fhirtypes';
+ import express from 'express';
++import { randomUUID } from 'node:crypto';
+ import { initApp, shutdownApp } from '../app';
+ import { loadTestConfig } from '../config/loader';
+ import { getGlobalSystemRepo, Repository } from '../fhir/repo';
+ import { getResourceCacheKey } from '../fhir/repository/resource-cache';
++import { globalLogger } from '../logger';
+ import * as keysModule from '../oauth/keys';
+ import { getLoginForAccessToken, revokeLogin } from '../oauth/utils';
+ import { getCacheRedis } from '../redis';
+ import { createTestProject, withTestContext } from '../test.setup';
+-import { clearBotAccessTokenCache, getBotAccessToken, getJsFileExtension, normalizeBotExecutionResult } from './utils';
++import type { BotExecutionRequest } from './types';
++import {
++  clearBotAccessTokenCache,
++  getBotAccessToken,
++  getJsFileExtension,
++  logBotCallerSmartScopes,
++  normalizeBotExecutionResult,
++} from './utils';
+ 
+ describe('getJsFileExtension', () => {
+   test('returns .cjs for CommonJS code with .cjs extension', () => {
+@@ -86,6 +95,74 @@ describe('normalizeBotExecutionResult', () => {
+   });
+ });
+ 
++describe('logBotCallerSmartScopes', () => {
++  const message = 'Bot ran as a caller with SMART scopes';
++
++  function makeRequest(callerLogin?: Partial<Login>): BotExecutionRequest {
++    const user = { reference: 'User/' + randomUUID() };
++    return {
++      bot: { resourceType: 'Bot', id: randomUUID() },
++      runAs: {
++        resourceType: 'ProjectMembership',
++        id: randomUUID(),
++        project: { reference: 'Project/' + randomUUID() },
++        user,
++        profile: { reference: 'Practitioner/' + randomUUID() },
++      },
++      callerLogin: callerLogin && {
++        resourceType: 'Login',
++        user,
++        authMethod: 'password',
++        authTime: new Date().toISOString(),
++        ...callerLogin,
++      },
++      entryPoint: 'execute',
++      input: {},
++      contentType: 'application/json',
++    };
++  }
++
++  function logCalls(request: BotExecutionRequest, times = 1): unknown[] {
++    const warnSpy = vi.spyOn(globalLogger, 'warn');
++    try {
++      for (let i = 0; i < times; i++) {
++        logBotCallerSmartScopes(request);
++      }
++      return warnSpy.mock.calls.filter(([msg]) => msg === message).map(([, data]) => data);
++    } finally {
++      warnSpy.mockRestore();
++    }
++  }
++
++  test('Logs SMART resource scopes once per window', () => {
++    const request = makeRequest({ scope: 'openid patient/Observation.rs' });
++    expect(logCalls(request, 3)).toStrictEqual([
++      {
++        botId: request.bot.id,
++        runAsProject: resolveId(request.runAs.project),
++        callerMembership: 'ProjectMembership/' + request.runAs.id,
++        callerProfile: request.runAs.profile?.reference,
++        scope: 'openid patient/Observation.rs',
++        launch: undefined,
++        entryPoint: 'execute',
++        suppressed: 0,
++      },
++    ]);
++  });
++
++  test('Logs SMART App Launch context', () => {
++    const launch = { reference: 'SmartAppLaunch/' + randomUUID() };
++    expect(logCalls(makeRequest({ scope: 'openid', launch }))).toStrictEqual([
++      expect.objectContaining({ scope: 'openid', launch: launch.reference }),
++    ]);
++  });
++
++  test('Does not log without SMART scopes or caller', () => {
++    expect(logCalls(makeRequest({ scope: 'openid offline_access' }))).toStrictEqual([]);
++    expect(logCalls(makeRequest(undefined))).toStrictEqual([]);
++  });
++});
++
+ describe('getBotAccessToken', () => {
+   const bot = { resourceType: 'Bot', id: 'bot-1' } as WithId<Bot>;
+   let membership: WithId<ProjectMembership>;
+diff --git a/packages/server/src/bots/utils.ts b/packages/server/src/bots/utils.ts
+index b8474dae4e4..ff7c7e8f7b0 100644
+--- a/packages/server/src/bots/utils.ts
++++ b/packages/server/src/bots/utils.ts
+@@ -6,6 +6,7 @@ import {
+   badRequest,
+   ContentType,
+   createReference,
++  getReferenceString,
+   getStatus,
+   Hl7Message,
+   isGone,
+@@ -42,6 +43,7 @@ import { findProjectMembership } from '../fhir/projectmembership';
+ import type { SystemRepository } from '../fhir/repo';
+ import { getGlobalSystemRepo, getPermittedProjectIds } from '../fhir/repo';
+ import { sendFhirResponse } from '../fhir/response';
++import { parseSmartScopes } from '../fhir/smart';
+ import { getLogger } from '../logger';
+ import { generateAccessToken } from '../oauth/keys';
+ import { getBinaryStorage } from '../storage/loader';
+@@ -49,6 +51,7 @@ import { LogThrottle } from '../util/logthrottle';
+ import type { BotExecutionRequest, BotExecutionResult } from './types';
+ 
+ const missingMembershipLogThrottle = new LogThrottle(10 * 60 * 1000);
++const callerSmartScopesLogThrottle = new LogThrottle(10 * 60 * 1000);
+ 
+ /**
+  * Returns the bot's project membership.
+@@ -97,6 +100,32 @@ export function getBotBodyInput(bot: Bot, body: unknown, rawBody: Buffer | undef
+   return bot.rawBody && rawBody ? rawBody.toString('utf8') : body;
+ }
+ 
++/**
++ * Diagnostic logging for bots that run as a caller whose login has SMART resource scopes or a SMART App Launch
++ * context. The bot's access token does not carry them, so they do not limit the bot.
++ * @param request - The bot execution request.
++ */
++export function logBotCallerSmartScopes(request: BotExecutionRequest): void {
++  const { bot, runAs, callerLogin, entryPoint } = request;
++  if (!callerLogin || (parseSmartScopes(callerLogin.scope).length === 0 && !callerLogin.launch)) {
++    return;
++  }
++  const runAsProject = resolveId(runAs.project);
++  const key = [runAsProject, bot.id, runAs.id, entryPoint, callerLogin.scope].join('|');
++  callerSmartScopesLogThrottle.maybeLog(key, (suppressed) => {
++    getLogger().warn('Bot ran as a caller with SMART scopes', {
++      botId: bot.id,
++      runAsProject,
++      callerMembership: getReferenceString(runAs),
++      callerProfile: runAs.profile?.reference,
++      scope: callerLogin.scope,
++      launch: callerLogin.launch?.reference,
++      entryPoint,
++      suppressed,
++    });
++  });
++}
++
+ /**
+  * Returns the default headers to add to the MedplumClient.
+  * If the bot is configured to run as the user, then include the HTTP cookies from the request.
+diff --git a/packages/server/src/cds/routes.test.ts b/packages/server/src/cds/routes.test.ts
+index 8c5b9e53270..84a65f5473f 100644
+--- a/packages/server/src/cds/routes.test.ts
++++ b/packages/server/src/cds/routes.test.ts
+@@ -1,16 +1,17 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+ import type { WithId } from '@medplum/core';
+-import { ContentType } from '@medplum/core';
+-import type { Bot } from '@medplum/fhirtypes';
++import { ContentType, getReferenceString, Logger, parseJWTPayload } from '@medplum/core';
++import type { Bot, Project } from '@medplum/fhirtypes';
+ import express from 'express';
+ import request from 'supertest';
+ import { initApp, shutdownApp } from '../app';
+ import { loadTestConfig } from '../config/loader';
+-import { createTestProject } from '../test.setup';
++import { addTestUser, createTestProject, withTestContext } from '../test.setup';
+ 
+ describe('CDS Hooks', () => {
+   let app: express.Express;
++  let project: WithId<Project>;
+   let accessToken: string;
+   let cdsHookBot: WithId<Bot>;
+   let normalBot: WithId<Bot>;
+@@ -25,6 +26,7 @@ describe('CDS Hooks', () => {
+       withAccessToken: true,
+       membership: { admin: true },
+     });
++    project = testSetup.project;
+     accessToken = testSetup.accessToken;
+ 
+     const res1 = await request(app)
+@@ -161,6 +163,57 @@ describe('CDS Hooks', () => {
+     expect(res.body.cards).toBeDefined();
+   });
+ 
++  test('CDS hook bot run by a caller with SMART scopes is logged', async () => {
++    const res1 = await request(app)
++      .post('/fhir/R4/Bot')
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .send({
++        resourceType: 'Bot',
++        name: 'CDS Hook Scope Bot',
++        runtimeVersion: 'vmcontext',
++        cdsService: { hook: 'patient-view', title: 'CDS Hook Scope Bot', description: 'Returns its access token' },
++      });
++    expect(res1).toHaveStatus(201);
++    const bot = res1.body as WithId<Bot>;
++
++    const res2 = await request(app)
++      .post(`/fhir/R4/Bot/${bot.id}/$deploy`)
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .send({ code: `exports.handler = async (medplum) => ({ cards: [{ summary: medplum.getAccessToken() }] });` });
++    expect(res2).toHaveStatus(200);
++
++    const scope = 'openid user/Bot.rs';
++    const user = await withTestContext(() => addTestUser(project, { scope }));
++    const warnSpy = vi.spyOn(Logger.prototype, 'warn');
++    try {
++      const res3 = await request(app)
++        .post(`/cds-services/${bot.id}`)
++        .set('Content-Type', ContentType.JSON)
++        .set('Authorization', 'Bearer ' + user.accessToken)
++        .send({ hookInstance: 'd1577c69-dfbe-44ad-ba6d-3e05e953b2ea', hook: 'patient-view', context: {} });
++      expect(res3).toHaveStatus(200);
++      expect(parseJWTPayload(res3.body.cards[0].summary).scope).toBe('openid');
++
++      const calls = warnSpy.mock.calls.filter(([msg]) => msg === 'Bot ran as a caller with SMART scopes');
++      expect(calls.map(([, data]) => data)).toStrictEqual([
++        {
++          botId: bot.id,
++          runAsProject: project.id,
++          callerMembership: getReferenceString(user.membership),
++          callerProfile: getReferenceString(user.profile),
++          scope,
++          launch: undefined,
++          entryPoint: 'cds',
++          suppressed: 0,
++        },
++      ]);
++    } finally {
++      warnSpy.mockRestore();
++    }
++  });
++
+   test('Cannot call normal bot as CDS service', async () => {
+     const res = await request(app)
+       .post(`/cds-services/${normalBot.id}`)
+diff --git a/packages/server/src/cds/routes.ts b/packages/server/src/cds/routes.ts
+index bdb6e8fce64..6116c20502b 100644
+--- a/packages/server/src/cds/routes.ts
++++ b/packages/server/src/cds/routes.ts
+@@ -68,6 +68,8 @@ cdsRouter.post('/:id', async (req: Request, res: Response) => {
+     bot,
+     runAs: ctx.membership,
+     runAsProject: ctx.project,
++    callerLogin: ctx.login,
++    entryPoint: 'cds',
+     requester: ctx.membership.profile,
+     input: req.body,
+     contentType: ContentType.JSON,
+diff --git a/packages/server/src/fhir/operations/custom.test.ts b/packages/server/src/fhir/operations/custom.test.ts
+index 0eba6a550f4..34a5f707ada 100644
+--- a/packages/server/src/fhir/operations/custom.test.ts
++++ b/packages/server/src/fhir/operations/custom.test.ts
+@@ -1,13 +1,13 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+ import type { WithId } from '@medplum/core';
+-import { badRequest, ContentType, createReference } from '@medplum/core';
++import { badRequest, ContentType, createReference, getReferenceString, Logger, parseJWTPayload } from '@medplum/core';
+ import type { Bot, Patient } from '@medplum/fhirtypes';
+ import express from 'express';
+ import request from 'supertest';
+ import { initApp, shutdownApp } from '../../app';
+ import { loadTestConfig } from '../../config/loader';
+-import { initTestAuth } from '../../test.setup';
++import { addTestUser, createTestProject, initTestAuth, withTestContext } from '../../test.setup';
+ 
+ describe('Custom operation', () => {
+   const app = express();
+@@ -280,6 +280,80 @@ describe('Custom operation', () => {
+     });
+   });
+ 
++  test('Bot run by a caller with SMART scopes is logged', async () => {
++    const { project, accessToken: adminToken } = await createTestProject({
++      withAccessToken: true,
++      membership: { admin: true },
++    });
++
++    const res1 = await request(app)
++      .post('/fhir/R4/Bot')
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .set('Authorization', 'Bearer ' + adminToken)
++      .send({ resourceType: 'Bot', name: 'Scope Operation Bot', runtimeVersion: 'vmcontext', runAsUser: true });
++    expect(res1).toHaveStatus(201);
++    const bot = res1.body as WithId<Bot>;
++
++    const res2 = await request(app)
++      .post(`/fhir/R4/Bot/${bot.id}/$deploy`)
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .set('Authorization', 'Bearer ' + adminToken)
++      .send({ code: `exports.handler = async (medplum) => ({ token: medplum.getAccessToken() });` });
++    expect(res2).toHaveStatus(200);
++
++    const res3 = await request(app)
++      .post('/fhir/R4/OperationDefinition')
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .set('Authorization', 'Bearer ' + adminToken)
++      .send({
++        resourceType: 'OperationDefinition',
++        extension: [
++          {
++            url: 'https://medplum.com/fhir/StructureDefinition/operationDefinition-implementation',
++            valueReference: createReference(bot),
++          },
++        ],
++        name: 'scope-operation',
++        status: 'active',
++        kind: 'operation',
++        code: 'scope-operation',
++        system: true,
++        type: false,
++        instance: false,
++        parameter: [{ use: 'out', name: 'token', type: 'string', min: 1, max: '1' }],
++      });
++    expect(res3).toHaveStatus(201);
++
++    const scope = 'openid user/Bot.rs user/OperationDefinition.rs';
++    const user = await withTestContext(() => addTestUser(project, { scope }));
++    const warnSpy = vi.spyOn(Logger.prototype, 'warn');
++    try {
++      const res4 = await request(app)
++        .post('/fhir/R4/$scope-operation')
++        .set('Authorization', 'Bearer ' + user.accessToken)
++        .set('Content-Type', ContentType.FHIR_JSON)
++        .send({});
++      expect(res4).toHaveStatus(200);
++      expect(parseJWTPayload(res4.body.parameter[0].valueString).scope).toBe('openid');
++
++      const calls = warnSpy.mock.calls.filter(([msg]) => msg === 'Bot ran as a caller with SMART scopes');
++      expect(calls.map(([, data]) => data)).toStrictEqual([
++        {
++          botId: bot.id,
++          runAsProject: project.id,
++          callerMembership: getReferenceString(user.membership),
++          callerProfile: getReferenceString(user.profile),
++          scope,
++          launch: undefined,
++          entryPoint: 'custom-operation',
++          suppressed: 0,
++        },
++      ]);
++    } finally {
++      warnSpy.mockRestore();
++    }
++  });
++
+   test('Returns Parameters from bot unchanged', async () => {
+     const botRes = await request(app)
+       .post('/fhir/R4/Bot')
+diff --git a/packages/server/src/fhir/operations/custom.ts b/packages/server/src/fhir/operations/custom.ts
+index dc07dc2c593..47b8671d4f5 100644
+--- a/packages/server/src/fhir/operations/custom.ts
++++ b/packages/server/src/fhir/operations/custom.ts
+@@ -86,9 +86,12 @@ export async function tryCustomOperation(
+   }
+ 
+   // Execute the bot
++  const runAs = await getBotProjectMembership(ctx, bot);
+   const result = await executeBot({
+     bot,
+-    runAs: await getBotProjectMembership(ctx, bot),
++    runAs,
++    callerLogin: runAs.id === ctx.membership.id ? ctx.login : undefined,
++    entryPoint: 'custom-operation',
+     runAsProject: ctx.project,
+     requester: ctx.membership.profile,
+     input,
+diff --git a/packages/server/src/fhir/operations/execute.test.ts b/packages/server/src/fhir/operations/execute.test.ts
+index 89a38f0a517..902be2549d4 100644
+--- a/packages/server/src/fhir/operations/execute.test.ts
++++ b/packages/server/src/fhir/operations/execute.test.ts
+@@ -3,6 +3,7 @@
+ import type { WithId } from '@medplum/core';
+ import {
+   ContentType,
++  Logger,
+   Operator,
+   badRequest,
+   createReference,
+@@ -31,7 +32,7 @@ import { getConfig, loadTestConfig } from '../../config/loader';
+ import * as oathKeysModule from '../../oauth/keys';
+ import { getLoginForAccessToken } from '../../oauth/utils';
+ import { getBinaryStorage } from '../../storage/loader';
+-import { createTestProject, waitForAsyncJob, withTestContext } from '../../test.setup';
++import { addTestUser, createTestProject, waitForAsyncJob, withTestContext } from '../../test.setup';
+ import { getProjectSystemRepo } from '../repo';
+ 
+ const botCodes = [
+@@ -769,6 +770,75 @@ describe('Execute', () => {
+     expect(profileToken.profile).toEqual(getReferenceString(profile));
+   });
+ 
++  test.each<[string, Partial<Bot>, boolean]>([
++    ['runAsUser', { runAsUser: true }, false],
++    ['without a membership', {}, false],
++    ['with its own membership', {}, true],
++  ])('Bot %s and a caller with SMART scopes', async (_name, botProps, withMembership) => {
++    const res1 = await request(app)
++      .post(`/fhir/R4/Bot`)
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .set('Authorization', 'Bearer ' + accessToken1)
++      .send({ resourceType: 'Bot', name: 'Test Bot', runtimeVersion: 'vmcontext', ...botProps });
++    expect(res1).toHaveStatus(201);
++    const bot = res1.body as WithId<Bot>;
++
++    if (withMembership) {
++      const systemRepo = await getProjectSystemRepo(project1);
++      await systemRepo.createResource<ProjectMembership>({
++        resourceType: 'ProjectMembership',
++        project: createReference(project1),
++        user: createReference(bot),
++        profile: createReference(bot),
++      });
++    }
++
++    const res2 = await request(app)
++      .post(`/fhir/R4/Bot/${bot.id}/$deploy`)
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .set('Authorization', 'Bearer ' + accessToken1)
++      .send({ code: `exports.handler = async (medplum) => ({ token: medplum.getAccessToken() });` });
++    expect(res2).toHaveStatus(200);
++
++    const scope = 'openid user/Bot.rs';
++    const user = await withTestContext(() => addTestUser(project1, { scope }));
++    const warnSpy = vi.spyOn(Logger.prototype, 'warn');
++    try {
++      const res3 = await request(app)
++        .post(`/fhir/R4/Bot/${bot.id}/$execute`)
++        .set('Content-Type', ContentType.FHIR_JSON)
++        .set('Authorization', 'Bearer ' + user.accessToken)
++        .send({});
++      expect(res3).toHaveStatus(200);
++      expect(parseJWTPayload(res3.body.token).scope).toBe('openid');
++
++      const res4 = await request(app)
++        .get(`/fhir/R4/Patient`)
++        .set('Authorization', 'Bearer ' + res3.body.token);
++      expect(res4).toHaveStatus(200);
++
++      const calls = warnSpy.mock.calls.filter(([msg]) => msg === 'Bot ran as a caller with SMART scopes');
++      expect(calls.map(([, data]) => data)).toStrictEqual(
++        withMembership
++          ? []
++          : [
++              {
++                botId: bot.id,
++                runAsProject: project1.id,
++                callerMembership: getReferenceString(user.membership),
++                callerProfile: getReferenceString(user.profile),
++                scope,
++                launch: undefined,
++                entryPoint: 'execute',
++                suppressed: 0,
++              },
++            ]
++      );
++    } finally {
++      warnSpy.mockRestore();
++    }
++  });
++
+   test('Propagates trace ID', async () => {
+     // Create a bot with empty code
+     const res1 = await request(app)
+diff --git a/packages/server/src/fhir/operations/execute.ts b/packages/server/src/fhir/operations/execute.ts
+index 344b804aacf..0c052629eac 100644
+--- a/packages/server/src/fhir/operations/execute.ts
++++ b/packages/server/src/fhir/operations/execute.ts
+@@ -117,9 +117,12 @@ async function executeOperation(req: Request, res: Response): Promise<OperationO
+   // Execute the bot
+   // If the request is HTTP POST, then the body is the input
+   // If the request is HTTP GET, then the query string is the input
++  const runAs = await getBotProjectMembership(ctx, bot);
+   const result = await executeBot({
+     bot,
+-    runAs: await getBotProjectMembership(ctx, bot),
++    runAs,
++    callerLogin: runAs.id === ctx.membership.id ? ctx.login : undefined,
++    entryPoint: 'execute',
+     runAsProject: ctx.project,
+     requester: ctx.membership.profile,
+     input: req.method === 'POST' ? getBotBodyInput(bot, req.body, res.locals.rawBody) : req.query,
+diff --git a/packages/server/src/ws/agent.test.ts b/packages/server/src/ws/agent.test.ts
+index ce5aac624de..9506e75f80f 100644
+--- a/packages/server/src/ws/agent.test.ts
++++ b/packages/server/src/ws/agent.test.ts
+@@ -7,7 +7,9 @@ import {
+   createReference,
+   getReferenceString,
+   Hl7Message,
++  Logger,
+   MEDPLUM_VERSION,
++  parseJWTPayload,
+   sleep,
+ } from '@medplum/core';
+ import type { Agent, Bot, Device } from '@medplum/fhirtypes';
+@@ -27,7 +29,7 @@ import { heartbeat } from '../heartbeat';
+ import { globalLogger } from '../logger';
+ import * as redisModule from '../redis';
+ import { getCacheRedis } from '../redis';
+-import { createTestProject, initTestAuth } from '../test.setup';
++import { addTestUser, createTestProject, initTestAuth, withTestContext } from '../test.setup';
+ 
+ const app = express();
+ let config: ServerConfig;
+@@ -157,6 +159,85 @@ describe('Agent WebSockets', () => {
+       .expectClosed();
+   });
+ 
++  test('Transmit by a caller with SMART scopes is logged', async () => {
++    const { project, accessToken: adminToken } = await createTestProject({
++      withAccessToken: true,
++      membership: { admin: true },
++    });
++
++    const res1 = await request(server)
++      .post('/fhir/R4/Bot')
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .set('Authorization', 'Bearer ' + adminToken)
++      .send({ resourceType: 'Bot', name: 'Scope Bot', runtimeVersion: 'vmcontext' });
++    expect(res1.status).toBe(201);
++    const bot = res1.body as WithId<Bot>;
++
++    const res2 = await request(server)
++      .post(`/fhir/R4/Bot/${bot.id}/$deploy`)
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .set('Authorization', 'Bearer ' + adminToken)
++      .send({ code: `exports.handler = async (medplum) => medplum.getAccessToken();` });
++    expect(res2.status).toBe(200);
++
++    const res3 = await request(server)
++      .post('/fhir/R4/Agent')
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .set('Authorization', 'Bearer ' + adminToken)
++      .send({
++        resourceType: 'Agent',
++        name: 'Scope Agent',
++        status: 'active',
++        channel: [{ name: 'test', endpoint: { reference: 'Endpoint/123' }, targetReference: createReference(bot) }],
++      });
++    expect(res3.status).toBe(201);
++
++    const scope = 'openid user/Agent.rs user/Bot.rs';
++    const user = await withTestContext(() => addTestUser(project, { scope }));
++
++    const warnSpy = vi.spyOn(Logger.prototype, 'warn');
++    try {
++      await request(server)
++        .ws('/ws/agent')
++        .sendText(
++          JSON.stringify({ type: 'agent:connect:request', accessToken: user.accessToken, agentId: res3.body.id })
++        )
++        .expectText('{"type":"agent:connect:response"}')
++        .sendText(
++          JSON.stringify({
++            type: 'agent:transmit:request',
++            accessToken: user.accessToken,
++            channel: 'test',
++            remote: '0.0.0.0:57000',
++            contentType: ContentType.TEXT,
++            body: 'input',
++          })
++        )
++        .expectJson((actual) => {
++          expect(actual).toMatchObject({ type: 'agent:transmit:response', statusCode: 200 });
++          expect(parseJWTPayload(actual.body).scope).toBe('openid');
++        })
++        .close()
++        .expectClosed();
++
++      const calls = warnSpy.mock.calls.filter(([msg]) => msg === 'Bot ran as a caller with SMART scopes');
++      expect(calls.map(([, data]) => data)).toStrictEqual([
++        {
++          botId: bot.id,
++          runAsProject: project.id,
++          callerMembership: getReferenceString(user.membership),
++          callerProfile: getReferenceString(user.profile),
++          scope,
++          launch: undefined,
++          entryPoint: 'agent',
++          suppressed: 0,
++        },
++      ]);
++    } finally {
++      warnSpy.mockRestore();
++    }
++  });
++
+   test('Send non-JSON', async () => {
+     await request(server)
+       .ws('/ws/agent')
+diff --git a/packages/server/src/ws/agent.ts b/packages/server/src/ws/agent.ts
+index 91859f1c024..7d8499d8ef4 100644
+--- a/packages/server/src/ws/agent.ts
++++ b/packages/server/src/ws/agent.ts
+@@ -277,6 +277,8 @@ export async function handleAgentConnection(socket: WebSocket, request: Incoming
+       bot,
+       runAs: authState.membership,
+       runAsProject: authState.project,
++      callerLogin: authState.login,
++      entryPoint: 'agent',
+       requester: authState.membership.profile,
+       contentType: command.contentType,
+       input,

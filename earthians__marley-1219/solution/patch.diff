@@ -1,0 +1,1760 @@
+diff --git a/healthcare/healthcare/doctype/fee_validity/fee_validity.json b/healthcare/healthcare/doctype/fee_validity/fee_validity.json
+index 9af797b987d..ef4fc50e557 100644
+--- a/healthcare/healthcare/doctype/fee_validity/fee_validity.json
++++ b/healthcare/healthcare/doctype/fee_validity/fee_validity.json
+@@ -13,15 +13,17 @@
+   "medical_department",
+   "column_break_3",
+   "status",
+-  "patient_appointment",
++  "reference_dt",
++  "reference_dn",
+   "sales_invoice_ref",
+   "section_break_3",
+   "max_visits",
+   "visited",
+-  "ref_appointments",
+   "column_break_6",
+   "start_date",
+-  "valid_till"
++  "valid_till",
++  "section_break_zmhp",
++  "reference_visits"
+  ],
+  "fields": [
+   {
+@@ -94,9 +96,9 @@
+    "read_only": 1
+   },
+   {
+-   "fieldname": "ref_appointments",
+-   "fieldtype": "Table MultiSelect",
+-   "label": "Reference Appointments",
++   "fieldname": "reference_visits",
++   "fieldtype": "Table",
++   "label": "Reference Visits",
+    "options": "Fee Validity Reference",
+    "read_only": 1
+   },
+@@ -115,17 +117,30 @@
+    "read_only": 1
+   },
+   {
+-   "fieldname": "patient_appointment",
++   "fieldname": "reference_dt",
+    "fieldtype": "Link",
+-   "label": "Patient Appointment",
+-   "options": "Patient Appointment",
+-   "read_only": 1
++   "label": "Reference DocType",
++   "options": "DocType",
++   "read_only": 1,
++   "search_index": 1
++  },
++  {
++   "fieldname": "reference_dn",
++   "fieldtype": "Dynamic Link",
++   "label": "Reference Name",
++   "options": "reference_dt",
++   "read_only": 1,
++   "search_index": 1
++  },
++  {
++   "fieldname": "section_break_zmhp",
++   "fieldtype": "Section Break"
+   }
+  ],
+  "grid_page_length": 50,
+  "in_create": 1,
+  "links": [],
+- "modified": "2025-12-25 09:36:29.334799",
++ "modified": "2026-09-17 14:30:09.631711",
+  "modified_by": "Administrator",
+  "module": "Healthcare",
+  "name": "Fee Validity",
+diff --git a/healthcare/healthcare/doctype/fee_validity/fee_validity.py b/healthcare/healthcare/doctype/fee_validity/fee_validity.py
+index 4e67ebf77b6..5cc915e9fef 100644
+--- a/healthcare/healthcare/doctype/fee_validity/fee_validity.py
++++ b/healthcare/healthcare/doctype/fee_validity/fee_validity.py
+@@ -5,8 +5,9 @@
+ import json
+ 
+ import frappe
++from frappe import _
+ from frappe.model.document import Document
+-from frappe.utils import getdate
++from frappe.utils import get_link_to_form, getdate
+ 
+ 
+ class FeeValidity(Document):
+@@ -22,190 +23,368 @@ def update_status(self):
+ 			self.status = "Active"
+ 
+ 
+-def create_fee_validity(appointment):
+-	if patient_has_validity(appointment):
++VISIT_DOCTYPES = ("Patient Appointment", "Patient Encounter")
++
++
++def validate_visit_doctype(reference_dt):
++	if reference_dt not in VISIT_DOCTYPES:
++		frappe.throw(_("{0} is not a visit").format(frappe.bold(reference_dt)))
++
++
++def validate_read_access(doctype, name=None):
++	"""A whitelisted lookup must not reveal a validity for a record the caller cannot read"""
++	if not frappe.has_permission(doctype, "read", name):
++		frappe.throw(_("Not permitted to read {0} {1}").format(doctype, name or ""), frappe.PermissionError)
++
++
++def validate_visit_access(visit):
++	"""The caller must be able to read the patient, and the visit itself once it is saved"""
++	validate_read_access("Patient", visit.patient)
++	if not visit.get("__islocal"):
++		validate_read_access(visit.doctype, visit.name)
++
++
++def get_visit_date(visit):
++	if visit.doctype == "Patient Encounter":
++		return getdate(visit.encounter_date)
++	return getdate(visit.appointment_date)
++
++
++def get_visit_department(visit):
++	if visit.doctype == "Patient Encounter":
++		return visit.medical_department
++	return visit.department
++
++
++def is_visit_cancelled(visit):
++	if visit.doctype == "Patient Encounter":
++		return visit.docstatus == 2
++	return visit.status == "Cancelled"
++
++
++def covers_visit_date(fee_validity, date):
++	"""A validity may serve a visit made before it started, but not one made before it existed.
++
++	A future dated appointment opens a validity that starts tomorrow, and today's encounter
++	should still use it. A visit backdated to last year should not.
++	"""
++	return date >= fee_validity.start_date or date >= getdate(fee_validity.creation)
++
++
++def is_inpatient_visit(visit):
++	"""Inpatient visits are billed with the admission, they are not outpatient follow ups."""
++	if visit.get("inpatient_record"):
++		return True
++
++	inpatient_record = frappe.db.get_value("Patient", visit.patient, "inpatient_record")
++	if not inpatient_record:
++		return False
++
++	return frappe.db.get_value("Inpatient Record", inpatient_record, "status") == "Admitted"
++
++
++def is_free_follow_up_enabled(practitioner, doctype="Patient Appointment"):
++	"""Free follow ups apply when enabled for the practitioner or in Healthcare Settings."""
++	if not practitioner:
++		return False
++
++	if doctype == "Patient Encounter" and not frappe.db.get_single_value(
++		"Healthcare Settings", "apply_free_follow_ups_on_encounters"
++	):
++		return False
++
++	pract_enabled = frappe.get_cached_value("Healthcare Practitioner", practitioner, "enable_free_follow_ups")
++	settings_enabled = frappe.db.get_single_value("Healthcare Settings", "enable_free_follow_ups")
++
++	return bool(pract_enabled or settings_enabled)
++
++
++def lock_patient(patient):
++	"""Serialize every fee validity write for a patient until the transaction ends.
++
++	Two visits submitted together must not both find no validity and open one each, nor both read
++	the same visit count and overwrite each other. Under REPEATABLE READ a plain read after the
++	lock still sees the transaction's old snapshot, so the reads inside the critical section that
++	another visit could have changed are locking reads (for_update) as well.
++	"""
++	frappe.db.get_value("Patient", patient, "name", for_update=True)
++
++
++def create_fee_validity(visit):
++	if patient_has_validity(visit):
+ 		return
+ 
+ 	settings = frappe.get_single("Healthcare Settings")
+ 	valid_days, max_visits = settings.valid_days, settings.max_visits
+-	pract_enabled = False
+-	if appointment.practitioner:
+-		pract_enabled = frappe.get_cached_value(
+-			"Healthcare Practitioner", appointment.practitioner, "enable_free_follow_ups"
++	# a visit always has a practitioner here, free follow ups are never enabled without one
++	if frappe.get_cached_value("Healthcare Practitioner", visit.practitioner, "enable_free_follow_ups"):
++		valid_days, max_visits = frappe.get_cached_value(
++			"Healthcare Practitioner", visit.practitioner, ["valid_days", "max_visits"]
+ 		)
+ 
+-		if pract_enabled:
+-			valid_days, max_visits = frappe.get_cached_value(
+-				"Healthcare Practitioner", appointment.practitioner, ["valid_days", "max_visits"]
+-			)
++	visit_date = get_visit_date(visit)
+ 
+ 	fee_validity = frappe.new_doc("Fee Validity")
+-	fee_validity.practitioner = appointment.practitioner
+-	fee_validity.patient = appointment.patient
+-	fee_validity.medical_department = appointment.department
+-	fee_validity.patient_appointment = appointment.name
++	fee_validity.practitioner = visit.practitioner
++	fee_validity.patient = visit.patient
++	fee_validity.medical_department = get_visit_department(visit)
++	fee_validity.reference_dt = visit.doctype
++	fee_validity.reference_dn = visit.name
+ 	fee_validity.sales_invoice_ref = frappe.db.get_value(
+-		"Sales Invoice Item", {"reference_dn": appointment.name}, "parent"
++		"Sales Invoice Item", {"reference_dt": visit.doctype, "reference_dn": visit.name}, "parent"
+ 	)
+ 	fee_validity.max_visits = max_visits or 1
+ 	fee_validity.visited = 0
+-	fee_validity.start_date = getdate(appointment.appointment_date)
+-	fee_validity.valid_till = getdate(appointment.appointment_date) + datetime.timedelta(
+-		days=int(valid_days or 1)
+-	)
++	fee_validity.start_date = visit_date
++	fee_validity.valid_till = visit_date + datetime.timedelta(days=int(valid_days or 1))
+ 	fee_validity.save(ignore_permissions=True)
+ 
+ 	return fee_validity
+ 
+ 
+-def patient_has_validity(appointment):
+-	validity_exists = frappe.db.exists(
++def patient_has_validity(visit):
++	"""A patient can hold only one active validity per practitioner at a time."""
++	visit_date = get_visit_date(visit)
++	validity = frappe.db.get_value(
+ 		"Fee Validity",
+ 		{
+-			"practitioner": appointment.practitioner,
+-			"patient": appointment.patient,
++			"practitioner": visit.practitioner,
++			"patient": visit.patient,
+ 			"status": "Active",
+-			"valid_till": [">=", appointment.appointment_date],
+-			"start_date": ["<=", appointment.appointment_date],
++			"valid_till": [">=", visit_date],
+ 		},
++		["name", "start_date", "creation"],
++		as_dict=True,
++		for_update=True,
+ 	)
+ 
+-	return validity_exists
++	return bool(validity and covers_visit_date(validity, visit_date))
+ 
+ 
+ @frappe.whitelist()
+-def check_fee_validity(appointment, date=None, practitioner=None):
+-	if isinstance(appointment, str):
+-		appointment = frappe.get_doc(json.loads(appointment))
+-
+-	practitioner = practitioner if practitioner else appointment.practitioner
+-	if not practitioner:
++def check_fee_validity(
++	visit: str | Document,
++	date: str | datetime.date | None = None,
++	practitioner: str | None = None,
++) -> Document | None:
++	if isinstance(visit, str):
++		visit = json.loads(visit)
++		validate_visit_doctype(visit.get("doctype"))
++		visit = frappe.get_doc(visit)
++
++	validate_visit_access(visit)
++	return find_fee_validity(visit, date, practitioner)
++
++
++def find_fee_validity(visit, date=None, practitioner=None, for_update=False):
++	"""The validity covering this visit; for_update reads and locks the latest committed row"""
++	if isinstance(visit, str):
++		visit = frappe.get_doc(json.loads(visit))
++
++	practitioner = practitioner if practitioner else visit.practitioner
++	if not practitioner or is_inpatient_visit(visit):
+ 		return
+ 
+ 	# Check if free follow-ups are enabled
+-	pract_enabled = frappe.get_cached_value("Healthcare Practitioner", practitioner, "enable_free_follow_ups")
+-	settings_enabled = frappe.db.get_single_value("Healthcare Settings", "enable_free_follow_ups")
+-	if not (pract_enabled or settings_enabled):
++	if not is_free_follow_up_enabled(practitioner, visit.doctype):
+ 		return
+ 
+-	date = getdate(date) if date else appointment.appointment_date
++	date = getdate(date) if date else get_visit_date(visit)
+ 
+ 	filters = {
+ 		"practitioner": practitioner,
+-		"patient": appointment.patient,
++		"patient": visit.patient,
+ 		"valid_till": (">=", date),
+-		"start_date": ("<=", date),
+ 	}
+-	if appointment.status != "Cancelled":
++	if not is_visit_cancelled(visit):
+ 		filters["status"] = "Active"
+ 	else:
+-		filters["patient_appointment"] = appointment.name
++		filters["reference_dt"] = visit.doctype
++		filters["reference_dn"] = visit.name
+ 
+-	validity = frappe.db.exists(
+-		"Fee Validity",
+-		filters,
++	validity = frappe.db.get_value(
++		"Fee Validity", filters, ["name", "start_date", "creation"], as_dict=True, for_update=for_update
+ 	)
+ 
+-	if validity:
+-		return frappe.get_doc("Fee Validity", validity)
++	if validity and covers_visit_date(validity, date):
++		return frappe.get_doc("Fee Validity", validity.name, for_update=for_update)
+ 
+-	# Fallback for rescheduled appointments
+-	if appointment.get("__islocal"):
++	# Fallback for rescheduled visits
++	if visit.get("__islocal"):
+ 		return
+ 
+-	validity = get_fee_validity(appointment.get("name"), date, ignore_status=True) or None
++	validity = (
++		query_fee_validity(visit.get("name"), date, ignore_status=True, reference_dt=visit.doctype) or None
++	)
+ 	if validity and len(validity):
+ 		return frappe.get_doc("Fee Validity", validity[0].get("name"))
+ 
+-	return
+ 
+-
+-def manage_fee_validity(appointment):
+-	settings_enabled = frappe.db.get_single_value("Healthcare Settings", "enable_free_follow_ups")
+-	pract_enabled = False
+-	free_follow_ups = False
+-
+-	if appointment.practitioner:
+-		pract_enabled = frappe.db.get_value(
+-			"Healthcare Practitioner", appointment.practitioner, "enable_free_follow_ups"
+-		)
+-		free_follow_ups = pract_enabled or settings_enabled
+-
+-	if not free_follow_ups:
++def manage_fee_validity(visit):
++	if is_inpatient_visit(visit) or not is_free_follow_up_enabled(visit.practitioner, visit.doctype):
+ 		return
+ 
+-	# Update fee validity dates when rescheduling an invoiced appointment
+-	invoiced_fee_validity = frappe.db.exists("Fee Validity", {"patient_appointment": appointment.name})
+-	if invoiced_fee_validity and appointment.invoiced:
++	lock_patient(visit.patient)
++	pract_enabled = frappe.db.get_value(
++		"Healthcare Practitioner", visit.practitioner, "enable_free_follow_ups"
++	)
++	visit_date = get_visit_date(visit)
++
++	# Update fee validity dates when rescheduling an invoiced visit
++	invoiced_fee_validity = frappe.db.exists(
++		"Fee Validity", {"reference_dt": visit.doctype, "reference_dn": visit.name}
++	)
++	if invoiced_fee_validity and visit.get("invoiced"):
+ 		start_date = frappe.db.get_value("Fee Validity", invoiced_fee_validity, "start_date")
+-		if getdate(appointment.appointment_date) != start_date:
++		if visit_date != start_date:
+ 			valid_days = frappe.db.get_single_value("Healthcare Settings", "valid_days")
+ 			if pract_enabled:
+-				valid_days = frappe.db.get_value(
+-					"Healthcare Practitioner", appointment.practitioner, "valid_days"
+-				)
++				valid_days = frappe.db.get_value("Healthcare Practitioner", visit.practitioner, "valid_days")
+ 			frappe.db.set_value(
+ 				"Fee Validity",
+ 				invoiced_fee_validity,
+ 				{
+-					"start_date": appointment.appointment_date,
+-					"valid_till": getdate(appointment.appointment_date)
+-					+ datetime.timedelta(days=int(valid_days or 1)),
++					"start_date": visit_date,
++					"valid_till": visit_date + datetime.timedelta(days=int(valid_days or 1)),
+ 				},
+ 			)
+ 
+ 	# Check for existing valid fee
+-	fee_validity = check_fee_validity(appointment)
++	fee_validity = find_fee_validity(visit, for_update=True)
+ 
+ 	if fee_validity:
+-		exists = frappe.db.exists("Fee Validity Reference", {"appointment": appointment.name})
+-		if appointment.status == "Cancelled" and fee_validity.visited > 0:
++		exists = frappe.db.exists(
++			"Fee Validity Reference", {"reference_dt": visit.doctype, "reference_dn": visit.name}
++		)
++		if is_visit_cancelled(visit) and fee_validity.visited > 0:
+ 			fee_validity.visited -= 1
+-			frappe.db.delete("Fee Validity Reference", {"appointment": appointment.name})
++			frappe.db.delete(
++				"Fee Validity Reference", {"reference_dt": visit.doctype, "reference_dn": visit.name}
++			)
+ 		elif fee_validity.status != "Active":
+ 			return
+-		elif appointment.name != fee_validity.patient_appointment and not exists:
++		elif visit.name != fee_validity.reference_dn and not exists:
+ 			fee_validity.visited += 1
+-			fee_validity.append("ref_appointments", {"appointment": appointment.name})
++			fee_validity.append(
++				"reference_visits", {"reference_dt": visit.doctype, "reference_dn": visit.name}
++			)
++			if visit_date < fee_validity.start_date:
++				# the validity now serves a visit earlier than the one that opened it
++				fee_validity.start_date = visit_date
++
++		if not fee_validity.sales_invoice_ref:
++			# an encounter is invoiced after the validity is created, unlike an appointment
++			fee_validity.sales_invoice_ref = frappe.db.get_value(
++				"Sales Invoice Item", {"reference_dt": visit.doctype, "reference_dn": visit.name}, "parent"
++			)
++
+ 		fee_validity.save(ignore_permissions=True)
+ 	else:
+-		# remove appointment from fee validity reference when rescheduling an appointment to date not in fee validity
++		# remove visit from fee validity reference when rescheduling a visit to date not in fee validity
+ 		free_visit_validity = frappe.db.get_value(
+-			"Fee Validity Reference", {"appointment": appointment.name}, "parent"
++			"Fee Validity Reference", {"reference_dt": visit.doctype, "reference_dn": visit.name}, "parent"
+ 		)
+ 		if free_visit_validity:
+-			fee_validity = frappe.get_doc(
+-				"Fee Validity",
+-				free_visit_validity,
++			fee_validity = frappe.get_doc("Fee Validity", free_visit_validity, for_update=True)
++			frappe.db.delete(
++				"Fee Validity Reference", {"reference_dt": visit.doctype, "reference_dn": visit.name}
+ 			)
+-			frappe.db.delete("Fee Validity Reference", {"appointment": appointment.name})
+ 			if fee_validity.visited > 0:
+ 				fee_validity.visited -= 1
+ 				fee_validity.save(ignore_permissions=True)
+ 
+-		fee_validity = create_fee_validity(appointment)
++		fee_validity = create_fee_validity(visit)
+ 
+ 	return fee_validity
+ 
+ 
++def cancel_fee_validity(visit):
++	"""Cancel the validity this visit opened, or give back the visit it consumed.
++
++	The validity exists only because of the visit that opened it, so it goes with it. An
++	encounter is invoiced after it is submitted, so its invoiced state says nothing here.
++	"""
++	lock_patient(visit.patient)
++	fee_validity = frappe.db.get_value(
++		"Fee Validity", {"reference_dt": visit.doctype, "reference_dn": visit.name}, for_update=True
++	)
++	if fee_validity:
++		validate_free_visits_not_taken(fee_validity)
++		frappe.db.set_value("Fee Validity", fee_validity, "status", "Cancelled")
++		return
++
++	return manage_fee_validity(visit)
++
++
++def set_sales_invoice_reference(reference_dt, reference_dn, sales_invoice=None):
++	"""Stamp the invoice on the validity a visit opened, without ever opening one"""
++	fee_validity = frappe.db.get_value(
++		"Fee Validity", {"reference_dt": reference_dt, "reference_dn": reference_dn}
++	)
++	if fee_validity:
++		frappe.db.set_value("Fee Validity", fee_validity, "sales_invoice_ref", sales_invoice)
++
++
++def validate_fee_validity_cancellation(visit):
++	"""A visit cannot be cancelled while free visits stand against the validity it opened.
++
++	This runs before anything is written, so the cancellation is refused rather than rolled back.
++	"""
++	fee_validity = frappe.db.get_value(
++		"Fee Validity", {"reference_dt": visit.doctype, "reference_dn": visit.name}
++	)
++	if fee_validity:
++		validate_free_visits_not_taken(fee_validity)
++
++
++def validate_free_visits_not_taken(fee_validity):
++	"""Free visits already taken would be left without the validity that made them free"""
++	free_visits = frappe.get_all(
++		"Fee Validity Reference", {"parent": fee_validity}, ["reference_dt", "reference_dn"]
++	)
++	if not free_visits:
++		return
++
++	frappe.throw(
++		_("Cannot cancel, {0} taken against Fee Validity {1}. Cancel {2} first.").format(
++			frappe.bold(_("free visits")),
++			get_link_to_form("Fee Validity", fee_validity),
++			", ".join(get_link_to_form(visit.reference_dt, visit.reference_dn) for visit in free_visits),
++		),
++		title=_("Free Visits Taken"),
++	)
++
++
+ @frappe.whitelist()
+-def get_fee_validity(appointment_name, date, ignore_status=False):
++def get_fee_validity(
++	reference_dn: str | None,
++	date: str | datetime.date,
++	ignore_status: bool = False,
++	reference_dt: str = "Patient Appointment",
++) -> list[dict] | None:
+ 	"""
+-	Get the fee validity details for the free visit appointment
+-	:params appointment_name: Appointment doc name
++	Get the fee validity details for the free visit
++	:params reference_dn: Patient Appointment or Patient Encounter doc name
+ 	:params date: Schedule date
+ 	:params ignore_status: status will not filter in query
+-	:return fee validity name and valid_till values of free visit appointments
++	:params reference_dt: Patient Appointment or Patient Encounter
++	:return fee validity name and valid_till values of free visits
+ 	"""
++	validate_visit_doctype(reference_dt)
++	validate_read_access(reference_dt, reference_dn)
++	return query_fee_validity(reference_dn, date, ignore_status, reference_dt)
++
+ 
+-	if not appointment_name:
++def query_fee_validity(reference_dn, date, ignore_status=False, reference_dt="Patient Appointment"):
++	if not reference_dn:
+ 		return None
+ 
+-	appointment_details = frappe.db.get_value(
+-		"Patient Appointment", appointment_name, ["patient", "practitioner"], as_dict=True
+-	)
++	if reference_dt not in ("Patient Appointment", "Patient Encounter"):
++		frappe.throw(_(f"Invalid reference doctype {reference_dt}"))
++
++	visit_details = frappe.db.get_value(reference_dt, reference_dn, ["patient", "practitioner"], as_dict=True)
+ 
+-	if not appointment_details:
++	if not visit_details:
+ 		return None
+ 
+ 	fee_validity = frappe.qb.DocType("Fee Validity")
+@@ -216,11 +395,11 @@ def get_fee_validity(appointment_name, date, ignore_status=False):
+ 		.inner_join(child)
+ 		.on(fee_validity.name == child.parent)
+ 		.select(fee_validity.name, fee_validity.valid_till)
+-		.where(fee_validity.start_date <= date)
+ 		.where(fee_validity.valid_till >= date)
+-		.where(fee_validity.patient == appointment_details.patient)
+-		.where(fee_validity.practitioner == appointment_details.practitioner)
+-		.where(child.appointment == appointment_name)
++		.where(fee_validity.patient == visit_details.patient)
++		.where(fee_validity.practitioner == visit_details.practitioner)
++		.where(child.reference_dt == reference_dt)
++		.where(child.reference_dn == reference_dn)
+ 	)
+ 
+ 	if not ignore_status:
+diff --git a/healthcare/healthcare/doctype/fee_validity/fee_validity_list.js b/healthcare/healthcare/doctype/fee_validity/fee_validity_list.js
+index 90845167cff..56b97dda50f 100644
+--- a/healthcare/healthcare/doctype/fee_validity/fee_validity_list.js
++++ b/healthcare/healthcare/doctype/fee_validity/fee_validity_list.js
+@@ -1,10 +1,11 @@
+ frappe.listview_settings["Fee Validity"] = {
+ 	add_fields: ["practitioner", "patient", "status", "valid_till"],
++	filters: [["status", "=", "Active"]],
+ 	get_indicator: function (doc) {
+ 		const color = {
+ 			Active: "green",
+-			Completed: "green",
+-			Expired: "red",
++			Completed: "grey",
++			Expired: "orange",
+ 			Cancelled: "red",
+ 		};
+ 		return [__(doc.status), color[doc.status], "status,=," + doc.status];
+diff --git a/healthcare/healthcare/doctype/fee_validity/test_fee_validity.py b/healthcare/healthcare/doctype/fee_validity/test_fee_validity.py
+index 51546a66b1d..9ff4489aa6d 100644
+--- a/healthcare/healthcare/doctype/fee_validity/test_fee_validity.py
++++ b/healthcare/healthcare/doctype/fee_validity/test_fee_validity.py
+@@ -3,14 +3,33 @@
+ 
+ 
+ import frappe
+-from frappe.utils import add_days, date_diff, nowdate
++from frappe.utils import add_days, date_diff, getdate, now_datetime, nowdate
+ 
+ from erpnext.accounts.doctype.pos_profile.test_pos_profile import make_pos_profile
+ 
++from healthcare.healthcare.doctype.fee_validity.fee_validity import (
++	check_fee_validity,
++	create_fee_validity,
++	get_fee_validity,
++	manage_fee_validity,
++	query_fee_validity,
++	update_validity_status,
++)
++from healthcare.healthcare.doctype.healthcare_settings.healthcare_settings import (
++	get_income_account,
++	get_receivable_account,
++)
++from healthcare.healthcare.doctype.inpatient_record.inpatient_record import admit_patient
++from healthcare.healthcare.doctype.inpatient_record.test_inpatient_record import (
++	create_inpatient,
++	get_healthcare_service_unit,
++)
+ from healthcare.healthcare.doctype.patient_appointment.test_patient_appointment import (
+ 	create_appointment,
+ 	update_status,
+ )
++from healthcare.healthcare.utils import get_encounters_to_invoice
++from healthcare.tests.test_utils import create_encounter
+ from healthcare.tests.utils import HealthcareTestSuite
+ 
+ 
+@@ -18,6 +37,7 @@ class TestFeeValidity(HealthcareTestSuite):
+ 	def setUp(self):
+ 		super().setUp()
+ 		frappe.db.sql("""delete from `tabPatient Appointment`""")
++		frappe.db.sql("""delete from `tabPatient Encounter`""")
+ 		frappe.db.sql("""delete from `tabFee Validity`""")
+ 		make_pos_profile()
+ 
+@@ -38,7 +58,12 @@ def test_fee_validity(self):
+ 		appointment = create_appointment(patient, practitioner, nowdate())
+ 		fee_validity = frappe.db.exists(
+ 			"Fee Validity",
+-			{"patient": patient, "practitioner": practitioner, "patient_appointment": appointment.name},
++			{
++				"patient": patient,
++				"practitioner": practitioner,
++				"reference_dt": "Patient Appointment",
++				"reference_dn": appointment.name,
++			},
+ 		)
+ 		invoiced = frappe.db.get_value("Patient Appointment", appointment.name, "invoiced")
+ 		self.assertEqual(invoiced, 1)
+@@ -60,7 +85,12 @@ def test_fee_validity(self):
+ 
+ 		fee_validity = frappe.db.exists(
+ 			"Fee Validity",
+-			{"patient": patient, "practitioner": practitioner, "patient_appointment": appointment.name},
++			{
++				"patient": patient,
++				"practitioner": practitioner,
++				"reference_dt": "Patient Appointment",
++				"reference_dn": appointment.name,
++			},
+ 		)
+ 		self.assertTrue(fee_validity)
+ 		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "status"), "Active")
+@@ -72,7 +102,12 @@ def test_fee_validity(self):
+ 
+ 		fee_validity = frappe.db.exists(
+ 			"Fee Validity",
+-			{"patient": patient, "practitioner": practitioner, "patient_appointment": appointment.name},
++			{
++				"patient": patient,
++				"practitioner": practitioner,
++				"reference_dt": "Patient Appointment",
++				"reference_dn": appointment.name,
++			},
+ 		)
+ 		self.assertTrue(fee_validity)
+ 		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "status"), "Active")
+@@ -104,7 +139,12 @@ def test_practitioner_fee_validity(self):
+ 		appointment = create_appointment(patient, practitioner, nowdate())
+ 		fee_validity = frappe.db.exists(
+ 			"Fee Validity",
+-			{"patient": patient, "practitioner": practitioner, "patient_appointment": appointment.name},
++			{
++				"patient": patient,
++				"practitioner": practitioner,
++				"reference_dt": "Patient Appointment",
++				"reference_dn": appointment.name,
++			},
+ 		)
+ 		invoiced = frappe.db.get_value("Patient Appointment", appointment.name, "invoiced")
+ 		self.assertEqual(invoiced, 1)
+@@ -116,3 +156,606 @@ def test_practitioner_fee_validity(self):
+ 			"Fee Validity", fee_validity, ["start_date", "valid_till"]
+ 		)
+ 		self.assertEqual(date_diff(valid_till, start_date), 5)
++
++	def test_encounter_billed_when_setting_disabled(self):
++		"""Free follow ups must not apply to encounters until explicitly opted in"""
++		patient, practitioner = self.enable_free_follow_ups(apply_on_encounters=0)
++
++		first = create_encounter(patient, practitioner, submit=True)
++		second = create_encounter(patient, practitioner, submit=True)
++
++		self.assertFalse(
++			frappe.db.exists("Fee Validity", {"reference_dt": "Patient Encounter"}),
++			"Fee Validity created for an encounter while the setting is disabled",
++		)
++		for encounter in (first, second):
++			self.assertIn(encounter.name, self.encounters_to_invoice(patient))
++
++	def test_fee_validity_for_encounter(self):
++		patient, practitioner = self.enable_free_follow_ups()
++
++		# first encounter is billed and starts the validity
++		first = create_encounter(patient, practitioner, submit=True)
++		fee_validity = frappe.db.exists(
++			"Fee Validity", {"reference_dt": "Patient Encounter", "reference_dn": first.name}
++		)
++		self.assertTrue(fee_validity)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "status"), "Active")
++		self.assertIn(first.name, self.encounters_to_invoice(patient))
++
++		# second encounter is a free follow up, so it is not billed
++		second = create_encounter(patient, practitioner, submit=True)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 1)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "status"), "Completed")
++		self.assertNotIn(second.name, self.encounters_to_invoice(patient))
++
++		# max visits are used up, so the third encounter is billed and starts a new validity
++		third = create_encounter(patient, practitioner, submit=True)
++		self.assertIn(third.name, self.encounters_to_invoice(patient))
++		self.assertTrue(
++			frappe.db.exists(
++				"Fee Validity", {"reference_dt": "Patient Encounter", "reference_dn": third.name}
++			)
++		)
++
++	def test_fee_validity_shared_between_appointment_and_encounter(self):
++		patient, practitioner = self.enable_free_follow_ups()
++
++		appointment = create_appointment(patient, practitioner, nowdate())
++		fee_validity = frappe.db.exists(
++			"Fee Validity", {"reference_dt": "Patient Appointment", "reference_dn": appointment.name}
++		)
++		self.assertTrue(fee_validity)
++
++		# the walk in encounter consumes the visit the appointment paid for
++		encounter = create_encounter(patient, practitioner, submit=True)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 1)
++		self.assertNotIn(encounter.name, self.encounters_to_invoice(patient))
++
++	def test_encounter_with_appointment_ignored(self):
++		"""An encounter booked through an appointment is counted on the appointment only"""
++		patient, practitioner = self.enable_free_follow_ups()
++
++		create_appointment(patient, practitioner, nowdate())
++		appointment = create_appointment(patient, practitioner, add_days(nowdate(), 1))
++		fee_validity = frappe.db.get_value(
++			"Fee Validity", {"patient": patient, "practitioner": practitioner}, "name"
++		)
++		visited = frappe.db.get_value("Fee Validity", fee_validity, "visited")
++
++		create_encounter(patient, practitioner, submit=True, appointment=appointment.name)
++
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), visited)
++
++	def test_cancel_encounter_restores_visit(self):
++		patient, practitioner = self.enable_free_follow_ups()
++
++		create_encounter(patient, practitioner, submit=True)
++		encounter = create_encounter(patient, practitioner, submit=True)
++		fee_validity = frappe.db.get_value(
++			"Fee Validity", {"patient": patient, "practitioner": practitioner}, "name"
++		)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 1)
++
++		encounter.cancel()
++
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 0)
++		self.assertFalse(
++			frappe.db.exists(
++				"Fee Validity Reference",
++				{"reference_dt": "Patient Encounter", "reference_dn": encounter.name},
++			)
++		)
++
++	def enable_free_follow_ups(self, apply_on_encounters=1, max_visits=1, valid_days=7):
++		patient = frappe.get_list("Patient", pluck="name")[0]
++		practitioner = frappe.get_list("Healthcare Practitioner", pluck="name")[0]
++
++		# another suite may have left this shared patient flagged as admitted
++		frappe.db.set_value("Patient", patient, {"inpatient_record": None, "inpatient_status": None})
++
++		healthcare_settings = frappe.get_single("Healthcare Settings")
++		healthcare_settings.enable_free_follow_ups = 1
++		healthcare_settings.apply_free_follow_ups_on_encounters = apply_on_encounters
++		healthcare_settings.max_visits = max_visits
++		healthcare_settings.valid_days = valid_days
++		healthcare_settings.show_payment_popup = 1
++		healthcare_settings.op_consulting_charge_item = "HLC-SI-001"
++		healthcare_settings.save(ignore_permissions=True)
++
++		return patient, practitioner
++
++	def encounters_to_invoice(self, patient):
++		patient = frappe.get_doc("Patient", patient)
++		return [
++			item["reference_name"]
++			for item in get_encounters_to_invoice(patient, "_Test Company")
++			if item["reference_type"] == "Patient Encounter"
++		]
++
++	def test_expired_validity_status_is_updated(self):
++		patient, practitioner = self.enable_free_follow_ups()
++		encounter = create_encounter(patient, practitioner, submit=True)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++
++		frappe.db.set_value("Fee Validity", fee_validity, "valid_till", add_days(nowdate(), -1))
++		update_validity_status()
++
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "status"), "Expired")
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "reference_dn"), encounter.name)
++
++	def test_create_fee_validity_skipped_when_one_is_active(self):
++		patient, practitioner = self.enable_free_follow_ups()
++		encounter = create_encounter(patient, practitioner, submit=True)
++
++		self.assertIsNone(create_fee_validity(encounter))
++
++	def test_check_fee_validity_accepts_serialized_visit(self):
++		patient, practitioner = self.enable_free_follow_ups()
++		encounter = create_encounter(patient, practitioner, submit=True)
++
++		fee_validity = check_fee_validity(frappe.as_json(encounter.as_dict()))
++
++		self.assertEqual(fee_validity.reference_dn, encounter.name)
++
++	def test_check_fee_validity_when_free_follow_ups_disabled(self):
++		patient, practitioner = self.enable_free_follow_ups(apply_on_encounters=0)
++		encounter = create_encounter(patient, practitioner, submit=True)
++
++		self.assertIsNone(check_fee_validity(encounter))
++
++	def test_check_fee_validity_for_unsaved_visit(self):
++		patient, practitioner = self.enable_free_follow_ups()
++
++		encounter = frappe.new_doc("Patient Encounter")
++		encounter.patient = patient
++		encounter.practitioner = practitioner
++		encounter.encounter_date = nowdate()
++
++		self.assertIsNone(check_fee_validity(encounter))
++
++	def test_reschedule_invoiced_visit_shifts_validity(self):
++		patient, practitioner = self.enable_free_follow_ups()
++		appointment = create_appointment(patient, practitioner, nowdate(), invoice=1)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++
++		new_date = add_days(nowdate(), 2)
++		appointment.db_set("appointment_date", new_date)
++		appointment.reload()
++		manage_fee_validity(appointment)
++
++		start_date, valid_till = frappe.db.get_value(
++			"Fee Validity", fee_validity, ["start_date", "valid_till"]
++		)
++		self.assertEqual(start_date, getdate(new_date))
++		self.assertEqual(date_diff(valid_till, start_date), 7)
++
++	def test_reschedule_uses_practitioner_valid_days(self):
++		patient, practitioner = self.enable_free_follow_ups()
++		frappe.db.set_value(
++			"Healthcare Practitioner",
++			practitioner,
++			{"enable_free_follow_ups": 1, "max_visits": 2, "valid_days": 5},
++		)
++		appointment = create_appointment(patient, practitioner, nowdate(), invoice=1)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++
++		new_date = add_days(nowdate(), 2)
++		appointment.db_set("appointment_date", new_date)
++		appointment.reload()
++		manage_fee_validity(appointment)
++
++		start_date, valid_till = frappe.db.get_value(
++			"Fee Validity", fee_validity, ["start_date", "valid_till"]
++		)
++		self.assertEqual(start_date, getdate(new_date))
++		self.assertEqual(date_diff(valid_till, start_date), 5)
++
++	def test_visit_not_counted_again_when_validity_is_completed(self):
++		patient, practitioner = self.enable_free_follow_ups()
++		create_appointment(patient, practitioner, nowdate())
++		follow_up = create_appointment(patient, practitioner, add_days(nowdate(), 1))
++		fee_validity = self.get_fee_validity(patient, practitioner)
++
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "status"), "Completed")
++
++		self.assertIsNone(manage_fee_validity(follow_up))
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 1)
++
++	def test_reschedule_outside_validity_releases_visit(self):
++		patient, practitioner = self.enable_free_follow_ups(max_visits=2)
++		create_appointment(patient, practitioner, nowdate())
++		follow_up = create_appointment(patient, practitioner, add_days(nowdate(), 1))
++		fee_validity = self.get_fee_validity(patient, practitioner)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 1)
++
++		follow_up.db_set("appointment_date", add_days(nowdate(), 30))
++		follow_up.reload()
++		manage_fee_validity(follow_up)
++
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 0)
++		self.assertFalse(
++			frappe.db.exists(
++				"Fee Validity Reference",
++				{"reference_dt": "Patient Appointment", "reference_dn": follow_up.name},
++			)
++		)
++
++	def test_get_fee_validity_returns_none_for_unknown_visit(self):
++		self.assertIsNone(get_fee_validity(None, nowdate()))
++		self.assertIsNone(get_fee_validity("HLC-ENC-MISSING", nowdate(), reference_dt="Patient Encounter"))
++
++	def get_fee_validity(self, patient, practitioner):
++		return frappe.db.get_value("Fee Validity", {"patient": patient, "practitioner": practitioner}, "name")
++
++	def test_invoiced_visit_keeps_validity_dates_when_not_rescheduled(self):
++		patient, practitioner = self.enable_free_follow_ups()
++		appointment = create_appointment(patient, practitioner, nowdate(), invoice=1)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++		dates = frappe.db.get_value("Fee Validity", fee_validity, ["start_date", "valid_till"])
++
++		appointment.reload()
++		manage_fee_validity(appointment)
++
++		self.assertEqual(
++			frappe.db.get_value("Fee Validity", fee_validity, ["start_date", "valid_till"]), dates
++		)
++
++	def test_released_visit_does_not_drive_the_counter_negative(self):
++		patient, practitioner = self.enable_free_follow_ups(max_visits=2)
++		create_appointment(patient, practitioner, nowdate())
++		follow_up = create_appointment(patient, practitioner, add_days(nowdate(), 1))
++		fee_validity = self.get_fee_validity(patient, practitioner)
++
++		# the reference row is left behind with a counter that is already spent
++		frappe.db.set_value("Fee Validity", fee_validity, "visited", 0)
++
++		follow_up.db_set("appointment_date", add_days(nowdate(), 30))
++		follow_up.reload()
++		manage_fee_validity(follow_up)
++
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 0)
++		self.assertFalse(
++			frappe.db.exists(
++				"Fee Validity Reference",
++				{"reference_dt": "Patient Appointment", "reference_dn": follow_up.name},
++			)
++		)
++
++	def test_encounter_validity_is_consumed_by_appointment(self):
++		"""A validity started by a walk in encounter must cover a later appointment"""
++		patient, practitioner = self.enable_free_follow_ups()
++		encounter = create_encounter(patient, practitioner, submit=True)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++		self.assertEqual(
++			frappe.db.get_value("Fee Validity", fee_validity, "reference_dt"), "Patient Encounter"
++		)
++
++		appointment = create_appointment(patient, practitioner, add_days(nowdate(), 1))
++
++		self.assertEqual(frappe.db.get_value("Patient Appointment", appointment.name, "invoiced"), 0)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 1)
++		self.assertTrue(
++			frappe.db.exists(
++				"Fee Validity Reference",
++				{
++					"parent": fee_validity,
++					"reference_dt": "Patient Appointment",
++					"reference_dn": appointment.name,
++				},
++			)
++		)
++		self.assertIn(encounter.name, self.encounters_to_invoice(patient))
++
++	def test_visits_share_one_pool_across_doctypes(self):
++		"""Appointments and encounters draw from the same max_visits budget"""
++		patient, practitioner = self.enable_free_follow_ups(max_visits=2)
++		create_encounter(patient, practitioner, submit=True)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++
++		appointment = create_appointment(patient, practitioner, add_days(nowdate(), 1))
++		self.assertEqual(frappe.db.get_value("Patient Appointment", appointment.name, "invoiced"), 0)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 1)
++
++		free_encounter = create_encounter(patient, practitioner, submit=True)
++		self.assertNotIn(free_encounter.name, self.encounters_to_invoice(patient))
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 2)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "status"), "Completed")
++
++		# the budget is spent, so the next visit of either kind is billed again
++		billed = create_appointment(patient, practitioner, add_days(nowdate(), 2), invoice=1)
++		self.assertEqual(frappe.db.get_value("Patient Appointment", billed.name, "invoiced"), 1)
++
++	def test_only_one_active_validity_per_patient_and_practitioner(self):
++		"""A visit before an active validity must not open a second, overlapping one"""
++		patient, practitioner = self.enable_free_follow_ups(max_visits=4, valid_days=30)
++
++		# the appointment is booked for tomorrow, so its validity starts tomorrow
++		appointment = create_appointment(patient, practitioner, add_days(nowdate(), 1))
++		fee_validity = self.get_fee_validity(patient, practitioner)
++		self.assertEqual(
++			frappe.db.get_value("Fee Validity", fee_validity, "start_date"), getdate(add_days(nowdate(), 1))
++		)
++
++		# an encounter recorded today falls before that start date
++		encounter = create_encounter(patient, practitioner, submit=True)
++
++		validities = frappe.get_all(
++			"Fee Validity", {"patient": patient, "practitioner": practitioner, "status": "Active"}
++		)
++		self.assertEqual(len(validities), 1)
++		self.assertEqual(validities[0].name, fee_validity)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "reference_dn"), appointment.name)
++
++		# it consumes the one validity rather than being billed for nothing
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 1)
++		self.assertNotIn(encounter.name, self.encounters_to_invoice(patient))
++
++		# and the window stretches back to cover it
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "start_date"), getdate(nowdate()))
++
++	def test_inpatient_encounter_is_left_out_of_fee_validity(self):
++		patient, practitioner = self.enable_free_follow_ups()
++		inpatient_record = self.admit(patient)
++
++		create_encounter(patient, practitioner, submit=True, inpatient_record=inpatient_record)
++
++		self.assertFalse(frappe.db.exists("Fee Validity", {"patient": patient, "practitioner": practitioner}))
++
++	def test_inpatient_appointment_is_left_out_of_fee_validity(self):
++		patient, practitioner = self.enable_free_follow_ups()
++		self.admit(patient)
++
++		create_appointment(patient, practitioner, nowdate())
++
++		self.assertFalse(frappe.db.exists("Fee Validity", {"patient": patient, "practitioner": practitioner}))
++
++	def test_inpatient_encounter_does_not_consume_an_active_validity(self):
++		patient, practitioner = self.enable_free_follow_ups(max_visits=4)
++		create_encounter(patient, practitioner, submit=True)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++
++		inpatient_record = self.admit(patient)
++		inpatient_encounter = create_encounter(
++			patient, practitioner, submit=True, inpatient_record=inpatient_record
++		)
++
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 0)
++		self.assertFalse(
++			frappe.db.exists(
++				"Fee Validity Reference",
++				{"reference_dt": "Patient Encounter", "reference_dn": inpatient_encounter.name},
++			)
++		)
++
++	def admit(self, patient):
++		inpatient_record = create_inpatient(patient)
++		inpatient_record.expected_length_of_stay = 0
++		inpatient_record.save(ignore_permissions=True)
++		admit_patient(inpatient_record, get_healthcare_service_unit(), now_datetime())
++		self.addCleanup(
++			frappe.db.set_value,
++			"Patient",
++			patient,
++			{"inpatient_record": None, "inpatient_status": None},
++		)
++		return inpatient_record.name
++
++	def test_cancel_source_encounter_cancels_its_validity(self):
++		patient, practitioner = self.enable_free_follow_ups()
++		encounter = create_encounter(patient, practitioner, submit=True)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "status"), "Active")
++
++		encounter.cancel()
++
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "status"), "Cancelled")
++
++		# the cancelled validity must not block the next one
++		create_encounter(patient, practitioner, submit=True)
++		active = frappe.get_all(
++			"Fee Validity", {"patient": patient, "practitioner": practitioner, "status": "Active"}
++		)
++		self.assertEqual(len(active), 1)
++		self.assertNotEqual(active[0].name, fee_validity)
++
++	def test_cannot_cancel_a_visit_whose_free_visits_were_taken(self):
++		patient, practitioner = self.enable_free_follow_ups(max_visits=4)
++		source = create_encounter(patient, practitioner, submit=True)
++		follow_up = create_encounter(patient, practitioner, submit=True)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 1)
++
++		self.assertRaises(frappe.ValidationError, source.cancel)
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "status"), "Active")
++		self.assertEqual(frappe.db.get_value("Patient Encounter", source.name, "docstatus"), 1)
++
++		# giving the free visit back releases the source
++		follow_up.reload()
++		follow_up.cancel()
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 0)
++
++		source.reload()
++		source.cancel()
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "status"), "Cancelled")
++
++	def test_encounter_validity_period_and_expiry(self):
++		patient, practitioner = self.enable_free_follow_ups(max_visits=4, valid_days=7)
++		create_encounter(patient, practitioner, submit=True, encounter_date=nowdate())
++		fee_validity = self.get_fee_validity(patient, practitioner)
++
++		start_date, valid_till = frappe.db.get_value(
++			"Fee Validity", fee_validity, ["start_date", "valid_till"]
++		)
++		self.assertEqual(start_date, getdate(nowdate()))
++		self.assertEqual(date_diff(valid_till, start_date), 7)
++
++		# inside the window the encounter is free
++		inside = create_encounter(patient, practitioner, submit=True, encounter_date=add_days(nowdate(), 4))
++		self.assertNotIn(inside.name, self.encounters_to_invoice(patient))
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 1)
++
++		# past valid_till it is billed and opens its own validity
++		outside = create_encounter(patient, practitioner, submit=True, encounter_date=add_days(nowdate(), 10))
++		self.assertIn(outside.name, self.encounters_to_invoice(patient))
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 1)
++		self.assertTrue(
++			frappe.db.exists(
++				"Fee Validity", {"reference_dt": "Patient Encounter", "reference_dn": outside.name}
++			)
++		)
++
++	def test_encounter_uses_practitioner_validity_period(self):
++		patient, practitioner = self.enable_free_follow_ups(max_visits=1, valid_days=7)
++		frappe.db.set_value(
++			"Healthcare Practitioner",
++			practitioner,
++			{"enable_free_follow_ups": 1, "max_visits": 3, "valid_days": 5},
++		)
++
++		create_encounter(patient, practitioner, submit=True)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++
++		start_date, valid_till, max_visits = frappe.db.get_value(
++			"Fee Validity", fee_validity, ["start_date", "valid_till", "max_visits"]
++		)
++		self.assertEqual(max_visits, 3)
++		self.assertEqual(date_diff(valid_till, start_date), 5)
++
++	def test_backdated_visit_opens_its_own_validity(self):
++		"""A validity must not stretch back to a visit made before it existed"""
++		patient, practitioner = self.enable_free_follow_ups(max_visits=4, valid_days=30)
++		create_encounter(patient, practitioner, submit=True)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++
++		backdated = create_encounter(
++			patient, practitioner, submit=True, encounter_date=add_days(nowdate(), -60)
++		)
++
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "visited"), 0)
++		self.assertTrue(
++			frappe.db.exists(
++				"Fee Validity", {"reference_dt": "Patient Encounter", "reference_dn": backdated.name}
++			)
++		)
++
++	def test_amended_encounter_opens_a_new_validity(self):
++		patient, practitioner = self.enable_free_follow_ups()
++		encounter = create_encounter(patient, practitioner, submit=True)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++
++		encounter.cancel()
++		self.assertEqual(frappe.db.get_value("Fee Validity", fee_validity, "status"), "Cancelled")
++
++		amended = frappe.copy_doc(encounter)
++		amended.amended_from = encounter.name
++		amended.docstatus = 0
++		amended.save()
++		amended.submit()
++
++		active = frappe.get_all(
++			"Fee Validity", {"patient": patient, "practitioner": practitioner, "status": "Active"}
++		)
++		self.assertEqual(len(active), 1)
++		self.assertNotEqual(active[0].name, fee_validity)
++		self.assertEqual(frappe.db.get_value("Fee Validity", active[0].name, "reference_dn"), amended.name)
++
++	def test_encounter_validity_records_its_sales_invoice(self):
++		patient, practitioner = self.enable_free_follow_ups()
++		encounter = create_encounter(patient, practitioner, submit=True)
++		fee_validity = self.get_fee_validity(patient, practitioner)
++
++		# the encounter is invoiced after it is submitted, so the validity starts without one
++		self.assertFalse(frappe.db.get_value("Fee Validity", fee_validity, "sales_invoice_ref"))
++
++		sales_invoice = self.invoice_encounter(encounter)
++		self.assertEqual(
++			frappe.db.get_value("Fee Validity", fee_validity, "sales_invoice_ref"), sales_invoice.name
++		)
++
++		sales_invoice.cancel()
++		self.assertFalse(frappe.db.get_value("Fee Validity", fee_validity, "sales_invoice_ref"))
++
++	def invoice_encounter(self, encounter):
++		sales_invoice = frappe.new_doc("Sales Invoice")
++		sales_invoice.patient = encounter.patient
++		sales_invoice.customer = frappe.db.get_value("Patient", encounter.patient, "customer")
++		sales_invoice.due_date = getdate()
++		sales_invoice.company = "_Test Company"
++		sales_invoice.debit_to = get_receivable_account("_Test Company")
++		sales_invoice.append(
++			"items",
++			{
++				"item_code": "HLC-SI-001",
++				"qty": 1,
++				"uom": "Nos",
++				"conversion_factor": 1,
++				"income_account": get_income_account(None, "_Test Company"),
++				"rate": 300,
++				"amount": 300,
++				"reference_dt": "Patient Encounter",
++				"reference_dn": encounter.name,
++			},
++		)
++		sales_invoice.set_missing_values()
++		sales_invoice.submit()
++		return sales_invoice
++
++	def test_invoicing_an_encounter_never_opens_a_validity(self):
++		"""The invoice only stamps a validity that already exists, it never creates one"""
++		patient, practitioner = self.enable_free_follow_ups(apply_on_encounters=0)
++		encounter = create_encounter(patient, practitioner, submit=True)
++		reference = {"reference_dt": "Patient Encounter", "reference_dn": encounter.name}
++		self.assertFalse(frappe.db.exists("Fee Validity", reference))
++
++		self.invoice_encounter(encounter)
++
++		self.assertFalse(frappe.db.exists("Fee Validity", reference))
++
++	def test_validity_records_the_department_of_the_visit_that_opened_it(self):
++		"""Exports and consumers read medical_department, so both doctypes must fill it"""
++		patient, practitioner = self.enable_free_follow_ups(max_visits=1, valid_days=7)
++
++		appointment = create_appointment(patient, practitioner, nowdate())
++		self.assertTrue(appointment.department)
++		self.assertEqual(self.validity_department(patient, practitioner), appointment.department)
++
++		frappe.db.sql("delete from `tabFee Validity`")
++		encounter = create_encounter(patient, practitioner, submit=True)
++		self.assertTrue(encounter.medical_department)
++		self.assertEqual(self.validity_department(patient, practitioner), encounter.medical_department)
++
++	def validity_department(self, patient, practitioner):
++		return frappe.db.get_value(
++			"Fee Validity", self.get_fee_validity(patient, practitioner), "medical_department"
++		)
++
++	def test_get_fee_validity_rejects_a_doctype_that_is_not_a_visit(self):
++		self.assertRaises(
++			frappe.ValidationError, get_fee_validity, "Administrator", nowdate(), reference_dt="User"
++		)
++
++	def test_get_fee_validity_requires_read_access_to_the_visit(self):
++		"""Knowing an inaccessible visit's name must not reveal its validity"""
++		patient, practitioner = self.enable_free_follow_ups()
++		appointment = create_appointment(patient, practitioner, nowdate())
++
++		self.act_as("test3@example.com")
++		self.assertRaises(
++			frappe.PermissionError, get_fee_validity, appointment.name, appointment.appointment_date
++		)
++
++	def test_check_fee_validity_requires_read_access_to_the_patient(self):
++		"""A crafted unsaved visit naming any patient must not reveal that patient's validity"""
++		patient, practitioner = self.enable_free_follow_ups()
++		create_encounter(patient, practitioner, submit=True)
++		crafted = frappe.as_json(
++			{"doctype": "Patient Encounter", "patient": patient, "practitioner": practitioner, "__islocal": 1}
++		)
++
++		self.act_as("test3@example.com")
++		self.assertRaises(frappe.PermissionError, check_fee_validity, crafted)
++
++	def act_as(self, user):
++		self.addCleanup(frappe.set_user, "Administrator")
++		frappe.set_user(user)
+diff --git a/healthcare/healthcare/doctype/fee_validity_reference/fee_validity_reference.json b/healthcare/healthcare/doctype/fee_validity_reference/fee_validity_reference.json
+index 4e6decdf723..85c32dfbcd6 100644
+--- a/healthcare/healthcare/doctype/fee_validity_reference/fee_validity_reference.json
++++ b/healthcare/healthcare/doctype/fee_validity_reference/fee_validity_reference.json
+@@ -5,21 +5,32 @@
+  "editable_grid": 1,
+  "engine": "InnoDB",
+  "field_order": [
+-  "appointment"
++  "reference_dt",
++  "reference_dn"
+  ],
+  "fields": [
+   {
+-   "fieldname": "appointment",
++   "fieldname": "reference_dt",
+    "fieldtype": "Link",
+    "in_list_view": 1,
+-   "label": "Patient Appointment",
+-   "options": "Patient Appointment",
+-   "reqd": 1
++   "label": "Reference DocType",
++   "options": "DocType",
++   "reqd": 1,
++   "search_index": 1
++  },
++  {
++   "fieldname": "reference_dn",
++   "fieldtype": "Dynamic Link",
++   "in_list_view": 1,
++   "label": "Reference Name",
++   "options": "reference_dt",
++   "reqd": 1,
++   "search_index": 1
+   }
+  ],
+  "istable": 1,
+  "links": [],
+- "modified": "2025-12-25 09:36:37.137814",
++ "modified": "2026-09-05 19:49:14.535302",
+  "modified_by": "Administrator",
+  "module": "Healthcare",
+  "name": "Fee Validity Reference",
+diff --git a/healthcare/healthcare/doctype/healthcare_settings/healthcare_settings.json b/healthcare/healthcare/doctype/healthcare_settings/healthcare_settings.json
+index 9d1322c6c99..6e239ccffe1 100644
+--- a/healthcare/healthcare/doctype/healthcare_settings/healthcare_settings.json
++++ b/healthcare/healthcare/doctype/healthcare_settings/healthcare_settings.json
+@@ -20,6 +20,7 @@
+   "enable_free_follow_ups",
+   "max_visits",
+   "valid_days",
++  "apply_free_follow_ups_on_encounters",
+   "medication_alerts_section",
+   "enable_medication_alerts",
+   "contraindicated_alert_action",
+@@ -120,6 +121,14 @@
+    "label": "Valid Number of Days",
+    "mandatory_depends_on": "eval:doc.enable_free_follow_ups == 1"
+   },
++  {
++   "default": "0",
++   "depends_on": "eval:doc.enable_free_follow_ups == 1",
++   "description": "Apply free follow ups to Patient Encounters created without an Appointment",
++   "fieldname": "apply_free_follow_ups_on_encounters",
++   "fieldtype": "Check",
++   "label": "Apply Free Follow-ups on Encounters"
++  },
+   {
+    "description": "You can configure default Items for billing consultation charges, procedure consumption items and inpatient visits",
+    "fieldname": "healthcare_service_items",
+@@ -584,7 +593,7 @@
+  ],
+  "issingle": 1,
+  "links": [],
+- "modified": "2026-09-10 10:00:00.000000",
++ "modified": "2026-09-11 19:06:48.509344",
+  "modified_by": "Administrator",
+  "module": "Healthcare",
+  "name": "Healthcare Settings",
+diff --git a/healthcare/healthcare/doctype/patient_appointment/patient_appointment.js b/healthcare/healthcare/doctype/patient_appointment/patient_appointment.js
+index c60323717d4..dc1c2c21e6a 100644
+--- a/healthcare/healthcare/doctype/patient_appointment/patient_appointment.js
++++ b/healthcare/healthcare/doctype/patient_appointment/patient_appointment.js
+@@ -289,7 +289,7 @@ frappe.ui.form.on("Patient Appointment", {
+ 						await frappe.call(
+ 							"healthcare.healthcare.doctype.fee_validity.fee_validity.get_fee_validity",
+ 							{
+-								appointment_name: frm.doc.name,
++								reference_dn: frm.doc.name,
+ 								date: frm.doc.appointment_date,
+ 								ignore_status: true,
+ 							},
+@@ -350,7 +350,7 @@ frappe.ui.form.on("Patient Appointment", {
+ 					.then(val => {
+ 						frappe.call({
+ 							method: "healthcare.healthcare.doctype.fee_validity.fee_validity.check_fee_validity",
+-							args: { appointment: frm.doc },
++							args: { visit: frm.doc },
+ 							callback: r => {
+ 								if (val && !r.message && !frm.doc.invoiced) {
+ 									make_payment(frm, val);
+@@ -807,11 +807,11 @@ let check_and_set_availability = function (frm) {
+ 						.then(val => {
+ 							frappe.call({
+ 								method: "healthcare.healthcare.doctype.fee_validity.fee_validity.check_fee_validity",
+-								args: { appointment: frm.doc },
++								args: { visit: frm.doc },
+ 								callback: r => {
+ 									if (val && !r.message && !frm.doc.invoiced) {
+ 										make_payment(frm, val);
+-									} else {
++									} else if (val) {
+ 										frappe.call({
+ 											method: "healthcare.healthcare.doctype.patient_appointment.patient_appointment.update_fee_validity",
+ 											args: { appointment: frm.doc },
+@@ -819,6 +819,9 @@ let check_and_set_availability = function (frm) {
+ 												frm.reload_doc();
+ 											},
+ 										});
++									} else {
++										// fee validity is already managed server side, in on_update
++										frm.reload_doc();
+ 									}
+ 								},
+ 							});
+diff --git a/healthcare/healthcare/doctype/patient_appointment/patient_appointment.py b/healthcare/healthcare/doctype/patient_appointment/patient_appointment.py
+index 4aba05ef234..51633c5467b 100755
+--- a/healthcare/healthcare/doctype/patient_appointment/patient_appointment.py
++++ b/healthcare/healthcare/doctype/patient_appointment/patient_appointment.py
+@@ -24,9 +24,12 @@
+ 
+ from healthcare.healthcare.api.patient_portal import update_payment_record
+ from healthcare.healthcare.doctype.fee_validity.fee_validity import (
+-	check_fee_validity,
+-	get_fee_validity,
++	cancel_fee_validity,
++	find_fee_validity,
+ 	manage_fee_validity,
++	query_fee_validity,
++	validate_fee_validity_cancellation,
++	validate_visit_access,
+ )
+ from healthcare.healthcare.doctype.healthcare_settings.healthcare_settings import (
+ 	get_income_account,
+@@ -80,7 +83,7 @@ def after_insert(self):
+ 		send_confirmation_msg(self)
+ 		self.insert_calendar_event()
+ 
+-		if self.insurance_policy and self.appointment_type and not check_fee_validity(self):
++		if self.insurance_policy and self.appointment_type and not find_fee_validity(self):
+ 			if frappe.db.get_single_value("Healthcare Settings", "show_payment_popup"):
+ 				# TODO: apply insurance coverage
+ 				frappe.msgprint(
+@@ -535,12 +538,12 @@ def invoice_appointment(
+ 	settings = frappe.get_single("Healthcare Settings")
+ 
+ 	if settings.enable_free_follow_ups:
+-		fee_validity = check_fee_validity(appointment_doc)
++		fee_validity = find_fee_validity(appointment_doc)
+ 
+ 		if fee_validity and fee_validity.status != "Active":
+ 			fee_validity = None
+ 		elif not fee_validity:
+-			if get_fee_validity(appointment_doc.name, appointment_doc.appointment_date):
++			if query_fee_validity(appointment_doc.name, appointment_doc.appointment_date):
+ 				return
+ 	else:
+ 		fee_validity = None
+@@ -601,6 +604,8 @@ def get_appointment_doc(appointment: str | dict | PatientAppointment) -> Patient
+ 	if isinstance(appointment, str):
+ 		appointment = json.loads(appointment)
+ 	if isinstance(appointment, dict):
++		if appointment.get("doctype") != "Patient Appointment":
++			frappe.throw(_("Expected a Patient Appointment"))
+ 		appointment = frappe.get_doc(appointment)
+ 
+ 	return appointment
+@@ -667,12 +672,10 @@ def cancel_appointment(appointment_id):
+ 			msg = _("Appointment Cancelled. Please review and cancel the invoice {0}").format(
+ 				sales_invoice.name
+ 			)
+-		fee_validity = frappe.db.get_value("Fee Validity", {"patient_appointment": appointment.name})
+-		if fee_validity:
+-			frappe.db.set_value("Fee Validity", fee_validity, "status", "Cancelled")
++		cancel_fee_validity(appointment)
+ 
+ 	else:
+-		fee_validity = manage_fee_validity(appointment)
++		fee_validity = cancel_fee_validity(appointment)
+ 		msg = _("Appointment Cancelled.")
+ 		if fee_validity:
+ 			msg += _("Fee Validity {0} updated.").format(fee_validity.name)
+@@ -716,6 +719,8 @@ def get_availability_data(date: str, practitioner: str, appointment: str | dict
+ 	:param appointment: Appointment doc to validate fee validity
+ 	:return: dict containing a list of available slots, list of appointments and time of appointments
+ 	"""
++	appointment = get_appointment_doc(appointment)
++	validate_visit_access(appointment)
+ 
+ 	date = getdate(date)
+ 	weekday = date.strftime("%A")
+@@ -725,7 +730,6 @@ def get_availability_data(date: str, practitioner: str, appointment: str | dict
+ 	check_employee_wise_availability(date, practitioner_doc)
+ 
+ 	available_slots = []
+-	appointment = get_appointment_doc(appointment)
+ 
+ 	if frappe.db.exists(
+ 		"Practitioner Availability",
+@@ -769,9 +773,9 @@ def get_availability_data(date: str, practitioner: str, appointment: str | dict
+ 		free_follow_ups = True
+ 
+ 	if free_follow_ups:
+-		fee_validity = check_fee_validity(appointment, date, practitioner)
++		fee_validity = find_fee_validity(appointment, date, practitioner)
+ 		if not fee_validity and not appointment.get("__islocal"):
+-			validity_details = get_fee_validity(appointment.get("name"), date, ignore_status=True)
++			validity_details = query_fee_validity(appointment.get("name"), date, ignore_status=True)
+ 			if validity_details:
+ 				fee_validity = validity_details[0]
+ 
+@@ -1051,6 +1055,9 @@ def check_in_appointment(
+ 
+ @frappe.whitelist()
+ def update_status(appointment_id: str, status: str) -> None:
++	if status == "Cancelled":
++		validate_fee_validity_cancellation(frappe.get_doc("Patient Appointment", appointment_id))
++
+ 	frappe.db.set_value("Patient Appointment", appointment_id, "status", status)
+ 	appointment_booked = True
+ 	if status == "Cancelled":
+diff --git a/healthcare/healthcare/doctype/patient_appointment/test_patient_appointment.py b/healthcare/healthcare/doctype/patient_appointment/test_patient_appointment.py
+index f2ec016ce31..48ff8510fb2 100644
+--- a/healthcare/healthcare/doctype/patient_appointment/test_patient_appointment.py
++++ b/healthcare/healthcare/doctype/patient_appointment/test_patient_appointment.py
+@@ -13,6 +13,7 @@
+ 	check_in_appointment,
+ 	check_is_new_patient,
+ 	check_payment_reqd,
++	get_availability_data,
+ 	invoice_appointment,
+ 	make_encounter,
+ 	update_status,
+@@ -1044,3 +1045,39 @@ def test_appointment_reschedule(self, appointment):
+ def test_appointment_cancel(self, appointment):
+ 	update_status(appointment.name, "Cancelled")
+ 	self.assertTrue(frappe.db.exists("Event", {"name": appointment.event, "status": "Cancelled"}))
++
++
++class TestAvailabilityAccess(HealthcareTestSuite):
++	def setUp(self):
++		super().setUp()
++		self.patient = frappe.get_list("Patient", pluck="name")[0]
++		self.practitioner = frappe.get_list("Healthcare Practitioner", pluck="name")[0]
++		self.addCleanup(frappe.set_user, "Administrator")
++
++	def test_availability_data_requires_read_access_to_the_patient(self):
++		"""A crafted appointment naming any patient must not reveal that patient's validity"""
++		crafted = frappe.as_json({"doctype": "Patient Appointment", "patient": self.patient, "__islocal": 1})
++
++		frappe.set_user("test3@example.com")
++		self.assertRaises(
++			frappe.PermissionError, get_availability_data, nowdate(), self.practitioner, crafted
++		)
++
++	def test_availability_data_requires_read_access_to_the_appointment(self):
++		appointment = create_appointment(self.patient, self.practitioner, nowdate())
++
++		frappe.set_user("test3@example.com")
++		self.assertRaises(
++			frappe.PermissionError,
++			get_availability_data,
++			nowdate(),
++			self.practitioner,
++			frappe.as_json(appointment.as_dict()),
++		)
++
++	def test_availability_data_rejects_a_document_that_is_not_an_appointment(self):
++		crafted = frappe.as_json({"doctype": "Patient Encounter", "patient": self.patient, "__islocal": 1})
++
++		self.assertRaises(
++			frappe.ValidationError, get_availability_data, nowdate(), self.practitioner, crafted
++		)
+diff --git a/healthcare/healthcare/doctype/patient_encounter/patient_encounter.py b/healthcare/healthcare/doctype/patient_encounter/patient_encounter.py
+index 5e2e8d1c47f..6fb911b5147 100644
+--- a/healthcare/healthcare/doctype/patient_encounter/patient_encounter.py
++++ b/healthcare/healthcare/doctype/patient_encounter/patient_encounter.py
+@@ -10,6 +10,11 @@
+ from frappe.model.mapper import get_mapped_doc
+ from frappe.utils import add_days, get_link_to_form, getdate
+ 
++from healthcare.healthcare.doctype.fee_validity.fee_validity import (
++	cancel_fee_validity,
++	manage_fee_validity,
++	validate_fee_validity_cancellation,
++)
+ from healthcare.healthcare.doctype.medication.medication import validate_medication_is_orderable
+ from healthcare.healthcare.doctype.medication_alert_log.medication_alert_log import (
+ 	check_document,
+@@ -47,7 +52,14 @@ def on_submit(self):
+ 		self.save("Update")
+ 		self.db_set("status", "Completed")
+ 
++		if not self.appointment:
++			# an encounter booked through an appointment is billed, and counted, on the appointment
++			manage_fee_validity(self)
++
+ 	def before_cancel(self):
++		if not self.appointment:
++			validate_fee_validity_cancellation(self)
++
+ 		orders = frappe.get_all("Service Request", {"order_group": self.name})
+ 		for order in orders:
+ 			order_doc = frappe.get_doc("Service Request", order.name)
+@@ -59,6 +71,8 @@ def on_cancel(self):
+ 
+ 		if self.appointment:
+ 			frappe.db.set_value("Patient Appointment", self.appointment, "status", "Open")
++		else:
++			cancel_fee_validity(self)
+ 
+ 		therapy_plan = frappe.db.exists(
+ 			"Therapy Plan", {"source_doc": self.doctype, "order_group": self.name}
+diff --git a/healthcare/healthcare/utils.py b/healthcare/healthcare/utils.py
+index d94125950c3..1ecc231cef4 100644
+--- a/healthcare/healthcare/utils.py
++++ b/healthcare/healthcare/utils.py
+@@ -15,8 +15,10 @@
+ from erpnext.setup.utils import insert_record
+ 
+ from healthcare.healthcare.doctype.fee_validity.fee_validity import (
+-	get_fee_validity,
++	is_free_follow_up_enabled,
+ 	manage_fee_validity,
++	query_fee_validity,
++	set_sales_invoice_reference,
+ )
+ from healthcare.healthcare.doctype.healthcare_settings.healthcare_settings import (
+ 	get_income_account,
+@@ -99,15 +101,9 @@ def get_appointments_to_invoice(patient, company):
+ 				)
+ 		# Consultation Appointments, should check fee validity
+ 		else:
+-			if appointment.practitioner:
+-				pract_enabled = frappe.get_cached_value(
+-					"Healthcare Practitioner", appointment.practitioner, "enable_free_follow_ups"
+-				)
+-				settings_enabled = frappe.db.get_single_value("Healthcare Settings", "enable_free_follow_ups")
+-
+-				if pract_enabled or settings_enabled:
+-					if get_fee_validity(appointment.name, appointment.appointment_date, ignore_status=True):
+-						continue  # Skip invoicing, fee validity exists
++			if is_free_follow_up_enabled(appointment.practitioner):
++				if query_fee_validity(appointment.name, appointment.appointment_date, ignore_status=True):
++					continue  # Skip invoicing, fee validity exists
+ 
+ 			practitioner_charge = 0
+ 			income_account = None
+@@ -196,6 +192,15 @@ def get_encounters_to_invoice(patient, company):
+ 		for encounter in encounters:
+ 			encounter = frappe.get_doc("Patient Encounter", encounter)
+ 			if not encounter.appointment:  # TODO: make if not
++				if is_free_follow_up_enabled(encounter.practitioner, "Patient Encounter"):
++					if query_fee_validity(
++						encounter.name,
++						encounter.encounter_date,
++						ignore_status=True,
++						reference_dt="Patient Encounter",
++					):
++						continue  # Skip invoicing, fee validity exists
++
+ 				practitioner_charge = 0
+ 				income_account = None
+ 				service_item = None
+@@ -1040,6 +1045,12 @@ def manage_invoice_submit_cancel(doc, method):
+ 				# update Fee validity with Sales Invoice Reference if exists
+ 				if item.reference_dt == "Patient Appointment":
+ 					manage_fee_validity(frappe.get_doc("Patient Appointment", item.reference_dn))
++				elif item.reference_dt == "Patient Encounter":
++					# an encounter manages its fee validity on submit, and only then, so the
++					# invoice is only stamped on a validity that already exists
++					set_sales_invoice_reference(
++						item.reference_dt, item.reference_dn, doc.name if method == "on_submit" else None
++					)
+ 
+ 				# set patient as active if registration invoice
+ 				if item.get("reference_dt") == "Patient":
+diff --git a/healthcare/patches.txt b/healthcare/patches.txt
+index 558845570ea..0b9ac1ba36d 100644
+--- a/healthcare/patches.txt
++++ b/healthcare/patches.txt
+@@ -33,3 +33,4 @@ healthcare.patches.v16_0.create_emergency_masters
+ healthcare.patches.v16_0.rebuild_medication_class_tree
+ healthcare.patches.v16_0.create_allergy_and_medication_class_masters
+ healthcare.patches.v16_0.set_medications_orderable
++healthcare.patches.v16_0.set_dynamic_reference_in_fee_validity
+diff --git a/healthcare/patches/v16_0/set_dynamic_reference_in_fee_validity.py b/healthcare/patches/v16_0/set_dynamic_reference_in_fee_validity.py
+new file mode 100644
+index 00000000000..a28b1305c72
+--- /dev/null
++++ b/healthcare/patches/v16_0/set_dynamic_reference_in_fee_validity.py
+@@ -0,0 +1,43 @@
++import frappe
++
++
++def execute():
++	frappe.reload_doc("healthcare", "doctype", "fee_validity_reference")
++	frappe.reload_doc("healthcare", "doctype", "fee_validity")
++
++	set_reference_in_fee_validity()
++	set_reference_in_fee_validity_reference()
++
++
++def set_reference_in_fee_validity():
++	"""Move the originating appointment into the reference_dt, reference_dn pair"""
++	if not frappe.db.has_column("Fee Validity", "patient_appointment"):
++		return
++
++	fee_validity = frappe.qb.DocType("Fee Validity")
++	(
++		frappe.qb.update(fee_validity)
++		.set(fee_validity.reference_dt, "Patient Appointment")
++		.set(fee_validity.reference_dn, fee_validity.patient_appointment)
++		.where(fee_validity.patient_appointment.notnull())
++		.where(fee_validity.patient_appointment != "")
++	).run()
++
++
++def set_reference_in_fee_validity_reference():
++	"""Move the referred appointments into the reference_dt, reference_dn pair
++
++	The parent field is renamed along with them, as ref_appointments is now reference_visits.
++	"""
++	if not frappe.db.has_column("Fee Validity Reference", "appointment"):
++		return
++
++	reference = frappe.qb.DocType("Fee Validity Reference")
++	(
++		frappe.qb.update(reference)
++		.set(reference.reference_dt, "Patient Appointment")
++		.set(reference.reference_dn, reference.appointment)
++		.set(reference.parentfield, "reference_visits")
++		.where(reference.appointment.notnull())
++		.where(reference.appointment != "")
++	).run()
+diff --git a/healthcare/tests/test_utils.py b/healthcare/tests/test_utils.py
+index c2ca3bffe49..514a8f93dc3 100644
+--- a/healthcare/tests/test_utils.py
++++ b/healthcare/tests/test_utils.py
+@@ -1,10 +1,13 @@
+ import frappe
+ 
+ 
+-def create_encounter(patient, practitioner, submit=False):
++def create_encounter(patient, practitioner, submit=False, **kwargs):
+ 	encounter = frappe.new_doc("Patient Encounter")
+ 	encounter.patient = patient
+ 	encounter.practitioner = practitioner
++	encounter.company = "_Test Company"
++	encounter.appointment_type = "_Test Appointment Type"
++	encounter.update(kwargs)
+ 	encounter.save()
+ 	if submit:
+ 		encounter.submit()

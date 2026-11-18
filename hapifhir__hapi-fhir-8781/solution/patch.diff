@@ -1,0 +1,198 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8780-mdm-metrics-partition-scoping.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8780-mdm-metrics-partition-scoping.yaml
+new file mode 100644
+index 000000000000..bf695a36b2d7
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8780-mdm-metrics-partition-scoping.yaml
+@@ -0,0 +1,7 @@
++---
++type: fix
++issue: 8780
++title: "Previously, when MDM metrics were requested for a specific partition, the resource counts were scoped to that
++  partition but the link-type and match-score counts were not: those were totalled across every partition.
++  MDM metrics now count links and match scores only for the requested partition, and total across all
++  partitions only when no partition is specified."
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/IMdmLinkJpaMetricsRepository.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/IMdmLinkJpaMetricsRepository.java
+index 19a6f5648896..ca4f930aaa7f 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/IMdmLinkJpaMetricsRepository.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/IMdmLinkJpaMetricsRepository.java
+@@ -43,4 +43,18 @@ Object[][] generateMetrics(
+ 			@Param("resourceName") String theResourceType,
+ 			@Param("linkSource") List<MdmLinkSourceEnum> theLinkSources,
+ 			@Param("matchResult") List<MdmMatchResultEnum> theMatchTypes);
++
++	@Query("SELECT ml.myMatchResult AS match_result, ml.myLinkSource AS link_source, count(*) AS c "
++			+ "FROM MdmLink ml "
++			+ "WHERE ml.myMdmSourceType = :resourceName "
++			+ "AND ml.myLinkSource in (:linkSource) "
++			+ "AND ml.myMatchResult in (:matchResult) "
++			+ "AND ml.myPartitionIdValue in (:partitionIds) "
++			+ "GROUP BY match_result, link_source "
++			+ "ORDER BY match_result")
++	Object[][] generateMetricsForPartitions(
++			@Param("resourceName") String theResourceType,
++			@Param("linkSource") List<MdmLinkSourceEnum> theLinkSources,
++			@Param("matchResult") List<MdmMatchResultEnum> theMatchTypes,
++			@Param("partitionIds") List<Integer> thePartitionIds);
+ }
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/mdm/MdmMetricSvcJpaImpl.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/mdm/MdmMetricSvcJpaImpl.java
+index 1b69aa10508a..cb901c793911 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/mdm/MdmMetricSvcJpaImpl.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/mdm/MdmMetricSvcJpaImpl.java
+@@ -19,6 +19,7 @@
+  */
+ package ca.uhn.fhir.jpa.dao.mdm;
+ 
++import ca.uhn.fhir.interceptor.model.RequestPartitionId;
+ import ca.uhn.fhir.jpa.api.dao.DaoRegistry;
+ import ca.uhn.fhir.jpa.dao.data.IMdmLinkJpaMetricsRepository;
+ import ca.uhn.fhir.mdm.api.BaseMdmMetricSvc;
+@@ -65,7 +66,11 @@ protected MdmLinkMetrics generateLinkMetrics(GenerateMdmMetricsParameters thePar
+ 			matchResults = Arrays.asList(MdmMatchResultEnum.values());
+ 		}
+ 
+-		Object[][] data = myJpaRepository.generateMetrics(theParameters.getResourceType(), linkSources, matchResults);
++		List<Integer> partitionIds = getPartitionIdsToFilterOrNull(theParameters);
++		Object[][] data = partitionIds == null
++				? myJpaRepository.generateMetrics(theParameters.getResourceType(), linkSources, matchResults)
++				: myJpaRepository.generateMetricsForPartitions(
++						theParameters.getResourceType(), linkSources, matchResults, partitionIds);
+ 		MdmLinkMetrics metrics = new MdmLinkMetrics();
+ 		metrics.setResourceType(theParameters.getResourceType());
+ 		for (Object[] row : data) {
+@@ -87,8 +92,13 @@ protected MdmLinkScoreMetrics generateLinkScoreMetrics(GenerateMdmMetricsParamet
+ 			matchResultTypes = Arrays.asList(MdmMatchResultEnum.values());
+ 		}
+ 
++		List<Integer> partitionIds = getPartitionIdsToFilterOrNull(theParameters);
++
+ 		String sql = "SELECT %s FROM MPI_LINK ml WHERE ml.TARGET_TYPE = :resourceType "
+ 				+ "AND ml.MATCH_RESULT in (:matchResult)";
++		if (partitionIds != null) {
++			sql += " AND ml.PARTITION_ID in (:partitionIds)";
++		}
+ 
+ 		StringBuilder sb = new StringBuilder();
+ 		sb.append("sum(case when ml.SCORE is null then 1 else 0 end) as B_" + NULL_VALUE);
+@@ -116,6 +126,9 @@ protected MdmLinkScoreMetrics generateLinkScoreMetrics(GenerateMdmMetricsParamet
+ 		hibernateQuery.setParameter("resourceType", resourceType);
+ 		hibernateQuery.setParameter(
+ 				"matchResult", matchResultTypes.stream().map(Enum::ordinal).collect(Collectors.toList()));
++		if (partitionIds != null) {
++			hibernateQuery.setParameter("partitionIds", partitionIds);
++		}
+ 
+ 		List<?> results = hibernateQuery.getResultList();
+ 
+@@ -142,6 +155,23 @@ protected MdmLinkScoreMetrics generateLinkScoreMetrics(GenerateMdmMetricsParamet
+ 		return metrics;
+ 	}
+ 
++	/**
++	 * Returns the partition ids the link/score metrics queries should be scoped to, or {@code null}
++	 * when no partition filter applies (no partition context, or an all-partitions request) — in which
++	 * case the metrics aggregate across every partition, preserving the historical behaviour. Scoping
++	 * here keeps the link and score metrics consistent with the partition-aware resource metrics and
++	 * prevents cross-partition disclosure.
++	 */
++	private static List<Integer> getPartitionIdsToFilterOrNull(GenerateMdmMetricsParameters theParameters) {
++		RequestPartitionId requestPartitionId = theParameters.getRequestPartitionId();
++		if (requestPartitionId == null
++				|| requestPartitionId.isAllPartitions()
++				|| !requestPartitionId.hasPartitionIds()) {
++			return null;
++		}
++		return requestPartitionId.getPartitionIds();
++	}
++
+ 	@Transactional
+ 	@Override
+ 	public MdmMetrics generateMdmMetrics(GenerateMdmMetricsParameters theParameters) {
+diff --git a/hapi-fhir-jpaserver-mdm/src/test/java/ca/uhn/fhir/jpa/mdm/dao/MdmMetricSvcJpaIT.java b/hapi-fhir-jpaserver-mdm/src/test/java/ca/uhn/fhir/jpa/mdm/dao/MdmMetricSvcJpaIT.java
+index 47757d00be1a..1cf0aa12c72d 100644
+--- a/hapi-fhir-jpaserver-mdm/src/test/java/ca/uhn/fhir/jpa/mdm/dao/MdmMetricSvcJpaIT.java
++++ b/hapi-fhir-jpaserver-mdm/src/test/java/ca/uhn/fhir/jpa/mdm/dao/MdmMetricSvcJpaIT.java
+@@ -12,8 +12,12 @@
+ import ca.uhn.fhir.jpa.mdm.models.LinkMetricTestParameters;
+ import ca.uhn.fhir.jpa.mdm.models.LinkScoreMetricTestParams;
+ import ca.uhn.fhir.jpa.mdm.models.ResourceMetricTestParams;
++import ca.uhn.fhir.interceptor.model.RequestPartitionId;
+ import ca.uhn.fhir.jpa.model.dao.JpaPid;
+ import ca.uhn.fhir.mdm.api.IMdmMetricSvc;
++import ca.uhn.fhir.mdm.api.MdmLinkSourceEnum;
++import ca.uhn.fhir.mdm.api.MdmMatchResultEnum;
++import ca.uhn.fhir.mdm.api.params.GenerateMdmMetricsParameters;
+ import ca.uhn.fhir.mdm.model.MdmMetrics;
+ import ca.uhn.fhir.mdm.util.MdmResourceUtil;
+ import tools.jackson.core.JacksonException;
+@@ -22,6 +26,7 @@
+ import org.apache.commons.lang3.StringUtils;
+ import org.hl7.fhir.r4.model.Patient;
+ import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.beans.factory.annotation.Autowired;
+@@ -31,7 +36,9 @@
+ import org.springframework.test.context.ContextConfiguration;
+ 
+ import java.util.List;
++import java.util.Map;
+ 
++import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.fail;
+ 
+ 
+@@ -164,4 +171,53 @@ public String getStringMetrics(MdmMetrics theMetrics) {
+ 			return "NOT PARSEABLE!";
+ 		}
+ 	}
++
++	@Test
++	public void generateMdmMetrics_withRequestPartitionId_scopesLinkAndScoreMetricsToThatPartition() {
++		// two MATCH/AUTO Patient links; place one in partition 1 and the other in partition 2
++		MDMState<Patient, JpaPid> state = new MDMState<>();
++		state.setInputState("""
++			G1, AUTO, MATCH, P1
++			G2, AUTO, MATCH, P2
++			""");
++		myLinkHelper.setup(state);
++
++		List<MdmLink> links = myMdmLinkDao.findAll();
++		assertEquals(2, links.size());
++		links.get(0).setScore(0.8);
++		links.get(1).setScore(0.8);
++		myMdmLinkDao.save(links.get(0));
++		myMdmLinkDao.save(links.get(1));
++
++		// Place one link in partition 1 and the other in partition 2. Partitioning is not enabled in
++		// this test context, so the entity's PARTITION_ID is not persisted through a normal save; set the
++		// column directly to exercise the metrics queries' partition filter.
++		Long pidInPartition1 = links.get(0).getId().getId();
++		Long pidInPartition2 = links.get(1).getId().getId();
++		runInTransaction(() -> {
++			myEntityManager
++					.createNativeQuery("UPDATE MPI_LINK SET PARTITION_ID = 1 WHERE PID = :pid")
++					.setParameter("pid", pidInPartition1)
++					.executeUpdate();
++			myEntityManager
++					.createNativeQuery("UPDATE MPI_LINK SET PARTITION_ID = 2 WHERE PID = :pid")
++					.setParameter("pid", pidInPartition2)
++					.executeUpdate();
++		});
++
++		GenerateMdmMetricsParameters parameters = new GenerateMdmMetricsParameters("Patient");
++		parameters.setRequestPartitionId(RequestPartitionId.fromPartitionIds(1));
++
++		MdmMetrics metrics = mySvc.generateMdmMetrics(parameters);
++
++		// link metrics must count only the partition-1 link
++		Long matchAutoCount = metrics.getMatchTypeToLinkToCountMap()
++				.getOrDefault(MdmMatchResultEnum.MATCH, Map.of())
++				.get(MdmLinkSourceEnum.AUTO);
++		assertEquals(1L, matchAutoCount);
++
++		// score metrics must likewise count only the partition-1 link
++		long totalScored = metrics.getScoreCounts().values().stream().mapToLong(Long::longValue).sum();
++		assertEquals(1L, totalScored);
++	}
+ }

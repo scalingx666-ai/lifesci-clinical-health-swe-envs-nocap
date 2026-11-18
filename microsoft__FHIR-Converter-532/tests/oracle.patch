@@ -1,0 +1,206 @@
+diff --git a/src/Microsoft.Health.Fhir.TemplateManagement.UnitTests/Providers/BlobTemplateCollectionProviderTests.cs b/src/Microsoft.Health.Fhir.TemplateManagement.UnitTests/Providers/BlobTemplateCollectionProviderTests.cs
+index 1fd51a99e..0fe98400b 100644
+--- a/src/Microsoft.Health.Fhir.TemplateManagement.UnitTests/Providers/BlobTemplateCollectionProviderTests.cs
++++ b/src/Microsoft.Health.Fhir.TemplateManagement.UnitTests/Providers/BlobTemplateCollectionProviderTests.cs
+@@ -12,6 +12,8 @@
+ using Microsoft.Extensions.Caching.Memory;
+ using Microsoft.Health.Fhir.TemplateManagement.ArtifactProviders;
+ using Microsoft.Health.Fhir.TemplateManagement.Configurations;
++using Microsoft.Health.Fhir.TemplateManagement.Exceptions;
++using Microsoft.Health.Fhir.TemplateManagement.Models;
+ using Moq;
+ using Xunit;
+ 
+@@ -25,7 +27,8 @@ public async Task GivenBlobTemplateProvider_WhenGetTemplateCollectionFromTemplat
+             var templateConfiguration = new TemplateCollectionConfiguration();
+ 
+             int templateCount = 1;
+-            var blobTemplateProvider = new BlobTemplateCollectionProvider(GetBlobContainerClientMock(templateCount), new MemoryCache(new MemoryCacheOptions()), templateConfiguration);
++            var blobItemProperties = BlobsModelFactory.BlobItemProperties(accessTierInferred: true, contentLength: 100);
++            var blobTemplateProvider = new BlobTemplateCollectionProvider(GetBlobContainerClientMock(templateCount, blobItemProperties), new MemoryCache(new MemoryCacheOptions()), templateConfiguration);
+ 
+             var templateCollection = await blobTemplateProvider.GetTemplateCollectionAsync();
+ 
+@@ -33,6 +36,20 @@ public async Task GivenBlobTemplateProvider_WhenGetTemplateCollectionFromTemplat
+             Assert.Equal(templateCount, templateCollection[0].Count);
+         }
+ 
++        [Fact]
++        public async Task GivenBlobTemplateProviderWithLargeTemplates_WhenGetTemplateCollectionFromTemplateProvider_ThenTemplatesAreReturned()
++        {
++            var templateConfiguration = new TemplateCollectionConfiguration();
++
++            int templateCount = 2;
++            var blobItemProperties = BlobsModelFactory.BlobItemProperties(accessTierInferred: true, contentLength: 10 * 1024 * 1024);
++            var blobTemplateProvider = new BlobTemplateCollectionProvider(GetBlobContainerClientMock(templateCount, blobItemProperties), new MemoryCache(new MemoryCacheOptions()), templateConfiguration);
++
++            var ex = await Assert.ThrowsAsync<TemplateCollectionExceedsSizeLimitException>(async() => await blobTemplateProvider.GetTemplateCollectionAsync());
++
++            Assert.Equal(TemplateManagementErrorCode.BlobTemplateCollectionTooLarge, ex.TemplateManagementErrorCode);
++        }
++
+         [Fact]
+         public async Task GivenBlobTemplateProviderWithoutTemplates_WhenGetTemplateCollectionFromTemplateProvider_ThenEmptyTemplateCollectionReturned()
+         {
+@@ -45,7 +62,7 @@ public async Task GivenBlobTemplateProviderWithoutTemplates_WhenGetTemplateColle
+             Assert.Empty(templateCollection);
+         }
+ 
+-        public static BlobContainerClient GetBlobContainerClientMock(int templateCount = 1)
++        public static BlobContainerClient GetBlobContainerClientMock(int templateCount = 1, BlobItemProperties blobItemProperties = null)
+         {
+             var mock = new Mock<BlobContainerClient>();
+ 
+@@ -57,7 +74,7 @@ public static BlobContainerClient GetBlobContainerClientMock(int templateCount =
+ 
+             for (int i = 0; i < templateCount; i++)
+             {
+-                blobs[i] = BlobsModelFactory.BlobItem($"blob_name-{i}.liquid");
++                blobs[i] = BlobsModelFactory.BlobItem($"blob_name-{i}.liquid", properties: blobItemProperties);
+             }
+ 
+             Page<BlobItem> page = Page<BlobItem>.FromValues(blobs, null, Mock.Of<Response>());
+diff --git a/src/Microsoft.Health.Fhir.TemplateManagement/ArtifactProviders/BlobTemplateCollectionProvider.cs b/src/Microsoft.Health.Fhir.TemplateManagement/ArtifactProviders/BlobTemplateCollectionProvider.cs
+index be67c3392..6e72a0c4f 100644
+--- a/src/Microsoft.Health.Fhir.TemplateManagement/ArtifactProviders/BlobTemplateCollectionProvider.cs
++++ b/src/Microsoft.Health.Fhir.TemplateManagement/ArtifactProviders/BlobTemplateCollectionProvider.cs
+@@ -13,9 +13,12 @@
+ using Azure.Storage.Blobs;
+ using Azure.Storage.Blobs.Models;
+ using DotLiquid;
++using EnsureThat;
+ using Microsoft.Extensions.Caching.Memory;
+ using Microsoft.Health.Fhir.Liquid.Converter.Utilities;
+ using Microsoft.Health.Fhir.TemplateManagement.Configurations;
++using Microsoft.Health.Fhir.TemplateManagement.Exceptions;
++using Microsoft.Health.Fhir.TemplateManagement.Models;
+ using Polly;
+ using Polly.Retry;
+ 
+@@ -37,14 +40,18 @@ public class BlobTemplateCollectionProvider : IConvertDataTemplateCollectionProv
+ 
+         private readonly int _maxParallelism = 50;
+ 
++        private readonly int _maxTemplateCollectionSizeInBytes;
++
+         public BlobTemplateCollectionProvider(BlobContainerClient blobContainerClient, IMemoryCache templateCache, TemplateCollectionConfiguration templateConfiguration)
+         {
+-            _blobContainerClient = blobContainerClient;
+-            _templateCache = templateCache;
+-            _templateCollectionConfiguration = templateConfiguration;
++            _blobContainerClient = EnsureArg.IsNotNull(blobContainerClient, nameof(blobContainerClient));
++            _templateCache = EnsureArg.IsNotNull(templateCache, nameof(templateCache));
++            _templateCollectionConfiguration = EnsureArg.IsNotNull(templateConfiguration, nameof(templateConfiguration));
+             _downloadRetryPolicy = Policy
+                     .Handle<Exception>()
+                     .WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromMilliseconds(10));
++
++            _maxTemplateCollectionSizeInBytes = _templateCollectionConfiguration.TemplateCollectionSizeLimitMegabytes * 1024 * 1024;
+         }
+ 
+         public async Task<List<Dictionary<string, Template>>> GetTemplateCollectionAsync(CancellationToken cancellationToken = default)
+@@ -97,18 +104,27 @@ public async Task<List<Dictionary<string, Template>>> GetTemplateCollectionAsync
+             return templateCollection;
+         }
+ 
+-        private static async Task<List<string>> ListBlobsFlatListing(BlobContainerClient blobContainerClient, int? segmentSize, CancellationToken ct)
++        private async Task<List<string>> ListBlobsFlatListing(BlobContainerClient blobContainerClient, int? segmentSize, CancellationToken ct)
+         {
+             var blobs = new List<string>();
+ 
+             var resultSegment = blobContainerClient.GetBlobsAsync(default, default, null, ct)
+                 .AsPages(default, segmentSize);
+ 
++            long totalBlobsSize = 0;
++
+             await foreach (Page<BlobItem> blobPage in resultSegment)
+             {
+                 foreach (BlobItem blobItem in blobPage.Values)
+                 {
+                     blobs.Add(blobItem.Name);
++
++                    totalBlobsSize += blobItem.Properties.ContentLength ?? 0;
++
++                    if (totalBlobsSize > _maxTemplateCollectionSizeInBytes)
++                    {
++                        throw new TemplateCollectionExceedsSizeLimitException(TemplateManagementErrorCode.BlobTemplateCollectionTooLarge, $"Total blob template collection size is larger than the size limit: {_templateCollectionConfiguration.TemplateCollectionSizeLimitMegabytes}MB.");
++                    }
+                 }
+             }
+ 
+diff --git a/src/Microsoft.Health.Fhir.TemplateManagement/Configurations/StorageAccountConfiguration.cs b/src/Microsoft.Health.Fhir.TemplateManagement/Configurations/StorageAccountConfiguration.cs
+index 43771d0d1..03609c119 100644
+--- a/src/Microsoft.Health.Fhir.TemplateManagement/Configurations/StorageAccountConfiguration.cs
++++ b/src/Microsoft.Health.Fhir.TemplateManagement/Configurations/StorageAccountConfiguration.cs
+@@ -1,8 +1,7 @@
+-﻿// --------------------------------------------------------------------------
+-// <copyright file="StorageAccountConfiguration.cs" company="Microsoft Corporation">
++﻿// -------------------------------------------------------------------------------------------------
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+-// </copyright>
+-// --------------------------------------------------------------------------
++// Licensed under the MIT License (MIT). See LICENSE in the repo root for license information.
++// -------------------------------------------------------------------------------------------------
+ 
+ using System;
+ 
+diff --git a/src/Microsoft.Health.Fhir.TemplateManagement/Configurations/TemplateHostingConfiguration.cs b/src/Microsoft.Health.Fhir.TemplateManagement/Configurations/TemplateHostingConfiguration.cs
+index a19c6de97..ec9829b8f 100644
+--- a/src/Microsoft.Health.Fhir.TemplateManagement/Configurations/TemplateHostingConfiguration.cs
++++ b/src/Microsoft.Health.Fhir.TemplateManagement/Configurations/TemplateHostingConfiguration.cs
+@@ -1,8 +1,7 @@
+-﻿// --------------------------------------------------------------------------
+-// <copyright file="TemplateHostingConfiguration.cs" company="Microsoft Corporation">
++﻿// -------------------------------------------------------------------------------------------------
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+-// </copyright>
+-// --------------------------------------------------------------------------
++// Licensed under the MIT License (MIT). See LICENSE in the repo root for license information.
++// -------------------------------------------------------------------------------------------------
+ 
+ namespace Microsoft.Health.Fhir.TemplateManagement.Configurations
+ {
+diff --git a/src/Microsoft.Health.Fhir.TemplateManagement/Exceptions/TemplateCollectionExceedsSizeLimitException.cs b/src/Microsoft.Health.Fhir.TemplateManagement/Exceptions/TemplateCollectionExceedsSizeLimitException.cs
+new file mode 100644
+index 000000000..dcb12b471
+--- /dev/null
++++ b/src/Microsoft.Health.Fhir.TemplateManagement/Exceptions/TemplateCollectionExceedsSizeLimitException.cs
+@@ -0,0 +1,23 @@
++﻿// -------------------------------------------------------------------------------------------------
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License (MIT). See LICENSE in the repo root for license information.
++// -------------------------------------------------------------------------------------------------
++
++using System;
++using Microsoft.Health.Fhir.TemplateManagement.Models;
++
++namespace Microsoft.Health.Fhir.TemplateManagement.Exceptions
++{
++    public class TemplateCollectionExceedsSizeLimitException : TemplateManagementException
++    {
++        public TemplateCollectionExceedsSizeLimitException(TemplateManagementErrorCode templateManagementErrorCode, string message)
++            : base(templateManagementErrorCode, message)
++        {
++        }
++
++        public TemplateCollectionExceedsSizeLimitException(TemplateManagementErrorCode templateManagementErrorCode, string message, Exception innerException)
++            : base(templateManagementErrorCode, message, innerException)
++        {
++        }
++    }
++}
+diff --git a/src/Microsoft.Health.Fhir.TemplateManagement/Models/TemplateManagementErrorCode.cs b/src/Microsoft.Health.Fhir.TemplateManagement/Models/TemplateManagementErrorCode.cs
+index a15f1224d..05702a15a 100644
+--- a/src/Microsoft.Health.Fhir.TemplateManagement/Models/TemplateManagementErrorCode.cs
++++ b/src/Microsoft.Health.Fhir.TemplateManagement/Models/TemplateManagementErrorCode.cs
+@@ -29,8 +29,9 @@ public enum TemplateManagementErrorCode
+         InvalidManifestInfo = 2601,
+         InvalidBlobContent = 2602,
+ 
+-        // ImageTooLargeException
++        // TemplateCollectionTooLargeException
+         ImageSizeTooLarge = 2701,
++        BlobTemplateCollectionTooLarge = 2702,
+ 
+         // ArtifactArchiveException
+         DecompressArtifactFailed = 2801,

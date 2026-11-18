@@ -1,0 +1,385 @@
+diff --git a/grails-app/i18n/messages.properties b/grails-app/i18n/messages.properties
+index 636f30504bc..1963aae0577 100644
+--- a/grails-app/i18n/messages.properties
++++ b/grails-app/i18n/messages.properties
+@@ -3935,6 +3935,10 @@ react.receiving.resetSorting.tooltip.label=Revert the list to the order of the o
+ react.receiving.import.label=Import
+ react.receiving.saveAndExit.label=Save & Exit
+ react.receiving.saveAndExit.tooltip.label=Save and exit without completing the receipt
++react.receiving.exit.label=Exit
++react.receiving.continueReceipt.label=Continue Receipt
++react.receiving.unsavedRows.confirm.title=Unsaved changes
++react.receiving.unsavedRows.confirm.message=Some rows were unable to be saved. Do you still want to exit? Updates to those rows will be lost.
+ react.receiving.filters.receiptStatus.receivedMoreThanShipped.label=Received more than shipped
+ react.receiving.filters.receiptStatus.receivedLessThanShipped.label=Received less than shipped
+ react.receiving.filters.receiptStatus.noQuantityEntered.label=No quantity entered
+diff --git a/src/js/consts/rowSaveStatus.js b/src/js/consts/rowSaveStatus.js
+index 3b0ce5f06aa..6516accdd65 100644
+--- a/src/js/consts/rowSaveStatus.js
++++ b/src/js/consts/rowSaveStatus.js
+@@ -1,8 +1,22 @@
+ const RowSaveStatus = {
++  /** The row was saved successfully */
+   SAVED: 'SAVED',
+-  PENDING: 'PENDING', // Row is newly created or edited
++  /** The row is newly created or edited and a save request has not yet been issue */
++  PENDING: 'PENDING',
++  /** A save request is currently in progress. We're awaiting a response from the server */
+   SAVING: 'SAVING',
++  /** The save request for the row failed */
+   ERROR: 'ERROR',
++  /** The row failed validation (so a save request was not sent to the server) */
++  INVALID: 'INVALID',
+ };
+ 
++const UNSAVED_ROW_STATUSES = [RowSaveStatus.ERROR, RowSaveStatus.INVALID];
++
++/**
++ * @param row
++ * @return {boolean} True if the row is unsaved, either due to a request error or failed validation
++ */
++export const isRowUnsaved = (row) => UNSAVED_ROW_STATUSES.includes(row?.saveStatus);
++
+ export default RowSaveStatus;
+diff --git a/src/js/hooks/receiving/v2/useReceivingAutosave.js b/src/js/hooks/receiving/v2/useReceivingAutosave.js
+index 3aa882eba35..23b0df3feeb 100644
+--- a/src/js/hooks/receiving/v2/useReceivingAutosave.js
++++ b/src/js/hooks/receiving/v2/useReceivingAutosave.js
+@@ -30,7 +30,7 @@ const reconcileStaleRow = (row, line) => ({ receiptItemId: line.id });
+ const useReceivingAutosave = ({ initialRows, receiptId }) => {
+   const { lineItemSchema } = useReceivingLineItemValidation();
+ 
+-  const shouldSaveRow = (row) => hasRowChanged(row) && lineItemSchema.safeParse(row).success;
++  const isRowValid = (row) => lineItemSchema.safeParse(row).success;
+ 
+   const updateFn = async (dirtyRows) => {
+     const payload = buildReceiptItemsBatchPayload(dirtyRows);
+@@ -53,7 +53,8 @@ const useReceivingAutosave = ({ initialRows, receiptId }) => {
+     initialRows,
+     requests: { updateFn, deleteFn },
+     rowOptions: {
+-      shouldSaveRow,
++      shouldSaveRow: hasRowChanged,
++      isRowValid,
+       reconcileRow,
+       reconcileStaleRow,
+       removeRowFromState: removeSplitItemRow,
+diff --git a/src/js/hooks/receiving/v2/useReceivingSaveAction.js b/src/js/hooks/receiving/v2/useReceivingSaveAction.js
+index a925d899a78..1be9ac4d6d5 100644
+--- a/src/js/hooks/receiving/v2/useReceivingSaveAction.js
++++ b/src/js/hooks/receiving/v2/useReceivingSaveAction.js
+@@ -5,20 +5,23 @@ import { useParams } from 'react-router-dom';
+ 
+ import { hideSpinner, showSpinner } from 'actions';
+ import { STOCK_MOVEMENT_URL } from 'consts/applicationUrls';
++import confirmExitWithUnsavedRows from 'utils/receiving/confirmExitWithUnsavedRows';
+ 
+ const useReceivingSaveAction = ({ flush }) => {
+   const { shipmentId } = useParams();
+   const dispatch = useDispatch();
+ 
+-  // Autosave persists edits continuously, so exiting only needs to flush whatever is
+-  // still unsaved. When the flush fails (some rows could not be saved even after a
+-  // retry), we stay on the page - the autosave indicator surfaces the error.
++  // Autosave persists edits continuously, so exiting only needs to flush whatever is still unsaved.
+   const onSaveAndExit = useCallback(async () => {
+     dispatch(showSpinner());
+-    try {
+-      await flush();
+-    } finally {
+-      dispatch(hideSpinner());
++    const hasUnsavedRows = await flush()
++      .then(() => false)
++      .catch(() => true)
++      .finally(() => dispatch(hideSpinner()));
++    // If the flush failed (some rows could not be saved, or are invalid), prompt the user to
++    // decide if they still want to exit and lose those updates.
++    if (hasUnsavedRows && !(await confirmExitWithUnsavedRows())) {
++      return;
+     }
+     window.location = STOCK_MOVEMENT_URL.show(shipmentId);
+   }, [flush, shipmentId]);
+diff --git a/src/js/hooks/useAutosave.js b/src/js/hooks/useAutosave.js
+index ff248fffed3..248221009d9 100644
+--- a/src/js/hooks/useAutosave.js
++++ b/src/js/hooks/useAutosave.js
+@@ -7,7 +7,7 @@ import { useSelector } from 'react-redux';
+ import { getAutosaveBatchSize, getAutosaveDebounceTime } from 'selectors';
+ 
+ import { AutosaveStatus } from 'consts/autosaveStatuses';
+-import RowSaveStatus from 'consts/rowSaveStatus';
++import RowSaveStatus, { isRowUnsaved as defaultIsRowUnsaved } from 'consts/rowSaveStatus';
+ import useAutosaveQueue from 'hooks/useAutosaveQueue';
+ import useAutosaveRetry from 'hooks/useAutosaveRetry';
+ import useAutosaveRows from 'hooks/useAutosaveRows';
+@@ -35,6 +35,8 @@ import {
+  *   response only copies in server-assigned ids (`reconcileStaleRow`), so an older request
+  *   can never overwrite a newer edit. The row stays dirty and the next flush sends its
+  *   latest value.
++ * - a dirty row where `isRowValid==false` is not sent: it is marked INVALID and left out of the
++ *   dirty map until edited again, so it counts as unsaved.
+  * - a failed batch marks its rows dirty again (saveStatus ERROR) and retries with exponential
+  *   backoff (`retryDelay`, doubled on each try, limited at `maxRetryDelay`). Failures answered
+  *   by the server are added until `maxRetries` is reached; network failures (`isNetworkError`)
+@@ -62,7 +64,12 @@ import {
+  * @param {Function} [options.rowOptions.generateRowId] - () => id for added rows
+  * @param {Function} [options.rowOptions.shouldSaveRow] - decides whether a dirty row really
+  *   needs a request: (row) => boolean. Checked at flush time; when it returns false, the row
+- *   is marked SAVED without a request.
++ *   is marked SAVED without a request (e.g. an edit that restored the saved value).
++ * @param {Function} [options.rowOptions.isRowValid] - decides whether a row that needs a
++ *   request can be sent: (row) => boolean. Checked at flush time, after `shouldSaveRow`; when
++ *   it returns false, the row is marked INVALID without a request.
++ * @param {Function} [options.rowOptions.isRowUnsaved] - decides whether a row counts as
++ *   unsaved: (row) => boolean. Used by `flush` and `autosaveStatus`.
+  * @param {Function} [options.rowOptions.reconcileRow] - builds the changes to apply to a row
+  *   from a fresh response (the row was not edited while its request was running):
+  *   (row, serverRow) => partial. The returned partial is merged into the row.
+@@ -117,6 +124,8 @@ const useAutosave = ({
+     keyField = 'rowId',
+     generateRowId = () => _.uniqueId('row-'),
+     shouldSaveRow = () => true,
++    isRowValid = () => true,
++    isRowUnsaved = defaultIsRowUnsaved,
+     reconcileRow = (row, serverRow) => serverRow,
+     reconcileStaleRow = () => ({}),
+     removeRowFromState = removeNormalizedItem,
+@@ -167,6 +176,8 @@ const useAutosave = ({
+     updateFn,
+     deleteFn,
+     shouldSaveRow,
++    isRowValid,
++    isRowUnsaved,
+     reconcileRow,
+     reconcileStaleRow,
+     removeRowFromState,
+@@ -197,22 +208,30 @@ const useAutosave = ({
+     debounceTimerRef.current = setTimeout(() => flushDirtyRef.current(), delay);
+   }, []);
+ 
+-  // Collects the rows to send. Rows that no longer exist are dropped, edits
+-  // (shouldSaveRow) are marked SAVED without a request, and rows that ran out of retries
+-  // stay dirty but are skipped until edited again (or retried by flush()).
++  // Collects the rows to send
+   const drainDirtyRows = useCallback(() => {
+     const batchIds = [];
+     dirtyRef.current.forEach(({ attempts }, rowId) => {
+       const row = stateRef.current.entities[rowId];
++      // Rows that no longer exist are dropped
+       if (!row) {
+         dirtyRef.current.delete(rowId);
+         return;
+       }
++      // Edits that need no request (e.g. an edit that restored the saved value) are marked SAVED
+       if (!optionsRef.current.shouldSaveRow(row)) {
+         dirtyRef.current.delete(rowId);
+         setRowStatus(rowId, RowSaveStatus.SAVED);
+         return;
+       }
++      // Invalid rows (likely due to failed validation) are marked INVALID
++      if (!optionsRef.current.isRowValid(row)) {
++        dirtyRef.current.delete(rowId);
++        setRowStatus(rowId, RowSaveStatus.INVALID);
++        return;
++      }
++      // Rows that ran out of retries stay dirty, but are skipped until edited again or are
++      // retried by a flush() call.
+       if (attempts > optionsRef.current.maxRetries) {
+         return;
+       }
+@@ -428,7 +447,7 @@ const useAutosave = ({
+       isFlushingRef.current = false;
+     }
+     const hasUnsavedRows = Object.values(stateRef.current.entities)
+-      .some((row) => row?.saveStatus === RowSaveStatus.ERROR);
++      .some(optionsRef.current.isRowUnsaved);
+     if (hasUnsavedRows) {
+       throw new Error('Autosave failed: some rows could not be saved');
+     }
+@@ -442,10 +461,10 @@ const useAutosave = ({
+ 
+   // General status for the autosave indicator
+   const autosaveStatus = useMemo(() => {
+-    const hasFailedRows = Object.values(rowsState.entities || {})
+-      .some((row) => row?.saveStatus === RowSaveStatus.ERROR);
++    const hasUnsavedRows = Object.values(rowsState.entities || {})
++      .some(optionsRef.current.isRowUnsaved);
+ 
+-    if (hasFailedRows) {
++    if (hasUnsavedRows) {
+       return AutosaveStatus.ERROR;
+     }
+     if (isSavePending) {
+diff --git a/src/js/tests/hooks/receiving/v2/autofillReceivingQuantities.test.js b/src/js/tests/hooks/receiving/v2/autofillReceivingQuantities.test.js
+index 9b433b8f73b..68d350173ef 100644
+--- a/src/js/tests/hooks/receiving/v2/autofillReceivingQuantities.test.js
++++ b/src/js/tests/hooks/receiving/v2/autofillReceivingQuantities.test.js
+@@ -8,6 +8,10 @@ import {
+ 
+ import '@testing-library/jest-dom';
+ 
++// Stub the save and exit modal. It is not invoked in these tests, and it pulls in
++// react-icons/all, which jest cannot parse.
++jest.mock('utils/receiving/confirmExitWithUnsavedRows', () => jest.fn());
++
+ const buildRow = (rowId, overrides = {}) => ({
+   rowId,
+   rowType: null,
+diff --git a/src/js/tests/hooks/useAutosave.test.js b/src/js/tests/hooks/useAutosave.test.js
+index 3002c4e48ca..c1cc6669f1b 100644
+--- a/src/js/tests/hooks/useAutosave.test.js
++++ b/src/js/tests/hooks/useAutosave.test.js
+@@ -119,6 +119,39 @@ describe('useAutosave', () => {
+     expect(result.current.autosaveStatus).toBe(AutosaveStatus.SAVED);
+   });
+ 
++  describe('isRowValid', () => {
++    const rowOptions = { isRowValid: (row) => row.quantityReceiving >= 0 };
++
++    it('does not save invalid row', async () => {
++      const { result } = renderUseAutosave({ rowOptions });
++
++      act(() => result.current.updateRow('row-1', { quantityReceiving: -1 }));
++      act(() => jest.advanceTimersByTime(DEBOUNCE_TIME));
++      await flushPromises();
++
++      expect(updateFn).not.toHaveBeenCalled();
++      expect(result.current.rows['row-1'].saveStatus).toBe(RowSaveStatus.INVALID);
++      expect(result.current.isSavePending).toBe(false);
++      expect(result.current.autosaveStatus).toBe(AutosaveStatus.ERROR);
++    });
++
++    it('saves invalid row once it is edited back to a valid value', async () => {
++      const { result } = renderUseAutosave({ rowOptions });
++
++      act(() => result.current.updateRow('row-1', { quantityReceiving: -1 }));
++      act(() => jest.advanceTimersByTime(DEBOUNCE_TIME));
++      act(() => result.current.updateRow('row-1', { quantityReceiving: 5 }));
++      act(() => jest.advanceTimersByTime(DEBOUNCE_TIME));
++
++      expect(updateFn).toHaveBeenCalledTimes(1);
++      deferreds[0].resolve([{ rowId: 'row-1' }]);
++      await flushPromises();
++
++      expect(result.current.rows['row-1'].saveStatus).toBe(RowSaveStatus.SAVED);
++      expect(result.current.autosaveStatus).toBe(AutosaveStatus.SAVED);
++    });
++  });
++
+   it('flushes immediately when the batch size is reached', () => {
+     const { result } = renderUseAutosave({ flushOptions: { batchSize: 2 } });
+ 
+diff --git a/src/js/utils/confirmationModalUtils.jsx b/src/js/utils/confirmationModalUtils.jsx
+index 2992be2e288..e2225efc124 100644
+--- a/src/js/utils/confirmationModalUtils.jsx
++++ b/src/js/utils/confirmationModalUtils.jsx
+@@ -6,6 +6,20 @@ import ConfirmModal from 'utils/ConfirmModal';
+ 
+ import 'react-confirm-alert/src/react-confirm-alert.css';
+ 
++/**
++ * Convenience wrapper on a {@link ConfirmModal}, wrapping it in a confirmAlert.
++ *
++ * @param param0
++ * @param {object} param0.title - the title text of the modal
++ * @param {object} param0.content - the body text of the modal
++ * @param {object} param0.buttons - the buttons to include in the modal
++ * @param {Function} [param0.handleOnClose] - the function to call when close is triggered
++ * @param {boolean} [param0.hideCloseButton] - true if there should NOT be an 'x' button
++ * @param {boolean} [param0.closeOnClickOutside=true] - true if clicking outside the window should
++ * close the modal
++ * @param {boolean} [param0.closeOnEscape=closeOnClickOutside] - true if pressing the escape key
++ * should close the modal
++ */
+ const confirmationModal = ({
+   title,
+   content,
+@@ -13,6 +27,7 @@ const confirmationModal = ({
+   handleOnClose,
+   hideCloseButton,
+   closeOnClickOutside = true,
++  closeOnEscape = closeOnClickOutside,
+ }) => {
+   confirmAlert({
+     customUI: ({ onClose }) => (
+@@ -30,6 +45,11 @@ const confirmationModal = ({
+       />
+     ),
+     closeOnClickOutside,
++    closeOnEscape,
++    // The library closes the modal itself automatically in these scenarios, so we only need
++    // to specify  our custom OnClose logic here.
++    onClickOutside: () => handleOnClose?.(),
++    onKeypressEscape: () => handleOnClose?.(),
+   });
+ };
+ 
+diff --git a/src/js/utils/receiving/confirmExitWithUnsavedRows.js b/src/js/utils/receiving/confirmExitWithUnsavedRows.js
+new file mode 100644
+index 00000000000..2df7a6da107
+--- /dev/null
++++ b/src/js/utils/receiving/confirmExitWithUnsavedRows.js
+@@ -0,0 +1,42 @@
++import confirmationModal from 'utils/confirmationModalUtils';
++
++/**
++ * Warns that some rows could not be saved and that their updates are lost on exit.
++ */
++const confirmExitWithUnsavedRows = () => new Promise((resolve) => {
++  confirmationModal({
++    closeOnClickOutside: true,
++    hideCloseButton: true,
++    handleOnClose: () => resolve(false),
++    title: {
++      label: 'react.receiving.unsavedRows.confirm.title',
++      default: 'Unsaved changes',
++    },
++    content: {
++      label: 'react.receiving.unsavedRows.confirm.message',
++      default: 'Some rows were unable to be saved. Do you still want to exit? Updates to those rows will be lost.',
++    },
++    buttons: (onClose) => [
++      {
++        variant: 'secondary',
++        label: 'react.receiving.exit.label',
++        defaultLabel: 'Exit',
++        onClick: () => {
++          onClose();
++          resolve(true);
++        },
++      },
++      {
++        variant: 'primary',
++        label: 'react.receiving.continueReceipt.label',
++        defaultLabel: 'Continue Receipt',
++        onClick: () => {
++          onClose();
++          resolve(false);
++        },
++      },
++    ],
++  });
++});
++
++export default confirmExitWithUnsavedRows;
+diff --git a/src/js/utils/receiving/getRowStripeStatus.js b/src/js/utils/receiving/getRowStripeStatus.js
+index 2ead552c61e..0385d7e9c50 100644
+--- a/src/js/utils/receiving/getRowStripeStatus.js
++++ b/src/js/utils/receiving/getRowStripeStatus.js
+@@ -1,13 +1,13 @@
+-import RowSaveStatus from 'consts/rowSaveStatus';
++import { isRowUnsaved } from 'consts/rowSaveStatus';
+ import VerticalStripeStatus from 'consts/verticalStripeStatus';
+ 
+ /**
+  * The VerticalStripeIndicator status for a receiving row:
+- * - ERROR if row has an error, including when the last save operation on the row failed
++ * - ERROR if the row is unsaved, meaning it failed validation, or its last save operation failed
+  * - null (no stripe) otherwise
+  */
+ const getRowStripeStatus = (item) => {
+-  if (item?.saveStatus === RowSaveStatus.ERROR) {
++  if (isRowUnsaved(item)) {
+     return VerticalStripeStatus.ERROR;
+   }
+   // We opt to display nothing in the success case so we return the null status for any non-error.

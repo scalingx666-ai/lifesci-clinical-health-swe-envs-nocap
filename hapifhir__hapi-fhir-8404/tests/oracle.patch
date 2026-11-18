@@ -1,0 +1,292 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_14_0/8387-partition-selected-hook-fires-for-system-level-operations.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_14_0/8387-partition-selected-hook-fires-for-system-level-operations.yaml
+new file mode 100644
+index 000000000000..398bb1c31066
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_14_0/8387-partition-selected-hook-fires-for-system-level-operations.yaml
+@@ -0,0 +1,9 @@
++---
++type: security
++issue: 8387
++title: "Previously, the `STORAGE_PARTITION_SELECTED` pointcut was only invoked for requests with a specific
++  resource type. Partition-selecting requests without one, such as system-level `_history`, result paging,
++  transactions and server-level operations, skipped it, so a client with access to one partition could
++  read another partition's resource history. The pointcut is now invoked for every partition-selecting
++  resolution, with a `null` `RuntimeResourceDefinition` when no resource type applies (per its Javadoc).
++  Interceptors hooking this pointcut must handle a `null` resource definition."
+diff --git a/hapi-fhir-jpaserver-searchparam/src/main/java/ca/uhn/fhir/jpa/partition/IRequestPartitionHelperSvc.java b/hapi-fhir-jpaserver-searchparam/src/main/java/ca/uhn/fhir/jpa/partition/IRequestPartitionHelperSvc.java
+index d4a0f43d6e9e..b85c57b57faf 100644
+--- a/hapi-fhir-jpaserver-searchparam/src/main/java/ca/uhn/fhir/jpa/partition/IRequestPartitionHelperSvc.java
++++ b/hapi-fhir-jpaserver-searchparam/src/main/java/ca/uhn/fhir/jpa/partition/IRequestPartitionHelperSvc.java
+@@ -137,14 +137,19 @@ default RequestPartitionId determineReadPartitionForRequestForSearchType(
+ 
+ 	/**
+ 	 * Determine partition to use when performing the history operation based on a resource type and resource instance.
++	 * <p>
++	 * A null resource type denotes a system-level history operation. The
++	 * {@link ca.uhn.fhir.interceptor.api.Pointcut#STORAGE_PARTITION_SELECTED} hook is still invoked for it,
++	 * with a null {@link ca.uhn.fhir.context.RuntimeResourceDefinition}.
++	 * </p>
+ 	 * @param theRequest the request details from the context of the call
+-	 * @param theResourceType the resource type
+-	 * @param theIdType the id of the resource instance
++	 * @param theResourceType the resource type, or {@literal null} for a system-level history operation
++	 * @param theIdType the id of the resource, or {@literal null} for a type- or system-level history operation
+ 	 * @return the partition id which should be used for the history operation
+ 	 */
+ 	@Nonnull
+ 	default RequestPartitionId determineReadPartitionForRequestForHistory(
+-			@Nullable RequestDetails theRequest, String theResourceType, IIdType theIdType) {
++			@Nullable RequestDetails theRequest, @Nullable String theResourceType, @Nullable IIdType theIdType) {
+ 		ReadPartitionIdRequestDetails details = ReadPartitionIdRequestDetails.forHistory(theResourceType, theIdType);
+ 		return determineReadPartitionForRequest(theRequest, details);
+ 	}
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/PartitioningSqlR4Test.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/PartitioningSqlR4Test.java
+index 47481ee39ae7..62e292229f32 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/PartitioningSqlR4Test.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/PartitioningSqlR4Test.java
+@@ -35,6 +35,7 @@
+ import ca.uhn.fhir.jpa.util.SqlQuery;
+ import ca.uhn.fhir.rest.api.Constants;
+ import ca.uhn.fhir.rest.api.server.IBundleProvider;
++import ca.uhn.fhir.rest.api.server.RequestDetails;
+ import ca.uhn.fhir.rest.api.server.SystemRequestDetails;
+ import ca.uhn.fhir.rest.api.server.storage.TransactionDetails;
+ import ca.uhn.fhir.rest.param.DateAndListParam;
+@@ -48,6 +49,7 @@
+ import ca.uhn.fhir.rest.param.StringParam;
+ import ca.uhn.fhir.rest.param.TokenParam;
+ import ca.uhn.fhir.rest.param.TokenParamModifier;
++import ca.uhn.fhir.rest.server.exceptions.ForbiddenOperationException;
+ import ca.uhn.fhir.rest.server.exceptions.InternalErrorException;
+ import ca.uhn.fhir.rest.server.exceptions.InvalidRequestException;
+ import ca.uhn.fhir.rest.server.exceptions.PreconditionFailedException;
+@@ -104,6 +106,7 @@
+ import static ca.uhn.fhir.util.TestUtil.sleepAtLeast;
+ import static org.apache.commons.lang3.StringUtils.countMatches;
+ import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
+@@ -3508,6 +3511,62 @@ void testHistory_Server_SpecificPartition() {
+ 
+ 	}
+ 
++	/**
++	 * System-level history has no resource type, but the partition it runs against is still chosen
++	 * by the caller, so the {@link Pointcut#STORAGE_PARTITION_SELECTED} security hook must fire.
++	 */
++	@Test
++	void testHistory_Server_InvokesPartitionSelectedHookWithNullResourceDefinition() {
++		createPatient(withCreatePartition(1), withBirthdate("2020-01-01"));
++
++		IAnonymousInterceptor interceptor = mock(IAnonymousInterceptor.class);
++		myInterceptorRegistry.registerAnonymousInterceptor(Pointcut.STORAGE_PARTITION_SELECTED, interceptor);
++		try {
++			addNextTargetPartitionsForRead(1);
++			IBundleProvider results = mySystemDao.history(null, null, null, mySrd);
++			assertEquals(1, results.sizeOrThrowNpe());
++
++			ArgumentCaptor<HookParams> captor = ArgumentCaptor.forClass(HookParams.class);
++			verify(interceptor, times(1)).invoke(eq(Pointcut.STORAGE_PARTITION_SELECTED), captor.capture());
++
++			HookParams params = captor.getValue();
++			RequestPartitionId partitionId = params.get(RequestPartitionId.class);
++			assertThat(partitionId.getPartitionIds()).containsExactly(1);
++			assertThat(partitionId.getPartitionNames()).containsExactly("PART-1");
++			assertThat(params.get(RequestDetails.class)).isSameAs(mySrd);
++			assertThat(params.get(RuntimeResourceDefinition.class)).isNull();
++		} finally {
++			myInterceptorRegistry.unregisterInterceptor(interceptor);
++		}
++	}
++
++	@Test
++	void testHistory_Server_PartitionSelectedHookCanDenyAccess() {
++		createPatient(withCreatePartition(1), withBirthdate("2020-01-01"));
++
++		IAnonymousInterceptor interceptor = (thePointcut, theArgs) -> {
++			throw new ForbiddenOperationException("Denied by test");
++		};
++		myInterceptorRegistry.registerAnonymousInterceptor(Pointcut.STORAGE_PARTITION_SELECTED, interceptor);
++		try {
++			addNextTargetPartitionsForRead(1);
++			myCaptureQueriesListener.clear();
++
++			assertThatThrownBy(() -> mySystemDao.history(null, null, null, mySrd))
++				.isInstanceOf(ForbiddenOperationException.class)
++				.hasMessage("Denied by test");
++
++			// The history query must not have been executed
++			List<String> historyQueries = myCaptureQueriesListener.getSelectQueriesForCurrentThread().stream()
++				.map(t -> t.getSql(false, false).toUpperCase())
++				.filter(t -> t.contains("HFJ_RES_VER"))
++				.toList();
++			assertThat(historyQueries).isEmpty();
++		} finally {
++			myInterceptorRegistry.unregisterInterceptor(interceptor);
++		}
++	}
++
+ 	@Test
+ 	void testHistory_Server_DefaultPartition() {
+ 		IIdType id1A = createPatient(withCreatePartition(null), withBirthdate("2020-01-01"));
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/partition/RequestPartitionHelperSvcTest.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/partition/RequestPartitionHelperSvcTest.java
+index 881d2f1c1979..17ef1c2c3a7b 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/partition/RequestPartitionHelperSvcTest.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/partition/RequestPartitionHelperSvcTest.java
+@@ -1,5 +1,10 @@
+ package ca.uhn.fhir.jpa.partition;
+ 
++import ca.uhn.fhir.context.RuntimeResourceDefinition;
++import ca.uhn.fhir.interceptor.api.Hook;
++import ca.uhn.fhir.interceptor.api.Interceptor;
++import ca.uhn.fhir.interceptor.api.Pointcut;
++import ca.uhn.fhir.interceptor.model.ReadPartitionIdRequestDetails;
+ import ca.uhn.fhir.interceptor.model.RequestPartitionId;
+ import ca.uhn.fhir.jpa.dao.data.IPartitionDao;
+ import ca.uhn.fhir.jpa.entity.PartitionEntity;
+@@ -7,6 +12,7 @@
+ import ca.uhn.fhir.jpa.model.config.PartitionSettings;
+ import ca.uhn.fhir.jpa.searchparam.extractor.ISearchParamExtractor;
+ import ca.uhn.fhir.jpa.test.BaseJpaR4Test;
++import ca.uhn.fhir.rest.api.server.RequestDetails;
+ import ca.uhn.fhir.rest.api.server.SystemRequestDetails;
+ import ca.uhn.fhir.rest.server.exceptions.ResourceNotFoundException;
+ import ca.uhn.fhir.rest.server.servlet.ServletRequestDetails;
+@@ -17,10 +23,13 @@
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.extension.ExtendWith;
+ import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.Arguments;
+ import org.junit.jupiter.params.provider.MethodSource;
+ import org.mockito.junit.jupiter.MockitoExtension;
+ import org.springframework.beans.factory.annotation.Autowired;
+ 
++import java.util.ArrayList;
++import java.util.List;
+ import java.util.Set;
+ import java.util.stream.Stream;
+ 
+@@ -321,6 +330,97 @@ void testDetermineReadPartition_withNullTenantId_shouldUseInterceptors() {
+ 		}
+ 	}
+ 
++	/**
++	 * Partition-selecting resolutions that carry no resource type (system-level history, page
++	 * fetches, server-level operations) still run against a caller-chosen partition, so the
++	 * {@link Pointcut#STORAGE_PARTITION_SELECTED} security hook must fire for them too, with a
++	 * null {@link RuntimeResourceDefinition}.
++	 */
++	@ParameterizedTest(name = "{0}")
++	@MethodSource("readDetailsWithoutResourceType")
++	void testDetermineReadPartitionForRequest_noResourceType_invokesPartitionSelectedHook(String theName, ReadPartitionIdRequestDetails theDetails) {
++		createPartition1();
++		MyReadPartitionInterceptor readInterceptor = new MyReadPartitionInterceptor(RequestPartitionId.fromPartitionId(PARTITION_ID_1));
++		MyPartitionSelectedInterceptor selectedInterceptor = new MyPartitionSelectedInterceptor();
++		myInterceptorRegistry.registerInterceptor(readInterceptor);
++		myInterceptorRegistry.registerInterceptor(selectedInterceptor);
++		try {
++			ServletRequestDetails srd = new ServletRequestDetails();
++
++			RequestPartitionId result = mySvc.determineReadPartitionForRequest(srd, theDetails);
++
++			assertThat(result.getPartitionIds()).containsExactly(PARTITION_ID_1);
++			assertThat(result.getPartitionNames()).containsExactly(PARTITION_NAME_1);
++			assertThat(selectedInterceptor.myPartitionIds).hasSize(1);
++			assertThat(selectedInterceptor.myPartitionIds.get(0).getPartitionNames()).containsExactly(PARTITION_NAME_1);
++			assertThat(selectedInterceptor.myRequestDetails).containsExactly(srd);
++			assertThat(selectedInterceptor.myResourceDefinitions).containsExactly((RuntimeResourceDefinition) null);
++		} finally {
++			myInterceptorRegistry.unregisterInterceptor(readInterceptor);
++			myInterceptorRegistry.unregisterInterceptor(selectedInterceptor);
++		}
++	}
++
++	static Stream<Arguments> readDetailsWithoutResourceType() {
++		return Stream.of(
++			Arguments.of("system history", ReadPartitionIdRequestDetails.forHistory(null, null)),
++			Arguments.of("server operation", ReadPartitionIdRequestDetails.forServerOperation("$expunge")),
++			Arguments.of("page fetch", ReadPartitionIdRequestDetails.forSearchUuid("some-search-uuid"))
++		);
++	}
++
++	@Test
++	void testDetermineGenericPartitionForRequest_noResourceName_invokesPartitionSelectedHook() {
++		createPartition1();
++		MyReadPartitionInterceptor readInterceptor = new MyReadPartitionInterceptor(RequestPartitionId.fromPartitionId(PARTITION_ID_1));
++		MyPartitionSelectedInterceptor selectedInterceptor = new MyPartitionSelectedInterceptor();
++		myInterceptorRegistry.registerInterceptor(readInterceptor);
++		myInterceptorRegistry.registerInterceptor(selectedInterceptor);
++		try {
++			// A server-level request (e.g. a transaction) has no resource name
++			ServletRequestDetails srd = new ServletRequestDetails();
++			assertThat(srd.getResourceName()).isNull();
++
++			RequestPartitionId result = mySvc.determineGenericPartitionForRequest(srd);
++
++			assertThat(result.getPartitionNames()).containsExactly(PARTITION_NAME_1);
++			assertThat(selectedInterceptor.myPartitionIds).hasSize(1);
++			assertThat(selectedInterceptor.myRequestDetails).containsExactly(srd);
++			assertThat(selectedInterceptor.myResourceDefinitions).containsExactly((RuntimeResourceDefinition) null);
++		} finally {
++			myInterceptorRegistry.unregisterInterceptor(readInterceptor);
++			myInterceptorRegistry.unregisterInterceptor(selectedInterceptor);
++		}
++	}
++
++	@Interceptor
++	private static class MyReadPartitionInterceptor {
++		private final RequestPartitionId myPartitionId;
++
++		private MyReadPartitionInterceptor(RequestPartitionId thePartitionId) {
++			myPartitionId = thePartitionId;
++		}
++
++		@Hook(Pointcut.STORAGE_PARTITION_IDENTIFY_READ)
++		public RequestPartitionId identifyForRead(RequestDetails theRequestDetails) {
++			return myPartitionId;
++		}
++	}
++
++	@Interceptor
++	private static class MyPartitionSelectedInterceptor {
++		private final List<RequestPartitionId> myPartitionIds = new ArrayList<>();
++		private final List<RequestDetails> myRequestDetails = new ArrayList<>();
++		private final List<RuntimeResourceDefinition> myResourceDefinitions = new ArrayList<>();
++
++		@Hook(Pointcut.STORAGE_PARTITION_SELECTED)
++		public void partitionSelected(RequestDetails theRequestDetails, RequestPartitionId theRequestPartitionId, RuntimeResourceDefinition theRuntimeResourceDefinition) {
++			myRequestDetails.add(theRequestDetails);
++			myPartitionIds.add(theRequestPartitionId);
++			myResourceDefinitions.add(theRuntimeResourceDefinition);
++		}
++	}
++
+ 	private PartitionEntity createPartition1() {
+ 		return myPartitionDao.save(new PartitionEntity().setId(PARTITION_ID_1).setName(PARTITION_NAME_1));
+ 	}
+diff --git a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/jpa/partition/BaseRequestPartitionHelperSvc.java b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/jpa/partition/BaseRequestPartitionHelperSvc.java
+index 4f55231dafe9..2b2da3a2378d 100644
+--- a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/jpa/partition/BaseRequestPartitionHelperSvc.java
++++ b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/jpa/partition/BaseRequestPartitionHelperSvc.java
+@@ -39,7 +39,6 @@
+ import ca.uhn.fhir.util.Logs;
+ import jakarta.annotation.Nonnull;
+ import jakarta.annotation.Nullable;
+-import org.apache.commons.lang3.StringUtils;
+ import org.hl7.fhir.instance.model.api.IBaseResource;
+ import org.slf4j.Logger;
+ import org.springframework.beans.factory.annotation.Autowired;
+@@ -390,9 +389,8 @@ private RequestPartitionId validateAndNormalizePartition(
+ 
+ 		// Note: It's still possible that the partition only has a date but no name/id
+ 
+-		if (StringUtils.isNotBlank(theResourceType)) {
+-			validateHasPartitionPermissions(theRequest, theResourceType, retVal);
+-		}
++		// Fire STORAGE_PARTITION_SELECTED even with no resource type, so system-level ops are checked too.
++		validateHasPartitionPermissions(theRequest, theResourceType, retVal);
+ 
+ 		// Replace null partition ID with non-null default partition ID if one is being used
+ 		if (myPartitionSettings.getDefaultPartitionId() != null

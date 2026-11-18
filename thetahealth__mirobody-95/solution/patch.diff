@@ -1,0 +1,239 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 071a6a884..c2da958ad 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,10 @@
+ - **Headless clients can read the API capability version.** `/mirobody.json`
+   now serves `capability_version` and `server_version` even without a web
+   client. A GET or HEAD request verifies that the route exists.
++- **The offline device vocabulary can now be exported for phone clients.**
++  `mirobody device-bundle [--out PATH]` writes the metric catalogue, labels,
++  LOINC crosswalk and vendor fields with a canonical SHA-256 digest. Run the
++  command twice and compare the bytes to check reproducibility.
+ 1.5.2 genetics preview scope: genotype facts and CPIC coverage are available
+ with the measured public candidate. Drug phenotypes and rare-disease risk
+ interpretation are deferred; the tool reports `not_determined` rather than
+diff --git a/mirobody/cli.py b/mirobody/cli.py
+index c8a726dec..69cd623f1 100644
+--- a/mirobody/cli.py
++++ b/mirobody/cli.py
+@@ -10,6 +10,9 @@
+   Requires the ``[parse]`` extra.
+ * ``mirobody resolve <terms...>``       offline indicator-name resolution
+   against the shipped bundles. Needs NOTHING: no key, no config, no network.
++* ``mirobody device-bundle [--out PATH]``  the device vocabulary (catalogue,
++  labels, crosswalks) as one digested JSON file, for a client that codes
++  health-store batches without Python. Needs nothing, like ``resolve``.
+ * ``mirobody dev [--pg-url URL]``       the same server in ONE command, with
+   no config file, no Redis requirement and generated dev secrets. `config.yaml`
+   is not in the wheel, so this is the only shape in which
+@@ -351,6 +354,21 @@ def _cmd_mcp(args: argparse.Namespace) -> None:
+     raise SystemExit(serve_stdio([]))
+ 
+ 
++def _cmd_device_bundle(args: argparse.Namespace) -> None:
++    import json
++
++    from mirobody.translate import device_bundle
++
++    data = device_bundle.dumps()
++    if not args.out:
++        sys.stdout.buffer.write(data)
++        return
++    with open(args.out, "wb") as f:
++        f.write(data)
++    digest = json.loads(data)["digest"]
++    print(f"wrote {args.out} ({len(data)} bytes, {digest})", file=sys.stderr)
++
++
+ def _cmd_parse(args: argparse.Namespace) -> None:
+     """Read a document into standardized readings. Needs one vision-capable key.
+ 
+@@ -525,6 +543,12 @@ def main(argv: list[str] | None = None) -> None:
+     p_resolve.add_argument("terms", nargs="+", help="indicator names in any supported language")
+     p_resolve.set_defaults(func=_cmd_resolve)
+ 
++    p_bundle = sub.add_parser(
++        "device-bundle",
++        help="write the device vocabulary (catalogue, labels, crosswalks) as one JSON file — offline, no extra",
++    )
++    p_bundle.add_argument("--out", default="", help="write to this file instead of stdout")
++    p_bundle.set_defaults(func=_cmd_device_bundle)
+     p_mcp = sub.add_parser("mcp", help="run the stdio MCP server over the offline vocabularies (no key, no database)")
+     p_mcp.set_defaults(func=_cmd_mcp)
+ 
+diff --git a/mirobody/translate/__init__.py b/mirobody/translate/__init__.py
+index a2a276329..6da1bd563 100644
+--- a/mirobody/translate/__init__.py
++++ b/mirobody/translate/__init__.py
+@@ -9,6 +9,8 @@
+                              -> an ICPC-3 code, on the same terms
+     devices.py               thirteen vendors' device fields -> LOINC, with
+                              the confidence and the source behind each row
++    device_bundle.py         the catalogue and those crosswalks as one
++                             digested file, for a client without Python
+     indicators_info.py       the indicator catalogue
+     canonical_units.py       a reading in the unit the catalogue declares
+                              for its indicator (NOT `mirobody.units`, the
+diff --git a/mirobody/translate/device_bundle.py b/mirobody/translate/device_bundle.py
+new file mode 100644
+index 000000000..41016e5bc
+--- /dev/null
++++ b/mirobody/translate/device_bundle.py
+@@ -0,0 +1,156 @@
++"""The device vocabulary as one file a client without Python can load.
++
++A phone codes a health-store batch before any server sees it, and it has to
++code it the way this package would: the same catalogue name, the same LOINC
++code, the same refusal where the crosswalk has none. Porting the TSVs by hand
++is how two vocabularies start. This module writes what the phone needs, from
++the same files the server reads:
++
++    metrics     the catalogue (``res/catalog/metrics.tsv``), every member, with the
++                ``(system, code)`` identity `Metric.canonical` gives it
++    labels      the shipped display labels (``res/catalog/labels/<locale>.tsv``)
++    codes       the crosswalk base table, one row per LOINC code
++    vendors     every vendor field read, coded or declined, with its source
++    unmappable  the metrics no LOINC code fits, and why
++
++The file names its own versions (``terminology_version``, ``loinc_release``)
++and carries a ``digest``: sha256 over the canonical JSON of everything else
++(keys sorted, no whitespace, UTF-8). The same release gives the same bytes on
++any machine, so the digest is what a coded reading can cite as the vocabulary
++that coded it. To check one, drop ``digest`` and hash `canonical_json` of the
++rest.
++
++Pure, like the seam it serves: no clock, no database, stdlib only.
++"""
++
++from __future__ import annotations
++
++import csv
++import hashlib
++import io
++import json
++from importlib import resources
++from typing import Any
++
++from mirobody.kernel import metrics
++
++from . import devices
++
++#: The shape of this file. Raise it by one when a consumer written against the
++#: previous shape would misread the new one; adding a key does not count.
++FORMAT = "mirobody.device-bundle"
++FORMAT_VERSION = 1
++
++
++def _labels() -> dict[str, dict[str, dict[str, str]]]:
++    out: dict[str, dict[str, dict[str, str]]] = {}
++    root = resources.files("mirobody").joinpath("res", "catalog", "labels")
++    for entry in sorted(root.iterdir(), key=lambda e: e.name):
++        if not entry.name.endswith(".tsv"):
++            continue
++        rows = csv.DictReader(io.StringIO(entry.read_text(encoding="utf-8")), delimiter="\t")
++        out[entry.name[:-4]] = {
++            r["key"]: {"kind": r["kind"], "label": r.get("label") or "", "description": r.get("description") or ""}
++            for r in rows
++        }
++    return out
++
++
++def _metric(m: metrics.Metric) -> dict[str, Any]:
++    system, code = m.canonical
++    return {
++        "member": m.member,
++        "name": m.name,
++        # A name declared under several members keeps its first as the identity.
++        "primary": metrics.METRICS[m.name] is m,
++        "display": m.display,
++        "category": m.category,
++        "standard_unit": m.standard_unit,
++        "unit_ucum": m.unit_ucum,
++        "data_type": m.data_type,
++        "state_class": m.state_class,
++        "aggregation_policy": m.aggregation_policy,
++        "loinc": m.loinc,
++        "confidence": m.confidence,
++        "system": system,
++        "code": code,
++        "window": m.window,
++        "panel": m.panel,
++        "aggregation_methods": list(m.aggregation_methods),
++        "derived": list(m.derived),
++        "description": m.description,
++        "since": m.since,
++    }
++
++
++def _vendor(vendor: str) -> dict[str, Any]:
++    source = devices.SOURCES[vendor]
++    return {
++        "name": source.name,
++        "urls": list(source.urls),
++        "note": source.note,
++        "fields": [
++            {
++                "type": f.type,
++                "field": f.field,
++                "key": f.key,
++                "metric": f.metric,
++                "loinc": f.loinc,
++                "confidence": f.confidence,
++                "note": f.note,
++            }
++            for f in devices.vendor_fields(vendor)
++        ],
++    }
++
++
++def canonical_json(value: Any) -> bytes:
++    """The one serialization the digest is taken over."""
++    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
++
++
++def build() -> dict[str, Any]:
++    """The bundle as a dict, ``digest`` included."""
++    body: dict[str, Any] = {
++        "format": FORMAT,
++        "format_version": FORMAT_VERSION,
++        "terminology_version": metrics.TERMINOLOGY_VERSION,
++        "loinc_release": devices.LOINC_RELEASE,
++        "retrieved": devices.RETRIEVED,
++        "systems": {"loinc": metrics.SYSTEM_LOINC, "device": metrics.SYSTEM_DEVICE},
++        "metrics": [_metric(m) for m in metrics.ROWS],
++        "labels": _labels(),
++        "codes": [
++            {
++                "loinc": c.loinc,
++                "name": c.name,
++                "axes": c.axes,
++                "metric": c.metric,
++                "confidence": c.confidence,
++                "fields": dict(c.fields),
++                "note": c.note,
++            }
++            for c in devices.base_table()
++        ],
++        "vendors": {v: _vendor(v) for v in devices.VENDORS},
++        "unmappable": [
++            {"reason": u.reason, "metric": u.metric, "vendors": u.vendors, "detail": u.detail, "disposition": u.disposition}
++            for u in devices.unmappable()
++        ],
++    }
++    body["digest"] = "sha256:" + hashlib.sha256(canonical_json(body)).hexdigest()
++    return body
++
++
++def dumps() -> bytes:
++    """The bundle file: `canonical_json` of `build`, newline-terminated."""
++    return canonical_json(build()) + b"\n"
++
++
++def verify(bundle: dict[str, Any]) -> bool:
++    """Whether ``bundle`` still hashes to the digest it carries."""
++    rest = {k: v for k, v in bundle.items() if k != "digest"}
++    return bundle.get("digest") == "sha256:" + hashlib.sha256(canonical_json(rest)).hexdigest()
++
++
++__all__ = ["FORMAT", "FORMAT_VERSION", "build", "canonical_json", "dumps", "verify"]

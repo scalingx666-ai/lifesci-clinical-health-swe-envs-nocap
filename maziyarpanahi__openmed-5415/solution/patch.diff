@@ -1,0 +1,2535 @@
+diff --git a/docs/structured/local-journey-store.md b/docs/structured/local-journey-store.md
+index 52ac5ff85d..738d267fb5 100644
+--- a/docs/structured/local-journey-store.md
++++ b/docs/structured/local-journey-store.md
+@@ -88,6 +88,37 @@ blob and atomically writes artifact metadata, evidence, facts, and conflicts.
+ Replaying identical records is idempotent and creates neither duplicate rows nor
+ an empty revision.
+ 
++## Bounded waits
++
++Writes run under the earliest of `transaction(deadline=...)`, the ambient
++`store_deadline(...)` scope, and `StoreTimeouts.operation_seconds` (default 30
++seconds, `OPENMED_JOURNEY_STORE_TIMEOUT_SECONDS`). Waiting for the store's
++connection and for SQLite's write lock (`busy_timeout`) is capped by
++`StoreTimeouts.lock_wait_seconds` (default 5 seconds,
++`OPENMED_JOURNEY_STORE_LOCK_WAIT_SECONDS`) or the time left, whichever is less.
++
++```python
++from openmed.structured.store import StoreTimeouts, store_deadline
++
++metadata = SQLiteJourneyStore(
++    "./journey-data/journey.sqlite3",
++    timeouts=StoreTimeouts(lock_wait_seconds=1),
++)
++with store_deadline(2.0):
++    result = metadata.put_artifact(artifact, committed_at="2026-01-02T03:04:05Z")
++```
++
++A busy connection or write lock returns `failure` with `store_busy`. A statement
++still running at the deadline is interrupted, and work is never committed after
++the deadline; both roll back and return `store_deadline_exceeded`. If `COMMIT`
++fails after SQLite has already ended the transaction, the outcome cannot be
++proven and the result is `unknown` with `commit_status_unknown`; replay the same
++idempotent records to reconcile. `LocalJourneyStore.ingest_graph()` removes a
++newly written blob after `store_busy` or `store_deadline_exceeded`, and keeps it
++for `commit_status_unknown`. See
++[PostgreSQL and object-backed Journey storage](postgres-object-journey-store.md#bounded-waits-and-cancellation)
++for the shared deadline API.
++
+ ## Point-in-time history
+ 
+ Facts are immutable rows. A correction is a new `ClinicalFact` whose
+diff --git a/docs/structured/postgres-object-journey-store.md b/docs/structured/postgres-object-journey-store.md
+index c334122405..e772d7af40 100644
+--- a/docs/structured/postgres-object-journey-store.md
++++ b/docs/structured/postgres-object-journey-store.md
+@@ -166,12 +166,70 @@ Do not put database dumps, object copies, credentials, raw clinical content, or
+ restricted datasets in source control. Encryption, object versioning, deletion
+ holds, disaster-recovery testing, and retention remain operator responsibilities.
+ 
++## Bounded waits and cancellation
++
++Every Journey-store read and write runs under one deadline: the earliest of an
++explicit `deadline=` argument to `transaction()`, the ambient
++`store_deadline(...)` scope, and the store's server cap. A caller can shorten
++the cap but never extend it.
++
++```python
++from openmed.core.budget import RequestBudget
++from openmed.structured.store import StoreTimeouts, store_deadline
++
++metadata = PostgresJourneyStore(
++    connection,
++    timeouts=StoreTimeouts(operation_seconds=10, lock_wait_seconds=2),
++)
++budget = RequestBudget(max_wall_time=5).start()
++
++with store_deadline(budget):  # or seconds, or a StoreDeadline
++    result = metadata.put_fact(fact, committed_at="2026-01-02T03:04:05Z")
++```
++
++| Setting | Environment variable | Default | Bounds |
++| --- | --- | --- | --- |
++| `operation_seconds` | `OPENMED_JOURNEY_STORE_TIMEOUT_SECONDS` | 30 | one operation; caps `statement_timeout` |
++| `lock_wait_seconds` | `OPENMED_JOURNEY_STORE_LOCK_WAIT_SECONDS` | 5 | connection checkout and `lock_timeout` |
++
++When `timeouts` is omitted, the store reads these variables. An invalid value
++fails `open()` and `connect()` with `store_timeouts_invalid` before a
++connection is opened; the error names the variable, never its value.
++
++For each operation the store:
++
++1. Checks out its dedicated connection with a bounded wait. If another
++   operation still holds it, the result is `failure` with code `store_busy`
++   instead of an indefinite block.
++2. Opens a transaction (`READ ONLY` for reads) and sets transaction-local
++   `statement_timeout` and `lock_timeout` (`SET LOCAL` semantics) from the time
++   left, lowering `statement_timeout` again as the deadline approaches.
++3. Refuses to start a statement, or to commit, after the deadline. A statement
++   cancelled by `statement_timeout` returns `store_deadline_exceeded`; a lock
++   wait ended by `lock_timeout` returns `store_busy`.
++4. On any failure, timeout, or cancellation, rolls back, runs `RESET ALL`
++   (clearing any session policy context), restores the schema search path, and
++   drops driver-retained notices before the connection is reused. A connection
++   that cannot be reset is closed, so it is never reused in an unknown state.
++
++A rollback is provable whenever the commit was never sent. If the commit
++acknowledgement is lost, the result is `unknown` with `commit_status_unknown`.
++Every put is idempotent, so replaying the same records reconciles it: the
++replay returns `created=False` when the earlier commit landed.
++
++`transaction()` raises `StoreBusyError`, `StoreDeadlineExceededError`, or
++`CommitStatusUnknown` for the same states; auto-committed puts, reads, and
++`ComposedJourneyStore.ingest_graph()` return the typed codes. Store errors are
++raised without the driver's exception context, so SQL parameters and server
++diagnostics do not travel with them. Migrations on `open()` are not bounded by
++these caps; `connect()` keeps its separate `connect_timeout`.
++
+ ## Conformance testing
+ 
+ The integration suite exercises the same synthetic graph against SQLite and a
+ caller-provided ephemeral PostgreSQL database, including idempotency, rollback,
+-historical canonical reads, restart, integrity verification, and interrupted
+-migration recovery:
++historical canonical reads, restart, integrity verification, interrupted
++migration recovery, and bounded lock waits with session reset:
+ 
+ ```bash
+ OPENMED_TEST_POSTGRES_DSN='postgresql://...' \
+diff --git a/openmed/structured/store/__init__.py b/openmed/structured/store/__init__.py
+index d614770009..5eb13429e5 100644
+--- a/openmed/structured/store/__init__.py
++++ b/openmed/structured/store/__init__.py
+@@ -1,6 +1,21 @@
+ """Durable local persistence for longitudinal Journey records."""
+ 
+ from .composed import ComposedJourneyStore, StoredJourneyGraph
++from .deadlines import (
++    STORE_BUSY_CODE,
++    STORE_DEADLINE_EXCEEDED_CODE,
++    STORE_LOCK_WAIT_ENV_VAR,
++    STORE_TIMEOUT_ENV_VAR,
++    STORE_TIMEOUTS_INVALID_CODE,
++    StoreBusyError,
++    StoreDeadline,
++    StoreDeadlineExceededError,
++    StoreTimeouts,
++    StoreTimeoutsError,
++    StoreWaitError,
++    current_store_deadline,
++    store_deadline,
++)
+ from .local import (
+     IngestedGraph,
+     LocalArtifactStore,
+@@ -56,6 +71,11 @@
+     "LATEST_POSTGRES_MIGRATION_VERSION",
+     "MIGRATIONS",
+     "POSTGRES_MIGRATIONS",
++    "STORE_BUSY_CODE",
++    "STORE_DEADLINE_EXCEEDED_CODE",
++    "STORE_LOCK_WAIT_ENV_VAR",
++    "STORE_TIMEOUT_ENV_VAR",
++    "STORE_TIMEOUTS_INVALID_CODE",
+     "AllowAllStoragePolicy",
+     "ArtifactStore",
+     "CanonicalRecord",
+@@ -90,12 +110,20 @@
+     "SQLiteJourneyStore",
+     "SQLiteJourneyTransaction",
+     "StoragePolicy",
++    "StoreBusyError",
+     "StoreCompatibilityError",
++    "StoreDeadline",
++    "StoreDeadlineExceededError",
+     "StoreMigration",
+     "StoreMigrationError",
+     "StorePoint",
+     "StoreResult",
+     "StoreState",
++    "StoreTimeouts",
++    "StoreTimeoutsError",
++    "StoreWaitError",
+     "StoredJourneyGraph",
+     "TransactionalJourneyStore",
++    "current_store_deadline",
++    "store_deadline",
+ ]
+diff --git a/openmed/structured/store/composed.py b/openmed/structured/store/composed.py
+index 430f6ad85c..26016eccbd 100644
+--- a/openmed/structured/store/composed.py
++++ b/openmed/structured/store/composed.py
+@@ -13,6 +13,7 @@
+     EvidenceLocator,
+ )
+ 
++from .deadlines import StoreWaitError
+ from .protocols import (
+     CommitStatusUnknown,
+     CompensatingArtifactStore,
+@@ -124,6 +125,8 @@ def ingest_graph(
+                         created_metadata = created_metadata or result.created
+         except CommitStatusUnknown:
+             return StoreResult.outcome(StoreState.UNKNOWN, "commit_status_unknown")
++        except StoreWaitError as error:
++            failure = error.outcome()
+         except Exception:
+             failure = StoreResult.outcome(StoreState.FAILURE, "transaction_failed")
+ 
+diff --git a/openmed/structured/store/deadlines.py b/openmed/structured/store/deadlines.py
+new file mode 100644
+index 0000000000..599ad82605
+--- /dev/null
++++ b/openmed/structured/store/deadlines.py
+@@ -0,0 +1,485 @@
++"""Bounded waits, deadlines, and wait outcomes for Journey metadata stores.
++
++Every metadata-store operation runs under one deadline: the earliest of an
++explicit ``deadline=`` argument, the ambient :func:`store_deadline` scope, and
++the store's configured server cap (:class:`StoreTimeouts`). The deadline bounds
++the in-process checkout of the store's dedicated connection, database lock
++waits, and statement execution.
++
++Failures carry controlled codes only. No SQL, parameters, identifiers, paths,
++configuration values, or driver diagnostics are attached to these errors.
++
++Example:
++    >>> from openmed.structured.store import StoreTimeouts, store_deadline
++    >>> timeouts = StoreTimeouts(operation_seconds=10, lock_wait_seconds=2)
++    >>> with store_deadline(0.5):
++    ...     bound = timeouts.operation_deadline()
++    >>> bound.remaining() <= 0.5
++    True
++"""
++
++from __future__ import annotations
++
++import math
++import os
++import threading
++import time
++from collections.abc import Callable, Iterator, Mapping
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass, field
++from typing import Any, Union
++
++from openmed.core.budget import BudgetClock
++
++from .protocols import StoreResult, StoreState
++
++STORE_TIMEOUT_ENV_VAR = "OPENMED_JOURNEY_STORE_TIMEOUT_SECONDS"
++STORE_LOCK_WAIT_ENV_VAR = "OPENMED_JOURNEY_STORE_LOCK_WAIT_SECONDS"
++DEFAULT_STORE_TIMEOUT_SECONDS = 30.0
++DEFAULT_STORE_LOCK_WAIT_SECONDS = 5.0
++MAX_STORE_TIMEOUT_SECONDS = 3600.0
++
++STORE_BUSY_CODE = "store_busy"
++STORE_DEADLINE_EXCEEDED_CODE = "store_deadline_exceeded"
++STORE_TIMEOUTS_INVALID_CODE = "store_timeouts_invalid"
++
++Clock = Callable[[], float]
++StoreDeadlineInput = Union["StoreDeadline", BudgetClock, float, int, None]
++
++
++class StoreWaitError(RuntimeError):
++    """Base class for value-free bounded-wait failures.
++
++    Attributes:
++        code: Stable controlled reason code for typed store results.
++    """
++
++    code = "store_wait_failed"
++    _message = "journey store wait failed"
++
++    def __init__(self) -> None:
++        super().__init__(self._message)
++
++    def outcome(self) -> StoreResult[Any]:
++        """Return the typed ``failure`` result for this wait failure."""
++
++        return StoreResult.outcome(StoreState.FAILURE, self.code)
++
++
++class StoreBusyError(StoreWaitError):
++    """The dedicated connection or a database lock stayed busy past its bound."""
++
++    code = STORE_BUSY_CODE
++    _message = "journey store is busy"
++
++
++class StoreDeadlineExceededError(StoreWaitError):
++    """The operation deadline expired before the operation could finish."""
++
++    code = STORE_DEADLINE_EXCEEDED_CODE
++    _message = "journey store deadline exceeded"
++
++
++class StoreTimeoutsError(ValueError):
++    """Store timeout configuration is invalid; values are never echoed."""
++
++    code = STORE_TIMEOUTS_INVALID_CODE
++
++
++def _finite_seconds(value: Any, name: str) -> float:
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        raise TypeError(f"{name} must be a number of seconds")
++    seconds = float(value)
++    if not math.isfinite(seconds):
++        raise ValueError(f"{name} must be finite")
++    return seconds
++
++
++@dataclass(frozen=True, slots=True)
++class StoreDeadline:
++    """An absolute monotonic deadline for one store operation.
++
++    Attributes:
++        expires_at: Clock reading at which the operation must have finished.
++        clock: Monotonic clock in seconds used to measure the time left.
++    """
++
++    expires_at: float
++    clock: Clock = field(default=time.monotonic, repr=False, compare=False)
++
++    def __post_init__(self) -> None:
++        object.__setattr__(
++            self, "expires_at", _finite_seconds(self.expires_at, "expires_at")
++        )
++        if not callable(self.clock):
++            raise TypeError("clock must be callable")
++
++    @classmethod
++    def after(cls, seconds: float, *, clock: Clock = time.monotonic) -> StoreDeadline:
++        """Return a deadline ``seconds`` from now.
++
++        Args:
++            seconds: Time allowed from now. Zero or less is already expired.
++            clock: Monotonic clock in seconds.
++
++        Returns:
++            The absolute deadline.
++
++        Raises:
++            TypeError: If ``seconds`` is not a number.
++            ValueError: If ``seconds`` is not finite.
++        """
++
++        return cls(clock() + _finite_seconds(seconds, "seconds"), clock)
++
++    @classmethod
++    def from_budget(
++        cls,
++        budget: BudgetClock,
++        *,
++        clock: Clock = time.monotonic,
++    ) -> StoreDeadline | None:
++        """Derive a deadline from a started request budget.
++
++        Args:
++            budget: A clock returned by ``RequestBudget.start()``.
++            clock: Monotonic clock in seconds for the returned deadline.
++
++        Returns:
++            The deadline at which the budget's wall time runs out, or ``None``
++            when the budget has no wall-time limit.
++        """
++
++        limit = budget.budget.max_wall_time
++        if limit is None:
++            return None
++        return cls(clock() + (limit - budget.elapsed), clock)
++
++    def remaining(self) -> float:
++        """Return the seconds left; zero or less means the deadline passed."""
++
++        return self.expires_at - self.clock()
++
++    @property
++    def expired(self) -> bool:
++        """Return whether the deadline has passed."""
++
++        return self.remaining() <= 0
++
++    def check(self) -> None:
++        """Raise when the deadline has passed.
++
++        Raises:
++            StoreDeadlineExceededError: If no time is left.
++        """
++
++        if self.expired:
++            raise StoreDeadlineExceededError()
++
++    def milliseconds(self, cap_seconds: float) -> int:
++        """Return a positive millisecond bound no later than the deadline or cap.
++
++        Args:
++            cap_seconds: Server-side cap for this bound.
++
++        Returns:
++            Whole milliseconds, at least one.
++
++        Raises:
++            StoreDeadlineExceededError: If no time is left.
++        """
++
++        seconds = min(self.remaining(), cap_seconds)
++        if seconds <= 0:
++            raise StoreDeadlineExceededError()
++        return max(1, int(seconds * 1000))
++
++
++def earliest_deadline(*deadlines: StoreDeadline | None) -> StoreDeadline | None:
++    """Return the deadline with the least time left, ignoring ``None``."""
++
++    candidates = [deadline for deadline in deadlines if deadline is not None]
++    if not candidates:
++        return None
++    return min(candidates, key=lambda deadline: deadline.remaining())
++
++
++def coerce_store_deadline(
++    value: StoreDeadlineInput,
++    *,
++    clock: Clock = time.monotonic,
++) -> StoreDeadline | None:
++    """Normalize a caller deadline.
++
++    Args:
++        value: A ``StoreDeadline``, a started ``BudgetClock``, a number of
++            seconds from now, or ``None``.
++        clock: Clock for deadlines created from seconds or a budget.
++
++    Returns:
++        The deadline, or ``None`` when the caller set no time limit.
++
++    Raises:
++        TypeError: If ``value`` has an unsupported type.
++        ValueError: If a number of seconds is not finite.
++    """
++
++    if value is None or isinstance(value, StoreDeadline):
++        return value
++    if isinstance(value, BudgetClock):
++        return StoreDeadline.from_budget(value, clock=clock)
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        raise TypeError(
++            "deadline must be a StoreDeadline, BudgetClock, seconds, or None"
++        )
++    return StoreDeadline.after(value, clock=clock)
++
++
++_AMBIENT_DEADLINE: ContextVar[StoreDeadline | None] = ContextVar(
++    "openmed_journey_store_deadline",
++    default=None,
++)
++
++
++def current_store_deadline() -> StoreDeadline | None:
++    """Return the ambient caller deadline for this context, if any."""
++
++    return _AMBIENT_DEADLINE.get()
++
++
++@contextmanager
++def store_deadline(deadline: StoreDeadlineInput) -> Iterator[StoreDeadline | None]:
++    """Bound every Journey-store operation in this context by a caller deadline.
++
++    Scopes nest and can only shorten the active deadline. The scope is a
++    context variable, so it follows ``asyncio`` tasks and ``contextvars``
++    copies but not unrelated threads.
++
++    Args:
++        deadline: A ``StoreDeadline``, a started ``BudgetClock``, seconds from
++            now, or ``None`` to keep the enclosing deadline.
++
++    Yields:
++        The effective ambient deadline inside the scope.
++    """
++
++    effective = earliest_deadline(
++        _AMBIENT_DEADLINE.get(),
++        coerce_store_deadline(deadline),
++    )
++    token = _AMBIENT_DEADLINE.set(effective)
++    try:
++        yield effective
++    finally:
++        _AMBIENT_DEADLINE.reset(token)
++
++
++def _cap_seconds(value: Any, name: str) -> float:
++    try:
++        seconds = _finite_seconds(value, name)
++    except (TypeError, ValueError):
++        raise StoreTimeoutsError(f"{name} must be a finite number of seconds") from None
++    if not 0 < seconds <= MAX_STORE_TIMEOUT_SECONDS:
++        raise StoreTimeoutsError(
++            f"{name} must be greater than zero and at most "
++            f"{int(MAX_STORE_TIMEOUT_SECONDS)} seconds"
++        )
++    return seconds
++
++
++@dataclass(frozen=True, slots=True)
++class StoreTimeouts:
++    """Server-side caps for Journey metadata-store waits.
++
++    A caller deadline can shorten these caps but never extend them.
++
++    Attributes:
++        operation_seconds: Longest time one store operation may take,
++            including connection checkout, lock waits, and statement
++            execution. It also caps PostgreSQL ``statement_timeout``.
++        lock_wait_seconds: Longest wait to check out the store's dedicated
++            connection and to acquire a database lock (PostgreSQL
++            ``lock_timeout``, SQLite ``busy_timeout``).
++        clock: Monotonic clock in seconds; injectable for tests.
++
++    Raises:
++        StoreTimeoutsError: If a cap is not in ``(0, 3600]`` seconds.
++    """
++
++    operation_seconds: float = DEFAULT_STORE_TIMEOUT_SECONDS
++    lock_wait_seconds: float = DEFAULT_STORE_LOCK_WAIT_SECONDS
++    clock: Clock = field(default=time.monotonic, repr=False, compare=False)
++
++    def __post_init__(self) -> None:
++        for name in ("operation_seconds", "lock_wait_seconds"):
++            object.__setattr__(self, name, _cap_seconds(getattr(self, name), name))
++        if not callable(self.clock):
++            raise TypeError("clock must be callable")
++
++    @classmethod
++    def from_env(cls, environ: Mapping[str, str] | None = None) -> StoreTimeouts:
++        """Read caps from ``OPENMED_JOURNEY_STORE_*`` environment variables.
++
++        Blank or unset variables keep the built-in defaults of 30 seconds per
++        operation and 5 seconds per lock wait.
++
++        Args:
++            environ: Optional mapping used instead of ``os.environ``.
++
++        Returns:
++            The configured caps.
++
++        Raises:
++            StoreTimeoutsError: If a variable is not a valid number of seconds.
++                The message names the variable but never its value.
++        """
++
++        source = os.environ if environ is None else environ
++        values: dict[str, float] = {}
++        for attribute, name in (
++            ("operation_seconds", STORE_TIMEOUT_ENV_VAR),
++            ("lock_wait_seconds", STORE_LOCK_WAIT_ENV_VAR),
++        ):
++            raw = source.get(name, "").strip()
++            if not raw:
++                continue
++            try:
++                values[attribute] = _cap_seconds(float(raw), name)
++            except ValueError:
++                raise StoreTimeoutsError(
++                    f"{name} must be a number of seconds in (0, "
++                    f"{int(MAX_STORE_TIMEOUT_SECONDS)}]"
++                ) from None
++        return cls(**values)
++
++    def operation_deadline(self, deadline: StoreDeadlineInput = None) -> StoreDeadline:
++        """Return the effective deadline for one operation starting now.
++
++        Args:
++            deadline: Optional explicit caller deadline.
++
++        Returns:
++            The earliest of the explicit deadline, the ambient
++            :func:`store_deadline` scope, and ``operation_seconds`` from now.
++        """
++
++        cap = StoreDeadline.after(self.operation_seconds, clock=self.clock)
++        effective = earliest_deadline(
++            cap,
++            coerce_store_deadline(deadline, clock=self.clock),
++            current_store_deadline(),
++        )
++        return cap if effective is None else effective
++
++
++def resolve_store_timeouts(value: StoreTimeouts | None) -> StoreTimeouts:
++    """Return explicit caps, or the environment-configured defaults.
++
++    Args:
++        value: Explicit caps, or ``None`` to read :meth:`StoreTimeouts.from_env`.
++
++    Returns:
++        The caps a store should apply.
++
++    Raises:
++        TypeError: If ``value`` is not ``StoreTimeouts`` or ``None``.
++        StoreTimeoutsError: If the environment configuration is invalid.
++    """
++
++    if value is None:
++        return StoreTimeouts.from_env()
++    if not isinstance(value, StoreTimeouts):
++        raise TypeError("timeouts must be StoreTimeouts or None")
++    return value
++
++
++class ConnectionCheckout:
++    """Reentrant checkout of a store's dedicated connection with a bounded wait.
++
++    It replaces an unbounded ``threading.RLock``. ``with checkout:`` waits at
++    most the lock-wait cap (or less when a caller deadline is shorter) and
++    raises :class:`StoreBusyError` instead of blocking forever.
++    """
++
++    __slots__ = ("_depth", "_lock", "_owner", "_timeouts")
++
++    def __init__(self, timeouts: StoreTimeouts) -> None:
++        self._lock = threading.RLock()
++        self._timeouts = timeouts
++        self._owner: int | None = None
++        self._depth = 0
++
++    @property
++    def held(self) -> bool:
++        """Return whether the current thread holds the checkout."""
++
++        return self._owner == threading.get_ident()
++
++    def acquire(self, deadline: StoreDeadline | None = None) -> None:
++        """Check out the connection within the bounded wait.
++
++        Args:
++            deadline: Operation deadline; defaults to the configured caps and
++                the ambient caller deadline.
++
++        Raises:
++            StoreBusyError: If another operation still holds the connection
++                when the wait ends.
++            StoreDeadlineExceededError: If the deadline already passed.
++        """
++
++        if self.held:
++            self._lock.acquire()
++            self._depth += 1
++            return
++        bound = self._timeouts.operation_deadline() if deadline is None else deadline
++        wait = min(bound.remaining(), self._timeouts.lock_wait_seconds)
++        if wait <= 0:
++            raise StoreDeadlineExceededError()
++        if not self._lock.acquire(timeout=wait):
++            raise StoreBusyError()
++        self._owner = threading.get_ident()
++        self._depth = 1
++
++    def release(self) -> None:
++        """Release one level of the checkout."""
++
++        if not self.held:
++            raise RuntimeError("connection checkout is not held by this thread")
++        self._depth -= 1
++        if self._depth == 0:
++            self._owner = None
++        self._lock.release()
++
++    def __enter__(self) -> ConnectionCheckout:
++        self.acquire()
++        return self
++
++    def __exit__(self, *exc_info: object) -> None:
++        self.release()
++
++
++__all__ = [
++    "DEFAULT_STORE_LOCK_WAIT_SECONDS",
++    "DEFAULT_STORE_TIMEOUT_SECONDS",
++    "MAX_STORE_TIMEOUT_SECONDS",
++    "STORE_BUSY_CODE",
++    "STORE_DEADLINE_EXCEEDED_CODE",
++    "STORE_LOCK_WAIT_ENV_VAR",
++    "STORE_TIMEOUTS_INVALID_CODE",
++    "STORE_TIMEOUT_ENV_VAR",
++    "ConnectionCheckout",
++    "StoreBusyError",
++    "StoreDeadline",
++    "StoreDeadlineExceededError",
++    "StoreDeadlineInput",
++    "StoreTimeouts",
++    "StoreTimeoutsError",
++    "StoreWaitError",
++    "coerce_store_deadline",
++    "current_store_deadline",
++    "earliest_deadline",
++    "resolve_store_timeouts",
++    "store_deadline",
++]
+diff --git a/openmed/structured/store/local.py b/openmed/structured/store/local.py
+index 6e29b9ac1e..860a73fe18 100644
+--- a/openmed/structured/store/local.py
++++ b/openmed/structured/store/local.py
+@@ -26,6 +26,18 @@
+     sha256_digest,
+ )
+ 
++from .deadlines import (
++    STORE_TIMEOUTS_INVALID_CODE,
++    ConnectionCheckout,
++    StoreBusyError,
++    StoreDeadline,
++    StoreDeadlineExceededError,
++    StoreDeadlineInput,
++    StoreTimeouts,
++    StoreTimeoutsError,
++    StoreWaitError,
++    resolve_store_timeouts,
++)
+ from .migrations import LATEST_MIGRATION_VERSION, MIGRATIONS
+ from .protocols import (
+     AllowAllStoragePolicy,
+@@ -46,6 +58,12 @@
+     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+     r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+ )
++# SQLite primary result codes for lock contention and progress interruption.
++_SQLITE_BUSY = 5
++_SQLITE_LOCKED = 6
++_SQLITE_INTERRUPT = 9
++# Virtual-machine steps between deadline checks while a statement runs.
++_SQLITE_PROGRESS_STEPS = 1000
+ 
+ T = TypeVar("T")
+ 
+@@ -212,18 +230,32 @@ def _blob_path(self, content_hash: str) -> Path:
+ 
+ 
+ class SQLiteJourneyStore:
+-    """Append-only SQLite store with revisions and deterministic migrations."""
++    """Append-only SQLite store with revisions and deterministic migrations.
++
++    Args:
++        path: SQLite database path.
++        policy: Optional storage policy.
++        timeouts: Caps for connection checkout, write-lock waits, and
++            transaction time. ``None`` reads ``StoreTimeouts.from_env()``.
++
++    Raises:
++        StoreTimeoutsError: If the timeout configuration is invalid.
++        StoreCompatibilityError: If the persisted schema is unsupported.
++        LocalStoreError: If the database cannot be opened.
++    """
+ 
+     def __init__(
+         self,
+         path: str | Path,
+         *,
+         policy: StoragePolicy | None = None,
++        timeouts: StoreTimeouts | None = None,
+     ) -> None:
+         assert_contract_compatibility()
++        self.timeouts = resolve_store_timeouts(timeouts)
+         self.path = Path(path)
+         self.policy = policy or AllowAllStoragePolicy()
+-        self._lock = threading.RLock()
++        self._lock = ConnectionCheckout(self.timeouts)
+         self._closed = False
+         self._prepare_path()
+         try:
+@@ -237,7 +269,9 @@ def __init__(
+             self._connection.execute("PRAGMA foreign_keys = ON")
+             self._connection.execute("PRAGMA journal_mode = WAL")
+             self._connection.execute("PRAGMA synchronous = FULL")
+-            self._connection.execute("PRAGMA busy_timeout = 5000")
++            self._connection.execute(
++                f"PRAGMA busy_timeout = {self._baseline_busy_timeout_ms}"
++            )
+             self._apply_migrations()
+         except StoreCompatibilityError:
+             self._close_after_failed_open()
+@@ -252,11 +286,14 @@ def open(
+         path: str | Path,
+         *,
+         policy: StoragePolicy | None = None,
++        timeouts: StoreTimeouts | None = None,
+     ) -> StoreResult["SQLiteJourneyStore"]:
+         """Open a store with typed compatibility and failure outcomes."""
+ 
+         try:
+-            return StoreResult.success(cls(path, policy=policy))
++            return StoreResult.success(cls(path, policy=policy, timeouts=timeouts))
++        except StoreTimeoutsError:
++            return StoreResult.outcome(StoreState.FAILURE, STORE_TIMEOUTS_INVALID_CODE)
+         except StoreCompatibilityError:
+             return StoreResult.outcome(StoreState.UNSUPPORTED, "schema_unsupported")
+         except LocalStoreError:
+@@ -299,31 +336,73 @@ def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+         self.close()
+ 
+     @contextmanager
+-    def transaction(self, *, committed_at: str) -> Iterator["SQLiteJourneyTransaction"]:
+-        """Open one atomic append-only transaction at a supplied timestamp."""
++    def transaction(
++        self,
++        *,
++        committed_at: str,
++        deadline: StoreDeadlineInput = None,
++    ) -> Iterator["SQLiteJourneyTransaction"]:
++        """Open one atomic append-only transaction at a supplied timestamp.
++
++        The transaction runs under the earliest of ``deadline``, the ambient
++        ``store_deadline`` scope, and ``timeouts.operation_seconds``. Waiting
++        for the connection or the database write lock is bounded, a statement
++        still running at the deadline is interrupted, and work is never
++        committed after the deadline.
++
++        Args:
++            committed_at: Timezone-aware ISO timestamp for the revision.
++            deadline: Optional caller deadline: a ``StoreDeadline``, a started
++                ``BudgetClock``, or seconds from now.
++
++        Yields:
++            The transaction mutation surface.
++
++        Raises:
++            ValueError: If ``committed_at`` is not a timezone-aware timestamp.
++            StoreBusyError: If the connection or write lock stayed busy.
++            StoreDeadlineExceededError: If the deadline passed; the
++                transaction was rolled back.
++            CommitStatusUnknown: If ``COMMIT`` failed after SQLite ended the
++                transaction, so the outcome cannot be proven. Replaying the
++                same idempotent records reconciles it.
++        """
+ 
+         if not _valid_timestamp(committed_at):
+             raise ValueError("committed_at must be a timezone-aware ISO timestamp")
+         self._require_open()
+-        with self._lock:
+-            try:
+-                self._connection.execute("BEGIN IMMEDIATE")
+-                cursor = self._connection.execute(
+-                    "INSERT INTO store_revisions(committed_at) VALUES (?)",
+-                    (committed_at,),
+-                )
+-                if cursor.lastrowid is None:
+-                    raise LocalStoreError("local store revision was not allocated")
+-                transaction = SQLiteJourneyTransaction(self, int(cursor.lastrowid))
+-                yield transaction
+-                if transaction.failed or not transaction.mutated:
+-                    self._connection.execute("ROLLBACK")
+-                else:
+-                    self._connection.execute("COMMIT")
+-            except BaseException:
+-                if self._connection.in_transaction:
+-                    self._connection.execute("ROLLBACK")
++        bound = self.timeouts.operation_deadline(deadline)
++        self._lock.acquire(bound)
++        wait_failure: StoreWaitError | None = None
++        try:
++            self._require_open()
++            self._arm_sqlite_deadline(bound)
++            self._connection.execute("BEGIN IMMEDIATE")
++            cursor = self._connection.execute(
++                "INSERT INTO store_revisions(committed_at) VALUES (?)",
++                (committed_at,),
++            )
++            if cursor.lastrowid is None:
++                raise LocalStoreError("local store revision was not allocated")
++            transaction = SQLiteJourneyTransaction(self, int(cursor.lastrowid))
++            yield transaction
++            if transaction.failed or not transaction.mutated:
++                self._disarm_sqlite_deadline()
++                self._connection.execute("ROLLBACK")
++            else:
++                self._commit_before_deadline(bound)
++        except BaseException as exc:
++            self._disarm_sqlite_deadline()
++            if not self._closed and self._connection.in_transaction:
++                self._connection.execute("ROLLBACK")
++            wait_failure = _sqlite_wait_failure(exc)
++            if wait_failure is None:
+                 raise
++        finally:
++            self._disarm_sqlite_deadline()
++            self._lock.release()
++        if wait_failure is not None:
++            raise wait_failure
+ 
+     def put_artifact(
+         self,
+@@ -887,6 +966,8 @@ def _auto_put(
+                 result = operation(transaction)
+         except CommitStatusUnknown:
+             return StoreResult.outcome(StoreState.UNKNOWN, "commit_status_unknown")
++        except StoreWaitError as error:
++            return error.outcome()
+         except (LocalStoreError, sqlite3.Error, ValueError, TypeError):
+             return StoreResult.outcome(StoreState.FAILURE, "transaction_failed")
+         if not result.ok:
+@@ -1001,6 +1082,44 @@ def _require_open(self) -> None:
+         if self._closed:
+             raise LocalStoreError("local metadata store is closed")
+ 
++    @property
++    def _baseline_busy_timeout_ms(self) -> int:
++        return max(1, int(self.timeouts.lock_wait_seconds * 1000))
++
++    def _arm_sqlite_deadline(self, deadline: StoreDeadline) -> None:
++        """Bound the write-lock wait and interrupt statements at the deadline."""
++
++        busy_ms = deadline.milliseconds(self.timeouts.lock_wait_seconds)
++        self._connection.execute(f"PRAGMA busy_timeout = {busy_ms}")
++        self._connection.set_progress_handler(
++            lambda: 1 if deadline.expired else 0,
++            _SQLITE_PROGRESS_STEPS,
++        )
++
++    def _disarm_sqlite_deadline(self) -> None:
++        """Restore the connection's baseline wait settings before reuse."""
++
++        try:
++            self._connection.set_progress_handler(None, 0)
++            self._connection.execute(
++                f"PRAGMA busy_timeout = {self._baseline_busy_timeout_ms}"
++            )
++        except sqlite3.Error:
++            return
++
++    def _commit_before_deadline(self, deadline: StoreDeadline) -> None:
++        """Commit only before the deadline; report an unprovable outcome."""
++
++        deadline.check()
++        self._disarm_sqlite_deadline()
++        try:
++            self._connection.execute("COMMIT")
++            return
++        except sqlite3.Error:
++            if self._connection.in_transaction:
++                raise
++        raise CommitStatusUnknown("sqlite commit status is unknown")
++
+ 
+ class SQLiteJourneyTransaction:
+     """Mutation surface bound to one SQLite revision and transaction."""
+@@ -1393,10 +1512,15 @@ def __init__(
+         root: str | Path,
+         *,
+         policy: StoragePolicy | None = None,
++        timeouts: StoreTimeouts | None = None,
+     ) -> None:
+         root_path = Path(root)
+         self.artifacts = LocalArtifactStore(root_path / "artifacts", policy=policy)
+-        self.metadata = SQLiteJourneyStore(root_path / "journey.sqlite3", policy=policy)
++        self.metadata = SQLiteJourneyStore(
++            root_path / "journey.sqlite3",
++            policy=policy,
++            timeouts=timeouts,
++        )
+ 
+     def close(self) -> None:
+         """Close the metadata store."""
+@@ -1461,6 +1585,11 @@ def ingest_graph(
+                         failure = conflict_result
+                     else:
+                         created_metadata = created_metadata or conflict_result.created
++        except CommitStatusUnknown:
++            # Keep the blob: an unacknowledged commit may already reference it.
++            return StoreResult.outcome(StoreState.UNKNOWN, "commit_status_unknown")
++        except StoreWaitError as error:
++            failure = error.outcome()
+         except (LocalStoreError, sqlite3.Error, TypeError, ValueError):
+             failure = StoreResult.outcome(StoreState.FAILURE, "transaction_failed")
+ 
+@@ -1502,6 +1631,22 @@ def _valid_opaque_id(value: Any) -> bool:
+     return isinstance(value, str) and _OPAQUE_ID_RE.fullmatch(value) is not None
+ 
+ 
++def _sqlite_wait_failure(error: BaseException) -> StoreWaitError | None:
++    """Classify SQLite lock contention and deadline interruption."""
++
++    if isinstance(error, StoreWaitError):
++        return error
++    if not isinstance(error, sqlite3.OperationalError):
++        return None
++    code = getattr(error, "sqlite_errorcode", None)
++    primary = code & 0xFF if isinstance(code, int) else None
++    if primary in {_SQLITE_BUSY, _SQLITE_LOCKED}:
++        return StoreBusyError()
++    if primary == _SQLITE_INTERRUPT:
++        return StoreDeadlineExceededError()
++    return None
++
++
+ def _fsync_directory(path: Path) -> None:
+     try:
+         descriptor = os.open(path, os.O_RDONLY)
+diff --git a/openmed/structured/store/postgres.py b/openmed/structured/store/postgres.py
+index d7257322a8..b903661887 100644
+--- a/openmed/structured/store/postgres.py
++++ b/openmed/structured/store/postgres.py
+@@ -7,21 +7,33 @@
+ 
+ from __future__ import annotations
+ 
++import functools
+ import hashlib
+ import json
+ import re
+ import ssl
+-import threading
+-from collections.abc import Iterator, Mapping, Sequence
++from collections.abc import Callable, Iterator, Mapping, Sequence
+ from contextlib import contextmanager
+ from dataclasses import dataclass
+ from enum import Enum
+ from importlib import import_module
+-from typing import Any, Protocol, cast
++from typing import Any, Protocol, TypeVar, cast
+ from urllib.parse import parse_qsl, unquote, urlsplit
+ 
+ from openmed.clinical.journey_contracts import canonical_digest
+ 
++from .deadlines import (
++    STORE_TIMEOUTS_INVALID_CODE,
++    ConnectionCheckout,
++    StoreBusyError,
++    StoreDeadline,
++    StoreDeadlineExceededError,
++    StoreDeadlineInput,
++    StoreTimeouts,
++    StoreTimeoutsError,
++    StoreWaitError,
++    resolve_store_timeouts,
++)
+ from .local import (
+     LocalStoreError,
+     SQLiteJourneyStore,
+@@ -42,7 +54,23 @@
+ 
+ _SCHEMA_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+ _CONSTRAINT_SQLSTATES = frozenset({"23502", "23503", "23505", "23514", "23P01"})
++# query_canceled is raised when statement_timeout fires.
++_DEADLINE_SQLSTATES = frozenset({"57014"})
++# lock_not_available is raised when lock_timeout fires.
++_BUSY_SQLSTATES = frozenset({"55P03"})
+ _MIGRATION_LOCK_ID = 613_753_209
++# set_config(..., true) has SET LOCAL semantics: values end with the transaction.
++_ARM_TIMEOUTS_SQL = (
++    "SELECT set_config('statement_timeout', ?, true) AS statement_timeout, "
++    "set_config('lock_timeout', ?, true) AS lock_timeout"
++)
++_REARM_STATEMENT_SQL = (
++    "SELECT set_config('statement_timeout', ?, true) AS statement_timeout"
++)
++# Lower statement_timeout again once the deadline is this much closer.
++_REARM_TOLERANCE_MS = 50
++
++T = TypeVar("T")
+ 
+ 
+ class DBAPICursor(Protocol):
+@@ -496,48 +524,132 @@ def _mapping(self, row: Sequence[Any] | Mapping[str, Any]) -> Mapping[str, Any]:
+ 
+ 
+ class _PostgresConnectionAdapter:
++    """Value-safe statement executor with optional deadline enforcement.
++
++    Driver errors are replaced by controlled store errors raised outside the
++    driver's exception context, so no SQL parameters or server diagnostics
++    are reachable through ``__context__``.
++    """
++
+     def __init__(self, connection: DBAPIConnection) -> None:
+         self.raw = connection
++        self._deadline: StoreDeadline | None = None
++        self._statement_cap_seconds = 0.0
++        self._statement_timeout_ms = 0
++
++    def arm(self, deadline: StoreDeadline, timeouts: StoreTimeouts) -> None:
++        """Apply transaction-local statement and lock timeouts.
++
++        Must run inside an open transaction.
++        """
++
++        statement_ms = deadline.milliseconds(timeouts.operation_seconds)
++        lock_ms = deadline.milliseconds(timeouts.lock_wait_seconds)
++        self.execute(_ARM_TIMEOUTS_SQL, (str(statement_ms), str(lock_ms))).fetchone()
++        self._deadline = deadline
++        self._statement_cap_seconds = timeouts.operation_seconds
++        self._statement_timeout_ms = statement_ms
++
++    def disarm(self) -> None:
++        """Stop enforcing the deadline once its transaction has ended."""
++
++        self._deadline = None
+ 
+     def execute(
+         self,
+         operation: str,
+         parameters: Sequence[Any] = (),
+     ) -> _CursorResult:
++        self._enforce_deadline()
+         cursor: DBAPICursor | None = None
+         try:
+             cursor = self.raw.cursor()
+             cursor.execute(_postgres_sql(operation), parameters)
+             return _CursorResult(cursor)
+         except Exception as exc:
+-            if cursor is not None:
+-                try:
+-                    cursor.close()
+-                except Exception:
+-                    pass
+-            if _sqlstate(exc) in _CONSTRAINT_SQLSTATES:
+-                raise StoreConstraintError("postgres constraint conflict") from None
+-            raise PostgresStoreError("postgres operation failed") from None
++            _close_cursor(cursor)
++            failure = _postgres_failure(exc)
++        raise failure
+ 
+     def executemany(
+         self,
+         operation: str,
+         parameters: Sequence[Sequence[Any]] | Iterator[Sequence[Any]],
+     ) -> None:
++        self._enforce_deadline()
+         cursor: DBAPICursor | None = None
+         try:
+             cursor = self.raw.cursor()
+             cursor.executemany(_postgres_sql(operation), tuple(parameters))
+             cursor.close()
++            return
+         except Exception as exc:
+-            if cursor is not None:
+-                try:
+-                    cursor.close()
+-                except Exception:
+-                    pass
+-            if _sqlstate(exc) in _CONSTRAINT_SQLSTATES:
+-                raise StoreConstraintError("postgres constraint conflict") from None
+-            raise PostgresStoreError("postgres operation failed") from None
++            _close_cursor(cursor)
++            failure = _postgres_failure(exc)
++        raise failure
++
++    def _enforce_deadline(self) -> None:
++        """Refuse statements after the deadline and keep the timeout ahead of it."""
++
++        deadline = self._deadline
++        if deadline is None:
++            return
++        target_ms = deadline.milliseconds(self._statement_cap_seconds)
++        if target_ms + _REARM_TOLERANCE_MS >= self._statement_timeout_ms:
++            return
++        self._statement_timeout_ms = target_ms
++        self.execute(_REARM_STATEMENT_SQL, (str(target_ms),)).fetchone()
++
++
++def _close_cursor(cursor: DBAPICursor | None) -> None:
++    if cursor is None:
++        return
++    try:
++        cursor.close()
++    except Exception:
++        return
++
++
++def _postgres_failure(error: Exception) -> LocalStoreError | StoreWaitError:
++    """Map a driver error to a controlled store error without its diagnostics."""
++
++    state = _sqlstate(error)
++    if state in _CONSTRAINT_SQLSTATES:
++        return StoreConstraintError("postgres constraint conflict")
++    if state in _DEADLINE_SQLSTATES:
++        return StoreDeadlineExceededError()
++    if state in _BUSY_SQLSTATES:
++        return StoreBusyError()
++    return PostgresStoreError("postgres operation failed")
++
++
++def _clear_driver_diagnostics(connection: Any) -> None:
++    """Drop driver-retained server notices, which may echo statement values."""
++
++    notices = getattr(connection, "notices", None)
++    clear = getattr(notices, "clear", None)
++    if not callable(clear):
++        return
++    try:
++        clear()
++    except Exception:
++        return
++
++
++def _bounded_read(
++    method: Callable[..., StoreResult[T]],
++) -> Callable[..., StoreResult[T]]:
++    """Run an inherited result-returning read in a bounded read-only unit."""
++
++    @functools.wraps(method)
++    def bounded(
++        self: "PostgresJourneyStore",
++        *args: Any,
++        **kwargs: Any,
++    ) -> StoreResult[T]:
++        return self._bounded_result(lambda: method(self, *args, **kwargs))
++
++    return bounded
+ 
+ 
+ class PostgresJourneyTransaction(SQLiteJourneyTransaction):
+@@ -550,14 +662,41 @@ class PostgresJourneyStore(SQLiteJourneyStore):
+     The supplied connection must be dedicated to this store.  The adapter sets
+     it to autocommit mode, creates or selects the configured schema, and closes
+     it when the store closes.
++
++    Every read and write runs as one bounded unit: a bounded checkout of the
++    connection, then a transaction with transaction-local ``statement_timeout``
++    and ``lock_timeout`` derived from the operation deadline. After a failure,
++    timeout, or cancellation the transaction is rolled back and the session is
++    reset with ``RESET ALL`` before the connection is reused; a connection that
++    cannot be reset is closed.
++
++    Args:
++        connection: Dedicated DB-API connection.
++        schema: Controlled PostgreSQL schema name.
++        policy: Optional storage policy.
++        timeouts: Caps for checkout, lock waits, and statement time. ``None``
++            reads ``StoreTimeouts.from_env()``.
+     """
+ 
++    # Inherited reads run in a bounded, read-only, armed unit.
++    _read_record = _bounded_read(SQLiteJourneyStore._read_record)
++    get_canonical = _bounded_read(SQLiteJourneyStore.get_canonical)
++    list_canonical_versions = _bounded_read(SQLiteJourneyStore.list_canonical_versions)
++    list_canonical_records = _bounded_read(SQLiteJourneyStore.list_canonical_records)
++    get_job = _bounded_read(SQLiteJourneyStore.get_job)
++    list_job_versions = _bounded_read(SQLiteJourneyStore.list_job_versions)
++    list_jobs = _bounded_read(SQLiteJourneyStore.list_jobs)
++    list_facts = _bounded_read(SQLiteJourneyStore.list_facts)
++    list_conflicts = _bounded_read(SQLiteJourneyStore.list_conflicts)
++    list_resolutions = _bounded_read(SQLiteJourneyStore.list_resolutions)
++
+     def __init__(
+         self,
+         connection: DBAPIConnection,
+         *,
+         schema: str = "openmed_journey",
+         policy: StoragePolicy | None = None,
++        timeouts: StoreTimeouts | None = None,
+     ) -> None:
+         assert_contract_compatibility()
+         if _SCHEMA_RE.fullmatch(schema) is None:
+@@ -569,9 +708,10 @@ def __init__(
+                 )
+         if not hasattr(connection, "autocommit"):
+             raise TypeError("connection must expose an autocommit attribute")
++        self.timeouts = resolve_store_timeouts(timeouts)
+         self.schema = schema
+         self.policy = policy or AllowAllStoragePolicy()
+-        self._lock = threading.RLock()
++        self._lock = ConnectionCheckout(self.timeouts)
+         self._closed = False
+         self._raw_connection = connection
+         self._connection = cast(Any, _PostgresConnectionAdapter(connection))
+@@ -601,11 +741,16 @@ def open(  # type: ignore[override]
+         *,
+         schema: str = "openmed_journey",
+         policy: StoragePolicy | None = None,
++        timeouts: StoreTimeouts | None = None,
+     ) -> StoreResult["PostgresJourneyStore"]:
+         """Open a store with typed compatibility and failure outcomes."""
+ 
+         try:
+-            return StoreResult.success(cls(connection, schema=schema, policy=policy))
++            return StoreResult.success(
++                cls(connection, schema=schema, policy=policy, timeouts=timeouts)
++            )
++        except StoreTimeoutsError:
++            return StoreResult.outcome(StoreState.FAILURE, STORE_TIMEOUTS_INVALID_CODE)
+         except StoreCompatibilityError:
+             return StoreResult.outcome(StoreState.UNSUPPORTED, "schema_unsupported")
+         except (PostgresStoreError, TypeError, ValueError):
+@@ -619,15 +764,21 @@ def connect(
+         schema: str = "openmed_journey",
+         policy: StoragePolicy | None = None,
+         connect_options: Mapping[str, Any] | None = None,
++        timeouts: StoreTimeouts | None = None,
+     ) -> StoreResult["PostgresJourneyStore"]:
+         """Connect lazily with pg8000 when the caller explicitly supplies a DSN.
+ 
+         The DSN and connection options are never stored, logged, or included in
+-        result representations.
++        result representations. ``timeouts`` (or the environment defaults) is
++        validated before any connection is opened.
+         """
+ 
+         if not isinstance(dsn, str) or not dsn:
+             return StoreResult.outcome(StoreState.FAILURE, "invalid_dsn")
++        try:
++            resolved_timeouts = resolve_store_timeouts(timeouts)
++        except (StoreTimeoutsError, TypeError):
++            return StoreResult.outcome(StoreState.FAILURE, STORE_TIMEOUTS_INVALID_CODE)
+         try:
+             parameters = _pg8000_connect_parameters(dsn, connect_options)
+         except (TypeError, ValueError):
+@@ -637,7 +788,12 @@ def connect(
+             connection = pg8000.connect(**parameters)
+         except Exception:
+             return StoreResult.outcome(StoreState.FAILURE, "postgres_connect_failed")
+-        return cls.open(connection, schema=schema, policy=policy)
++        return cls.open(
++            connection,
++            schema=schema,
++            policy=policy,
++            timeouts=resolved_timeouts,
++        )
+ 
+     @property
+     def migration_report(self) -> PostgresMigrationReport:
+@@ -649,6 +805,15 @@ def migration_report(self) -> PostgresMigrationReport:
+     def schema_version(self) -> int:
+         """Return the latest verified PostgreSQL migration version."""
+ 
++        return self._bounded(self._read_schema_version)
++
++    @property
++    def latest_revision(self) -> int | None:
++        """Return the latest committed revision, if any."""
++
++        return self._bounded(lambda: SQLiteJourneyStore.latest_revision.fget(self))
++
++    def _read_schema_version(self) -> int:
+         row = self._connection.execute(
+             "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations"
+         ).fetchone()
+@@ -676,43 +841,61 @@ def __enter__(self) -> "PostgresJourneyStore":
+         return self
+ 
+     @contextmanager
+-    def transaction(self, *, committed_at: str) -> Iterator[PostgresJourneyTransaction]:
+-        """Open one serializable, atomic PostgreSQL graph transaction."""
++    def transaction(
++        self,
++        *,
++        committed_at: str,
++        deadline: StoreDeadlineInput = None,
++    ) -> Iterator[PostgresJourneyTransaction]:
++        """Open one serializable, atomic PostgreSQL graph transaction.
++
++        The transaction runs under the earliest of ``deadline``, the ambient
++        ``store_deadline`` scope, and ``timeouts.operation_seconds``. The
++        connection checkout waits at most the lock-wait cap, the database
++        enforces ``statement_timeout`` and ``lock_timeout`` derived from the
++        deadline, and work is never committed after the deadline.
++
++        Args:
++            committed_at: Timezone-aware ISO timestamp for the revision.
++            deadline: Optional caller deadline: a ``StoreDeadline``, a started
++                ``BudgetClock``, or seconds from now.
++
++        Yields:
++            The transaction mutation surface.
++
++        Raises:
++            ValueError: If ``committed_at`` is not a timezone-aware timestamp.
++            StoreBusyError: If the connection or a database lock stayed busy.
++            StoreDeadlineExceededError: If the deadline passed; the
++                transaction was rolled back.
++            CommitStatusUnknown: If the commit acknowledgement was lost.
++                Replaying the same idempotent records reconciles it.
++        """
+ 
+         if not _valid_timestamp(committed_at):
+             raise ValueError("committed_at must be a timezone-aware ISO timestamp")
+         self._require_open()
+-        with self._lock:
+-            try:
+-                self._connection.execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+-                self._connection.execute("LOCK TABLE store_revisions IN EXCLUSIVE MODE")
+-                row = self._connection.execute(
+-                    "INSERT INTO store_revisions(revision, committed_at) "
+-                    "SELECT COALESCE(MAX(revision), 0) + 1, ? "
+-                    "FROM store_revisions "
+-                    "RETURNING revision",
+-                    (committed_at,),
+-                ).fetchone()
+-                if row is None:
+-                    raise PostgresStoreError("postgres revision was not allocated")
+-                transaction = PostgresJourneyTransaction(self, int(row["revision"]))
+-                yield transaction
+-                if transaction.failed or not transaction.mutated:
+-                    self._raw_connection.rollback()
+-                else:
+-                    try:
+-                        self._raw_connection.commit()
+-                    except Exception:
+-                        raise CommitStatusUnknown(
+-                            "postgres commit status is unknown"
+-                        ) from None
+-            except BaseException:
+-                try:
+-                    self._raw_connection.rollback()
+-                except Exception:
+-                    pass
+-                raise
+-
++        bound = self.timeouts.operation_deadline(deadline)
++        with self._bounded_unit("BEGIN ISOLATION LEVEL SERIALIZABLE", bound):
++            self._connection.execute("LOCK TABLE store_revisions IN EXCLUSIVE MODE")
++            row = self._connection.execute(
++                "INSERT INTO store_revisions(revision, committed_at) "
++                "SELECT COALESCE(MAX(revision), 0) + 1, ? "
++                "FROM store_revisions "
++                "RETURNING revision",
++                (committed_at,),
++            ).fetchone()
++            if row is None:
++                raise PostgresStoreError("postgres revision was not allocated")
++            transaction = PostgresJourneyTransaction(self, int(row["revision"]))
++            yield transaction
++            if transaction.failed or not transaction.mutated:
++                self._rollback()
++            else:
++                bound.check()
++                self._commit_or_report_unknown()
++
++    @_bounded_read
+     def integrity_check(self) -> StoreResult[Mapping[str, int]]:
+         """Validate constraints and payload hashes without returning values."""
+ 
+@@ -870,6 +1053,87 @@ def _close_after_failed_open(self) -> None:
+             pass
+         self._closed = True
+ 
++    @contextmanager
++    def _bounded_unit(self, begin: str, deadline: StoreDeadline) -> Iterator[None]:
++        """Hold the connection for one armed transaction and clean up after it.
++
++        The body must end its transaction. On any failure, timeout, or
++        cancellation the session is reset before the checkout is released.
++        """
++
++        self._lock.acquire(deadline)
++        clean = False
++        try:
++            self._require_open()
++            self._connection.execute(begin)
++            self._connection.arm(deadline, self.timeouts)
++            yield
++            clean = True
++        finally:
++            self._connection.disarm()
++            if not clean and not self._closed:
++                self._reset_session()
++            _clear_driver_diagnostics(self._raw_connection)
++            self._lock.release()
++
++    def _bounded(self, operation: Callable[[], T]) -> T:
++        """Run a read in its own bounded read-only unit, or inline in one."""
++
++        if self._lock.held:
++            return operation()
++        self._require_open()
++        deadline = self.timeouts.operation_deadline()
++        with self._bounded_unit("BEGIN READ ONLY", deadline):
++            result = operation()
++            self._rollback()
++        return result
++
++    def _bounded_result(
++        self,
++        operation: Callable[[], StoreResult[T]],
++    ) -> StoreResult[T]:
++        try:
++            return self._bounded(operation)
++        except StoreWaitError as error:
++            return error.outcome()
++
++    def _rollback(self) -> None:
++        failed = False
++        try:
++            self._raw_connection.rollback()
++        except Exception:
++            failed = True
++        if failed:
++            raise PostgresStoreError("postgres rollback failed")
++
++    def _commit_or_report_unknown(self) -> None:
++        acknowledged = False
++        try:
++            self._raw_connection.commit()
++            acknowledged = True
++        except Exception:
++            acknowledged = False
++        if not acknowledged:
++            raise CommitStatusUnknown("postgres commit status is unknown")
++
++    def _reset_session(self) -> None:
++        """Roll back and reset session state, or close an unusable connection.
++
++        ``RESET ALL`` returns every run-time parameter, including any session
++        policy context, to the connection default before the schema search
++        path is re-applied.
++        """
++
++        try:
++            self._raw_connection.rollback()
++            self._connection.execute("RESET ALL")
++            self._connection.execute(f"SET search_path TO {self.schema}")
++        except Exception:
++            self._close_after_failed_open()
++        except BaseException:
++            self._close_after_failed_open()
++            raise
++
+ 
+ def _postgres_sql(operation: str) -> str:
+     """Translate the internal qmark parameter style to DB-API ``format``."""
+diff --git a/scripts/security/effect_paths.json b/scripts/security/effect_paths.json
+index 03abeddc53..3367f52967 100644
+--- a/scripts/security/effect_paths.json
++++ b/scripts/security/effect_paths.json
+@@ -560,6 +560,21 @@
+       "function": "SQLiteJourneyStore._apply_migrations",
+       "module": "openmed.structured.store.local"
+     },
++    {
++      "classification": "operational",
++      "function": "SQLiteJourneyStore._arm_sqlite_deadline",
++      "module": "openmed.structured.store.local"
++    },
++    {
++      "classification": "operational",
++      "function": "SQLiteJourneyStore._commit_before_deadline",
++      "module": "openmed.structured.store.local"
++    },
++    {
++      "classification": "operational",
++      "function": "SQLiteJourneyStore._disarm_sqlite_deadline",
++      "module": "openmed.structured.store.local"
++    },
+     {
+       "classification": "operational",
+       "function": "SQLiteJourneyStore.close",
+@@ -610,11 +625,36 @@
+       "function": "PostgresJourneyStore._apply_postgres_migrations",
+       "module": "openmed.structured.store.postgres"
+     },
++    {
++      "classification": "operational",
++      "function": "PostgresJourneyStore._bounded_unit",
++      "module": "openmed.structured.store.postgres"
++    },
++    {
++      "classification": "operational",
++      "function": "PostgresJourneyStore._commit_or_report_unknown",
++      "module": "openmed.structured.store.postgres"
++    },
++    {
++      "classification": "operational",
++      "function": "PostgresJourneyStore._reset_session",
++      "module": "openmed.structured.store.postgres"
++    },
+     {
+       "classification": "operational",
+       "function": "PostgresJourneyStore.transaction",
+       "module": "openmed.structured.store.postgres"
+     },
++    {
++      "classification": "operational",
++      "function": "_PostgresConnectionAdapter._enforce_deadline",
++      "module": "openmed.structured.store.postgres"
++    },
++    {
++      "classification": "operational",
++      "function": "_PostgresConnectionAdapter.arm",
++      "module": "openmed.structured.store.postgres"
++    },
+     {
+       "classification": "operational",
+       "function": "_PostgresConnectionAdapter.execute",
+diff --git a/tests/integration/test_journey_postgres_conformance.py b/tests/integration/test_journey_postgres_conformance.py
+index 7870e55f07..bd2292cb12 100644
+--- a/tests/integration/test_journey_postgres_conformance.py
++++ b/tests/integration/test_journey_postgres_conformance.py
+@@ -19,6 +19,7 @@
+     sha256_digest,
+ )
+ from openmed.structured.store import (
++    STORE_BUSY_CODE,
+     CanonicalRecord,
+     DenyStorageOperations,
+     MigrationHealth,
+@@ -28,6 +29,7 @@
+     PostgresStoreError,
+     SQLiteJourneyStore,
+     StorePoint,
++    StoreTimeouts,
+     TransactionalJourneyStore,
+ )
+ from openmed.structured.store import postgres as postgres_module
+@@ -286,3 +288,50 @@ def test_interrupted_migration_rolls_back_and_recovers(
+         assert recovered.schema_version == original_latest
+     finally:
+         recovered.close()
++
++
++def _session_settings(store: PostgresJourneyStore) -> dict[str, str]:
++    row = store._connection.execute(
++        "SELECT current_setting('statement_timeout') AS statement_timeout, "
++        "current_setting('lock_timeout') AS lock_timeout, "
++        "current_setting('search_path') AS search_path"
++    ).fetchone()
++    assert row is not None
++    return {key: str(value) for key, value in row.items()}
++
++
++def test_postgres_lock_waits_are_bounded_and_sessions_reset_before_reuse(
++    postgres_runtime: tuple[Any, str, str],
++) -> None:
++    psycopg, dsn, schema = postgres_runtime
++    store = PostgresJourneyStore(
++        psycopg.connect(dsn),
++        schema=schema,
++        timeouts=StoreTimeouts(lock_wait_seconds=0.2),
++    )
++    blocker = psycopg.connect(dsn)
++    try:
++        baseline = _session_settings(store)
++        with blocker.cursor() as cursor:
++            cursor.execute(
++                f"LOCK TABLE {schema}.store_revisions IN ACCESS EXCLUSIVE MODE"
++            )
++
++        busy_write = store.put_artifact(_artifact(), committed_at=COMMITTED_1)
++        busy_read = store.get_artifact(_artifact().artifact_id)
++
++        assert busy_write.code == STORE_BUSY_CODE
++        assert busy_read.code == STORE_BUSY_CODE
++        assert _session_settings(store) == baseline
++        blocker.rollback()
++
++        with store.transaction(committed_at=COMMITTED_1, deadline=2.0) as transaction:
++            armed = _session_settings(store)
++            assert transaction.put_artifact(_artifact()).ok
++        assert armed["statement_timeout"] != baseline["statement_timeout"]
++        assert armed["lock_timeout"] != baseline["lock_timeout"]
++        assert _session_settings(store) == baseline
++        assert store.get_artifact(_artifact().artifact_id).ok
++    finally:
++        blocker.close()
++        store.close()
+diff --git a/tests/unit/structured/store/test_store_deadlines.py b/tests/unit/structured/store/test_store_deadlines.py
+new file mode 100644
+index 0000000000..45f9d6dc89
+--- /dev/null
++++ b/tests/unit/structured/store/test_store_deadlines.py
+@@ -0,0 +1,885 @@
++"""Offline tests for bounded Journey-store waits, cancellation, and reuse.
++
++PostgreSQL behavior is exercised through a synthetic DB-API driver backed by an
++in-memory SQLite database. It honors the transaction-local ``statement_timeout``
++and ``lock_timeout`` the store arms, records every statement, and keeps
++parameter-bearing notices so tests can prove they are dropped.
++"""
++
++from __future__ import annotations
++
++import re
++import sqlite3
++import threading
++import traceback
++from collections import deque
++from collections.abc import Callable, Iterator, Sequence
++from pathlib import Path
++from typing import Any
++
++import pytest
++
++from openmed.clinical.journey_contracts import (
++    ClinicalArtifact,
++    EvidenceLocator,
++    sha256_digest,
++)
++from openmed.core.budget import RequestBudget
++from openmed.structured.store import (
++    STORE_BUSY_CODE,
++    STORE_DEADLINE_EXCEEDED_CODE,
++    STORE_LOCK_WAIT_ENV_VAR,
++    STORE_TIMEOUT_ENV_VAR,
++    STORE_TIMEOUTS_INVALID_CODE,
++    ComposedJourneyStore,
++    LocalArtifactStore,
++    LocalJourneyStore,
++    PostgresJourneyStore,
++    PostgresStoreError,
++    SQLiteJourneyStore,
++    StoreBusyError,
++    StoreDeadline,
++    StoreDeadlineExceededError,
++    StoreState,
++    StoreTimeouts,
++    StoreTimeoutsError,
++    current_store_deadline,
++    store_deadline,
++)
++from openmed.structured.store.deadlines import ConnectionCheckout
++
++T1 = "2026-03-04T05:06:07Z"
++T2 = "2026-03-04T06:06:07Z"
++SYNTHETIC_VALUE = "synthetic-parameter-value-7f3a"
++# Bounds a broken implementation's wait so the suite cannot hang.
++SAFETY_SECONDS = 5.0
++LONG_SQLITE_QUERY = (
++    "WITH RECURSIVE counter(x) AS ("
++    "SELECT 1 UNION ALL SELECT x + 1 FROM counter WHERE x < {limit}"
++    ") SELECT max(x) FROM counter"
++)
++
++
++class FakeClock:
++    """Manually advanced monotonic clock."""
++
++    def __init__(self) -> None:
++        self.now = 1_000.0
++
++    def __call__(self) -> float:
++        return self.now
++
++    def advance(self, seconds: float) -> None:
++        self.now += seconds
++
++
++class FakeDriverError(Exception):
++    """Driver error whose diagnostics echo a synthetic parameter value."""
++
++    def __init__(self, sqlstate: str) -> None:
++        super().__init__(
++            {
++                "C": sqlstate,
++                "M": "synthetic driver failure",
++                "D": f"Key (artifact_id)=({SYNTHETIC_VALUE})",
++            }
++        )
++        self.sqlstate = sqlstate
++
++
++class FakeCursor:
++    """DB-API cursor over the fake connection."""
++
++    def __init__(self, connection: FakePostgresConnection) -> None:
++        self.connection = connection
++        self.description: Sequence[Sequence[Any]] | None = None
++        self.rowcount = -1
++        self._rows: list[tuple[Any, ...]] = []
++
++    def execute(self, operation: str, parameters: Sequence[Any] = ()) -> None:
++        self.connection.run(self, operation, tuple(parameters))
++
++    def executemany(
++        self,
++        operation: str,
++        parameters: Sequence[Sequence[Any]],
++    ) -> None:
++        for row in parameters:
++            self.connection.run(self, operation, tuple(row))
++
++    def fetchone(self) -> tuple[Any, ...] | None:
++        return self._rows.pop(0) if self._rows else None
++
++    def fetchall(self) -> list[tuple[Any, ...]]:
++        rows, self._rows = self._rows, []
++        return rows
++
++    def close(self) -> None:
++        self._rows = []
++
++    def set_result(self, names: Sequence[str], rows: list[tuple[Any, ...]]) -> None:
++        self.description = tuple(
++            (name, None, None, None, None, None, None) for name in names
++        )
++        self._rows = rows
++
++
++class FakePostgresConnection:
++    """SQLite-backed DB-API connection that enforces PostgreSQL wait settings."""
++
++    def __init__(self) -> None:
++        self.db = sqlite3.connect(
++            ":memory:",
++            isolation_level=None,
++            check_same_thread=False,
++        )
++        self.autocommit = False
++        self.closed = False
++        self.statements: list[str] = []
++        self.local: dict[str, str] = {}
++        self.session: dict[str, str] = {}
++        self.armed: list[dict[str, str]] = []
++        self.notices: deque[str] = deque()
++        self.block: Callable[[str], str | None] = lambda sql: None
++        self.fail_on: Callable[[str], bool] = lambda sql: False
++        self.release = threading.Event()
++        self.blocking = threading.Event()
++        self.fail_commit: str | None = None
++        self.fail_reset = False
++        self.unbounded_waits = 0
++
++    @property
++    def in_transaction(self) -> bool:
++        return self.db.in_transaction
++
++    def cursor(self) -> FakeCursor:
++        self._require_open()
++        return FakeCursor(self)
++
++    def commit(self) -> None:
++        self._require_open()
++        if self.fail_commit == "lost_ack":
++            self._end("COMMIT")
++            raise FakeDriverError("08006")
++        if self.fail_commit == "refused":
++            raise FakeDriverError("08006")
++        self._end("COMMIT")
++
++    def rollback(self) -> None:
++        self._require_open()
++        self._end("ROLLBACK")
++
++    def close(self) -> None:
++        self.closed = True
++
++    def run(
++        self,
++        cursor: FakeCursor,
++        operation: str,
++        parameters: tuple[Any, ...],
++    ) -> None:
++        self._require_open()
++        sql = " ".join(operation.split())
++        self.statements.append(sql)
++        if parameters:
++            self.notices.append(f"NOTICE: values {parameters!r}")
++        if self.fail_on(sql):
++            raise FakeDriverError("XX000")
++        self._wait_if_blocked(sql)
++        upper = sql.upper()
++        if upper.startswith("BEGIN"):
++            if self.db.in_transaction:
++                self.notices.append("WARNING: there is already a transaction")
++            else:
++                self.db.execute("BEGIN")
++            return
++        if upper.startswith(("LOCK TABLE", "CREATE SCHEMA", "SET LOCAL SEARCH_PATH")):
++            return
++        if upper.startswith("SET SEARCH_PATH"):
++            self.session["search_path"] = sql.rsplit(" ", 1)[-1]
++            return
++        if upper == "RESET ALL":
++            if self.fail_reset:
++                raise FakeDriverError("08006")
++            self.session.clear()
++            return
++        if "SET_CONFIG(" in upper:
++            names = re.findall(r"set_config\('(\w+)'", sql)
++            values = dict(zip(names, (str(value) for value in parameters), strict=True))
++            if self.db.in_transaction:
++                self.local.update(values)
++            self.armed.append(values)
++            cursor.set_result(names, [tuple(values[name] for name in names)])
++            return
++        if "PG_ADVISORY_XACT_LOCK" in upper:
++            cursor.set_result(("pg_advisory_xact_lock",), [(None,)])
++            return
++        try:
++            result = self.db.execute(operation.replace("%s", "?"), parameters)
++            rows = result.fetchall() if result.description else []
++        except sqlite3.IntegrityError:
++            raise FakeDriverError("23505") from None
++        except sqlite3.Error:
++            raise FakeDriverError("42601") from None
++        cursor.description = result.description
++        cursor.rowcount = result.rowcount
++        cursor._rows = rows
++
++    def _wait_if_blocked(self, sql: str) -> None:
++        kind = self.block(sql)
++        if kind is None:
++            return
++        bounds = (
++            [(int(self.local["statement_timeout"]), "57014")]
++            if ("statement_timeout" in self.local)
++            else []
++        )
++        if kind == "lock" and "lock_timeout" in self.local:
++            bounds.append((int(self.local["lock_timeout"]), "55P03"))
++        self.blocking.set()
++        if not bounds:
++            self.unbounded_waits += 1
++            self.release.wait(SAFETY_SECONDS)
++            return
++        wait_ms, sqlstate = min(bounds)
++        if self.release.wait(wait_ms / 1000):
++            return
++        raise FakeDriverError(sqlstate)
++
++    def _end(self, statement: str) -> None:
++        if self.db.in_transaction:
++            self.db.execute(statement)
++        self.local.clear()
++
++    def _require_open(self) -> None:
++        if self.closed:
++            raise FakeDriverError("08003")
++
++
++def _artifact(number: int = 1) -> tuple[ClinicalArtifact, bytes]:
++    content = f"synthetic bounded journey artifact {number}".encode()
++    suffix = f"{number:016d}"
++    artifact = ClinicalArtifact(
++        artifact_id=f"artifact_{suffix}",
++        artifact_type="clinical_note",
++        media_type="text/plain",
++        content_hash=sha256_digest(content),
++        byte_size=len(content),
++        source_id=f"source_{suffix}",
++        recorded_at=T1,
++        subject_id=f"subject_{suffix}",
++    )
++    return artifact, content
++
++
++def _evidence(artifact: ClinicalArtifact) -> EvidenceLocator:
++    return EvidenceLocator(
++        locator_id=f"evidence_{artifact.artifact_id.removeprefix('artifact_')}",
++        artifact_id=artifact.artifact_id,
++        location_type="text_span",
++        location={"start": 0, "end": 9},
++    )
++
++
++@pytest.fixture
++def fake() -> Iterator[FakePostgresConnection]:
++    connection = FakePostgresConnection()
++    yield connection
++    connection.release.set()
++
++
++def _postgres(
++    connection: FakePostgresConnection,
++    **timeouts: Any,
++) -> PostgresJourneyStore:
++    return PostgresJourneyStore(connection, timeouts=StoreTimeouts(**timeouts))
++
++
++def _statements_after(connection: FakePostgresConnection, start: int) -> list[str]:
++    return connection.statements[start:]
++
++
++class _StalledHolder:
++    """Hold a store transaction open on another thread until released."""
++
++    def __init__(self, store: Any) -> None:
++        self.store = store
++        self.entered = threading.Event()
++        self.release = threading.Event()
++        self.thread = threading.Thread(target=self._hold, daemon=True)
++
++    def _hold(self) -> None:
++        with self.store.transaction(committed_at=T1):
++            self.entered.set()
++            self.release.wait(SAFETY_SECONDS)
++
++    def __enter__(self) -> _StalledHolder:
++        self.thread.start()
++        assert self.entered.wait(SAFETY_SECONDS)
++        return self
++
++    def __exit__(self, *exc_info: object) -> None:
++        self.release.set()
++        self.thread.join(SAFETY_SECONDS)
++        assert not self.thread.is_alive()
++
++
++# --- Deadline primitives -------------------------------------------------
++
++
++def test_store_timeouts_validate_caps_without_echoing_values(subtests) -> None:
++    defaults = StoreTimeouts()
++    assert (defaults.operation_seconds, defaults.lock_wait_seconds) == (30.0, 5.0)
++    assert StoreTimeouts.from_env({}) == defaults
++    assert StoreTimeouts.from_env(
++        {STORE_TIMEOUT_ENV_VAR: " 12.5 ", STORE_LOCK_WAIT_ENV_VAR: "0.25"}
++    ) == StoreTimeouts(operation_seconds=12.5, lock_wait_seconds=0.25)
++
++    for raw in ("not-a-number", "0", "-1", "nan", "inf", "3601"):
++        with subtests.test(raw=raw):
++            with pytest.raises(StoreTimeoutsError) as caught:
++                StoreTimeouts.from_env({STORE_LOCK_WAIT_ENV_VAR: raw})
++            assert str(caught.value) == (
++                f"{STORE_LOCK_WAIT_ENV_VAR} must be a number of seconds in (0, 3600]"
++            )
++            assert caught.value.code == STORE_TIMEOUTS_INVALID_CODE
++    for value in (True, 0, -0.5, float("nan"), 3_601, "5"):
++        with subtests.test(value=value):
++            with pytest.raises(StoreTimeoutsError):
++                StoreTimeouts(operation_seconds=value)  # type: ignore[arg-type]
++
++
++def test_store_deadline_scopes_only_shorten_and_reuse_request_budgets() -> None:
++    clock = FakeClock()
++    timeouts = StoreTimeouts(operation_seconds=20, lock_wait_seconds=2, clock=clock)
++
++    assert current_store_deadline() is None
++    assert timeouts.operation_deadline().remaining() == 20
++    explicit = StoreDeadline.after(3, clock=clock)
++    assert timeouts.operation_deadline(explicit) is explicit
++    assert timeouts.operation_deadline(60).remaining() == 20
++
++    with store_deadline(StoreDeadline.after(5, clock=clock)) as outer:
++        assert outer is current_store_deadline()
++        with store_deadline(StoreDeadline.after(9, clock=clock)) as inner:
++            assert inner is outer
++        with store_deadline(None) as unchanged:
++            assert unchanged is outer
++        assert timeouts.operation_deadline().remaining() == 5
++        assert timeouts.operation_deadline(explicit).remaining() == 3
++    assert current_store_deadline() is None
++
++    budget = RequestBudget(max_wall_time=0.5).start()
++    derived = StoreDeadline.from_budget(budget, clock=clock)
++    assert derived is not None and 0 < derived.remaining() <= 0.5
++    assert StoreDeadline.from_budget(RequestBudget().start()) is None
++    assert timeouts.operation_deadline(budget).remaining() <= 0.5
++
++    expired = StoreDeadline.after(0, clock=clock)
++    assert expired.expired
++    with pytest.raises(StoreDeadlineExceededError):
++        expired.milliseconds(1)
++    assert StoreDeadline.after(0.0001, clock=clock).milliseconds(5) == 1
++    for invalid in ("5", True, object()):
++        with pytest.raises(TypeError):
++            timeouts.operation_deadline(invalid)  # type: ignore[arg-type]
++
++
++def test_connection_checkout_is_reentrant_and_never_blocks_forever() -> None:
++    checkout = ConnectionCheckout(StoreTimeouts(lock_wait_seconds=0.05))
++    checkout.acquire()
++    checkout.acquire()
++    assert checkout.held
++    outcome: list[BaseException] = []
++
++    def contend() -> None:
++        try:
++            checkout.acquire()
++        except BaseException as error:  # noqa: BLE001 - recorded for the assertion
++            outcome.append(error)
++        try:
++            checkout.release()
++        except BaseException as error:  # noqa: BLE001 - recorded for the assertion
++            outcome.append(error)
++
++    worker = threading.Thread(target=contend)
++    worker.start()
++    worker.join(SAFETY_SECONDS)
++    assert [type(error) for error in outcome] == [StoreBusyError, RuntimeError]
++    assert str(outcome[0]) == "journey store is busy"
++    checkout.release()
++    checkout.release()
++    assert not checkout.held
++    with pytest.raises(StoreDeadlineExceededError):
++        checkout.acquire(StoreDeadline.after(0))
++
++
++# --- PostgreSQL ------------------------------------------------------------
++
++
++def test_postgres_arms_transaction_local_timeouts_from_the_earliest_deadline(
++    fake: FakePostgresConnection,
++) -> None:
++    clock = FakeClock()
++    store = _postgres(fake, operation_seconds=20, lock_wait_seconds=2, clock=clock)
++    artifact, _ = _artifact()
++    start = len(fake.statements)
++
++    written = store.put_artifact(artifact, committed_at=T1)
++
++    assert written.ok and written.created
++    issued = _statements_after(fake, start)
++    assert issued[0] == "BEGIN ISOLATION LEVEL SERIALIZABLE"
++    assert "set_config('statement_timeout', %s, true)" in issued[1]
++    assert fake.armed[-1] == {"statement_timeout": "20000", "lock_timeout": "2000"}
++    assert fake.local == {} and not fake.in_transaction
++    assert "RESET ALL" not in issued
++
++    with store_deadline(StoreDeadline.after(0.75, clock=clock)):
++        start = len(fake.statements)
++        read = store.get_artifact(artifact.artifact_id)
++    assert read.ok and read.value == artifact
++    assert _statements_after(fake, start)[0] == "BEGIN READ ONLY"
++    assert fake.armed[-1] == {"statement_timeout": "750", "lock_timeout": "750"}
++
++    second, _ = _artifact(2)
++    with store.transaction(
++        committed_at=T2,
++        deadline=StoreDeadline.after(1.5, clock=clock),
++    ) as transaction:
++        assert fake.armed[-1] == {"statement_timeout": "1500", "lock_timeout": "1500"}
++        assert transaction.put_artifact(second).ok
++        start = len(fake.statements)
++        nested = store.get_artifact(second.artifact_id)
++        assert nested.ok
++        assert "BEGIN READ ONLY" not in _statements_after(fake, start)
++    assert store.latest_revision == 2
++    assert fake.local == {} and not fake.in_transaction
++
++
++def test_postgres_stalled_checkout_returns_store_busy_and_keeps_the_connection(
++    fake: FakePostgresConnection,
++) -> None:
++    clock = FakeClock()
++    store = _postgres(fake, clock=clock)
++    artifact, _ = _artifact()
++
++    with _StalledHolder(store) as holder:
++        start = len(fake.statements)
++        with store_deadline(StoreDeadline.after(0.05, clock=clock)):
++            busy_write = store.put_artifact(artifact, committed_at=T2)
++            busy_read = store.get_artifact(artifact.artifact_id)
++        assert holder.thread.is_alive()
++        assert _statements_after(fake, start) == []
++
++    for busy in (busy_write, busy_read):
++        assert busy.state is StoreState.FAILURE
++        assert busy.code == STORE_BUSY_CODE
++        assert busy.value is None
++        assert artifact.artifact_id not in repr(busy)
++    assert not fake.closed and not fake.in_transaction
++
++    retried = store.put_artifact(artifact, committed_at=T2)
++    assert retried.ok and retried.created and retried.revision == 1
++    store.close()
++    assert fake.closed
++
++
++def test_postgres_lock_wait_cap_bounds_checkout_without_a_caller_deadline(
++    fake: FakePostgresConnection,
++) -> None:
++    store = _postgres(fake, lock_wait_seconds=0.05)
++    artifact, _ = _artifact()
++
++    with _StalledHolder(store):
++        busy = store.put_artifact(artifact, committed_at=T2)
++
++    assert busy.code == STORE_BUSY_CODE
++    assert store.put_artifact(artifact, committed_at=T2).ok
++
++
++def test_postgres_blocked_query_is_cancelled_and_the_session_is_reset(
++    fake: FakePostgresConnection,
++) -> None:
++    clock = FakeClock()
++    store = _postgres(fake, clock=clock)
++    artifact, _ = _artifact()
++    fake.block = lambda sql: (
++        "statement" if sql.startswith("INSERT INTO artifacts") else None
++    )
++    # A context leaked by an earlier request must not survive the reset.
++    fake.session["app.request_policy"] = "synthetic-earlier-request"
++    start = len(fake.statements)
++
++    with store_deadline(StoreDeadline.after(0.1, clock=clock)):
++        timed_out = store.put_artifact(artifact, committed_at=T1)
++
++    assert timed_out.state is StoreState.FAILURE
++    assert timed_out.code == STORE_DEADLINE_EXCEEDED_CODE
++    assert fake.unbounded_waits == 0
++    assert fake.armed[-1] == {"statement_timeout": "100", "lock_timeout": "100"}
++    issued = _statements_after(fake, start)
++    blocked_at = next(
++        index
++        for index, sql in enumerate(issued)
++        if sql.startswith("INSERT INTO artifacts")
++    )
++    assert issued[blocked_at + 1 :] == [
++        "RESET ALL",
++        "SET search_path TO openmed_journey",
++    ]
++    assert fake.session == {"search_path": "openmed_journey"}
++    assert fake.local == {} and not fake.in_transaction
++    assert not fake.notices and not fake.closed
++
++    fake.block = lambda sql: None
++    missing = store.get_artifact(artifact.artifact_id)
++    assert missing.code == "artifact_not_found"
++    assert store.latest_revision is None
++    written = store.put_artifact(artifact, committed_at=T1)
++    assert written.ok and written.created and written.revision == 1
++
++
++def test_postgres_lock_timeout_reports_store_busy(
++    fake: FakePostgresConnection,
++) -> None:
++    store = _postgres(fake, lock_wait_seconds=0.05, clock=FakeClock())
++    artifact, _ = _artifact()
++    fake.block = lambda sql: (
++        "lock" if sql.startswith("LOCK TABLE store_revisions") else None
++    )
++
++    busy = store.put_artifact(artifact, committed_at=T1)
++
++    assert busy.code == STORE_BUSY_CODE
++    assert fake.armed[-1] == {"statement_timeout": "30000", "lock_timeout": "50"}
++    assert fake.unbounded_waits == 0
++    assert "RESET ALL" in fake.statements
++    fake.block = lambda sql: None
++    assert store.put_artifact(artifact, committed_at=T1).ok
++
++
++def test_postgres_never_commits_after_the_deadline(
++    fake: FakePostgresConnection,
++) -> None:
++    clock = FakeClock()
++    store = _postgres(fake, clock=clock)
++    artifact, _ = _artifact()
++
++    with pytest.raises(StoreDeadlineExceededError):
++        with store.transaction(
++            committed_at=T1,
++            deadline=StoreDeadline.after(5, clock=clock),
++        ) as transaction:
++            assert transaction.put_artifact(artifact).ok
++            clock.advance(6)
++            start = len(fake.statements)
++            with pytest.raises(StoreDeadlineExceededError):
++                transaction.put_evidence(_evidence(artifact))
++            assert _statements_after(fake, start) == []
++
++    assert "RESET ALL" in fake.statements
++    assert not fake.in_transaction
++    assert store.get_artifact(artifact.artifact_id).code == "artifact_not_found"
++    assert store.latest_revision is None
++
++
++def test_postgres_rearms_statement_timeout_as_the_deadline_approaches(
++    fake: FakePostgresConnection,
++) -> None:
++    clock = FakeClock()
++    store = _postgres(fake, clock=clock)
++    artifact, _ = _artifact()
++
++    with store.transaction(
++        committed_at=T1,
++        deadline=StoreDeadline.after(1, clock=clock),
++    ) as transaction:
++        assert fake.local["statement_timeout"] == "1000"
++        clock.advance(0.01)
++        assert transaction.put_artifact(artifact).ok
++        assert fake.local["statement_timeout"] == "1000"
++        clock.advance(0.49)
++        assert transaction.put_evidence(_evidence(artifact)).ok
++        assert fake.local["statement_timeout"] == "500"
++        assert fake.armed[-1] == {"statement_timeout": "500"}
++
++    assert store.get_evidence(_evidence(artifact).locator_id).ok
++
++
++def test_postgres_ambiguous_commit_is_reported_and_reconciled_by_replay(
++    fake: FakePostgresConnection,
++) -> None:
++    store = _postgres(fake)
++    landed, _ = _artifact(1)
++    refused, _ = _artifact(2)
++
++    fake.fail_commit = "lost_ack"
++    unknown_landed = store.put_artifact(landed, committed_at=T1)
++    fake.fail_commit = "refused"
++    unknown_refused = store.put_artifact(refused, committed_at=T1)
++    fake.fail_commit = None
++
++    for unknown in (unknown_landed, unknown_refused):
++        assert unknown.state is StoreState.UNKNOWN
++        assert unknown.code == "commit_status_unknown"
++    assert fake.statements.count("RESET ALL") == 2
++    assert not fake.closed and not fake.in_transaction
++
++    replay_landed = store.put_artifact(landed, committed_at=T2)
++    replay_refused = store.put_artifact(refused, committed_at=T2)
++    assert replay_landed.ok and not replay_landed.created
++    assert replay_refused.ok and replay_refused.created
++
++
++def test_postgres_connection_that_cannot_be_reset_is_closed_not_reused(
++    fake: FakePostgresConnection,
++) -> None:
++    clock = FakeClock()
++    store = _postgres(fake, clock=clock)
++    artifact, _ = _artifact()
++    fake.block = lambda sql: (
++        "statement" if sql.startswith("INSERT INTO artifacts") else None
++    )
++    fake.fail_reset = True
++
++    with store_deadline(StoreDeadline.after(0.05, clock=clock)):
++        timed_out = store.put_artifact(artifact, committed_at=T1)
++
++    assert timed_out.code == STORE_DEADLINE_EXCEEDED_CODE
++    assert fake.closed
++    issued = len(fake.statements)
++    after_close = store.put_artifact(artifact, committed_at=T1)
++    assert after_close.state is StoreState.FAILURE
++    assert len(fake.statements) == issued
++
++
++def test_postgres_errors_and_connection_retain_no_parameter_diagnostics(
++    fake: FakePostgresConnection,
++) -> None:
++    store = _postgres(fake)
++    artifact, _ = _artifact()
++    fake.fail_on = lambda sql: sql.startswith("INSERT INTO artifacts")
++
++    with pytest.raises(PostgresStoreError) as caught:
++        with store.transaction(committed_at=T1) as transaction:
++            transaction.put_artifact(artifact)
++
++    error = caught.value
++    assert error.__cause__ is None and error.__context__ is None
++    rendered = "".join(traceback.format_exception(error))
++    assert SYNTHETIC_VALUE not in rendered
++    assert artifact.artifact_id not in rendered
++    assert not fake.notices
++    assert fake.session == {"search_path": "openmed_journey"}
++    fake.fail_on = lambda sql: False
++    assert store.put_artifact(artifact, committed_at=T1).ok
++    assert not fake.notices
++
++
++def test_postgres_connect_rejects_invalid_timeouts_before_connecting(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    def forbidden_import(name: str) -> None:
++        raise AssertionError("driver import attempted")
++
++    monkeypatch.setattr(
++        "openmed.structured.store.postgres.import_module",
++        forbidden_import,
++    )
++    monkeypatch.setenv(STORE_TIMEOUT_ENV_VAR, "synthetic-invalid")
++
++    result = PostgresJourneyStore.connect("postgresql://openmed:secret@db/openmed")
++    opened = PostgresJourneyStore.open(FakePostgresConnection())
++
++    for outcome in (result, opened):
++        assert outcome.state is StoreState.FAILURE
++        assert outcome.code == STORE_TIMEOUTS_INVALID_CODE
++        assert "synthetic-invalid" not in repr(outcome)
++        assert "secret" not in repr(outcome)
++
++
++def test_composed_ingestion_discards_new_bytes_when_metadata_is_busy(
++    fake: FakePostgresConnection,
++    tmp_path: Path,
++) -> None:
++    clock = FakeClock()
++    artifacts = LocalArtifactStore(tmp_path / "objects")
++    store = ComposedJourneyStore(artifacts, _postgres(fake, clock=clock))
++    artifact, content = _artifact()
++
++    with _StalledHolder(store.metadata):
++        with store_deadline(StoreDeadline.after(0.05, clock=clock)):
++            busy = store.ingest_graph(artifact, content, committed_at=T2)
++
++    assert busy.code == STORE_BUSY_CODE
++    assert artifacts.get_bytes(artifact.content_hash).code == "artifact_not_found"
++    assert store.ingest_graph(artifact, content, committed_at=T2).ok
++
++
++# --- SQLite ----------------------------------------------------------------
++
++
++def test_sqlite_stalled_checkout_returns_store_busy_and_discards_new_bytes(
++    tmp_path: Path,
++) -> None:
++    clock = FakeClock()
++    store = LocalJourneyStore(
++        tmp_path / "journey",
++        timeouts=StoreTimeouts(clock=clock),
++    )
++    artifact, content = _artifact()
++
++    with _StalledHolder(store.metadata) as holder:
++        with store_deadline(StoreDeadline.after(0.05, clock=clock)):
++            busy_put = store.metadata.put_artifact(artifact, committed_at=T2)
++            busy_graph = store.ingest_graph(artifact, content, committed_at=T2)
++        assert holder.thread.is_alive()
++
++    for busy in (busy_put, busy_graph):
++        assert busy.state is StoreState.FAILURE
++        assert busy.code == STORE_BUSY_CODE
++    assert store.artifacts.get_bytes(artifact.content_hash).code == (
++        "artifact_not_found"
++    )
++    graph = store.ingest_graph(artifact, content, committed_at=T2)
++    assert graph.ok and graph.revision == 1
++    store.close()
++
++
++def test_sqlite_write_lock_wait_is_bounded_and_busy_timeout_restored(
++    tmp_path: Path,
++) -> None:
++    path = tmp_path / "journey.sqlite3"
++    store = SQLiteJourneyStore(path, timeouts=StoreTimeouts(lock_wait_seconds=0.05))
++    blocker = sqlite3.connect(path, isolation_level=None)
++    artifact, _ = _artifact()
++    try:
++        blocker.execute("BEGIN IMMEDIATE")
++        busy = store.put_artifact(artifact, committed_at=T1)
++        assert busy.code == STORE_BUSY_CODE
++        assert store._connection.execute("PRAGMA busy_timeout").fetchone()[0] == 50
++        assert not store._connection.in_transaction
++        blocker.execute("ROLLBACK")
++        assert store.put_artifact(artifact, committed_at=T1).ok
++    finally:
++        blocker.close()
++        store.close()
++
++
++def test_sqlite_statement_past_the_deadline_is_interrupted_and_rolled_back(
++    tmp_path: Path,
++) -> None:
++    clock = FakeClock()
++    store = SQLiteJourneyStore(
++        tmp_path / "journey.sqlite3",
++        timeouts=StoreTimeouts(operation_seconds=10, clock=clock),
++    )
++    artifact, _ = _artifact()
++
++    with pytest.raises(StoreDeadlineExceededError):
++        with store.transaction(committed_at=T1) as transaction:
++            assert transaction.put_artifact(artifact).ok
++            clock.advance(11)
++            with pytest.raises(sqlite3.OperationalError, match="interrupted"):
++                store._connection.execute(
++                    LONG_SQLITE_QUERY.format(limit=10_000_000)
++                ).fetchone()
++
++    assert store.get_artifact(artifact.artifact_id).code == "artifact_not_found"
++    assert store.latest_revision is None
++    # The deadline handler is removed, so later statements run to completion.
++    finished = store._connection.execute(LONG_SQLITE_QUERY.format(limit=20_000))
++    assert finished.fetchone()[0] == 20_000
++    assert store._connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5_000
++    store.close()
++
++
++def test_sqlite_explicit_deadline_and_budget_bound_transactions(tmp_path: Path) -> None:
++    store = SQLiteJourneyStore(tmp_path / "journey.sqlite3")
++    artifact, _ = _artifact()
++
++    with pytest.raises(StoreDeadlineExceededError):
++        with store.transaction(committed_at=T1, deadline=0):
++            pytest.fail("an expired deadline must not open a transaction")
++
++    clock = FakeClock()
++    with pytest.raises(StoreDeadlineExceededError):
++        with store.transaction(
++            committed_at=T1,
++            deadline=StoreDeadline.after(1, clock=clock),
++        ) as transaction:
++            assert transaction.put_artifact(artifact).ok
++            clock.advance(2)
++    assert store.latest_revision is None
++
++    budget = RequestBudget(max_wall_time=30).start()
++    with store.transaction(committed_at=T1, deadline=budget) as transaction:
++        assert transaction.put_artifact(artifact).ok
++    assert store.latest_revision == 1
++    store.close()
++
++
++class _CommitFailingConnection:
++    """Proxy that fails COMMIT, optionally after applying it."""
++
++    def __init__(self, inner: sqlite3.Connection, *, apply_commit: bool) -> None:
++        self._inner = inner
++        self._apply_commit = apply_commit
++
++    def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
++        if sql == "COMMIT":
++            if self._apply_commit:
++                self._inner.execute("COMMIT")
++            raise sqlite3.OperationalError("synthetic disk I/O error")
++        return self._inner.execute(sql, *args)
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(self._inner, name)
++
++
++def test_sqlite_ambiguous_commit_is_unknown_and_provable_failure_rolls_back(
++    tmp_path: Path,
++) -> None:
++    store = LocalJourneyStore(tmp_path / "journey")
++    metadata = store.metadata
++    inner = metadata._connection
++    landed, landed_bytes = _artifact(1)
++    refused, _ = _artifact(2)
++    try:
++        metadata._connection = _CommitFailingConnection(inner, apply_commit=True)
++        unknown = store.ingest_graph(landed, landed_bytes, committed_at=T1)
++        metadata._connection = _CommitFailingConnection(inner, apply_commit=False)
++        failed = metadata.put_artifact(refused, committed_at=T1)
++    finally:
++        metadata._connection = inner
++
++    assert unknown.state is StoreState.UNKNOWN
++    assert unknown.code == "commit_status_unknown"
++    # An unacknowledged commit may reference the bytes, so they are kept.
++    assert store.artifacts.get_bytes(landed.content_hash).ok
++    assert failed.state is StoreState.FAILURE and failed.code == "transaction_failed"
++    assert metadata.get_artifact(refused.artifact_id).code == "artifact_not_found"
++    replay = metadata.put_artifact(landed, committed_at=T2)
++    assert replay.ok and not replay.created
++    store.close()
++
++
++def test_sqlite_invalid_timeout_environment_fails_before_creating_files(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setenv(STORE_LOCK_WAIT_ENV_VAR, "synthetic-invalid")
++    path = tmp_path / "journey" / "journey.sqlite3"
++
++    opened = SQLiteJourneyStore.open(path)
++
++    assert opened.state is StoreState.FAILURE
++    assert opened.code == STORE_TIMEOUTS_INVALID_CODE
++    assert "synthetic-invalid" not in repr(opened)
++    assert not path.parent.exists()
++    monkeypatch.setenv(STORE_LOCK_WAIT_ENV_VAR, "0.5")
++    configured = SQLiteJourneyStore(path)
++    assert configured.timeouts.lock_wait_seconds == 0.5
++    assert configured._connection.execute("PRAGMA busy_timeout").fetchone()[0] == 500
++    configured.close()

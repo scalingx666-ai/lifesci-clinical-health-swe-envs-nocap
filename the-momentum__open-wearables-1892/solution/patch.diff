@@ -1,0 +1,516 @@
+diff --git a/backend/app/config.py b/backend/app/config.py
+index d0d8a4d69b..ec932b4717 100644
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -113,10 +113,12 @@ class Settings(BaseSettings):
+ 
+     # Time between sleep phases to conclude end of sleep session
+     sleep_end_gap_minutes: int = 120  # 2 hours
++    # Time without uploads to conclude end of Apple Watch sleep session
++    sleep_upload_quiet_minutes: int = 15
+ 
+     # SYNC SETTINGS
+     sync_interval_seconds: int = 3600  # Default: 1 hour (3600 seconds)
+-    sleep_sync_interval_seconds: int = 3600  # Default: 1 hour (3600 seconds)
++    sleep_sync_interval_seconds: int = 300  # Default: 5 minutes (300 seconds)
+     # Re-fetch a trailing window on each *live* pull sync so late provider revisions
+     # (e.g. Oura finalising a day's step count after we already moved past it) are
+     # picked up. Disabled by default. Set via a compact duration string: "2d", "20h",
+diff --git a/backend/app/integrations/celery/tasks/finalize_stale_sleep_task.py b/backend/app/integrations/celery/tasks/finalize_stale_sleep_task.py
+index fc93fbc0e8..62dbb92910 100644
+--- a/backend/app/integrations/celery/tasks/finalize_stale_sleep_task.py
++++ b/backend/app/integrations/celery/tasks/finalize_stale_sleep_task.py
+@@ -1,17 +1,17 @@
+ import contextlib
+-from datetime import datetime, timedelta, timezone
++from datetime import datetime, timezone
+ from logging import getLogger
+ from typing import cast
+ 
+ from celery import shared_task
+ 
+-from app.config import settings
+ from app.constants.celery_tasks import CeleryTask
+ from app.database import SessionLocal
+ from app.integrations.redis_client import get_redis_client
+ from app.services.sdk.sleep_service import (
+     active_users_key,
+     finish_sleep,
++    is_ready_to_finish,
+     load_sleep_states,
+ )
+ from app.utils.sentry_helpers import log_and_capture_error
+@@ -33,12 +33,11 @@ def finalize_stale_sleeps() -> None:
+                     continue
+ 
+                 try:
+-                    for state in load_sleep_states(user_id).values():
+-                        end_time = state.end_time
+-                        if end_time.tzinfo is None:
+-                            end_time = end_time.replace(tzinfo=timezone.utc)
+-
+-                        if now - end_time >= timedelta(minutes=settings.sleep_end_gap_minutes):
++                    states = load_sleep_states(user_id)
++                    if not states:
++                        redis_client.srem(active_users_key(), user_id)
++                    for state in states.values():
++                        if is_ready_to_finish(state, now):
+                             finish_sleep(db, user_id, state)
+                 finally:
+                     with contextlib.suppress(Exception):
+diff --git a/backend/app/repositories/health_score_repository.py b/backend/app/repositories/health_score_repository.py
+index 276813f2bb..8a8d1f5506 100644
+--- a/backend/app/repositories/health_score_repository.py
++++ b/backend/app/repositories/health_score_repository.py
+@@ -18,7 +18,7 @@
+ 
+ def _utc_midnight(moment: datetime) -> datetime:
+     """Start of the UTC day ``moment`` falls on; a naive moment is read as UTC."""
+-    return datetime.combine(typing_cast(datetime, as_utc(moment)).date(), time.min, tzinfo=timezone.utc)
++    return datetime.combine(as_utc(moment).date(), time.min, tzinfo=timezone.utc)
+ 
+ 
+ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, HealthScoreUpdate]):
+diff --git a/backend/app/schemas/providers/mobile_sdk/sleep_state.py b/backend/app/schemas/providers/mobile_sdk/sleep_state.py
+index 9d18f3b1e8..a6a2deaaf4 100644
+--- a/backend/app/schemas/providers/mobile_sdk/sleep_state.py
++++ b/backend/app/schemas/providers/mobile_sdk/sleep_state.py
+@@ -31,6 +31,8 @@ class SleepState(BaseModel):
+ 
+     last_start_timestamp: datetime
+     last_end_timestamp: datetime
++    last_received_at: datetime | None = None
++    has_apple_watch_sleep: bool = False
+ 
+     in_bed_seconds: float = 0
+     awake_seconds: float = 0
+diff --git a/backend/app/services/sdk/sleep_service.py b/backend/app/services/sdk/sleep_service.py
+index 27612a54dc..cd6e9e14ea 100644
+--- a/backend/app/services/sdk/sleep_service.py
++++ b/backend/app/services/sdk/sleep_service.py
+@@ -37,6 +37,7 @@
+ from app.services.event_record_service import event_record_service
+ from app.services.health_score_service import health_score_service
+ from app.services.sdk.device_resolution import extract_device_ids, extract_device_info, extract_device_type
++from app.utils.dates import as_utc
+ from app.utils.sleep_stages import measured_stages
+ from app.utils.structured_logging import log_structured
+ 
+@@ -135,6 +136,17 @@ def delete_sleep_state(user_id: str, state: SleepState) -> None:
+         get_redis_client().srem(active_users_key(), user_id)
+ 
+ 
++def is_ready_to_finish(state: SleepState, now: datetime) -> bool:
++    """True after the end gap, or for a session with Apple Watch sleep once its writer's uploads go quiet."""
++    if now - as_utc(state.end_time) >= timedelta(minutes=settings.sleep_end_gap_minutes):
++        return True
++    return (
++        state.has_apple_watch_sleep
++        and state.last_received_at is not None
++        and now - as_utc(state.last_received_at) >= timedelta(minutes=settings.sleep_upload_quiet_minutes)
++    )
++
++
+ def _create_new_sleep_state(
+     start_time: datetime,
+     end_time: datetime,
+@@ -226,6 +238,8 @@ def _apply_transition(
+         state.zone_offset = zone_offset
+     if device_type and not state.device_type and (source_name or "unknown") == state.source_name:
+         state.device_type = device_type
++    if device_type == DeviceType.WATCH and is_apple_own_source(source_app_id):
++        state.has_apple_watch_sleep = True
+ 
+     duration_seconds = (end_time - start_time).total_seconds()
+ 
+@@ -287,11 +301,11 @@ def handle_sleep_data(
+     (e.g. from a bulk historical upload) accumulate stages into the same session instead
+     of overwriting each other's state.
+ 
+-    Stale detection uses ``end_time`` (the last sleep-sample timestamp).  When a bulk
+-    historical upload finalizes a session whose ``end_time`` is in the past, the new
+-    session is merged with any adjacent record already in the database, so consecutive
+-    payloads within the same night are combined into a single session rather than being
+-    stored as separate fragments.
++    Stale detection uses ``end_time`` (the last sleep-sample timestamp), and for a session
++    with Apple Watch sleep also ``last_received_at``.  When a bulk historical upload
++    finalizes a session whose ``end_time`` is in the past, the new session is merged with
++    any adjacent record already in the database, so consecutive payloads within the same
++    night are combined into a single session rather than being stored as separate fragments.
+ 
+     Args:
+         db_session: Database session for persisting finalized sleep records
+@@ -337,6 +351,7 @@ def handle_sleep_data(
+                 seen.add(key_tuple)
+                 unique_data.append(item)
+ 
++        received_fields: set[str] = set()
+         for sjson in unique_data:
+             # Extract device info
+             device_model, software_version, original_source_name = extract_device_info(sjson.source)
+@@ -387,13 +402,17 @@ def handle_sleep_data(
+             )
+ 
+             states[field] = current_state
++            received_fields.add(field)
+ 
+             sleep_score = _extract_sleep_score(sjson.values)
+             if sleep_score is not None:
+                 current_state.sleep_score = sleep_score
+ 
+         # Persist the accumulated state to Redis only once after processing the entire batch
+-        for current_state in states.values():
++        now = datetime.now(timezone.utc)
++        for field, current_state in states.items():
++            if field in received_fields:
++                current_state.last_received_at = now
+             save_sleep_state(user_id, current_state)
+ 
+         # Finalise synchronously if the session is already stale.  Historical
+@@ -402,10 +421,7 @@ def handle_sleep_data(
+         # the DB — so each payload extends the growing record rather than
+         # creating a separate session.
+         for current_state in states.values():
+-            session_end = current_state.end_time
+-            if session_end.tzinfo is None:
+-                session_end = session_end.replace(tzinfo=timezone.utc)
+-            if datetime.now(timezone.utc) - session_end >= timedelta(minutes=settings.sleep_end_gap_minutes):
++            if is_ready_to_finish(current_state, now):
+                 finish_sleep(db_session, user_id, current_state)
+ 
+     finally:
+diff --git a/backend/app/utils/dates.py b/backend/app/utils/dates.py
+index c09bb46b34..b67e55c8b7 100644
+--- a/backend/app/utils/dates.py
++++ b/backend/app/utils/dates.py
+@@ -1,7 +1,7 @@
+ import re
+ from contextlib import suppress
+ from datetime import date, datetime, time, timedelta, timezone
+-from typing import Annotated
++from typing import Annotated, overload
+ 
+ from fastapi import Query
+ from pydantic import BeforeValidator, Field
+@@ -148,6 +148,10 @@ def align_tz_awareness(start: datetime | None, end: datetime | None) -> tuple[da
+     return start, end
+ 
+ 
++@overload
++def as_utc(moment: datetime) -> datetime: ...
++@overload
++def as_utc(moment: None) -> None: ...
+ def as_utc(moment: datetime | None) -> datetime | None:
+     """Return the same instant as a UTC-aware datetime; a naive input is read as UTC."""
+     if moment is None:
+diff --git a/backend/config/.env.example b/backend/config/.env.example
+index 0cabd185e1..4be37a67f3 100644
+--- a/backend/config/.env.example
++++ b/backend/config/.env.example
+@@ -117,7 +117,7 @@ AWS_SNS_TOPIC_ARN=arn:aws:sns:eu-north-1:123456789012:owear
+ 
+ #--- SYNC SETTINGS ---#
+ SYNC_INTERVAL_SECONDS=3600  # How often to run automatic sync (default: 1 hour)
+-# SLEEP_SYNC_INTERVAL_SECONDS=3600  # How often to run the sleep sync task (default: 1 hour)
++# SLEEP_SYNC_INTERVAL_SECONDS=300  # How often to run the sleep sync task (default: 5 min)
+ # Re-fetch a trailing window on each live pull sync so late provider revisions
+ # (e.g. Oura finalising a day's step count after we moved past it) are picked up.
+ # Disabled by default. Compact duration: "2d", "20h", "90m", "1d12h". Capped per
+@@ -162,6 +162,7 @@ DEFAULT_DATA_GRANULARITY=raw
+ #--- SLEEP SESSION TRACKING ---#
+ # REDIS_SLEEP_TTL_SECONDS=86400  # TTL for in-progress sleep session state in Redis (24 h)
+ # SLEEP_END_GAP_MINUTES=120  # Gap between sleep phases that closes a sleep session (2 h)
++# SLEEP_UPLOAD_QUIET_MINUTES=15  # Time without uploads that closes an Apple Watch sleep session (15 min)
+ 
+ #--- DATA LIFECYCLE ---#
+ # Master switch for sample retention (admin panel tab, API, nightly deletion). The 15-minute rollup
+diff --git a/backend/tests/services/test_sleep_service.py b/backend/tests/services/test_sleep_service.py
+index 5611c7942c..e0a8440467 100644
+--- a/backend/tests/services/test_sleep_service.py
++++ b/backend/tests/services/test_sleep_service.py
+@@ -9,7 +9,7 @@
+ - Newer Apple Watch (watchOS 9+): "in_bed", "awake", "light", "deep", "rem" stages
+ """
+ 
+-from datetime import datetime
++from datetime import datetime, timedelta, timezone
+ from unittest.mock import MagicMock, patch
+ from uuid import uuid4
+ 
+@@ -18,7 +18,7 @@
+ 
+ from app.constants.sleep import SleepStageType
+ from app.models import EventRecord, HealthScore
+-from app.schemas.enums import HealthScoreCategory, ProviderName
++from app.schemas.enums import DeviceType, HealthScoreCategory, ProviderName
+ from app.schemas.model_crud.activities import (
+     EventRecordCreate,
+     EventRecordDetailCreate,
+@@ -32,6 +32,7 @@
+     _calculate_final_metrics,
+     finish_sleep,
+     handle_sleep_data,
++    is_ready_to_finish,
+ )
+ from tests.factories import UserFactory
+ 
+@@ -864,6 +865,158 @@ def test_redis_set_called_once_per_batch(
+         assert len(state.stages) >= 8  # at least the 8 watch stages + 1 in_bed
+ 
+ 
++class TestReadyToFinish:
++    """A session closes after the end gap, and one with Apple Watch sleep also once its writer's uploads stop."""
++
++    NOW = _dt("2026-04-18T09:00:00Z")
++    WATCH = {"appId": "com.apple.health.FA11388E", "deviceType": "watch", "deviceModel": "Watch7,1"}
++    IPHONE = {"appId": "com.apple.health.81F2A6D0", "deviceType": "phone", "deviceModel": "iPhone15,2"}
++    OURA = {"appId": "com.ouraring.oura", "deviceType": "phone", "deviceModel": "iPhone15,2"}
++
++    def _state(
++        self, ended_ago: int, received_ago: int | None, watch_sleep: bool = True, now: datetime = NOW
++    ) -> SleepState:
++        end = now - timedelta(minutes=ended_ago)
++        return SleepState(
++            uuid=str(uuid4()),
++            source_name="Apple Watch",
++            source_app_id=self.WATCH["appId"],
++            provider="apple",
++            start_time=end - timedelta(hours=7),
++            end_time=end,
++            last_start_timestamp=end - timedelta(minutes=10),
++            last_end_timestamp=end,
++            last_received_at=None if received_ago is None else now - timedelta(minutes=received_ago),
++            has_apple_watch_sleep=watch_sleep,
++        )
++
++    def _payload(self, samples: list[tuple[str, str, str, dict]]) -> SyncRequest:
++        """One upload of (stage, start, end, source) samples."""
++        return SyncRequest.model_validate(
++            {
++                "provider": "apple",
++                "sdkVersion": "0.15.0",
++                "syncTimestamp": "2026-04-18T08:00:00Z",
++                "data": {
++                    "sleep": [
++                        {"id": str(uuid4()), "stage": stage, "startDate": start, "endDate": end, "source": source}
++                        for stage, start, end, source in samples
++                    ]
++                },
++            }
++        )
++
++    def _upload(self, mock_redis_func: MagicMock, samples: list[tuple[str, str, str, dict]]) -> dict[str, SleepState]:
++        """Handle one upload and return the states it saved, by writer field."""
++        with patch("app.services.sdk.sleep_service.finish_sleep"), patch("app.services.sdk.sleep_service.celery_app"):
++            handle_sleep_data(MagicMock(), self._payload(samples), str(uuid4()))
++        return {
++            c.args[1]: SleepState.model_validate_json(c.args[2])
++            for c in mock_redis_func.return_value.hset.call_args_list
++        }
++
++    def test_any_session_closes_after_the_end_gap(self) -> None:
++        assert is_ready_to_finish(self._state(ended_ago=120, received_ago=0, watch_sleep=False), self.NOW)
++
++    def test_an_apple_watch_session_closes_after_a_quiet_period(self) -> None:
++        assert is_ready_to_finish(self._state(ended_ago=40, received_ago=15), self.NOW)
++
++    def test_an_apple_watch_session_stays_open_while_uploads_arrive(self) -> None:
++        assert not is_ready_to_finish(self._state(ended_ago=40, received_ago=5), self.NOW)
++
++    def test_a_session_without_apple_watch_sleep_waits_for_the_end_gap(self) -> None:
++        assert not is_ready_to_finish(self._state(ended_ago=40, received_ago=30, watch_sleep=False), self.NOW)
++
++    def test_a_state_without_an_upload_time_waits_for_the_end_gap(self) -> None:
++        assert not is_ready_to_finish(self._state(ended_ago=40, received_ago=None), self.NOW)
++
++    @patch("app.services.sdk.sleep_service.get_redis_client")
++    def test_an_upload_records_when_it_arrived(self, mock_redis_func: MagicMock) -> None:
++        mock_redis_func.return_value.get.return_value = None
++        before = datetime.now(timezone.utc)
++
++        saved = self._upload(mock_redis_func, [("light", "2026-04-18T01:00:00Z", "2026-04-18T02:00:00Z", self.WATCH)])[
++            "apple:apple"
++        ]
++
++        assert saved.last_received_at is not None
++        assert saved.last_received_at >= before
++
++    @patch("app.services.sdk.sleep_service.celery_app")
++    @patch("app.services.sdk.sleep_service.finish_sleep")
++    @patch("app.services.sdk.sleep_service.get_redis_client")
++    def test_a_fresh_watch_upload_stays_open(
++        self, mock_redis_func: MagicMock, mock_finish_sleep: MagicMock, mock_finalize: MagicMock
++    ) -> None:
++        """The quiet period starts at the upload, so the night is not closed in the same call."""
++        mock_redis_func.return_value.get.return_value = None
++        woke_up = datetime.now(timezone.utc) - timedelta(minutes=10)
++        sample = ("light", (woke_up - timedelta(hours=1)).isoformat(), woke_up.isoformat(), self.WATCH)
++
++        handle_sleep_data(MagicMock(), self._payload([sample]), str(uuid4()))
++
++        mock_finish_sleep.assert_not_called()
++
++    @patch("app.services.sdk.sleep_service.get_redis_client")
++    def test_watch_sleep_counts_in_a_session_the_iphone_opened(self, mock_redis_func: MagicMock) -> None:
++        mock_redis_func.return_value.get.return_value = None
++
++        saved = self._upload(
++            mock_redis_func,
++            [
++                ("in_bed", "2026-04-18T00:30:00Z", "2026-04-18T07:00:00Z", self.IPHONE),
++                ("light", "2026-04-18T01:00:00Z", "2026-04-18T02:00:00Z", self.WATCH),
++            ],
++        )["apple:apple"]
++
++        assert saved.device_type == DeviceType.PHONE
++        assert saved.has_apple_watch_sleep
++
++    @patch("app.services.sdk.sleep_service.get_redis_client")
++    def test_watch_sleep_marks_only_the_apple_session(self, mock_redis_func: MagicMock) -> None:
++        mock_redis_func.return_value.get.return_value = None
++
++        saved = self._upload(
++            mock_redis_func,
++            [
++                ("light", "2026-04-18T01:00:00Z", "2026-04-18T02:00:00Z", self.WATCH),
++                ("light", "2026-04-18T01:05:00Z", "2026-04-18T02:00:00Z", self.OURA),
++            ],
++        )
++
++        assert saved["apple:apple"].has_apple_watch_sleep
++        assert not saved["apple:com.ouraring.oura"].has_apple_watch_sleep
++
++    @patch("app.services.sdk.sleep_service.celery_app")
++    @patch("app.services.sdk.sleep_service.finish_sleep")
++    @patch("app.services.sdk.sleep_service.get_redis_client")
++    def test_another_apps_upload_does_not_extend_the_watch_quiet_period(
++        self, mock_redis_func: MagicMock, mock_finish_sleep: MagicMock, mock_celery: MagicMock
++    ) -> None:
++        now = datetime.now(timezone.utc)
++        watch_state = self._state(ended_ago=40, received_ago=20, now=now)
++        woke_up = watch_state.end_time
++        mock_redis_func.return_value.get.return_value = None
++        mock_redis_func.return_value.hgetall.return_value = {"apple:apple": watch_state.model_dump_json()}
++        sample = ("light", (woke_up - timedelta(hours=1)).isoformat(), woke_up.isoformat(), self.OURA)
++
++        handle_sleep_data(MagicMock(), self._payload([sample]), str(uuid4()))
++
++        finished = [c.args[2] for c in mock_finish_sleep.call_args_list]
++        assert [state.source_app_id for state in finished] == [self.WATCH["appId"]]
++        assert finished[0].last_received_at == watch_state.last_received_at
++
++    @patch("app.services.sdk.sleep_service.get_redis_client")
++    def test_an_upload_without_usable_sleep_keeps_the_upload_time(self, mock_redis_func: MagicMock) -> None:
++        state = self._state(ended_ago=40, received_ago=30)
++        mock_redis_func.return_value.get.return_value = None
++        mock_redis_func.return_value.hgetall.return_value = {"apple:apple": state.model_dump_json()}
++
++        saved = self._upload(mock_redis_func, [("napping", "2026-04-18T08:30:00Z", "2026-04-18T08:40:00Z", self.WATCH)])
++
++        assert saved["apple:apple"].last_received_at == state.last_received_at
++
++
+ class TestHistoricalBulkUploadMerging:
+     """Regression tests: consecutive payloads for the same night must produce
+     a single merged DB record rather than one record per payload.
+diff --git a/backend/tests/tasks/test_finalize_stale_sleep_task.py b/backend/tests/tasks/test_finalize_stale_sleep_task.py
+index 283dc2a1d4..31065eb238 100644
+--- a/backend/tests/tasks/test_finalize_stale_sleep_task.py
++++ b/backend/tests/tasks/test_finalize_stale_sleep_task.py
+@@ -12,7 +12,9 @@
+ from sqlalchemy.orm import Session
+ 
+ from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_stale_sleeps
++from app.schemas.enums import DeviceType
+ from app.schemas.providers.mobile_sdk import SleepState
++from app.services.sdk.sleep_service import active_users_key
+ 
+ 
+ class TestFinalizeStaleSleepsTask:
+@@ -147,6 +149,52 @@ def test_finalize_stale_sleeps_skips_recent_session(
+         mock_load_state.assert_called_once_with(user_id)
+         mock_finish_sleep.assert_not_called()  # Should not finalize recent sessions
+ 
++    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finish_sleep")
++    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.load_sleep_states")
++    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.get_redis_client")
++    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.SessionLocal")
++    def test_finalize_stale_sleeps_closes_a_quiet_apple_watch_session(
++        self,
++        mock_session_local: MagicMock,
++        mock_redis_client_func: MagicMock,
++        mock_load_state: MagicMock,
++        mock_finish_sleep: MagicMock,
++        db: Session,
++        mock_celery_app: MagicMock,
++    ) -> None:
++        """An Apple Watch night closes once its uploads go quiet; another app's session waits for the end gap."""
++        user_id = str(uuid4())
++        now = datetime.now(timezone.utc)
++        woke_up = now - timedelta(minutes=40)
++
++        mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
++        mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
++        mock_redis = MagicMock()
++        mock_redis.smembers.return_value = [user_id]
++        mock_redis_client_func.return_value = mock_redis
++        mock_sleep_state = SleepState(
++            uuid=str(uuid4()),
++            source_name="Apple Watch",
++            device_model="Watch7,1",
++            device_type=DeviceType.WATCH,
++            source_app_id="com.apple.health.FA11388E",
++            provider="apple",
++            start_time=woke_up - timedelta(hours=7),
++            end_time=woke_up,
++            last_start_timestamp=woke_up - timedelta(minutes=10),
++            last_end_timestamp=woke_up,
++            last_received_at=now - timedelta(minutes=20),
++            has_apple_watch_sleep=True,
++        )
++        oura_state = mock_sleep_state.model_copy(
++            update={"source_name": "Oura", "source_app_id": "com.ouraring.oura", "has_apple_watch_sleep": False}
++        )
++        mock_load_state.return_value = {"apple:apple": mock_sleep_state, "apple:com.ouraring.oura": oura_state}
++
++        finalize_stale_sleeps()
++
++        mock_finish_sleep.assert_called_once_with(db, user_id, mock_sleep_state)
++
+     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.load_sleep_states")
+     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.get_redis_client")
+     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.SessionLocal")
+@@ -177,6 +225,7 @@ def test_finalize_stale_sleeps_handles_missing_state(
+         # Assert
+         assert result is None
+         mock_load_state.assert_called_once_with(user_id)
++        mock_redis.srem.assert_called_once_with(active_users_key(), user_id)
+ 
+     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finish_sleep")
+     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.load_sleep_states")
+diff --git a/docs/providers/apple-health.mdx b/docs/providers/apple-health.mdx
+index 4ce09d1939..d7c71c0618 100644
+--- a/docs/providers/apple-health.mdx
++++ b/docs/providers/apple-health.mdx
+@@ -90,6 +90,21 @@ Apple Health provides the widest range of health data types:
+ 
+ See the [Flutter SDK documentation](/sdk/flutter#supported-health-data-types) for the complete list of supported types.
+ 
++## When a Night's Sleep Becomes Available
++
++HealthKit has no sleep session object, only stage samples, so Open Wearables builds sessions from them:
++
++1. The app with the SDK uploads new sleep samples when iOS wakes it (HealthKit background delivery or a background refresh). Samples an Apple Watch records usually reach the phone after waking, sometimes hours later: iOS decides when the watch syncs with the phone.
++2. Open Wearables keeps one open session per writer app (the Apple Watch and iPhone count as one, an app such as Oura as another) and closes it once it is complete:
++   - a session with Apple Watch sleep 15 minutes after the last upload that added to it (`SLEEP_UPLOAD_QUIET_MINUTES`), since the watch writes the whole night after waking;
++   - any other session 2 hours after its last sample ended (`SLEEP_END_GAP_MINUTES`), since apps writing to HealthKit can send a night over several syncs;
++   - a night uploaded later than that as soon as it arrives.
++
++   Due sessions are closed every 5 minutes (`SLEEP_SYNC_INTERVAL_SECONDS`). A piece from the same source that arrives after its night was closed is merged into it; one from another source is stored as its own session.
++3. With OW scores on (`OW_SCORES_ENABLED`, the default), the OW sleep score follows within about 10 minutes.
++
++An Apple Watch night is usually available 15 to 20 minutes after it reaches Open Wearables, which can be hours after waking up.
++
+ ## Apple Health as a Data Bridge
+ 
+ Even if a provider is **not yet directly supported** by Open Wearables, its data can still be collected by syncing it into Apple Health first.

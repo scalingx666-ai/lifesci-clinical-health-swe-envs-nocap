@@ -1,0 +1,752 @@
+diff --git a/knowledge/src/main/java/com/google/android/fhir/knowledge/KnowledgeManager.kt b/knowledge/src/main/java/com/google/android/fhir/knowledge/KnowledgeManager.kt
+index e319fa79c9..3a3a956c6f 100644
+--- a/knowledge/src/main/java/com/google/android/fhir/knowledge/KnowledgeManager.kt
++++ b/knowledge/src/main/java/com/google/android/fhir/knowledge/KnowledgeManager.kt
+@@ -21,22 +21,19 @@ import androidx.room.Room
+ import ca.uhn.fhir.context.FhirContext
+ import ca.uhn.fhir.parser.IParser
+ import com.google.android.fhir.knowledge.db.KnowledgeDatabase
++import com.google.android.fhir.knowledge.db.entities.ImplementationGuideEntity
+ import com.google.android.fhir.knowledge.db.entities.ResourceMetadataEntity
+-import com.google.android.fhir.knowledge.db.entities.toEntity
+ import com.google.android.fhir.knowledge.files.NpmFileManager
+ import com.google.android.fhir.knowledge.npm.NpmPackageDownloader
+ import com.google.android.fhir.knowledge.npm.OkHttpNpmPackageDownloader
+ import java.io.File
+ import java.io.FileInputStream
+-import java.io.FileOutputStream
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.withContext
+ import org.hl7.fhir.instance.model.api.IBaseResource
+ import org.hl7.fhir.r4.context.IWorkerContext
+ import org.hl7.fhir.r4.context.SimpleWorkerContext
+-import org.hl7.fhir.r4.model.IdType
+ import org.hl7.fhir.r4.model.MetadataResource
+-import org.hl7.fhir.r4.model.Resource
+ import org.hl7.fhir.r4.model.ResourceType
+ import org.hl7.fhir.utilities.npm.NpmPackage
+ import timber.log.Timber
+@@ -46,9 +43,20 @@ import timber.log.Timber
+  * individually as JSON files or from FHIR NPM packages.
+  *
+  * Coordinates the management of knowledge artifacts by using the three following components:
+- * - database: indexing knowledge artifacts stored in the local file system,
+- * - file manager: managing files containing the knowledge artifacts, and
+- * - NPM downloader: downloading from an NPM package server the knowledge artifacts.
++ * - knowledgeDatabase: indexing knowledge artifacts stored in the local file system,
++ * - npmFileManager: managing files containing the knowledge artifacts, and
++ * - npmPackageDownloader: downloading the knowledge artifacts from an NPM package server .
++ *
++ * Knowledge artifacts are scoped by the application. Multiple applications using the knowledge
++ * manager will not share the same sets of knowledge artifacts.
++ *
++ * See [Clinical Reasoning](https://hl7.org/fhir/R4/clinicalreasoning-module.html) for the formal
++ * definition of knowledge artifacts. In this implementation, however, knowledge artifacts are
++ * represented as [MetadataResource]s.
++ *
++ * **Note** that the list of resources implementing the [MetadataResource] class differs from the
++ * list of resources implementing the
++ * [MetadataResource interface](https://www.hl7.org/fhir/R5/metadataresource.html) in FHIR R5.
+  */
+ class KnowledgeManager
+ internal constructor(
+@@ -60,9 +68,11 @@ internal constructor(
+   private val knowledgeDao = knowledgeDatabase.knowledgeDao()
+ 
+   /**
+-   * Checks if the [fhirNpmPackages] are present in DB. If necessary, downloads the dependencies
+-   * from NPM and imports data from the package manager (populates the metadata of the FHIR
+-   * Resources).
++   * Downloads and installs the [fhirNpmPackages] from the NPM package server with transitive
++   * dependencies. The NPM packages will be unzipped to a directory managed by the knowledge
++   * manager. The resources will be indexed in the database for future retrieval.
++   *
++   * FHIR NPM packages already present in the database will be skipped.
+    */
+   suspend fun install(vararg fhirNpmPackages: FhirNpmPackage) {
+     fhirNpmPackages
+@@ -81,7 +91,7 @@ internal constructor(
+         try {
+           val localFhirNpmPackageMetadata =
+             npmFileManager.getLocalFhirNpmPackageMetadata(it.name, it.version)
+-          install(it, localFhirNpmPackageMetadata.rootDirectory)
++          import(it, localFhirNpmPackageMetadata.rootDirectory)
+           install(*localFhirNpmPackageMetadata.dependencies.toTypedArray())
+         } catch (e: Exception) {
+           Timber.w("Unable to install package ${it.name} ${it.version}")
+@@ -90,35 +100,70 @@ internal constructor(
+   }
+ 
+   /**
+-   * Checks if the [fhirNpmPackage] is present in DB. If necessary, populates the database with the
+-   * metadata of FHIR Resource from the provided [rootDirectory].
++   * Imports the content of the [fhirNpmPackage] from the provided [rootDirectory] by indexing the
++   * metadata of the FHIR resources for future retrieval.
++   *
++   * FHIR NPM packages already present in the database will be skipped.
+    */
+-  suspend fun install(fhirNpmPackage: FhirNpmPackage, rootDirectory: File) {
++  suspend fun import(fhirNpmPackage: FhirNpmPackage, rootDirectory: File) {
+     // TODO(ktarasenko) copy files to the safe space?
+-    val igId = knowledgeDao.insert(fhirNpmPackage.toEntity(rootDirectory))
+-    rootDirectory.listFiles()?.sorted()?.forEach { file ->
+-      try {
+-        val resource = jsonParser.parseResource(FileInputStream(file))
+-        if (resource is Resource) {
+-          val newId = indexResourceFile(igId, resource, file)
+-          resource.setId(IdType(resource.resourceType.name, newId))
+-
+-          // Overrides the Id in the file
+-          FileOutputStream(file).use {
+-            it.write(jsonParser.encodeResourceToString(resource).toByteArray())
+-          }
+-        } else {
+-          Timber.d("Unable to import file: %file")
+-        }
+-      } catch (exception: Exception) {
+-        Timber.d(exception, "Unable to import file: %file")
+-      }
++    val implementationGuideId =
++      knowledgeDao.insert(
++        ImplementationGuideEntity(
++          0L,
++          fhirNpmPackage.canonical ?: "",
++          fhirNpmPackage.name,
++          fhirNpmPackage.version,
++          rootDirectory,
++        ),
++      )
++    val files = rootDirectory.listFiles() ?: return
++    files.sorted().forEach { file ->
++      // Ignore files that are not meta resources instead of throwing exceptions since unzipped
++      // NPM package might contain other types of files e.g. package.json.
++      val resource = readMetadataResourceOrNull(file) ?: return@forEach
++      knowledgeDao.insertResource(
++        implementationGuideId,
++        ResourceMetadataEntity(
++          0,
++          resource.resourceType,
++          resource.url,
++          resource.name,
++          resource.version,
++          file,
++        ),
++      )
+     }
+   }
+ 
+-  /** Imports the Knowledge Artifact from the provided [file] to the default dependency. */
+-  suspend fun install(file: File) {
+-    importFile(null, file)
++  /**
++   * Indexes a knowledge artifact as a JSON object in the provided [file].
++   *
++   * This creates a record of the knowledge artifact's metadata and the file's location. When the
++   * knowledge artifact is requested, knowledge manager will load the content of the file,
++   * deserialize it and return the resulting FHIR resource.
++   *
++   * This operation does not make a copy of the knowledge artifact, nor does it checksum the content
++   * of the file. Therefore, it cannot be guaranteed that subsequent retrievals of the knowledge
++   * artifact will produce the same result. Applications using this function must be aware of the
++   * risk of the content of the file being modified or corrupt, potentially resulting in incorrect
++   * or inaccurate result of decision support or measure evaluation.
++   *
++   * Use this API for knowledge artifacts in immutable files (e.g. in the app's `assets` folder).
++   */
++  suspend fun index(file: File) {
++    val resource = readMetadataResourceOrThrow(file)
++    knowledgeDao.insertResource(
++      null,
++      ResourceMetadataEntity(
++        0L,
++        resource.resourceType,
++        resource.url,
++        resource.name,
++        resource.version,
++        file,
++      ),
++    )
+   }
+ 
+   /** Loads resources from IGs listed in dependencies. */
+@@ -141,7 +186,7 @@ internal constructor(
+         name != null -> knowledgeDao.getResourcesWithName(resType, name)
+         else -> knowledgeDao.getResources(resType)
+       }
+-    return resourceEntities.map { loadResource(it) }
++    return resourceEntities.map { readMetadataResourceOrThrow(it.resourceFile)!! }
+   }
+ 
+   /** Deletes Implementation Guide, cleans up files. */
+@@ -155,43 +200,6 @@ internal constructor(
+     }
+   }
+ 
+-  private suspend fun importFile(igId: Long?, file: File) {
+-    val resource =
+-      withContext(Dispatchers.IO) {
+-        try {
+-          FileInputStream(file).use(jsonParser::parseResource)
+-        } catch (exception: Exception) {
+-          Timber.d(exception, "Unable to import file: $file. Parsing to FhirResource failed.")
+-        }
+-      }
+-    when (resource) {
+-      is Resource -> {
+-        val newId = indexResourceFile(igId, resource, file)
+-        resource.setId(IdType(resource.resourceType.name, newId))
+-
+-        // Overrides the Id in the file
+-        FileOutputStream(file).use {
+-          it.write(jsonParser.encodeResourceToString(resource).toByteArray())
+-        }
+-      }
+-    }
+-  }
+-
+-  private suspend fun indexResourceFile(igId: Long?, resource: Resource, file: File): Long {
+-    val metadataResource = resource as? MetadataResource
+-    val res =
+-      ResourceMetadataEntity(
+-        0L,
+-        resource.resourceType,
+-        metadataResource?.url,
+-        metadataResource?.name,
+-        metadataResource?.version,
+-        file,
+-      )
+-
+-    return knowledgeDao.insertResource(igId, res)
+-  }
+-
+   /**
+    * Loads and initializes a worker context with the specified npm packages.
+    *
+@@ -220,8 +228,37 @@ internal constructor(
+     }
+   }
+ 
+-  private fun loadResource(resourceEntity: ResourceMetadataEntity): IBaseResource {
+-    return jsonParser.parseResource(FileInputStream(resourceEntity.resourceFile))
++  /**
++   * Parses and returns the content of a file containing a FHIR resource in JSON, or null if the
++   * file does not contain a FHIR resource.
++   */
++  private suspend fun readResourceOrNull(file: File): IBaseResource? =
++    withContext(Dispatchers.IO) {
++      try {
++        FileInputStream(file).use(jsonParser::parseResource)
++      } catch (e: Exception) {
++        Timber.e(e, "Unable to load resource from $file")
++        null
++      }
++    }
++
++  /**
++   * Parses and returns the content of a file containing a FHIR metadata resource in JSON, or null
++   * if the file does not contain a FHIR metadata resource.
++   */
++  private suspend fun readMetadataResourceOrNull(file: File) =
++    readResourceOrNull(file) as? MetadataResource
++
++  /**
++   * Parses and returns the content of a file containing a FHIR metadata resource in JSON, or throws
++   * an exception if the file does not contain a FHIR metadata resource.
++   */
++  private suspend fun readMetadataResourceOrThrow(file: File): MetadataResource {
++    val resource = readResourceOrNull(file)!!
++    check(resource is MetadataResource) {
++      "Resource ${resource.idElement} is not a MetadataResource"
++    }
++    return resource
+   }
+ 
+   companion object {
+diff --git a/knowledge/src/main/java/com/google/android/fhir/knowledge/db/entities/ImplementationGuideEntity.kt b/knowledge/src/main/java/com/google/android/fhir/knowledge/db/entities/ImplementationGuideEntity.kt
+index 8d2a1804e0..91e53a6d82 100644
+--- a/knowledge/src/main/java/com/google/android/fhir/knowledge/db/entities/ImplementationGuideEntity.kt
++++ b/knowledge/src/main/java/com/google/android/fhir/knowledge/db/entities/ImplementationGuideEntity.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2022-2023 Google LLC
++ * Copyright 2022-2024 Google LLC
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -19,7 +19,6 @@ package com.google.android.fhir.knowledge.db.entities
+ import androidx.room.Entity
+ import androidx.room.Index
+ import androidx.room.PrimaryKey
+-import com.google.android.fhir.knowledge.FhirNpmPackage
+ import java.io.File
+ 
+ /**
+@@ -45,7 +44,3 @@ internal data class ImplementationGuideEntity(
+   /** Directory where the Implementation Guide files are stored */
+   val rootDirectory: File,
+ )
+-
+-internal fun FhirNpmPackage.toEntity(rootFolder: File): ImplementationGuideEntity {
+-  return ImplementationGuideEntity(0L, canonical ?: "", name, version, rootFolder)
+-}
+diff --git a/knowledge/src/test/java/com/google/android/fhir/knowledge/KnowledgeManagerTest.kt b/knowledge/src/test/java/com/google/android/fhir/knowledge/KnowledgeManagerTest.kt
+index abef67cbee..48cdefd60f 100644
+--- a/knowledge/src/test/java/com/google/android/fhir/knowledge/KnowledgeManagerTest.kt
++++ b/knowledge/src/test/java/com/google/android/fhir/knowledge/KnowledgeManagerTest.kt
+@@ -25,11 +25,14 @@ import com.google.android.fhir.knowledge.db.KnowledgeDatabase
+ import com.google.android.fhir.knowledge.files.NpmFileManager
+ import com.google.common.truth.Truth.assertThat
+ import java.io.File
++import kotlinx.coroutines.runBlocking
+ import kotlinx.coroutines.test.runTest
++import org.hl7.fhir.r4.model.BaseResource
+ import org.hl7.fhir.r4.model.Library
+-import org.hl7.fhir.r4.model.MetadataResource
++import org.hl7.fhir.r4.model.Patient
+ import org.hl7.fhir.r4.model.PlanDefinition
+ import org.junit.After
++import org.junit.Assert.assertThrows
+ import org.junit.Test
+ import org.junit.runner.RunWith
+ import org.robolectric.RobolectricTestRunner
+@@ -65,7 +68,7 @@ internal class KnowledgeManagerTest {
+ 
+   @Test
+   fun `importing IG creates entries in DB`() = runTest {
+-    knowledgeManager.install(fhirNpmPackage, dataFolder)
++    knowledgeManager.import(fhirNpmPackage, dataFolder)
+     val implementationGuideId =
+       knowledgeDb.knowledgeDao().getImplementationGuide("anc-cds", "0.3.0")!!.implementationGuideId
+ 
+@@ -81,9 +84,10 @@ internal class KnowledgeManagerTest {
+   @Test
+   fun `deleting IG deletes files and DB entries`() = runTest {
+     val igRoot = File(dataFolder.parentFile, "anc-cds.copy")
++    igRoot.deleteRecursively()
+     igRoot.deleteOnExit()
+     dataFolder.copyRecursively(igRoot)
+-    knowledgeManager.install(fhirNpmPackage, igRoot)
++    knowledgeManager.import(fhirNpmPackage, igRoot)
+ 
+     knowledgeManager.delete(fhirNpmPackage)
+ 
+@@ -93,7 +97,7 @@ internal class KnowledgeManagerTest {
+ 
+   @Test
+   fun `imported entries are readable`() = runTest {
+-    knowledgeManager.install(fhirNpmPackage, dataFolder)
++    knowledgeManager.import(fhirNpmPackage, dataFolder)
+ 
+     assertThat(knowledgeManager.loadResources(resourceType = "Library", name = "WHOCommon"))
+       .isNotNull()
+@@ -112,7 +116,16 @@ internal class KnowledgeManagerTest {
+   }
+ 
+   @Test
+-  fun `inserting a library of a different version creates new entry`() = runTest {
++  fun `indexing non metadata resource should throw an exception`() {
++    val patient = Patient().apply { id = "Patient/defaultA-A.1.0.0" }
++
++    assertThrows(IllegalStateException::class.java) {
++      runBlocking { knowledgeManager.index(writeToFile(patient)) }
++    }
++  }
++
++  @Test
++  fun `should index a library of a different version`() = runTest {
+     val libraryAOld =
+       Library().apply {
+         id = "Library/defaultA-A.1.0.0"
+@@ -128,8 +141,8 @@ internal class KnowledgeManagerTest {
+         version = "A.1.0.1"
+       }
+ 
+-    knowledgeManager.install(writeToFile(libraryAOld))
+-    knowledgeManager.install(writeToFile(libraryANew))
++    knowledgeManager.index(writeToFile(libraryAOld))
++    knowledgeManager.index(writeToFile(libraryANew))
+ 
+     val resources = knowledgeDb.knowledgeDao().getResources()
+     assertThat(resources).hasSize(2)
+@@ -137,14 +150,14 @@ internal class KnowledgeManagerTest {
+     val resourceA100 =
+       knowledgeManager
+         .loadResources(resourceType = "Library", name = "defaultA", version = "A.1.0.0")
+-        .single()
+-    assertThat(resourceA100.idElement.toString()).isEqualTo("Library/1")
++        .single() as Library
++    assertThat(resourceA100.version).isEqualTo("A.1.0.0")
+ 
+     val resourceA101 =
+       knowledgeManager
+         .loadResources(resourceType = "Library", name = "defaultA", version = "A.1.0.1")
+-        .single()
+-    assertThat(resourceA101.idElement.toString()).isEqualTo("Library/2")
++        .single() as Library
++    assertThat(resourceA101.version.toString()).isEqualTo("A.1.0.1")
+   }
+ 
+   fun `installing from npmPackageManager`() = runTest {
+@@ -182,19 +195,20 @@ internal class KnowledgeManagerTest {
+         url = commonUrl
+       }
+ 
+-    knowledgeManager.install(writeToFile(libraryWithSameUrl))
+-    knowledgeManager.install(writeToFile(planDefinitionWithSameUrl))
++    knowledgeManager.index(writeToFile(libraryWithSameUrl))
++    knowledgeManager.index(writeToFile(planDefinitionWithSameUrl))
+ 
+     val resources = knowledgeDb.knowledgeDao().getResources()
+     assertThat(resources).hasSize(2)
+ 
+     val libraryLoadedByUrl =
+-      knowledgeManager.loadResources(resourceType = "Library", url = commonUrl).single()
+-    assertThat(libraryLoadedByUrl.idElement.toString()).isEqualTo("Library/1")
++      knowledgeManager.loadResources(resourceType = "Library", url = commonUrl).single() as Library
++    assertThat(libraryLoadedByUrl.name.toString()).isEqualTo("LibraryName")
+ 
+     val planDefinitionLoadedByUrl =
+       knowledgeManager.loadResources(resourceType = "PlanDefinition", url = commonUrl).single()
+-    assertThat(planDefinitionLoadedByUrl.idElement.toString()).isEqualTo("PlanDefinition/2")
++        as PlanDefinition
++    assertThat(planDefinitionLoadedByUrl.name.toString()).isEqualTo("PlanDefinitionName")
+   }
+ 
+   @Test
+@@ -215,25 +229,26 @@ internal class KnowledgeManagerTest {
+         version = "0"
+       }
+ 
+-    knowledgeManager.install(writeToFile(libraryWithSameUrl))
+-    knowledgeManager.install(writeToFile(planDefinitionWithSameUrl))
++    knowledgeManager.index(writeToFile(libraryWithSameUrl))
++    knowledgeManager.index(writeToFile(planDefinitionWithSameUrl))
+ 
+     val resources = knowledgeDb.knowledgeDao().getResources()
+     assertThat(resources).hasSize(2)
+ 
+     val libraryLoadedByUrl =
+-      knowledgeManager.loadResources(resourceType = "Library", url = commonUrl).single()
+-    assertThat(libraryLoadedByUrl.idElement.toString()).isEqualTo("Library/1")
++      knowledgeManager.loadResources(resourceType = "Library", url = commonUrl).single() as Library
++    assertThat(libraryLoadedByUrl.name.toString()).isEqualTo("LibraryName")
+ 
+     val planDefinitionLoadedByUrl =
+       knowledgeManager.loadResources(resourceType = "PlanDefinition", url = commonUrl).single()
+-    assertThat(planDefinitionLoadedByUrl.idElement.toString()).isEqualTo("PlanDefinition/2")
++        as PlanDefinition
++    assertThat(planDefinitionLoadedByUrl.name.toString()).isEqualTo("PlanDefinitionName")
+   }
+ 
+-  private fun writeToFile(metadataResource: MetadataResource): File {
+-    return File(context.filesDir, metadataResource.id).apply {
++  private fun writeToFile(resource: BaseResource): File {
++    return File(context.filesDir, resource.id).apply {
+       this.parentFile?.mkdirs()
+-      writeText(jsonParser.encodeResourceToString(metadataResource))
++      writeText(jsonParser.encodeResourceToString(resource))
+     }
+   }
+ }
+diff --git a/workflow-testing/src/main/resources/plan-definition/cql-applicability-condition/care_plan.json b/workflow-testing/src/main/resources/plan-definition/cql-applicability-condition/care_plan.json
+index 131bb2fc7d..3779b876d0 100644
+--- a/workflow-testing/src/main/resources/plan-definition/cql-applicability-condition/care_plan.json
++++ b/workflow-testing/src/main/resources/plan-definition/cql-applicability-condition/care_plan.json
+@@ -1,9 +1,9 @@
+ {
+   "resourceType": "CarePlan",
+-  "id": "17",
++  "id": "Plan-Definition-Example",
+   "contained": [ {
+     "resourceType": "RequestGroup",
+-    "id": "17",
++    "id": "Plan-Definition-Example",
+     "instantiatesCanonical": [ "http://example.com/PlanDefinition/Plan-Definition-Example" ],
+     "status": "draft",
+     "intent": "proposal",
+@@ -20,15 +20,15 @@
+         }
+       } ],
+       "resource": {
+-        "reference": "Task/16"
++        "reference": "Task/Activity-Example"
+       }
+     } ]
+   }, {
+     "resourceType": "Task",
+-    "id": "16",
++    "id": "Activity-Example",
+     "instantiatesCanonical": "http://example.com/ActivityDefinition/Activity-Example",
+     "basedOn": [ {
+-      "reference": "RequestGroup/17"
++      "reference": "RequestGroup/Plan-Definition-Example"
+     } ],
+     "status": "draft",
+     "intent": "proposal",
+@@ -45,7 +45,7 @@
+   },
+   "activity": [ {
+     "reference": {
+-      "reference": "#RequestGroup/17"
++      "reference": "#RequestGroup/Plan-Definition-Example"
+     }
+   } ]
+ }
+\ No newline at end of file
+diff --git a/workflow-testing/src/main/resources/plan-definition/med-request/med_request_careplan.json b/workflow-testing/src/main/resources/plan-definition/med-request/med_request_careplan.json
+index 8e7b401c7b..f152723d04 100644
+--- a/workflow-testing/src/main/resources/plan-definition/med-request/med_request_careplan.json
++++ b/workflow-testing/src/main/resources/plan-definition/med-request/med_request_careplan.json
+@@ -1,10 +1,10 @@
+ {
+   "resourceType": "CarePlan",
+-  "id": "17",
++  "id": "MedRequest-Example",
+   "contained": [
+     {
+       "resourceType": "RequestGroup",
+-      "id": "17",
++      "id": "MedRequest-Example",
+       "instantiatesCanonical": [
+         "http://localhost/PlanDefinition/MedRequest-Example"
+       ],
+@@ -18,14 +18,14 @@
+           "id": "medication-action-1",
+           "title": "Administer Medication 1",
+           "resource": {
+-            "reference": "medication-action-1-16"
++            "reference": "medication-action-1-MedicationRequest-1"
+           }
+         }
+       ]
+     },
+     {
+       "resourceType": "MedicationRequest",
+-      "id": "medication-action-1-16",
++      "id": "medication-action-1-MedicationRequest-1",
+       "status": "draft",
+       "intent": "order",
+       "medicationCodeableConcept": {
+@@ -50,7 +50,7 @@
+   "activity": [
+     {
+       "reference": {
+-        "reference": "#RequestGroup/17"
++        "reference": "#RequestGroup/MedRequest-Example"
+       }
+     }
+   ]
+diff --git a/workflow/benchmark/src/androidTest/java/com/google/android/fhir/workflow/benchmark/F_CqlEvaluatorBenchmark.kt b/workflow/benchmark/src/androidTest/java/com/google/android/fhir/workflow/benchmark/F_CqlEvaluatorBenchmark.kt
+index dc63e1fc5c..4c3d40fbe1 100644
+--- a/workflow/benchmark/src/androidTest/java/com/google/android/fhir/workflow/benchmark/F_CqlEvaluatorBenchmark.kt
++++ b/workflow/benchmark/src/androidTest/java/com/google/android/fhir/workflow/benchmark/F_CqlEvaluatorBenchmark.kt
+@@ -68,7 +68,7 @@ class F_CqlEvaluatorBenchmark {
+           for (entry in patientImmunizationHistory.entry) {
+             fhirEngine.create(entry.resource)
+           }
+-          knowledgeManager.install(
++          knowledgeManager.index(
+             File(context.filesDir, lib.name).apply {
+               writeText(jsonParser.encodeResourceToString(lib))
+             },
+diff --git a/workflow/build.gradle.kts b/workflow/build.gradle.kts
+index 83e5d49f56..3d2696e944 100644
+--- a/workflow/build.gradle.kts
++++ b/workflow/build.gradle.kts
+@@ -114,8 +114,18 @@ dependencies {
+   testImplementation(libs.androidx.test.core)
+   testImplementation(libs.junit)
+   testImplementation(libs.truth)
+-  testImplementation(project(mapOf("path" to ":knowledge")))
+   testImplementation(project(":workflow-testing"))
++  testImplementation(project(":knowledge"))
++
++  configurations.all {
++    if (name.contains("test", ignoreCase = true)) {
++      resolutionStrategy.dependencySubstitution {
++        // To test the workflow library against the latest Knowledge Manager APIs, substitute the
++        // dependency on the released Knowledge Manager library with the current build.
++        substitute(module(Dependencies.androidFhirKnowledge)).using(project(":knowledge"))
++      }
++    }
++  }
+ 
+   constraints {
+     Dependencies.hapiFhirConstraints().forEach { (libName, constraints) ->
+diff --git a/workflow/sampledata/smart-imm/tests/IMMZ-Patient-NoVaxeninfant-f/CarePlan/CarePlan.json b/workflow/sampledata/smart-imm/tests/IMMZ-Patient-NoVaxeninfant-f/CarePlan/CarePlan.json
+index 8996cb92fc..50b5053423 100644
+--- a/workflow/sampledata/smart-imm/tests/IMMZ-Patient-NoVaxeninfant-f/CarePlan/CarePlan.json
++++ b/workflow/sampledata/smart-imm/tests/IMMZ-Patient-NoVaxeninfant-f/CarePlan/CarePlan.json
+@@ -1,10 +1,10 @@
+ {
+   "resourceType": "CarePlan",
+-  "id": "26",
++  "id": "IMMZD2DTMeasles",
+   "contained": [
+     {
+       "resourceType": "RequestGroup",
+-      "id": "26",
++      "id": "IMMZD2DTMeasles",
+       "instantiatesCanonical": [
+         "http://fhir.org/guides/who/smart-immunization/PlanDefinition/IMMZD2DTMeasles|0.1.0"
+       ],
+@@ -28,14 +28,14 @@
+             }
+           ],
+           "resource": {
+-            "reference": "MedicationRequest/1"
++            "reference": "MedicationRequest/IMMZD2DTMeaslesMR"
+           }
+         }
+       ]
+     },
+     {
+       "resourceType": "MedicationRequest",
+-      "id": "1",
++      "id": "IMMZD2DTMeaslesMR",
+       "meta": {
+         "profile": [
+           "http://hl7.org/fhir/uv/cpg/StructureDefinition/cpg-immunizationrequest"
+@@ -77,7 +77,7 @@
+   "activity": [
+     {
+       "reference": {
+-        "reference": "#RequestGroup/26"
++        "reference": "#RequestGroup/IMMZD2DTMeasles"
+       }
+     }
+   ]
+diff --git a/workflow/src/androidTest/java/com/google/android/fhir/workflow/FhirOperatorLibraryEvaluateTest.kt b/workflow/src/androidTest/java/com/google/android/fhir/workflow/FhirOperatorLibraryEvaluateTest.kt
+index 345bc28049..f42ecfb020 100644
+--- a/workflow/src/androidTest/java/com/google/android/fhir/workflow/FhirOperatorLibraryEvaluateTest.kt
++++ b/workflow/src/androidTest/java/com/google/android/fhir/workflow/FhirOperatorLibraryEvaluateTest.kt
+@@ -121,7 +121,7 @@ class FhirOperatorLibraryEvaluateTest {
+     }
+ 
+     // Load Library that checks if Patient has taken a vaccine
+-    knowledgeManager.install(copy("/immunity-check/ImmunityCheck.json"))
++    knowledgeManager.index(copy("/immunity-check/ImmunityCheck.json"))
+ 
+     // Evaluates a specific Patient
+     val results =
+@@ -142,8 +142,8 @@ class FhirOperatorLibraryEvaluateTest {
+     }
+ 
+     // Load Library that checks if Patient has taken a vaccine
+-    knowledgeManager.install(copy("/immunity-check/ImmunityCheck.json"))
+-    knowledgeManager.install(copy("/immunity-check/FhirHelpers.json"))
++    knowledgeManager.index(copy("/immunity-check/ImmunityCheck.json"))
++    knowledgeManager.index(copy("/immunity-check/FhirHelpers.json"))
+ 
+     val location =
+       """
+@@ -185,7 +185,7 @@ class FhirOperatorLibraryEvaluateTest {
+     }
+ 
+     // Load Library that checks if Patient has taken a vaccine
+-    knowledgeManager.install(copy("/immunity-check/ImmunityCheck.json"))
++    knowledgeManager.index(copy("/immunity-check/ImmunityCheck.json"))
+ 
+     // Evaluates a specific Patient
+     val results =
+diff --git a/workflow/src/androidTest/java/com/google/android/fhir/workflow/SmartImmunizationAndroidTest.kt b/workflow/src/androidTest/java/com/google/android/fhir/workflow/SmartImmunizationAndroidTest.kt
+index 32f88a275a..f562b3ae13 100644
+--- a/workflow/src/androidTest/java/com/google/android/fhir/workflow/SmartImmunizationAndroidTest.kt
++++ b/workflow/src/androidTest/java/com/google/android/fhir/workflow/SmartImmunizationAndroidTest.kt
+@@ -116,7 +116,7 @@ class SmartImmunizationAndroidTest {
+ 
+     moveAllIGResourcesIntoFilesDir("smart-imm")
+ 
+-    knowledgeManager.install(
++    knowledgeManager.import(
+       FhirNpmPackage(
+         "who.fhir.immunization",
+         "1.0.0",
+@@ -136,8 +136,6 @@ class SmartImmunizationAndroidTest {
+         )
+         .single()
+ 
+-    assertThat(planDef.idElement.idPart).isEqualTo("26")
+-
+     val patient =
+       load(
+         "/smart-imm/tests/IMMZ-Patient-NoVaxeninfant-f/Patient/Patient-IMMZ-Patient-NoVaxeninfant-f.json",
+diff --git a/workflow/src/test/java/com/google/android/fhir/workflow/FhirOperatorLibraryEvaluateJavaTest.kt b/workflow/src/test/java/com/google/android/fhir/workflow/FhirOperatorLibraryEvaluateJavaTest.kt
+index be66a40615..96e6982b9d 100644
+--- a/workflow/src/test/java/com/google/android/fhir/workflow/FhirOperatorLibraryEvaluateJavaTest.kt
++++ b/workflow/src/test/java/com/google/android/fhir/workflow/FhirOperatorLibraryEvaluateJavaTest.kt
+@@ -110,8 +110,8 @@ class FhirOperatorLibraryEvaluateJavaTest {
+     }
+ 
+     // Load Library that checks if Patient has taken a vaccine
+-    knowledgeManager.install(writeToFile(load("/immunity-check/ImmunityCheck.json") as Library))
+-    knowledgeManager.install(writeToFile(load("/immunity-check/FhirHelpers.json") as Library))
++    knowledgeManager.index(writeToFile(load("/immunity-check/ImmunityCheck.json") as Library))
++    knowledgeManager.index(writeToFile(load("/immunity-check/FhirHelpers.json") as Library))
+ 
+     // Evaluates a specific Patient
+     val results =
+@@ -137,7 +137,7 @@ class FhirOperatorLibraryEvaluateJavaTest {
+ 
+     val library = CqlBuilder.assembleFhirLib(cql, null, null, "TestGetName", "1.0.0")
+ 
+-    knowledgeManager.install(writeToFile(library))
++    knowledgeManager.index(writeToFile(library))
+ 
+     // Evaluates expression without any extra data
+     val results =
+@@ -162,7 +162,7 @@ class FhirOperatorLibraryEvaluateJavaTest {
+ 
+     val library = CqlBuilder.assembleFhirLib(cql, null, null, "TestSumWithParams", "1.0.0")
+ 
+-    knowledgeManager.install(writeToFile(library))
++    knowledgeManager.index(writeToFile(library))
+ 
+     val params =
+       Parameters().apply {
+diff --git a/workflow/src/test/java/com/google/android/fhir/workflow/FhirOperatorTest.kt b/workflow/src/test/java/com/google/android/fhir/workflow/FhirOperatorTest.kt
+index 287faceef8..f9b4ff4ff2 100644
+--- a/workflow/src/test/java/com/google/android/fhir/workflow/FhirOperatorTest.kt
++++ b/workflow/src/test/java/com/google/android/fhir/workflow/FhirOperatorTest.kt
+@@ -61,7 +61,7 @@ class FhirOperatorTest {
+ 
+     // Installing ANC CDS to the IGManager
+     val rootDirectory = File(javaClass.getResource("/anc-cds")!!.file)
+-    knowledgeManager.install(
++    knowledgeManager.import(
+       FhirNpmPackage(
+         "com.google.android.fhir",
+         "1.0.0",
+@@ -281,7 +281,9 @@ class FhirOperatorTest {
+   }
+ 
+   private suspend fun installToIgManager(resource: Resource) {
+-    knowledgeManager.install(writeToFile(resource))
++    try {
++      knowledgeManager.index(writeToFile(resource))
++    } catch (_: Exception) {}
+   }
+ 
+   private fun writeToFile(resource: Resource): File {
+diff --git a/workflow/src/test/java/com/google/android/fhir/workflow/SmartImmunizationTest.kt b/workflow/src/test/java/com/google/android/fhir/workflow/SmartImmunizationTest.kt
+index 85d46f13d2..cdfde7e17f 100644
+--- a/workflow/src/test/java/com/google/android/fhir/workflow/SmartImmunizationTest.kt
++++ b/workflow/src/test/java/com/google/android/fhir/workflow/SmartImmunizationTest.kt
+@@ -63,7 +63,7 @@ class SmartImmunizationTest {
+     // Installing SmartImmunizations IG into the IGManager
+     val rootDirectory = File(javaClass.getResource("/smart-imm/ig/")!!.file)
+ 
+-    knowledgeManager.install(
++    knowledgeManager.import(
+       FhirNpmPackage(
+         "who.fhir.immunization",
+         "1.0.0",
+@@ -83,8 +83,6 @@ class SmartImmunizationTest {
+         )
+         .firstOrNull()
+ 
+-    assertThat(planDef?.idElement?.idPart).isEqualTo("26")
+-
+     loader.loadFile(
+       "/smart-imm/tests/IMMZ-Patient-NoVaxeninfant-f/Patient/Patient-IMMZ-Patient-NoVaxeninfant-f.json",
+       ::importToFhirEngine,

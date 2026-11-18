@@ -1,0 +1,235 @@
+diff --git a/packages/core/src/command/hl7-sftp-ingestion/alohr/hl7-alohr-sftp-ingestion-client.ts b/packages/core/src/command/hl7-sftp-ingestion/alohr/hl7-alohr-sftp-ingestion-client.ts
+index 92554f0739..cd476e6309 100644
+--- a/packages/core/src/command/hl7-sftp-ingestion/alohr/hl7-alohr-sftp-ingestion-client.ts
++++ b/packages/core/src/command/hl7-sftp-ingestion/alohr/hl7-alohr-sftp-ingestion-client.ts
+@@ -1,11 +1,14 @@
+ import { BadRequestError, MetriportError } from "@metriport/shared";
++import dayjs from "dayjs";
++import timezone from "dayjs/plugin/timezone";
+ import { getSecretValueOrFail } from "../../../external/aws/secret-manager";
+ import { SftpClient } from "../../../external/sftp/client";
+ import { SftpConfig } from "../../../external/sftp/types";
+ import { Config } from "../../../util/config";
+-import { buildDayjs } from "@metriport/shared/common/date";
+ import { sftpConfigSchema } from "../sftp-config";
+ 
++dayjs.extend(timezone);
++
+ export class AlohrSftpIngestionClient extends SftpClient {
+   private readonly FILE_FORMAT = "YYYYMMDD";
+   protected override readonly log: typeof console.log;
+@@ -89,9 +92,15 @@ export class AlohrSftpIngestionClient extends SftpClient {
+     endingDate?: string
+   ): Promise<string[]> {
+     this.log(`Syncing from remotePath: ${remotePath}`);
+-
+-    const start = startingDate ? startingDate : buildDayjs(Date.now()).format(this.FILE_FORMAT);
+-    const end = endingDate ? endingDate : buildDayjs().add(1, "day").format(this.FILE_FORMAT);
++    const start = startingDate
++      ? startingDate
++      : dayjs.tz(Date.now(), Config.getAlohrIngestionTimezone()).format(this.FILE_FORMAT);
++    const end = endingDate
++      ? endingDate
++      : dayjs
++          .tz(Date.now(), Config.getAlohrIngestionTimezone())
++          .add(1, "day")
++          .format(this.FILE_FORMAT);
+     try {
+       await this.connect();
+ 
+diff --git a/packages/core/src/command/hl7-sftp-ingestion/alohr/hl7-alohr-sftp-ingestion-direct.ts b/packages/core/src/command/hl7-sftp-ingestion/alohr/hl7-alohr-sftp-ingestion-direct.ts
+index e51e8b0c21..09a22d6508 100644
+--- a/packages/core/src/command/hl7-sftp-ingestion/alohr/hl7-alohr-sftp-ingestion-direct.ts
++++ b/packages/core/src/command/hl7-sftp-ingestion/alohr/hl7-alohr-sftp-ingestion-direct.ts
+@@ -17,10 +17,12 @@ import {
+   getSegmentByNameOrFail,
+ } from "../../hl7v2-subscriptions/hl7v2-to-fhir-conversion/shared";
+ import { asString } from "../../hl7-notification/utils";
++import { capture } from "../../../util/notifications";
+ 
+ export class Hl7AlohrSftpIngestionDirect implements Hl7AlohrSftpIngestion {
+   private readonly ALTERNATE_PATIENT_ID_FIELD_INDEX = 4; // 1 indexed
+   private readonly PATIENT_ID_FIELD_INDEX = 3; // 1 indexed
++  private readonly ERROR_FILE_PATH = "errors";
+ 
+   private sftpClient: AlohrSftpIngestionClient;
+ 
+@@ -42,8 +44,24 @@ export class Hl7AlohrSftpIngestionDirect implements Hl7AlohrSftpIngestion {
+ 
+     log(`Reading synced files`);
+     const timestampedMessages: TimestampedMessage[] = [];
+-
+     for (const fileName of fileNames) {
++      const timestampedMessage = await this.processFile(s3Utils, bucketName, remotePath, fileName);
++      if (timestampedMessage) {
++        timestampedMessages.push(timestampedMessage);
++      }
++    }
++
++    log(`Sending to webhook sender`);
++    await this.sendToWebhookSender(timestampedMessages);
++  }
++
++  private async processFile(
++    s3Utils: S3Utils,
++    bucketName: string,
++    remotePath: string,
++    fileName: string
++  ): Promise<TimestampedMessage | undefined> {
++    try {
+       const filePath = this.getFilePath(remotePath, fileName);
+       const existsFile = await s3Utils.fileExists(bucketName, filePath);
+       if (!existsFile) {
+@@ -51,23 +69,36 @@ export class Hl7AlohrSftpIngestionDirect implements Hl7AlohrSftpIngestion {
+       }
+ 
+       const message = await s3Utils.getFileContentsAsString(bucketName, filePath);
+-      const recievedAt = buildDayjs(Date.now()).toISOString();
++      const receivedAt = buildDayjs().toISOString();
+       const hl7Message = Hl7Message.parse(message);
+ 
+       const remappedMessage = this.remapMessage(hl7Message);
+       const remappedMessageString = asString(remappedMessage);
+       const { cxId, patientId } = getCxIdAndPatientIdOrFail(remappedMessage);
+ 
+-      timestampedMessages.push({
++      return {
+         message: remappedMessageString,
+-        timestamp: recievedAt,
+-        cxId: cxId,
+-        patientId: patientId,
++        timestamp: receivedAt,
++        cxId,
++        patientId,
++        fileName,
++      };
++    } catch (error) {
++      const errorMessage = error instanceof Error ? error.message : String(error);
++      capture.error("error processing file: ", {
++        extra: {
++          fileName,
++          error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
++        },
+       });
++      log(`error processing file ${fileName}: ${errorMessage}`);
++      const filePath = this.getFilePath(remotePath, fileName);
++      const message = await s3Utils.getFileContentsAsString(bucketName, filePath);
++      const errorDetails =
++        error instanceof Error ? `${error.message}\n\nStack: ${error.stack}` : String(error);
++      await this.persistError(message, fileName, errorDetails);
++      return undefined;
+     }
+-
+-    log(`Sending to webhook sender`);
+-    await this.sendToWebhookSender(timestampedMessages);
+   }
+ 
+   private async sendToWebhookSender(timestampedMessages: TimestampedMessage[]): Promise<void> {
+@@ -80,11 +111,23 @@ export class Hl7AlohrSftpIngestionDirect implements Hl7AlohrSftpIngestion {
+         messageReceivedTimestamp: msg.timestamp,
+         hieName: HIE_NAME,
+       };
+-
+       await webhookSender.execute(webhookSenderParams);
+     }
+   }
+ 
++  private async persistError(message: string, fileName: string, error: string): Promise<void> {
++    const s3Utils = new S3Utils(Config.getAWSRegion());
++    const bucketName = Config.getAlohrIngestionBucket();
++    const filePath = this.getFilePath(this.ERROR_FILE_PATH, fileName);
++    const fileContents = `${error}\n\n${message}`;
++    await s3Utils.uploadFile({
++      bucket: bucketName,
++      key: filePath,
++      file: Buffer.from(fileContents),
++      contentType: "text/plain",
++    });
++  }
++
+   private getFilePath(remotePath: string, fileName: string): string {
+     return `${remotePath}/${fileName}`.replace(/^\//, "");
+   }
+diff --git a/packages/core/src/command/hl7-sftp-ingestion/alohr/hl7-alohr-sftp-ingestion.ts b/packages/core/src/command/hl7-sftp-ingestion/alohr/hl7-alohr-sftp-ingestion.ts
+index f375262090..58d0c8e5d1 100644
+--- a/packages/core/src/command/hl7-sftp-ingestion/alohr/hl7-alohr-sftp-ingestion.ts
++++ b/packages/core/src/command/hl7-sftp-ingestion/alohr/hl7-alohr-sftp-ingestion.ts
+@@ -18,4 +18,5 @@ export interface TimestampedMessage {
+   timestamp: string;
+   cxId: string;
+   patientId: string;
++  fileName: string;
+ }
+diff --git a/packages/core/src/util/config.ts b/packages/core/src/util/config.ts
+index 5192b06593..ab5edefb73 100644
+--- a/packages/core/src/util/config.ts
++++ b/packages/core/src/util/config.ts
+@@ -492,4 +492,8 @@ export class Config {
+   static getAlohrIngestionLambdaName(): string {
+     return getEnvVarOrFail("ALOHR_INGESTION_LAMBDA_NAME");
+   }
++
++  static getAlohrIngestionTimezone(): string {
++    return getEnvVarOrFail("ALOHR_INGESTION_TIMEZONE");
++  }
+ }
+diff --git a/packages/infra/lib/lambdas-nested-stack.ts b/packages/infra/lib/lambdas-nested-stack.ts
+index 66206533d0..127d56a945 100644
+--- a/packages/infra/lib/lambdas-nested-stack.ts
++++ b/packages/infra/lib/lambdas-nested-stack.ts
+@@ -1073,6 +1073,7 @@ export class LambdasNestedStack extends NestedStack {
+     const alohrProps = ownProps.config.hl7Notification?.AlohrSftpIngestionLambda;
+     const sftpPasswordSecret = ownProps.secrets["ALOHR_INGESTION_PASSWORD"];
+     const queue = ownProps.config.hl7Notification?.notificationWebhookSenderQueue;
++    const alohr = ownProps.config.hl7Notification?.hieConfigs["Alohr"];
+ 
+     if (!alohrProps) {
+       throw new Error("AlohrSftpIngestionLambda is undefined in config.");
+@@ -1086,6 +1087,9 @@ export class LambdasNestedStack extends NestedStack {
+     if (!sftpPasswordSecret) {
+       throw new Error("ALOHR_INGESTION_PASSWORD is not defined in config.");
+     }
++    if (!alohr) {
++      throw new Error("Alohr is undefined in config.");
++    }
+ 
+     const sftpConfig = alohrProps.sftpConfig;
+     const lambdaTimeout = Duration.minutes(5);
+@@ -1111,6 +1115,7 @@ export class LambdasNestedStack extends NestedStack {
+         ALOHR_INGESTION_BUCKET_NAME: ownProps.alohrSftpIngestionBucket.bucketName,
+         HL7_BASE64_SCRAMBLER_SEED_ARN: hl7Base64ScramblerSeed.secretArn,
+         HL7_NOTIFICATION_QUEUE_URL: queue.url,
++        ALOHR_INGESTION_TIMEZONE: alohr.timezone,
+       },
+       stack: this,
+       name: "Hl7SftpIngestionAlohr",
+diff --git a/packages/lambdas/src/hl7-alohr-sftp-ingestion.ts b/packages/lambdas/src/hl7-alohr-sftp-ingestion.ts
+index 82919acba3..70950c406f 100644
+--- a/packages/lambdas/src/hl7-alohr-sftp-ingestion.ts
++++ b/packages/lambdas/src/hl7-alohr-sftp-ingestion.ts
+@@ -16,6 +16,10 @@ const lambdaName = getEnvVarOrFail("AWS_LAMBDA_FUNCTION_NAME");
+ 
+ export const handler = capture.wrapHandler(
+   async (params: Hl7AlohrSftpIngestionParams): Promise<void> => {
++    if (Config.isStaging()) {
++      log("Skipping Alohr SFTP ingestion in staging. (We don't want to ingest PHI in staging)");
++      return;
++    }
+     const secretArn = Config.getHl7Base64ScramblerSeedArn();
+     const hl7Base64ScramblerSeed = await getSecretValueOrFail(secretArn, Config.getAWSRegion());
+     process.env["HL7_BASE64_SCRAMBLER_SEED"] = hl7Base64ScramblerSeed;
+diff --git a/packages/lambdas/src/hl7-lahie-sftp-ingestion.ts b/packages/lambdas/src/hl7-lahie-sftp-ingestion.ts
+index c09f340c7f..851be116f6 100644
+--- a/packages/lambdas/src/hl7-lahie-sftp-ingestion.ts
++++ b/packages/lambdas/src/hl7-lahie-sftp-ingestion.ts
+@@ -16,6 +16,10 @@ const lambdaName = getEnvVarOrFail("AWS_LAMBDA_FUNCTION_NAME");
+ 
+ export const handler = capture.wrapHandler(
+   async (params: Hl7LahieSftpIngestionParams): Promise<void> => {
++    if (Config.isStaging()) {
++      log("Skipping Lahie SFTP ingestion in staging. (We don't want to ingest PHI in staging)");
++      return;
++    }
+     const secretArn = Config.getHl7Base64ScramblerSeedArn();
+     const hl7Base64ScramblerSeed = await getSecretValueOrFail(secretArn, Config.getAWSRegion());
+     process.env["HL7_BASE64_SCRAMBLER_SEED"] = hl7Base64ScramblerSeed;

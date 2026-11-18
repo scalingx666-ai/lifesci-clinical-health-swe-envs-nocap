@@ -1,0 +1,1209 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c5afbed2dc..ce9c110ef0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Gate sustained local VLM execution and speech PHI screening on measured latency, queue age, fresh thermal state and memory pressure, preserving fallback history and withholding stale outputs (#2820).
++
+ - Extract review-only ECG rate, PR, QRS and QT candidates from freshly quality-gated samples, retaining original lead fiducials and algorithm provenance while withholding ambiguous or disagreeing measurements (#2809).
+ 
+ - Assemble ambient note drafts from finalized, PHI-screened, role-reviewed transcript evidence with original-offset citations, local claim verification, conflict holds and current clinician-custody checks before local export (#2816).
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index 43b029fbe6..a787f092f1 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -484,6 +484,7 @@ classification:
+     - multimodal/runtime-session.md
+     - multimodal/vision/edge-vlm-provider-contract.md
+     - multimodal/provider-capability-matrix.md
++    - multimodal/thermal-latency-gates.md
+     - multimodal/provider-capability-schema.md
+     - multimodal/vision/whole-slide-tiling.md
+     - multimodal/vision/whole-slide-provenance.md
+diff --git a/docs/multimodal/thermal-latency-gates.md b/docs/multimodal/thermal-latency-gates.md
+new file mode 100644
+index 0000000000..aeda620d61
+--- /dev/null
++++ b/docs/multimodal/thermal-latency-gates.md
+@@ -0,0 +1,107 @@
++# Sustained thermal and latency admission
++
++`openmed.multimodal.runtime.thermal_gate` controls local VLM execution and speech PHI screening against a task's sustained edge budget. It measures elapsed time itself, rejects stale queued work, checks current memory and thermal observations before inference, and checks again before returning actual output. A provider's own duration estimate cannot authorize release.
++
++The host supplies a monotonic clock, fresh local platform observations, already loaded adapters and an explicitly qualified mode ladder. There are no downloads, background probes, network calls or cloud fallbacks. Apple sensor acquisition and OpenMedKit admission are separate work tracked in #3836; this module implements the portable Python controller.
++
++## Declare the task and its local modes
++
++Each `LocalMode` binds a provider's model and preprocessing metadata to a host qualification digest, exact capability declarations, conservative additional allocation headroom, and maximum qualified thermal and memory-pressure states. Every mode must support the task's entire `ModalityProfile`. A capability marked `transform_required` is rejected: the gate does not resize images, drop source-coordinate requirements, shorten prompts or assume a smaller model preserves task quality.
++
++The host must qualify each mode for the intended task and device. Digests record declarations; they do not authenticate evidence, certify model quality or isolate arbitrary adapter code. Provision weights beforehand, keep telemetry disabled and retain normal human review of non-diagnostic outputs.
++
++`PlatformObservation` uses the same monotonic clock domain as enqueue times. `available_bytes` is conservative allocation headroom after accounting for already resident models and buffers. Unknown thermal state, unknown memory pressure, missing headroom, future measurements, stale measurements and regressing measurement timestamps all withhold work. Critical thermal or memory pressure cannot be enabled by a mode declaration. A stale sensor must never be replaced with an invented nominal reading.
++
++## Deterministic local example
++
++This example uses a synthetic provider and clock to demonstrate actual dispatch and withheld output. It does not load or qualify a medical model.
++
++```python
++from openmed.multimodal.capability_matrix import (
++    ModalityCapability, ModalityProfile, ProviderCapabilityEnvelope,
++)
++from openmed.multimodal.runtime.thermal_gate import (
++    EdgeBudget, GateReason, LocalMode, MemoryPressure,
++    PlatformObservation, ThermalGate, ThermalState, vlm_adapter_digest,
++)
++from openmed.multimodal.vision.providers.base import (
++    ImageInput, LocalProviderMetadata, Prompt, RuntimeBackend,
++    RuntimeMetadata, VLMRequest, VLMResult,
++)
++
++now = [10.0]
++thermal = [ThermalState.NOMINAL]
++
++
++class SyntheticProvider:
++    metadata = LocalProviderMetadata(
++        backend=RuntimeBackend.SYNTHETIC,
++        model_digest="a" * 64, preprocessing_digest="b" * 64,
++    )
++
++    def infer(self, request):
++        now[0] += 0.02
++        return VLMResult(
++            request_digest=request.digest,
++            runtime=RuntimeMetadata(
++                provider=self.metadata, duration_ms=20, output_tokens=1,
++            ),
++            text="Synthetic non-diagnostic draft",
++        )
++
++
++provider = SyntheticProvider()
++mode = LocalMode(
++    adapter_digest=vlm_adapter_digest(provider.metadata),
++    qualification_digest="c" * 64,
++    capabilities=ProviderCapabilityEnvelope(
++        provider_id="synthetic", capability_version="1.0.0",
++        capabilities=(ModalityCapability("image"),),
++    ),
++    required_available_bytes=1024,
++)
++gate = ThermalGate(
++    ModalityProfile("synthetic-task", "image"), (mode,),
++    EdgeBudget(max_latency_ms=100, max_queue_ms=50, max_output_age_ms=140),
++    lambda: PlatformObservation(
++        observed_at=now[0], thermal=thermal[0],
++        memory_pressure=MemoryPressure.NORMAL, available_bytes=4096,
++    ),
++    clock=lambda: now[0],
++)
++request = VLMRequest(
++    image=ImageInput(data=b"synthetic", media_type="image/png", width=1, height=1),
++    prompt=Prompt(text="Describe this synthetic image"),
++)
++first = gate.run_vlm((provider,), request, queued_at=now[0])
++assert first.reason is GateReason.READY and first.value is not None
++thermal[0] = ThermalState.CRITICAL
++held = gate.run_vlm((provider,), request, queued_at=now[0])
++assert held.reason is GateReason.RESOURCES and held.value is None
++assert "Synthetic non-diagnostic draft" not in gate.to_json()
++gate.close()
++```
++
++## Deadlines, degradation and recovery
++
++Each gate is one task session. Serialize calls and preserve the same instance across sustained work. `max_queue_ms` rejects work before dispatch; `max_output_age_ms` includes queueing, execution and the post-execution sensor check. `max_latency_ms` caps individual calls and the nearest-rank rolling p95 in a bounded per-mode window. Measurements use the controller's clock, including failed calls. A sensor outage does not erase a measured slow call. Clock failure or regression closes admission permanently.
++
++Modes are ordered from preferred to explicitly qualified fallback. Admission skips modes that cannot meet the observed resource constraints. Slow or failed execution withholds its result and advances the floor for later inputs; it never retries the same input automatically. Every switch preserves previous measurements. Once the last mode fails, the session abstains. Stale queue entries cannot be rescued by choosing another model.
++
++There is deliberately no automatic upgrade. A host may resume a transient resource hold with fresh measurements, but the floor never moves backward. Recovery to a previously rejected mode requires host requalification and an explicit new session. Do not recreate gates for every input or erase their history to manufacture a pass. Hosts also manage model residency: merely selecting a smaller adapter does not unload the larger model or reclaim its memory.
++
++The controller is cooperative. It can withhold a result after a native call returns; it cannot interrupt a hung call or guarantee hard real-time limits. Adapters must independently bound native execution, allocation and cancellation. The operation ceiling bounds session accounting, and each mode's history has a fixed maximum size.
++
++## Preserve speech privacy across runtime holds
++
++`release_speech(buffer, queued_at=oldest_pending_enqueue_time)` wraps the existing `WithholdingBuffer.release_ready()` call, including its local PHI screening. Configure one audio mode whose `adapter_digest` equals `buffer.screen_artifact_digest`. The existing screener still checks its live declaration against that pinned identity.
++
++The wrapper keeps the original revisions, redaction mappings, trailing-context rules and insertion deadlines. It never finalizes provisional text or interprets runtime clearance as privacy clearance: a `READY` outcome may contain an empty tuple while PHI or context remains unresolved. A thermal, age, provider or budget hold closes the buffer and discards remaining text; an overheated or late screening result is not returned. Do not replay discarded text into a fresh buffer automatically.
++
++This method gates screening and release; it does not control microphone capture or ASR inference. Call `buffer.tick()` while idle, close the buffer on cancellation, and let its original privacy deadline continue to run. Native streaming-ASR adapters must integrate admission at their own bounded execution boundary.
++
++## Evidence and limits
++
++`ThermalOutcome.value` contains protected output only on runtime clearance and is excluded from `repr`. `report_json` and `gate.to_json()` contain only controlled reason codes, counts, mode indices and aggregate p95 measurements. They contain no image bytes, speech text, prompts, patient identifiers, request digests, model names or filesystem paths. Do not serialize the protected value into logs or telemetry.
++
++Tests use synthetic providers, injected clocks and local sensor observations, including mid-call overheating, delayed results, exhausted fallback ladders, sensor outages, immutable provider pins and PHI screening. They establish controller behavior, not hardware performance, sensor accuracy, clinical safety or OCR/ASR/model quality.
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 607b848e76..92226901bb 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -424,6 +424,7 @@ nav:
+       - Local Multimodal Runtime Sessions: multimodal/runtime-session.md
+       - Offline Edge-VLM Provider Contract: multimodal/vision/edge-vlm-provider-contract.md
+       - Provider Capability Compatibility Matrix: multimodal/provider-capability-matrix.md
++      - Sustained Thermal and Latency Gates: multimodal/thermal-latency-gates.md
+       - Provider Capability Matrix Schema: multimodal/provider-capability-schema.md
+       - Whole-slide Tile Planning: multimodal/vision/whole-slide-tiling.md
+       - Whole-slide Aggregation Provenance: multimodal/vision/whole-slide-provenance.md
+diff --git a/openmed/multimodal/runtime/thermal_gate.py b/openmed/multimodal/runtime/thermal_gate.py
+new file mode 100644
+index 0000000000..1849960527
+--- /dev/null
++++ b/openmed/multimodal/runtime/thermal_gate.py
+@@ -0,0 +1,509 @@
++"""Gate local execution and actual output release on sustained edge budgets.
++
++This cooperative controller never loads a model or samples a platform sensor.
++Hosts provide fresh observations in the same monotonic clock domain and already
++qualified local modes. A declaration is not a sandbox or a clinical certificate.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++import re
++import time
++from collections import deque
++from collections.abc import Callable
++from dataclasses import dataclass, field
++from enum import IntEnum, StrEnum
++from typing import Generic, TypeVar, cast
++
++from openmed.multimodal.capability_matrix import (
++    ModalityProfile,
++    ProviderCapabilityEnvelope,
++    capability_matrix,
++)
++from openmed.multimodal.streaming.privacy.withholding_buffer import (
++    BufferState,
++    ReleasedSpeechSegment,
++    WithholdingBuffer,
++)
++from openmed.multimodal.vision.providers.base import (
++    EdgeVLMProvider,
++    LocalProviderMetadata,
++    VLMRequest,
++    VLMResult,
++    run_local_vlm,
++)
++
++T = TypeVar("T")
++_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
++
++
++class ThermalGateError(ValueError):
++    """Value-free invalid configuration or operation."""
++
++
++def _require(valid: bool) -> None:
++    if not valid:
++        raise ThermalGateError("invalid thermal gate contract")
++
++
++def _number(value: object, maximum: float, *, positive: bool = False) -> None:
++    _require(type(value) in (int, float))
++    number = cast("int | float", value)
++    _require(0 < number <= maximum if positive else 0 <= number <= maximum)
++    _require(math.isfinite(number))
++
++
++def _integer(value: object, minimum: int, maximum: int) -> None:
++    _require(type(value) is int and minimum <= value <= maximum)
++
++
++def _digest(value: object) -> None:
++    _require(type(value) is str and _DIGEST.fullmatch(value) is not None)
++
++
++class ThermalState(IntEnum):
++    """Host-normalized platform state; absent observations never mean normal."""
++
++    NOMINAL = 0
++    FAIR = 1
++    SERIOUS = 2
++    CRITICAL = 3
++
++
++class MemoryPressure(IntEnum):
++    """Host-normalized memory pressure, independent of available bytes."""
++
++    NORMAL = 0
++    WARNING = 1
++    CRITICAL = 2
++
++
++class GateReason(StrEnum):
++    """Closed vocabulary suitable for aggregate diagnostics."""
++
++    READY = "ready"
++    QUEUE_EXPIRED = "queue_expired"
++    OUTPUT_EXPIRED = "output_expired"
++    LATENCY = "latency"
++    RESOURCES = "resources"
++    OBSERVATION = "observation_unavailable"
++    CLOCK = "clock_invalid"
++    PROVIDER = "provider_rejected"
++    CLOSED = "closed"
++    LIMIT = "operation_limit"
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class PlatformObservation:
++    """Fresh host measurements without device names or raw workload identifiers.
++
++    Args:
++        observed_at: Monotonic seconds in the controller's clock domain.
++        thermal: Platform thermal state, or None when unsupported/unavailable.
++        memory_pressure: Platform pressure, or None when unavailable.
++        available_bytes: Conservative allocation headroom, or None if unknown.
++    """
++
++    observed_at: float
++    thermal: ThermalState | None
++    memory_pressure: MemoryPressure | None
++    available_bytes: int | None
++
++    def __post_init__(self) -> None:
++        _number(self.observed_at, 1e12)
++        _require(self.thermal is None or type(self.thermal) is ThermalState)
++        _require(
++            self.memory_pressure is None or type(self.memory_pressure) is MemoryPressure
++        )
++        if self.available_bytes is not None:
++            _integer(self.available_bytes, 0, 1 << 60)
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class EdgeBudget:
++    """Per-task deadlines and bounded history; all durations use milliseconds.
++
++    Args:
++        max_latency_ms: Maximum single execution and rolling p95 latency.
++        max_queue_ms: Maximum age before starting work.
++        max_output_age_ms: Maximum total age at return, including queue time.
++        max_observation_age_ms: Maximum platform measurement age at each check.
++        window: Number of measured executions retained per mode.
++        max_operations: Lifetime ceiling; create another explicitly qualified session.
++    """
++
++    max_latency_ms: float
++    max_queue_ms: float
++    max_output_age_ms: float
++    max_observation_age_ms: float = 500
++    window: int = 20
++    max_operations: int = 100_000
++
++    def __post_init__(self) -> None:
++        for value in (
++            self.max_latency_ms,
++            self.max_queue_ms,
++            self.max_output_age_ms,
++            self.max_observation_age_ms,
++        ):
++            _number(value, 3_600_000, positive=True)
++        _require(self.max_output_age_ms >= self.max_latency_ms)
++        _integer(self.window, 1, 1024)
++        _integer(self.max_operations, 1, 1_000_000)
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class LocalMode:
++    """One host-qualified mode in preferred-to-degraded order.
++
++    Args:
++        adapter_digest: Exact VLM metadata digest, or speech-screen artifact digest.
++        qualification_digest: Host evidence for this task/mode/device; not proof.
++        capabilities: Exact supported feature declarations, not transformations.
++        required_available_bytes: Conservative extra peak allocation requirement.
++        max_thermal: Highest qualified state; CRITICAL is never admitted.
++        max_memory_pressure: Highest qualified pressure; CRITICAL never admitted.
++
++    No policy assumes smaller models are cheaper or clinically interchangeable.
++    The host must establish those properties before declaring a fallback.
++    """
++
++    adapter_digest: str
++    qualification_digest: str
++    capabilities: ProviderCapabilityEnvelope = field(repr=False)
++    required_available_bytes: int
++    max_thermal: ThermalState = ThermalState.NOMINAL
++    max_memory_pressure: MemoryPressure = MemoryPressure.NORMAL
++
++    def __post_init__(self) -> None:
++        _digest(self.adapter_digest)
++        _digest(self.qualification_digest)
++        _require(type(self.capabilities) is ProviderCapabilityEnvelope)
++        _integer(self.required_available_bytes, 1, 1 << 60)
++        _require(type(self.max_thermal) is ThermalState)
++        _require(self.max_thermal < ThermalState.CRITICAL)
++        _require(type(self.max_memory_pressure) is MemoryPressure)
++        _require(self.max_memory_pressure < MemoryPressure.CRITICAL)
++
++
++def vlm_adapter_digest(metadata: LocalProviderMetadata) -> str:
++    """Bind a VLM mode to its existing local model and preprocessing declaration."""
++    _require(type(metadata) is LocalProviderMetadata)
++    metadata.__post_init__()
++    return hashlib.sha256(
++        json.dumps(
++            [
++                metadata.backend.value,
++                metadata.model_digest,
++                metadata.preprocessing_digest,
++            ],
++            separators=(",", ":"),
++        ).encode()
++    ).hexdigest()
++
++
++@dataclass(frozen=True, slots=True)
++class ThermalOutcome(Generic[T]):
++    """Protected result or abstention; only the aggregate report is exportable.
++
++    Args:
++        value: Actual result, absent whenever the execution or release was held.
++        reason: Controlled reason, never provider exception text.
++        mode_index: Selected declared mode index, if any.
++        report_json: Aggregate controller snapshot with no request IDs or values.
++    """
++
++    value: T | None = field(repr=False)
++    reason: GateReason
++    mode_index: int | None
++    report_json: str
++
++
++class ThermalGate:
++    """Serialize local calls with preflight and post-execution resource checks.
++
++    Args:
++        profile: Validated task requirements shared by every fallback mode.
++        modes: Explicit local ladder; every entry must exactly support the task.
++        budget: Per-task latency, age and history ceilings.
++        observe: Host-owned local sensor callback; no sensors are guessed.
++        clock: Monotonic seconds, injectable for deterministic offline replay.
++
++    Modes only degrade during a session. History survives every switch. A failed
++    or slow call is never retried with the same protected input automatically.
++    There is no background worker, model unload, remote fallback or preemption:
++    adapters must independently bound native execution and enforce cancellation.
++    """
++
++    def __init__(
++        self,
++        profile: ModalityProfile,
++        modes: tuple[LocalMode, ...],
++        budget: EdgeBudget,
++        observe: Callable[[], PlatformObservation],
++        *,
++        clock: Callable[[], float] = time.monotonic,
++    ) -> None:
++        _require(type(profile) is ModalityProfile)
++        _require(type(modes) is tuple and 0 < len(modes) <= 16)
++        _require(type(budget) is EdgeBudget and callable(observe) and callable(clock))
++        budget.__post_init__()
++        for mode in modes:
++            _require(type(mode) is LocalMode)
++            mode.__post_init__()
++            _require(
++                capability_matrix((mode.capabilities,), (profile,))[0].outcome
++                == "exact"
++            )
++        _require(len({mode.adapter_digest for mode in modes}) == len(modes))
++        self._profile, self._modes, self._budget = profile, modes, budget
++        self._observe, self._clock = observe, clock
++        self._last_clock: float | None = None
++        self._last_observation: float | None = None
++        self._history: list[deque[float]] = [deque(maxlen=budget.window) for _ in modes]
++        self._floor = self._operations = self._released = self._held = (
++            self._switches
++        ) = 0
++        self._last_reason = GateReason.READY
++        self._closed = self._busy = False
++
++    def _time(self) -> float | None:
++        value = None
++        try:
++            current = self._clock()
++            _number(current, 1e12)
++            _require(self._last_clock is None or current >= self._last_clock)
++            value = float(current)
++        except Exception:
++            pass
++        if value is None:
++            self._closed = True
++            self._last_reason = GateReason.CLOCK
++        else:
++            self._last_clock = value
++        return value
++
++    def _snapshot(self) -> tuple[float, PlatformObservation] | None:
++        observation = None
++        try:
++            candidate = self._observe()
++            _require(type(candidate) is PlatformObservation)
++            candidate.__post_init__()
++            observation = candidate
++        except Exception:
++            pass
++        now = self._time()
++        if now is None:
++            return None
++        if (
++            observation is None
++            or observation.thermal is None
++            or observation.memory_pressure is None
++            or observation.available_bytes is None
++            or not 0
++            <= (now - observation.observed_at) * 1000
++            <= self._budget.max_observation_age_ms
++            or (
++                self._last_observation is not None
++                and observation.observed_at < self._last_observation
++            )
++        ):
++            self._last_reason = GateReason.OBSERVATION
++            return None
++        self._last_observation = observation.observed_at
++        return now, observation
++
++    def _fits(self, index: int, observation: PlatformObservation) -> bool:
++        mode = self._modes[index]
++        return (
++            observation.thermal is not None
++            and observation.thermal <= mode.max_thermal
++            and observation.memory_pressure is not None
++            and observation.memory_pressure <= mode.max_memory_pressure
++            and observation.available_bytes is not None
++            and observation.available_bytes >= mode.required_available_bytes
++        )
++
++    def _p95(self, index: int) -> float:
++        history = sorted(self._history[index])
++        return history[math.ceil(len(history) * 0.95) - 1] if history else 0.0
++
++    def _advance(self, index: int) -> None:
++        if index > self._floor:
++            self._switches += 1
++            self._floor = index
++
++    def _outcome(
++        self, value: T | None, reason: GateReason, index: int | None
++    ) -> ThermalOutcome[T]:
++        self._last_reason = reason
++        if reason is GateReason.READY:
++            self._released += 1
++        else:
++            self._held += 1
++        return ThermalOutcome(value, reason, index, self.to_json())
++
++    def _execute(
++        self, operation: Callable[[int], T], queued_at: float
++    ) -> ThermalOutcome[T]:
++        _require(not self._busy)
++        _number(queued_at, 1e12)
++        if self._closed:
++            return self._outcome(None, GateReason.CLOSED, None)
++        if self._operations >= self._budget.max_operations:
++            self._closed = True
++            return self._outcome(None, GateReason.LIMIT, None)
++        self._operations += 1
++        self._busy = True
++        try:
++            snapshot = self._snapshot()
++            if snapshot is None:
++                return self._outcome(None, self._last_reason, None)
++            start, observation = snapshot
++            age = (start - queued_at) * 1000
++            if (
++                not 0
++                <= age
++                <= min(self._budget.max_queue_ms, self._budget.max_output_age_ms)
++            ):
++                return self._outcome(None, GateReason.QUEUE_EXPIRED, None)
++            index = next(
++                (
++                    i
++                    for i in range(self._floor, len(self._modes))
++                    if self._fits(i, observation)
++                    and self._p95(i) <= self._budget.max_latency_ms
++                ),
++                None,
++            )
++            if index is None:
++                return self._outcome(None, GateReason.RESOURCES, None)
++            self._advance(index)
++            result = None
++            failed = False
++            try:
++                result = operation(index)
++            except Exception:
++                failed = True
++            after = self._snapshot()
++            # A sensor outage must not erase a measured slow or broken call.
++            # Clock failure is terminal; otherwise _snapshot records its time
++            # even when the platform observation itself cannot be admitted.
++            end = self._last_clock
++            duration = 0.0 if end is None else (end - start) * 1000
++            if self._last_reason is not GateReason.CLOCK:
++                self._history[index].append(duration)
++                if failed or duration > self._budget.max_latency_ms:
++                    self._advance(index + 1)
++            if after is None:
++                return self._outcome(None, self._last_reason, index)
++            end, observation = after
++            if failed:
++                # Do not repeatedly call a broken adapter or retry patient input.
++                self._advance(index + 1)
++                return self._outcome(None, GateReason.PROVIDER, index)
++            if (end - queued_at) * 1000 > self._budget.max_output_age_ms:
++                if duration > self._budget.max_latency_ms:
++                    self._advance(index + 1)
++                return self._outcome(None, GateReason.OUTPUT_EXPIRED, index)
++            if (
++                duration > self._budget.max_latency_ms
++                or self._p95(index) > self._budget.max_latency_ms
++            ):
++                self._advance(index + 1)
++                return self._outcome(None, GateReason.LATENCY, index)
++            if not self._fits(index, observation):
++                return self._outcome(None, GateReason.RESOURCES, index)
++            return self._outcome(result, GateReason.READY, index)
++        finally:
++            self._busy = False
++
++    def run_vlm(
++        self,
++        providers: tuple[EdgeVLMProvider, ...],
++        request: VLMRequest,
++        *,
++        queued_at: float,
++    ) -> ThermalOutcome[VLMResult]:
++        """Dispatch the selected pinned VLM and withhold late or unsafe results.
++
++        Args:
++            providers: Already-loaded local adapters in exactly the declared order.
++            request: Original protected request; no implicit resize or prompt edit.
++            queued_at: Host-recorded enqueue time in the gate's monotonic domain.
++        """
++        _require(self._profile.modality == "image")
++        _require(type(providers) is tuple and len(providers) == len(self._modes))
++        _require(type(request) is VLMRequest)
++
++        def run(index: int) -> VLMResult:
++            provider = providers[index]
++            digest = self._modes[index].adapter_digest
++            _require(vlm_adapter_digest(provider.metadata) == digest)
++            result = run_local_vlm(provider, request)
++            _require(vlm_adapter_digest(provider.metadata) == digest)
++            return result
++
++        return self._execute(run, queued_at)
++
++    def release_speech(
++        self, buffer: WithholdingBuffer, *, queued_at: float
++    ) -> ThermalOutcome[tuple[ReleasedSpeechSegment, ...]]:
++        """Gate the actual PHI-screened release and discard pending text on hold.
++
++        Args:
++            buffer: Existing privacy buffer with its original lineage and deadlines.
++            queued_at: Oldest pending input's monotonic enqueue time.
++
++        Use one audio mode bound to the buffer's screen artifact. A live speech
++        buffer cannot be switched to another detector or replayed across modes.
++        This controls screening/release, not microphone capture or ASR execution.
++        """
++        _require(self._profile.modality == "audio" and len(self._modes) == 1)
++        _require(type(buffer) is WithholdingBuffer)
++
++        def release(index: int) -> tuple[ReleasedSpeechSegment, ...]:
++            _require(buffer.screen_artifact_digest == self._modes[index].adapter_digest)
++            _require(buffer.tick() in (BufferState.OPEN, BufferState.ENDING))
++            result = buffer.release_ready()
++            _require(buffer.state is not BufferState.ABSTAINED)
++            return result
++
++        outcome = self._execute(release, queued_at)
++        if outcome.reason is not GateReason.READY:
++            buffer.close()
++        return outcome
++
++    def close(self) -> None:
++        """Stop admission; caller-owned providers and previously returned values remain owned by the host."""
++        _require(not self._busy)
++        self._closed = True
++
++    def to_json(self) -> str:
++        """Export aggregate performance counters only; never source/model identifiers."""
++        return json.dumps(
++            {
++                "schema_version": "openmed.thermal_gate.v1",
++                "closed": self._closed,
++                "reason": self._last_reason.value,
++                "operations": self._operations,
++                "released": self._released,
++                "held": self._held,
++                "mode_switches": self._switches,
++                "mode_floor": self._floor,
++                "modes": [
++                    {
++                        "mode_index": index,
++                        "samples": len(history),
++                        "p95_ms": self._p95(index),
++                    }
++                    for index, history in enumerate(self._history)
++                ],
++            },
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        )
+diff --git a/openmed/multimodal/streaming/privacy/withholding_buffer.py b/openmed/multimodal/streaming/privacy/withholding_buffer.py
+index 7efd736cb5..17d3efb033 100644
+--- a/openmed/multimodal/streaming/privacy/withholding_buffer.py
++++ b/openmed/multimodal/streaming/privacy/withholding_buffer.py
+@@ -305,6 +305,11 @@ def state(self) -> BufferState:
+         """Current lifecycle state; failures discard all pending protected text."""
+         return self._state
+ 
++    @property
++    def screen_artifact_digest(self) -> str:
++        """Return the pinned local screen identity for external runtime admission."""
++        return self._declaration.artifact_digest
++
+     @property
+     def reason(self) -> HoldReason | None:
+         """Controlled current hold or terminal failure reason."""
+diff --git a/scripts/security/effect_paths.json b/scripts/security/effect_paths.json
+index 4de6b70524..8fe88ef6b4 100644
+--- a/scripts/security/effect_paths.json
++++ b/scripts/security/effect_paths.json
+@@ -365,6 +365,16 @@
+       "function": "StreamingTesseractEngine.recognize",
+       "module": "openmed.multimodal.ocr_tesseract_stream"
+     },
++    {
++      "classification": "operational",
++      "function": "ThermalGate.release_speech",
++      "module": "openmed.multimodal.runtime.thermal_gate"
++    },
++    {
++      "classification": "operational",
++      "function": "ThermalGate.run_vlm",
++      "module": "openmed.multimodal.runtime.thermal_gate"
++    },
+     {
+       "classification": "operational",
+       "function": "MultimodalSession._run",
+diff --git a/tests/unit/multimodal/runtime/test_thermal_gate.py b/tests/unit/multimodal/runtime/test_thermal_gate.py
+new file mode 100644
+index 0000000000..98ab7df561
+--- /dev/null
++++ b/tests/unit/multimodal/runtime/test_thermal_gate.py
+@@ -0,0 +1,501 @@
++"""Offline replay of sustained resource failures and protected output withholding."""
++
++import json
++import socket
++from dataclasses import replace
++
++import pytest
++
++from openmed.multimodal.capability_matrix import (
++    ModalityCapability,
++    ModalityProfile,
++    ProviderCapabilityEnvelope,
++)
++from openmed.multimodal.runtime.thermal_gate import (
++    EdgeBudget,
++    GateReason,
++    LocalMode,
++    MemoryPressure,
++    PlatformObservation,
++    ThermalGate,
++    ThermalGateError,
++    ThermalState,
++    vlm_adapter_digest,
++)
++from openmed.multimodal.streaming.privacy.withholding_buffer import (
++    BufferState,
++    PhiRedactionSpan,
++    PhiResolution,
++    PhiScreenDeclaration,
++    PhiScreenResult,
++    SegmentPhiDecision,
++    WithholdingBuffer,
++    WithholdingPolicy,
++)
++from openmed.multimodal.vision.providers.base import (
++    ImageInput,
++    LocalProviderMetadata,
++    Prompt,
++    RuntimeBackend,
++    RuntimeMetadata,
++    VLMRequest,
++    VLMResult,
++)
++
++PRIVATE = "SYNTHETIC-PATIENT-1234"
++
++
++class Clock:
++    def __init__(self):
++        self.now = 10.0
++
++    def __call__(self):
++        return self.now
++
++    def advance(self, milliseconds):
++        self.now += milliseconds / 1000
++
++
++class Sensors:
++    def __init__(self, clock):
++        self.clock = clock
++        self.thermal = ThermalState.NOMINAL
++        self.pressure = MemoryPressure.NORMAL
++        self.available = 1000
++        self.delay_ms = 0
++        self.calls = 0
++
++    def __call__(self):
++        self.calls += 1
++        return PlatformObservation(
++            observed_at=self.clock() - self.delay_ms / 1000,
++            thermal=self.thermal,
++            memory_pressure=self.pressure,
++            available_bytes=self.available,
++        )
++
++
++class Provider:
++    def __init__(self, clock, digit, delay=20):
++        self.clock = clock
++        self.metadata = LocalProviderMetadata(
++            backend=RuntimeBackend.SYNTHETIC,
++            model_digest=digit * 64,
++            preprocessing_digest="f" * 64,
++        )
++        self.calls = 0
++        self.delay = delay
++        self.effect = lambda: None
++
++    def infer(self, request):
++        self.calls += 1
++        self.clock.advance(self.delay)
++        self.effect()
++        return VLMResult(
++            request_digest=request.digest,
++            runtime=RuntimeMetadata(
++                provider=self.metadata, duration_ms=0, output_tokens=1
++            ),
++            text=PRIVATE,
++        )
++
++
++def capability(modality="image", **kwargs):
++    return ProviderCapabilityEnvelope(
++        provider_id="local",
++        capability_version="1.0.0",
++        capabilities=(ModalityCapability(modality, **kwargs),),
++    )
++
++
++def make_gate(*, budget=None, modes=None, profile=None):
++    clock = Clock()
++    sensors = Sensors(clock)
++    providers = (Provider(clock, "a"), Provider(clock, "b"))
++    default = tuple(
++        LocalMode(
++            adapter_digest=vlm_adapter_digest(p.metadata),
++            qualification_digest="c" * 64,
++            capabilities=capability(),
++            required_available_bytes=size,
++            max_thermal=thermal,
++            max_memory_pressure=pressure,
++        )
++        for p, size, thermal, pressure in (
++            (providers[0], 800, ThermalState.NOMINAL, MemoryPressure.NORMAL),
++            (providers[1], 200, ThermalState.SERIOUS, MemoryPressure.WARNING),
++        )
++    )
++    gate = ThermalGate(
++        profile or ModalityProfile("task", "image"),
++        modes or default,
++        budget
++        or EdgeBudget(max_latency_ms=100, max_queue_ms=50, max_output_age_ms=140),
++        sensors,
++        clock=clock,
++    )
++    return gate, clock, sensors, providers
++
++
++def request():
++    return VLMRequest(
++        image=ImageInput(
++            data=b"synthetic-image", media_type="image/png", width=1, height=1
++        ),
++        prompt=Prompt(text=PRIVATE),
++    )
++
++
++def run(gate, clock, providers, *, queued_at=None):
++    return gate.run_vlm(
++        providers, request(), queued_at=clock() if queued_at is None else queued_at
++    )
++
++
++def test_real_provider_dispatch_and_aggregate_report_do_not_expose_payloads():
++    gate, clock, _, providers = make_gate()
++    result = run(gate, clock, providers)
++    assert result.reason is GateReason.READY and result.value.text == PRIVATE
++    assert result.value.request_digest == request().digest
++    assert [p.calls for p in providers] == [1, 0]
++    assert PRIVATE not in repr(result) + result.report_json
++    assert (
++        "model_digest" not in result.report_json
++        and "request_digest" not in result.report_json
++    )
++    assert json.loads(result.report_json)["modes"][0]["p95_ms"] == pytest.approx(20)
++
++
++@pytest.mark.parametrize("change", ["thermal", "memory", "pressure"])
++def test_only_explicit_qualified_modes_receive_original_input(change):
++    gate, clock, sensors, providers = make_gate()
++    if change == "thermal":
++        sensors.thermal = ThermalState.SERIOUS
++    elif change == "memory":
++        sensors.available = 400
++    else:
++        sensors.pressure = MemoryPressure.WARNING
++    outcome = run(gate, clock, providers)
++    assert outcome.reason is GateReason.READY and outcome.mode_index == 1
++    assert [p.calls for p in providers] == [0, 1]
++    sensors.thermal, sensors.available, sensors.pressure = (
++        ThermalState.NOMINAL,
++        1000,
++        MemoryPressure.NORMAL,
++    )
++    assert (
++        run(gate, clock, providers).mode_index == 1
++    )  # No oscillating automatic upgrade.
++
++
++@pytest.mark.parametrize(
++    "attribute,value",
++    [
++        ("thermal", None),
++        ("pressure", None),
++        ("available", None),
++        ("thermal", ThermalState.CRITICAL),
++        ("pressure", MemoryPressure.CRITICAL),
++        ("available", 1),
++        ("delay_ms", 501),
++        ("delay_ms", -1),
++    ],
++)
++def test_unknown_stale_future_or_critical_observations_never_execute(attribute, value):
++    gate, clock, sensors, providers = make_gate()
++    setattr(sensors, attribute, value)
++    result = run(gate, clock, providers)
++    assert result.value is None and result.reason is not GateReason.READY
++    assert sum(p.calls for p in providers) == 0
++
++
++def test_observation_replay_is_rejected_even_inside_freshness_window():
++    gate, clock, sensors, providers = make_gate()
++    assert run(gate, clock, providers).value is not None
++    sensors.delay_ms = 1
++    assert run(gate, clock, providers).reason is GateReason.OBSERVATION
++    assert providers[0].calls == 1
++
++
++@pytest.mark.parametrize("age_ms", [51, -1])
++def test_queue_age_withholds_without_trying_faster_modes(age_ms):
++    gate, clock, _, providers = make_gate()
++    outcome = run(gate, clock, providers, queued_at=clock() - age_ms / 1000)
++    assert outcome.reason is GateReason.QUEUE_EXPIRED
++    assert sum(p.calls for p in providers) == 0
++
++
++def test_slow_execution_is_measured_independently_of_provider_and_never_retried():
++    gate, clock, _, providers = make_gate()
++    providers[0].delay = 110
++    result = run(gate, clock, providers)
++    assert result.value is None and result.reason is GateReason.LATENCY
++    assert providers[1].calls == 0
++    result = run(gate, clock, providers)
++    assert result.reason is GateReason.READY and result.mode_index == 1
++    report = json.loads(result.report_json)
++    assert report["modes"][0]["p95_ms"] == pytest.approx(110)
++    assert report["mode_switches"] == 1
++
++
++def test_queue_plus_execution_age_withholds_result_even_if_single_latency_passes():
++    gate, clock, _, providers = make_gate()
++    providers[0].delay = 95
++    result = run(gate, clock, providers, queued_at=clock() - 0.049)
++    assert result.value is None and result.reason is GateReason.OUTPUT_EXPIRED
++
++
++@pytest.mark.parametrize(
++    "attribute,value",
++    [
++        ("thermal", ThermalState.CRITICAL),
++        ("available", 0),
++        ("pressure", MemoryPressure.CRITICAL),
++        ("thermal", None),
++        ("delay_ms", 501),
++    ],
++)
++def test_resources_are_checked_again_after_actual_inference(attribute, value):
++    gate, clock, sensors, providers = make_gate()
++    providers[0].effect = lambda: setattr(sensors, attribute, value)
++    result = run(gate, clock, providers)
++    assert result.value is None and result.reason is not GateReason.READY
++    assert providers[0].calls == 1 and providers[1].calls == 0
++
++
++def test_regressing_clock_is_terminal_and_never_releases_a_result():
++    gate, clock, _, providers = make_gate()
++    providers[0].effect = lambda: clock.advance(-100)
++    result = run(gate, clock, providers)
++    assert result.value is None and result.reason is GateReason.CLOCK
++    clock.advance(500)
++    assert run(gate, clock, providers).reason is GateReason.CLOSED
++
++
++def test_sensor_and_provider_errors_are_content_free_and_no_context_escapes():
++    gate, clock, _, providers = make_gate()
++
++    def fail():
++        raise RuntimeError(PRIVATE)
++
++    providers[0].effect = fail
++    outcome = run(gate, clock, providers)
++    assert outcome.reason is GateReason.PROVIDER and PRIVATE not in repr(outcome)
++    assert run(gate, clock, providers).mode_index == 1
++    gate._observe = fail
++    outcome = run(gate, clock, providers)
++    assert outcome.reason is GateReason.OBSERVATION and PRIVATE not in repr(outcome)
++
++
++@pytest.mark.parametrize("when", ["before", "during"])
++def test_changed_provider_pin_withholds(when):
++    gate, clock, _, providers = make_gate()
++
++    def mutate():
++        providers[0].metadata = replace(providers[0].metadata, model_digest="d" * 64)
++
++    if when == "before":
++        mutate()
++    else:
++        providers[0].effect = mutate
++    assert run(gate, clock, providers).reason is GateReason.PROVIDER
++    assert providers[0].calls == (when == "during")
++
++
++def test_bounded_rolling_history_and_operation_limit():
++    budget = EdgeBudget(
++        max_latency_ms=100,
++        max_queue_ms=50,
++        max_output_age_ms=140,
++        window=3,
++        max_operations=5,
++    )
++    gate, clock, _, providers = make_gate(budget=budget)
++    for duration in (90, 80, 10, 20, 30):
++        providers[0].delay = duration
++        assert run(gate, clock, providers).reason is GateReason.READY
++    report = json.loads(gate.to_json())
++    assert report["modes"][0]["samples"] == 3
++    assert report["modes"][0]["p95_ms"] == pytest.approx(30)
++    assert run(gate, clock, providers).reason is GateReason.LIMIT
++    assert providers[0].calls == 5
++
++
++def test_last_mode_slow_abstains_without_restarting_bad_history():
++    gate, clock, sensors, providers = make_gate()
++    sensors.available = 300
++    providers[1].delay = 150
++    assert run(gate, clock, providers).value is None
++    providers[1].delay = 1
++    assert run(gate, clock, providers).reason is GateReason.RESOURCES
++    assert providers[1].calls == 1
++
++
++def test_capabilities_needing_transformation_are_not_silently_admitted():
++    _, _, _, providers = make_gate()
++    mode = LocalMode(
++        adapter_digest=vlm_adapter_digest(providers[0].metadata),
++        qualification_digest="c" * 64,
++        capabilities=capability(transformable_features=("source-coordinates",)),
++        required_available_bytes=1,
++    )
++    with pytest.raises(ThermalGateError):
++        make_gate(
++            modes=(mode,),
++            profile=ModalityProfile("task", "image", ("source-coordinates",)),
++        )
++
++
++@pytest.mark.parametrize(
++    "value", [float("nan"), float("inf"), -1, True, PRIVATE, 10**1000]
++)
++def test_invalid_numeric_configuration_and_clock_are_not_echoed(value):
++    with pytest.raises(ThermalGateError) as error:
++        EdgeBudget(max_latency_ms=value, max_queue_ms=50, max_output_age_ms=140)
++    assert PRIVATE not in str(error.value)
++    gate, clock, _, providers = make_gate()
++    clock.now = value
++    # Enqueue time remains a valid host timestamp; malformed clock closes admission.
++    outcome = run(gate, clock, providers, queued_at=10)
++    assert outcome.value is None and outcome.reason is GateReason.CLOCK
++
++
++def test_reentrant_sensor_cannot_execute_nested_work():
++    gate, clock, sensors, providers = make_gate()
++
++    def observe():
++        run(gate, clock, providers)
++        return sensors()
++
++    gate._observe = observe
++    assert run(gate, clock, providers).reason is GateReason.OBSERVATION
++    assert sum(p.calls for p in providers) == 0
++
++
++class Screener:
++    declaration = PhiScreenDeclaration(artifact_digest="e" * 64)
++
++    def __init__(self, effect=lambda: None):
++        self.effect = effect
++        self.resolution = PhiResolution.RESOLVED
++
++    def screen(self, request):
++        self.effect()
++        return PhiScreenResult(
++            request_digest=request.request_digest,
++            decisions=tuple(
++                SegmentPhiDecision(
++                    segment_ref=s.segment_ref,
++                    revision=s.revision,
++                    resolution=self.resolution,
++                    redactions=(PhiRedactionSpan(0, len(s.text)),),
++                )
++                for s in request.segments
++            ),
++        )
++
++
++def speech_gate():
++    clock = Clock()
++    sensors = Sensors(clock)
++    screener = Screener()
++    buffer = WithholdingBuffer(
++        "0" * 32,
++        screener,
++        clock=clock,
++        policy=WithholdingPolicy(trailing_segments=0),
++    )
++    buffer.append("1" * 32, PRIVATE)
++    buffer.finalize("1" * 32, expected_revision=0)
++    mode = LocalMode(
++        adapter_digest=screener.declaration.artifact_digest,
++        qualification_digest="c" * 64,
++        capabilities=capability("audio"),
++        required_available_bytes=100,
++    )
++    gate = ThermalGate(
++        ModalityProfile("speech", "audio"),
++        (mode,),
++        EdgeBudget(max_latency_ms=100, max_queue_ms=50, max_output_age_ms=140),
++        sensors,
++        clock=clock,
++    )
++    return gate, clock, sensors, screener, buffer
++
++
++def test_speech_release_runs_existing_phi_screen_and_preserves_redaction_lineage():
++    gate, clock, _, _, buffer = speech_gate()
++    result = gate.release_speech(buffer, queued_at=clock())
++    assert result.reason is GateReason.READY
++    assert result.value[0].text == "[REDACTED]" and result.value[0].mappings[0].redacted
++    assert PRIVATE not in repr(result) + result.report_json
++    assert json.loads(result.value[0].lineage_json)["finalized"]
++
++
++def test_speech_output_and_pending_context_are_discarded_when_screening_overheats():
++    gate, clock, sensors, screener, buffer = speech_gate()
++    screener.effect = lambda: setattr(sensors, "thermal", ThermalState.CRITICAL)
++    result = gate.release_speech(buffer, queued_at=clock())
++    assert result.value is None and result.reason is GateReason.RESOURCES
++    assert buffer.state is BufferState.CLOSED
++    assert json.loads(buffer.to_json())["pending"] == []
++
++
++def test_thermal_hold_does_not_reset_original_speech_deadline_or_replay_text():
++    gate, clock, sensors, _, buffer = speech_gate()
++    sensors.thermal = ThermalState.CRITICAL
++    assert gate.release_speech(buffer, queued_at=clock()).value is None
++    sensors.thermal = ThermalState.NOMINAL
++    assert gate.release_speech(buffer, queued_at=clock()).value is None
++    assert buffer.state is BufferState.CLOSED
++
++
++def test_unresolved_phi_and_provisional_context_still_withhold():
++    gate, clock, _, screener, buffer = speech_gate()
++    screener.resolution = PhiResolution.CRITICAL_UNRESOLVED
++    result = gate.release_speech(buffer, queued_at=clock())
++    assert result.value == ()  # Runtime clearance never overrides privacy hold.
++    assert json.loads(buffer.to_json())["pending"]
++    assert PRIVATE not in result.report_json
++
++
++def test_stream_buffer_deadline_is_enforced_even_when_runtime_budget_allows_call():
++    gate, clock, _, _, buffer = speech_gate()
++    clock.advance(5001)
++    result = gate.release_speech(buffer, queued_at=clock())
++    assert result.value is None and buffer.state is BufferState.ABSTAINED
++
++
++def test_speech_slow_screen_has_no_released_value():
++    gate, clock, _, screener, buffer = speech_gate()
++    screener.effect = lambda: clock.advance(150)
++    assert gate.release_speech(buffer, queued_at=clock()).value is None
++    assert buffer.state is BufferState.CLOSED
++
++
++def test_offline_replay_is_deterministic(monkeypatch):
++    def forbidden(*args, **kwargs):
++        raise AssertionError("network forbidden")
++
++    monkeypatch.setattr(socket, "socket", forbidden)
++    reports = []
++    for _ in range(2):
++        gate, clock, sensors, providers = make_gate()
++        local = [run(gate, clock, providers).report_json]
++        sensors.available = 300
++        local.append(run(gate, clock, providers).report_json)
++        providers[1].delay = 150
++        local.append(run(gate, clock, providers).report_json)
++        reports.append(local)
++    assert reports[0] == reports[1]
++
++
++def test_sensor_outage_does_not_erase_slow_call_history_or_reuse_bad_mode():
++    gate, clock, sensors, providers = make_gate()
++    providers[0].delay = 110
++    providers[0].effect = lambda: setattr(sensors, "thermal", None)
++    assert run(gate, clock, providers).reason is GateReason.OBSERVATION
++    assert json.loads(gate.to_json())["modes"][0]["p95_ms"] == pytest.approx(110)
++    sensors.thermal = ThermalState.NOMINAL
++    assert run(gate, clock, providers).mode_index == 1
++    assert providers[0].calls == 1

@@ -1,0 +1,306 @@
+diff --git a/packages/cli/src/auth.test.ts b/packages/cli/src/auth.test.ts
+index 4e499d59056..ca18093f522 100644
+--- a/packages/cli/src/auth.test.ts
++++ b/packages/cli/src/auth.test.ts
+@@ -277,4 +277,94 @@ describe('CLI auth', () => {
+     await expect(main(['node', 'index.js', 'token'])).rejects.toThrow('Process exited with exit code 1');
+     expect(processError).toHaveBeenLastCalledWith(expect.stringContaining('Error: Not logged in'));
+   });
++
++  describe('Logout', () => {
++    const alice = {
++      accessToken: 'alice-access',
++      refreshToken: 'alice-refresh',
++      profile: { reference: 'Practitioner/124', display: 'Alice Smith' },
++      project: { reference: 'Project/456', display: 'My Project' },
++    };
++    const bob = {
++      accessToken: 'bob-access',
++      refreshToken: 'bob-refresh',
++      profile: { reference: 'Practitioner/789', display: 'Bob Jones' },
++      project: { reference: 'Project/456', display: 'My Project' },
++    };
++    let file: string;
++
++    beforeEach(() => {
++      file = JSON.stringify({
++        options: JSON.stringify({ baseUrl: 'https://example.com/' }),
++        activeLogin: JSON.stringify(alice),
++        logins: JSON.stringify([alice, bob]),
++      });
++      (fs.existsSync as unknown as Mock).mockReturnValue(true);
++      (fs.readFileSync as unknown as Mock).mockImplementation(() => file);
++      (fs.writeFileSync as unknown as Mock).mockImplementation((_path: string, data: string) => {
++        file = data;
++      });
++    });
++
++    function mockSignOutResponse(status: number): void {
++      vi.stubGlobal(
++        'fetch',
++        vi.fn(async () => new Response(null, { status }))
++      );
++      vi.spyOn(medplum, 'signOut').mockImplementation(async () => {
++        const options = (createMedplumClient as unknown as Mock).mock.calls[0][0];
++        await options.fetch('https://example.com/oauth2/token', {});
++        throw new Error(`HTTP ${status}`);
++      });
++    }
++
++    afterEach(() => {
++      vi.unstubAllGlobals();
++    });
++
++    test('Revokes every stored session and keeps profile settings', async () => {
++      const signOut = vi.spyOn(medplum, 'signOut');
++
++      await main(['node', 'index.js', 'logout']);
++
++      expect(signOut).toHaveBeenCalledTimes(2);
++      expect((console.log as unknown as Mock).mock.calls).toStrictEqual([
++        ['Revoked session: Alice Smith (Practitioner/124)'],
++        ['Revoked session: Bob Jones (Practitioner/789)'],
++        ['Logged out'],
++      ]);
++      expect(JSON.parse(file)).toStrictEqual({ options: JSON.stringify({ baseUrl: 'https://example.com/' }) });
++    });
++
++    test('Treats tokens rejected by the server as already invalid', async () => {
++      mockSignOutResponse(400);
++
++      await main(['node', 'index.js', 'logout']);
++
++      expect(console.log).toHaveBeenCalledWith('Session already invalid: Alice Smith (Practitioner/124)');
++      expect(console.log).toHaveBeenLastCalledWith('Logged out');
++      expect(JSON.parse(file).activeLogin).toBeUndefined();
++    });
++
++    test('Keeps stored tokens when the server is unavailable', async () => {
++      mockSignOutResponse(503);
++      const original = file;
++
++      await expect(main(['node', 'index.js', 'logout'])).rejects.toThrow('Process exited with exit code 1');
++
++      expect(processError).toHaveBeenLastCalledWith(
++        expect.stringContaining('Logout failed; stored credentials were kept')
++      );
++      expect(file).toBe(original);
++    });
++
++    test('Not logged in', async () => {
++      file = JSON.stringify({});
++
++      await main(['node', 'index.js', 'logout']);
++
++      expect(console.log).toHaveBeenCalledWith('Not logged in');
++      expect(createMedplumClient).not.toHaveBeenCalled();
++    });
++  });
+ });
+diff --git a/packages/cli/src/auth.ts b/packages/cli/src/auth.ts
+index 62c6a1b79ce..f52b5071d7d 100644
+--- a/packages/cli/src/auth.ts
++++ b/packages/cli/src/auth.ts
+@@ -1,11 +1,19 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+-import type { MedplumClient } from '@medplum/core';
+-import { ContentType, getDisplayString, MEDPLUM_CLI_CLIENT_ID, normalizeErrorString } from '@medplum/core';
++import type { LoginState, MedplumClient } from '@medplum/core';
++import {
++  ClientStorage,
++  ContentType,
++  getDisplayString,
++  MEDPLUM_CLI_CLIENT_ID,
++  MemoryStorage,
++  normalizeErrorString,
++} from '@medplum/core';
+ import { exec } from 'node:child_process';
+ import { createServer } from 'node:http';
+ import { platform } from 'node:os';
+ import { promisify } from 'node:util';
++import { FileSystemStorage } from './storage';
+ import { createMedplumClient } from './util/client';
+ import type { Profile } from './utils';
+ import { jwtAssertionLogin, jwtBearerLogin, MedplumCommand, saveProfile } from './utils';
+@@ -16,6 +24,7 @@ const clientId = MEDPLUM_CLI_CLIENT_ID;
+ const redirectUri = 'http://localhost:9615';
+ 
+ export const login = new MedplumCommand('login');
++export const logout = new MedplumCommand('logout');
+ export const whoami = new MedplumCommand('whoami');
+ export const token = new MedplumCommand('token');
+ 
+@@ -29,6 +38,63 @@ login.action(async (options) => {
+   await startLogin(medplum, profile);
+ });
+ 
++logout.action(async (options) => {
++  const storage = new FileSystemStorage(options.profile ?? 'default');
++  const logins = storage.getObject<LoginState[]>('logins') ?? [];
++  if (logins.length === 0) {
++    console.log('Not logged in');
++    return;
++  }
++
++  // Revoke through an in-memory client: MedplumClient clears its storage after signOut() and when a token is
++  // rejected, which would otherwise erase the saved profile settings along with the tokens.
++  // MedplumClient reports a rejected token and a 429, 5xx or network failure through the same errors,
++  // so watch the response status to tell them apart: only a 400 or 401 means the session is already invalid.
++  let rejected = false;
++  const fetchApi = options.fetch ?? fetch;
++  const medplum = await createMedplumClient(
++    {
++      ...options,
++      fetch: async (url: string, init?: RequestInit) => {
++        const response = await fetchApi(url, init);
++        if (response.status === 400 || response.status === 401) {
++          rejected = true;
++        }
++        return response;
++      },
++      storage: new ClientStorage(new MemoryStorage()),
++      onUnauthenticated: () => undefined,
++    },
++    false
++  );
++
++  const errors: Error[] = [];
++  for (const login of logins) {
++    const display = `${login.profile.display} (${login.profile.reference})`;
++    rejected = false;
++    try {
++      medplum.setAccessToken(login.accessToken, login.refreshToken);
++      await medplum.signOut();
++      console.log(`Revoked session: ${display}`);
++    } catch (err) {
++      if (rejected) {
++        console.log(`Session already invalid: ${display}`);
++      } else {
++        errors.push(new Error(`Failed to revoke session ${display}: ${normalizeErrorString(err)}`));
++      }
++    }
++  }
++
++  if (errors.length > 0) {
++    // Keep the stored tokens so the user can retry
++    throw new Error('Logout failed; stored credentials were kept', { cause: errors });
++  }
++
++  storage.setObject('activeLogin', undefined);
++  storage.setObject('logins', undefined);
++  console.log('Logged out');
++});
++
+ whoami.action(async (options) => {
+   const medplum = await createMedplumClient(options);
+   printMe(medplum);
+diff --git a/packages/cli/src/index.ts b/packages/cli/src/index.ts
+index 58eeffbf7b8..5490fc75f78 100644
+--- a/packages/cli/src/index.ts
++++ b/packages/cli/src/index.ts
+@@ -4,7 +4,7 @@ import { MEDPLUM_VERSION, normalizeErrorString } from '@medplum/core';
+ import { CommanderError, Option } from 'commander';
+ import { existsSync } from 'node:fs';
+ import { agent } from './agent';
+-import { login, token, whoami } from './auth';
++import { login, logout, token, whoami } from './auth';
+ import { buildAwsCommand } from './aws/index';
+ import { bot, createBotDeprecate, deployBotDeprecate, saveBotDeprecate } from './bots';
+ import { bulk } from './bulk';
+@@ -55,6 +55,7 @@ export async function main(argv: string[]): Promise<void> {
+ 
+   // Auth commands
+   addSubcommand(index, login);
++  addSubcommand(index, logout);
+   addSubcommand(index, whoami);
+   addSubcommand(index, token);
+ 
+diff --git a/packages/cli/src/util/client.test.ts b/packages/cli/src/util/client.test.ts
+index 991b831ce9e..7782a1d072e 100644
+--- a/packages/cli/src/util/client.test.ts
++++ b/packages/cli/src/util/client.test.ts
+@@ -1,7 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+ import type { MedplumClientOptions } from '@medplum/core';
+-import { MEDPLUM_VERSION } from '@medplum/core';
++import { ClientStorage, MEDPLUM_VERSION, MemoryStorage } from '@medplum/core';
+ import type * as NodeFs from 'node:fs';
+ import { mkdtempSync, rmSync } from 'node:fs';
+ import os from 'node:os';
+@@ -186,6 +186,26 @@ describe('createMedplumClient', () => {
+     expect(storage.getObject('activeLogin')).toEqual(activeLogin);
+   });
+ 
++  test('Custom storage keeps the stored active login', async () => {
++    const testProfile = 'customStorageProfile';
++    const storage = new FileSystemStorage(testProfile);
++    const activeLogin = {
++      accessToken: 'test-access-token',
++      profile: { reference: 'Practitioner/123' },
++      project: { reference: 'Project/123' },
++    };
++    storage.setObject('options', { name: testProfile });
++    storage.setObject('activeLogin', activeLogin);
++
++    const medplumClient = await createMedplumClient(
++      { profile: testProfile, storage: new ClientStorage(new MemoryStorage()) },
++      false
++    );
++
++    expect(medplumClient.getActiveLogin()).toBeUndefined();
++    expect(storage.getObject('activeLogin')).toEqual(activeLogin);
++  });
++
+   test('validates base URL healthcheck on non-default URL', async () => {
+     const fetch = vi.fn(async (url: string) => {
+       if (url.includes('healthcheck')) {
+diff --git a/packages/cli/src/util/client.ts b/packages/cli/src/util/client.ts
+index 119bc0e8732..9cfcc77d084 100644
+--- a/packages/cli/src/util/client.ts
++++ b/packages/cli/src/util/client.ts
+@@ -32,7 +32,8 @@ export async function createMedplumClient(
+ 
+   // When logging in, discard any stored session so MedplumClient does not try to resume it.
+   // Resuming an expired session fails in the background and clears the profile storage.
+-  if (!setupCredentials) {
++  // A caller-provided storage is never resumed from, so the stored session is left alone.
++  if (!setupCredentials && !options.storage) {
+     storage.setObject('activeLogin', undefined);
+   }
+ 
+@@ -42,8 +43,8 @@ export async function createMedplumClient(
+     tokenUrl,
+     fhirUrlPath,
+     authorizeUrl,
+-    storage,
+-    onUnauthenticated,
++    storage: options.storage ?? storage,
++    onUnauthenticated: options.onUnauthenticated ?? onUnauthenticated,
+     verbose: options.verbose,
+     defaultHeaders: { 'User-Agent': CLI_USER_AGENT },
+   });
+diff --git a/packages/docs/docs/cli/index.md b/packages/docs/docs/cli/index.md
+index 347114278e1..08533b44a78 100644
+--- a/packages/docs/docs/cli/index.md
++++ b/packages/docs/docs/cli/index.md
+@@ -80,6 +80,18 @@ Example:
+ medplum login
+ ```
+ 
++#### `logout`
++
++The `logout` command signs out of every session stored in the current profile. Each session is revoked on the server, which invalidates both its access token and its refresh token, and the tokens are then removed from disk. Other profile settings, such as the base URL, are kept.
++
++```bash
++medplum logout
++```
++
++If a session cannot be revoked (for example, because the server is unreachable), the stored tokens are kept so you can run `medplum logout` again.
++
++Client credentials stored in a profile are not tokens and are not removed by `logout`. To delete them, use `medplum profile remove`.
++
+ #### `whoami`
+ 
+ The `whoami` command displays whether the client is authenticated, and, if so, the name of the current user and current Medplum project.

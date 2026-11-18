@@ -1,0 +1,1187 @@
+diff --git a/engine/build.gradle.kts b/engine/build.gradle.kts
+index ae44fe7a0c..afa565f71f 100644
+--- a/engine/build.gradle.kts
++++ b/engine/build.gradle.kts
+@@ -140,6 +140,7 @@ dependencies {
+   testImplementation(Dependencies.AndroidxTest.core)
+   testImplementation(Dependencies.AndroidxTest.workTestingRuntimeKtx)
+   testImplementation(Dependencies.Kotlin.kotlinCoroutinesTest)
++  testImplementation(Dependencies.Kotlin.kotlinTestJunit)
+   testImplementation(Dependencies.junit)
+   testImplementation(Dependencies.jsonAssert)
+   testImplementation(Dependencies.mockitoInline)
+diff --git a/engine/src/main/java/com/google/android/fhir/FhirEngineProvider.kt b/engine/src/main/java/com/google/android/fhir/FhirEngineProvider.kt
+index 0eee6f364c..076c0e27ed 100644
+--- a/engine/src/main/java/com/google/android/fhir/FhirEngineProvider.kt
++++ b/engine/src/main/java/com/google/android/fhir/FhirEngineProvider.kt
+@@ -18,6 +18,7 @@ package com.google.android.fhir
+ 
+ import android.content.Context
+ import com.google.android.fhir.DatabaseErrorStrategy.UNSPECIFIED
++import com.google.android.fhir.db.Database
+ import com.google.android.fhir.sync.DataSource
+ import com.google.android.fhir.sync.FhirDataStore
+ import com.google.android.fhir.sync.HttpAuthenticator
+@@ -73,6 +74,11 @@ object FhirEngineProvider {
+     return getOrCreateFhirService(context).fhirDataStore
+   }
+ 
++  @Synchronized
++  internal fun getFhirDatabase(context: Context): Database {
++    return getOrCreateFhirService(context).database
++  }
++
+   @Synchronized
+   private fun getOrCreateFhirService(context: Context): FhirServices {
+     if (fhirServices == null) {
+diff --git a/engine/src/main/java/com/google/android/fhir/db/Database.kt b/engine/src/main/java/com/google/android/fhir/db/Database.kt
+index 83157a35ba..5b813027b2 100644
+--- a/engine/src/main/java/com/google/android/fhir/db/Database.kt
++++ b/engine/src/main/java/com/google/android/fhir/db/Database.kt
+@@ -185,9 +185,24 @@ internal interface Database {
+    *   will delete resource entry from LocalChangeEntity table.
+    */
+   suspend fun purge(type: ResourceType, id: String, forcePurge: Boolean = false)
++
++  /**
++   * @return List of [LocalChangeResourceReference] associated with the [LocalChangeEntity.id]s. A
++   *   single [LocalChangeEntity] may have one or more [LocalChangeResourceReference] associated
++   *   with it.
++   */
++  suspend fun getLocalChangeResourceReferences(
++    localChangeIds: List<Long>,
++  ): List<LocalChangeResourceReference>
+ }
+ 
+ data class ResourceWithUUID<R>(
+   val uuid: UUID,
+   val resource: R,
+ )
++
++data class LocalChangeResourceReference(
++  val localChangeId: Long,
++  val resourceReferenceValue: String,
++  val resourceReferencePath: String?,
++)
+diff --git a/engine/src/main/java/com/google/android/fhir/db/impl/DatabaseImpl.kt b/engine/src/main/java/com/google/android/fhir/db/impl/DatabaseImpl.kt
+index af044b4f63..9acdf95ea5 100644
+--- a/engine/src/main/java/com/google/android/fhir/db/impl/DatabaseImpl.kt
++++ b/engine/src/main/java/com/google/android/fhir/db/impl/DatabaseImpl.kt
+@@ -26,6 +26,7 @@ import ca.uhn.fhir.util.FhirTerser
+ import com.google.android.fhir.DatabaseErrorStrategy
+ import com.google.android.fhir.LocalChange
+ import com.google.android.fhir.LocalChangeToken
++import com.google.android.fhir.db.LocalChangeResourceReference
+ import com.google.android.fhir.db.ResourceNotFoundException
+ import com.google.android.fhir.db.ResourceWithUUID
+ import com.google.android.fhir.db.impl.DatabaseImpl.Companion.UNENCRYPTED_DATABASE_NAME
+@@ -408,6 +409,18 @@ internal class DatabaseImpl(
+     }
+   }
+ 
++  override suspend fun getLocalChangeResourceReferences(
++    localChangeIds: List<Long>,
++  ): List<LocalChangeResourceReference> {
++    return localChangeDao.getReferencesForLocalChanges(localChangeIds).map {
++      LocalChangeResourceReference(
++        it.localChangeId,
++        it.resourceReferenceValue,
++        it.resourceReferencePath,
++      )
++    }
++  }
++
+   companion object {
+     /**
+      * The name for unencrypted database.
+diff --git a/engine/src/main/java/com/google/android/fhir/db/impl/dao/LocalChangeDao.kt b/engine/src/main/java/com/google/android/fhir/db/impl/dao/LocalChangeDao.kt
+index 43eac00442..664977fadb 100644
+--- a/engine/src/main/java/com/google/android/fhir/db/impl/dao/LocalChangeDao.kt
++++ b/engine/src/main/java/com/google/android/fhir/db/impl/dao/LocalChangeDao.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2023 Google LLC
++ * Copyright 2023-2024 Google LLC
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -348,6 +348,17 @@ internal abstract class LocalChangeDao {
+     localChangeId: Long,
+   ): List<LocalChangeResourceReferenceEntity>
+ 
++  @Query(
++    """
++        SELECT *
++        FROM LocalChangeResourceReferenceEntity
++        WHERE localChangeId = (:localChangeId)
++    """,
++  )
++  abstract suspend fun getReferencesForLocalChanges(
++    localChangeId: List<Long>,
++  ): List<LocalChangeResourceReferenceEntity>
++
+   @Insert(onConflict = OnConflictStrategy.REPLACE)
+   abstract suspend fun insertLocalChangeResourceReferences(
+     resourceReferences: List<LocalChangeResourceReferenceEntity>,
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/FhirSyncWorker.kt b/engine/src/main/java/com/google/android/fhir/sync/FhirSyncWorker.kt
+index 8a7d40bc75..c5c525b2d1 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/FhirSyncWorker.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/FhirSyncWorker.kt
+@@ -93,7 +93,11 @@ abstract class FhirSyncWorker(appContext: Context, workerParams: WorkerParameter
+         UploadConfiguration(
+           Uploader(
+             dataSource = dataSource,
+-            patchGenerator = PatchGeneratorFactory.byMode(getUploadStrategy().patchGeneratorMode),
++            patchGenerator =
++              PatchGeneratorFactory.byMode(
++                getUploadStrategy().patchGeneratorMode,
++                FhirEngineProvider.getFhirDatabase(applicationContext),
++              ),
+             requestGenerator =
+               UploadRequestGeneratorFactory.byMode(getUploadStrategy().requestGeneratorMode),
+           ),
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchGenerator.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchGenerator.kt
+index 325378d242..1a52da87c8 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchGenerator.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchGenerator.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2023 Google LLC
++ * Copyright 2023-2024 Google LLC
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -17,6 +17,7 @@
+ package com.google.android.fhir.sync.upload.patch
+ 
+ import com.google.android.fhir.LocalChange
++import com.google.android.fhir.db.Database
+ 
+ /**
+  * Generates [Patch]es from [LocalChange]s and output [List<[PatchMapping]>] to keep a mapping of
+@@ -34,16 +35,17 @@ internal interface PatchGenerator {
+    * NOTE: different implementations may have requirements on the size of [localChanges] and output
+    * certain numbers of [Patch]es.
+    */
+-  fun generate(localChanges: List<LocalChange>): List<PatchMapping>
++  suspend fun generate(localChanges: List<LocalChange>): List<PatchMapping>
+ }
+ 
+ internal object PatchGeneratorFactory {
+   fun byMode(
+     mode: PatchGeneratorMode,
++    database: Database,
+   ): PatchGenerator =
+     when (mode) {
+       is PatchGeneratorMode.PerChange -> PerChangePatchGenerator
+-      is PatchGeneratorMode.PerResource -> PerResourcePatchGenerator
++      is PatchGeneratorMode.PerResource -> PerResourcePatchGenerator.with(database)
+     }
+ }
+ 
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchOrdering.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchOrdering.kt
+new file mode 100644
+index 0000000000..c76fb46751
+--- /dev/null
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchOrdering.kt
+@@ -0,0 +1,142 @@
++/*
++ * Copyright 2024 Google LLC
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.google.android.fhir.sync.upload.patch
++
++import androidx.annotation.VisibleForTesting
++import com.google.android.fhir.db.Database
++import com.google.android.fhir.db.LocalChangeResourceReference
++
++private typealias Node = String
++
++/**
++ * Orders the [PatchMapping]s to maintain referential integrity during upload.
++ *
++ * ```
++ * Encounter().apply {
++ *   id = "encounter-1"
++ *   subject = Reference("Patient/patient-1")
++ * }
++ *
++ * Observation().apply {
++ *   id = "observation-1"
++ *   subject = Reference("Patient/patient-1")
++ *   encounter = Reference("Encounter/encounter-1")
++ * }
++ * ```
++ * * The Encounter has an outgoing reference to Patient and the Observation has outgoing references
++ *   to Patient and the Encounter.
++ * * Now, to maintain the referential integrity of the resources during the upload,
++ *   `Encounter/encounter-1` must go before the `Observation/observation-1`, irrespective of the
++ *   order in which the Encounter and Observation were added to the database.
++ */
++internal object PatchOrdering {
++
++  private val PatchMapping.resourceTypeAndId: String
++    get() = "${generatedPatch.resourceType}/${generatedPatch.resourceId}"
++
++  /**
++   * Order the [PatchMapping] so that if the resource A has outgoing references {B,C} (CREATE) and
++   * {D} (UPDATE), then B,C needs to go before the resource A so that referential integrity is
++   * retained. Order of D shouldn't matter for the purpose of referential integrity.
++   *
++   * @return - A ordered list of the [PatchMapping]s based on the references to other [PatchMapping]
++   *   if the mappings are acyclic
++   * - throws [IllegalStateException] otherwise
++   */
++  suspend fun List<PatchMapping>.orderByReferences(
++    database: Database,
++  ): List<PatchMapping> {
++    val resourceIdToPatchMapping = associateBy { patchMapping -> patchMapping.resourceTypeAndId }
++
++    /* Get LocalChangeResourceReferences for all the local changes. A single LocalChange may have
++    multiple LocalChangeResourceReference, one for each resource reference in the
++    LocalChange.payload.*/
++    val localChangeIdToResourceReferenceMap: Map<Long, List<LocalChangeResourceReference>> =
++      database
++        .getLocalChangeResourceReferences(flatMap { it.localChanges.flatMap { it.token.ids } })
++        .groupBy { it.localChangeId }
++
++    val adjacencyList = createAdjacencyListForCreateReferences(localChangeIdToResourceReferenceMap)
++    return createTopologicalOrderedList(adjacencyList).mapNotNull { resourceIdToPatchMapping[it] }
++  }
++
++  /**
++   * @return A map of [PatchMapping] to all the outgoing references to the other [PatchMapping]s of
++   *   type [Patch.Type.INSERT] .
++   */
++  @VisibleForTesting
++  internal fun List<PatchMapping>.createAdjacencyListForCreateReferences(
++    localChangeIdToReferenceMap: Map<Long, List<LocalChangeResourceReference>>,
++  ): Map<Node, List<Node>> {
++    val adjacencyList = mutableMapOf<Node, List<Node>>()
++    /* if the outgoing reference is to a resource that's just an update and not create, then don't
++    link to it. This may make the sub graphs smaller and also help avoid cyclic dependencies.*/
++    val resourceIdsOfInsertTypeLocalChanges =
++      asSequence()
++        .filter { it.generatedPatch.type == Patch.Type.INSERT }
++        .map { it.resourceTypeAndId }
++        .toSet()
++
++    forEach { patchMapping ->
++      adjacencyList[patchMapping.resourceTypeAndId] =
++        patchMapping.findOutgoingReferences(localChangeIdToReferenceMap).filter {
++          resourceIdsOfInsertTypeLocalChanges.contains(it)
++        }
++    }
++    return adjacencyList
++  }
++
++  private fun PatchMapping.findOutgoingReferences(
++    localChangeIdToReferenceMap: Map<Long, List<LocalChangeResourceReference>>,
++  ): Set<Node> {
++    val references = mutableSetOf<Node>()
++    when (generatedPatch.type) {
++      Patch.Type.INSERT,
++      Patch.Type.UPDATE, -> {
++        localChanges.forEach { localChange ->
++          localChange.token.ids.forEach { id ->
++            localChangeIdToReferenceMap[id]?.let {
++              references.addAll(it.map { it.resourceReferenceValue })
++            }
++          }
++        }
++      }
++      Patch.Type.DELETE -> {
++        // do nothing
++      }
++    }
++    return references
++  }
++
++  private fun createTopologicalOrderedList(adjacencyList: Map<Node, List<Node>>): List<Node> {
++    val stack = ArrayDeque<String>()
++    val visited = mutableSetOf<String>()
++    val currentPath = mutableSetOf<String>()
++
++    fun dfs(key: String) {
++      check(currentPath.add(key)) { "Detected a cycle." }
++      if (visited.add(key)) {
++        adjacencyList[key]?.forEach { dfs(it) }
++        stack.addFirst(key)
++      }
++      currentPath.remove(key)
++    }
++
++    adjacencyList.keys.forEach { dfs(it) }
++    return stack.reversed()
++  }
++}
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerChangePatchGenerator.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerChangePatchGenerator.kt
+index 153314e118..8c787f644e 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerChangePatchGenerator.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerChangePatchGenerator.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2023 Google LLC
++ * Copyright 2023-2024 Google LLC
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -25,7 +25,7 @@ import com.google.android.fhir.LocalChange
+  * maintain an audit trail.
+  */
+ internal object PerChangePatchGenerator : PatchGenerator {
+-  override fun generate(localChanges: List<LocalChange>): List<PatchMapping> =
++  override suspend fun generate(localChanges: List<LocalChange>): List<PatchMapping> =
+     localChanges.map {
+       PatchMapping(
+         localChanges = listOf(it),
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGenerator.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGenerator.kt
+index 1ca70b7f43..0eaa944008 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGenerator.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGenerator.kt
+@@ -22,6 +22,8 @@ import com.github.fge.jackson.JsonLoader
+ import com.github.fge.jsonpatch.JsonPatch
+ import com.google.android.fhir.LocalChange
+ import com.google.android.fhir.LocalChange.Type
++import com.google.android.fhir.db.Database
++import com.google.android.fhir.sync.upload.patch.PatchOrdering.orderByReferences
+ 
+ /**
+  * Generates a [Patch] for all [LocalChange]es made to a single FHIR resource.
+@@ -30,10 +32,16 @@ import com.google.android.fhir.LocalChange.Type
+  * maintain an audit trail, but instead, multiple changes made to the same FHIR resource on the
+  * client can be recorded as a single change on the server.
+  */
+-internal object PerResourcePatchGenerator : PatchGenerator {
++internal class PerResourcePatchGenerator private constructor(val database: Database) :
++  PatchGenerator {
+ 
+-  override fun generate(localChanges: List<LocalChange>): List<PatchMapping> {
+-    return localChanges
++  override suspend fun generate(localChanges: List<LocalChange>): List<PatchMapping> {
++    return generateSquashedChangesMapping(localChanges).orderByReferences(database)
++  }
++
++  @androidx.annotation.VisibleForTesting
++  internal fun generateSquashedChangesMapping(localChanges: List<LocalChange>) =
++    localChanges
+       .groupBy { it.resourceType to it.resourceId }
+       .values
+       .mapNotNull { resourceLocalChanges ->
+@@ -44,7 +52,6 @@ internal object PerResourcePatchGenerator : PatchGenerator {
+           )
+         }
+       }
+-  }
+ 
+   private fun mergeLocalChangesForSingleResource(localChanges: List<LocalChange>): Patch? {
+     // TODO (maybe this should throw exception when two entities don't have the same versionID)
+@@ -138,4 +145,20 @@ internal object PerResourcePatchGenerator : PatchGenerator {
+     mergedOperations.values.flatten().forEach(mergedNode::add)
+     return objectMapper.writeValueAsString(mergedNode)
+   }
++
++  companion object {
++
++    @Volatile private lateinit var _instance: PerResourcePatchGenerator
++
++    @Synchronized
++    fun with(database: Database): PerResourcePatchGenerator {
++      if (!::_instance.isInitialized) {
++        _instance = PerResourcePatchGenerator(database)
++      } else if (_instance.database != database) {
++        _instance = PerResourcePatchGenerator(database)
++      }
++
++      return _instance
++    }
++  }
+ }
+diff --git a/engine/src/main/java/com/google/android/fhir/testing/Utilities.kt b/engine/src/main/java/com/google/android/fhir/testing/Utilities.kt
+index 18f3b624e9..48b83f3f5e 100644
+--- a/engine/src/main/java/com/google/android/fhir/testing/Utilities.kt
++++ b/engine/src/main/java/com/google/android/fhir/testing/Utilities.kt
+@@ -191,8 +191,8 @@ object TestFhirEngineImpl : FhirEngine {
+       LocalChange(
+         resourceType = type.name,
+         resourceId = id,
+-        payload = "{ 'resourceType' : '$type', 'id' : '$id' }",
+-        token = LocalChangeToken(listOf()),
++        payload = """{ "resourceType" : "$type", "id" : "$id" }""",
++        token = LocalChangeToken(listOf(1)),
+         type = LocalChange.Type.INSERT,
+         timestamp = Instant.now(),
+       ),
+diff --git a/engine/src/test/java/com/google/android/fhir/sync/upload/UploaderTest.kt b/engine/src/test/java/com/google/android/fhir/sync/upload/UploaderTest.kt
+index 9d21c9db34..feffe91d7c 100644
+--- a/engine/src/test/java/com/google/android/fhir/sync/upload/UploaderTest.kt
++++ b/engine/src/test/java/com/google/android/fhir/sync/upload/UploaderTest.kt
+@@ -20,8 +20,10 @@ import ca.uhn.fhir.context.FhirContext
+ import ca.uhn.fhir.context.FhirVersionEnum
+ import com.google.android.fhir.LocalChange
+ import com.google.android.fhir.LocalChangeToken
++import com.google.android.fhir.db.Database
+ import com.google.android.fhir.db.impl.entities.LocalChangeEntity
+ import com.google.android.fhir.logicalId
++import com.google.android.fhir.sync.upload.patch.PatchGenerator
+ import com.google.android.fhir.sync.upload.patch.PatchGeneratorFactory
+ import com.google.android.fhir.sync.upload.patch.PatchGeneratorMode
+ import com.google.android.fhir.sync.upload.request.UploadRequestGeneratorFactory
+@@ -42,13 +44,32 @@ import org.hl7.fhir.r4.model.OperationOutcome
+ import org.hl7.fhir.r4.model.Patient
+ import org.hl7.fhir.r4.model.ResourceType
+ import org.hl7.fhir.r4.model.codesystems.HttpVerb
++import org.junit.Before
+ import org.junit.Test
+ import org.junit.runner.RunWith
++import org.mockito.Mock
++import org.mockito.MockitoAnnotations
++import org.mockito.kotlin.any
++import org.mockito.kotlin.whenever
+ import org.robolectric.RobolectricTestRunner
+ 
+ @RunWith(RobolectricTestRunner::class)
+ class UploaderTest {
+ 
++  @Mock private lateinit var database: Database
++  private lateinit var perResourcePatchGenerator: PatchGenerator
++  private lateinit var perChangePatchGenerator: PatchGenerator
++
++  @Before
++  fun setUp() {
++    MockitoAnnotations.openMocks(this)
++    runTest { whenever(database.getLocalChangeResourceReferences(any())).thenReturn(emptyList()) }
++
++    perResourcePatchGenerator =
++      PatchGeneratorFactory.byMode(PatchGeneratorMode.PerResource, database)
++    perChangePatchGenerator = PatchGeneratorFactory.byMode(PatchGeneratorMode.PerChange, database)
++  }
++
+   @Test
+   fun `bundle upload for per resource patch should output responses mapped correctly to the local changes`() =
+     runTest {
+@@ -513,9 +534,7 @@ class UploaderTest {
+     }
+ 
+   companion object {
+-    private val perResourcePatchGenerator =
+-      PatchGeneratorFactory.byMode(PatchGeneratorMode.PerResource)
+-    private val perChangePatchGenerator = PatchGeneratorFactory.byMode(PatchGeneratorMode.PerChange)
++
+     private val urlUploadRequestGenerator =
+       UploadRequestGeneratorFactory.byMode(
+         UploadRequestGeneratorMode.UrlRequest(HttpVerb.PUT, HttpVerb.PATCH),
+diff --git a/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PatchOrderingTest.kt b/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PatchOrderingTest.kt
+new file mode 100644
+index 0000000000..44f8889dc8
+--- /dev/null
++++ b/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PatchOrderingTest.kt
+@@ -0,0 +1,387 @@
++/*
++ * Copyright 2024 Google LLC
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.google.android.fhir.sync.upload.patch
++
++import com.google.android.fhir.LocalChange
++import com.google.android.fhir.LocalChangeToken
++import com.google.android.fhir.db.Database
++import com.google.android.fhir.db.LocalChangeResourceReference
++import com.google.android.fhir.db.impl.dao.diff
++import com.google.android.fhir.logicalId
++import com.google.android.fhir.sync.upload.patch.PatchOrdering.createAdjacencyListForCreateReferences
++import com.google.android.fhir.testing.jsonParser
++import com.google.android.fhir.versionId
++import com.google.common.truth.Truth.assertThat
++import java.time.Instant
++import java.util.LinkedList
++import kotlin.random.Random
++import kotlin.test.assertFailsWith
++import kotlinx.coroutines.test.runTest
++import org.hl7.fhir.r4.model.Encounter
++import org.hl7.fhir.r4.model.Group
++import org.hl7.fhir.r4.model.Observation
++import org.hl7.fhir.r4.model.Patient
++import org.hl7.fhir.r4.model.Reference
++import org.hl7.fhir.r4.model.RelatedPerson
++import org.hl7.fhir.r4.model.Resource
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.mockito.Mock
++import org.mockito.MockitoAnnotations
++import org.mockito.kotlin.any
++import org.mockito.kotlin.whenever
++import org.robolectric.RobolectricTestRunner
++
++@RunWith(RobolectricTestRunner::class)
++class PatchOrderingTest {
++
++  @Mock private lateinit var database: Database
++  private lateinit var patchGenerator: PerResourcePatchGenerator
++
++  @Before
++  fun setUp() {
++    MockitoAnnotations.openMocks(this)
++    patchGenerator = PerResourcePatchGenerator.with(database)
++  }
++
++  @Test
++  fun `createReferenceAdjacencyList with local changes for only new resources should only have edges to inserted resources`() =
++    runTest {
++      val helper = LocalChangeHelper()
++
++      var group = helper.createGroup("group-1", 1)
++      helper.createPatient("patient-1", 2)
++      helper.createEncounter("encounter-1", 3, "Patient/patient-1")
++      helper.createObservation("observation-1", 4, "Patient/patient-1", "Encounter/encounter-1")
++      group = helper.updateGroup(group, 5, "Patient/patient-1")
++
++      helper.createPatient("patient-2", 6)
++      helper.createEncounter("encounter-2", 7, "Patient/patient-2")
++      helper.createObservation("observation-2", 8, "Patient/patient-2", "Encounter/encounter-2")
++      group = helper.updateGroup(group, 9, "Patient/patient-2")
++
++      helper.createPatient("patient-3", 10)
++      helper.createEncounter("encounter-3", 11, "Patient/patient-3")
++      helper.createObservation("observation-3", 12, "Patient/patient-3", "Encounter/encounter-3")
++      group = helper.updateGroup(group, 13, "Patient/patient-3")
++      whenever(database.getLocalChangeResourceReferences(any()))
++        .thenReturn(helper.localChangeResourceReferences)
++
++      val result =
++        patchGenerator
++          .generateSquashedChangesMapping(helper.localChanges)
++          .createAdjacencyListForCreateReferences(
++            helper.localChangeResourceReferences.groupBy { it.localChangeId },
++          )
++
++      assertThat(result)
++        .isEqualTo(
++          mutableMapOf(
++            "Group/group-1" to
++              listOf("Patient/patient-1", "Patient/patient-2", "Patient/patient-3"),
++            "Patient/patient-1" to emptyList(),
++            "Patient/patient-2" to emptyList(),
++            "Patient/patient-3" to emptyList(),
++            "Encounter/encounter-1" to listOf("Patient/patient-1"),
++            "Encounter/encounter-2" to listOf("Patient/patient-2"),
++            "Encounter/encounter-3" to listOf("Patient/patient-3"),
++            "Observation/observation-1" to listOf("Patient/patient-1", "Encounter/encounter-1"),
++            "Observation/observation-2" to listOf("Patient/patient-2", "Encounter/encounter-2"),
++            "Observation/observation-3" to listOf("Patient/patient-3", "Encounter/encounter-3"),
++          ),
++        )
++    }
++
++  @Test
++  fun `createReferenceAdjacencyList with local changes for new and old resources should only have edges to inserted resources`() =
++    runTest {
++      val helper = LocalChangeHelper()
++      var group = helper.createGroup("group-1", 1)
++      // The scenario is that Patient is already created on the server and device is just updating
++      // it.
++      helper.updatePatient(Patient().apply { id = "patient-1" }, 2)
++      helper.createEncounter("encounter-1", 3, "Patient/patient-1")
++      helper.createObservation("observation-1", 4, "Patient/patient-1", "Encounter/encounter-1")
++
++      group = helper.updateGroup(group, 5, "Patient/patient-1")
++      // The scenario is that Patient is already created on the server and device is just updating
++      // it.
++      helper.updatePatient(Patient().apply { id = "patient-2" }, 6)
++      helper.createEncounter("encounter-2", 7, "Patient/patient-2")
++      helper.createObservation("observation-2", 8, "Patient/patient-2", "Encounter/encounter-2")
++
++      group = helper.updateGroup(group, 9, "Patient/patient-2")
++      // The scenario is that Patient is already created on the server and device is just updating
++      // it.
++      helper.updatePatient(Patient().apply { id = "patient-3" }, 10)
++      helper.createEncounter("encounter-3", 11, "Patient/patient-3")
++      helper.createObservation("observation-3", 12, "Patient/patient-3", "Encounter/encounter-3")
++      group = helper.updateGroup(group, 13, "Patient/patient-3")
++
++      val result =
++        patchGenerator
++          .generateSquashedChangesMapping(helper.localChanges)
++          .createAdjacencyListForCreateReferences(
++            helper.localChangeResourceReferences.groupBy { it.localChangeId },
++          )
++
++      assertThat(result)
++        .isEqualTo(
++          mutableMapOf(
++            "Group/group-1" to emptyList(),
++            "Patient/patient-1" to emptyList(),
++            "Patient/patient-2" to emptyList(),
++            "Patient/patient-3" to emptyList(),
++            "Encounter/encounter-1" to emptyList(),
++            "Encounter/encounter-2" to emptyList(),
++            "Encounter/encounter-3" to emptyList(),
++            "Observation/observation-1" to listOf("Encounter/encounter-1"),
++            "Observation/observation-2" to listOf("Encounter/encounter-2"),
++            "Observation/observation-3" to listOf("Encounter/encounter-3"),
++          ),
++        )
++    }
++
++  @Test
++  fun `generate with acyclic references should return the list in topological order`() = runTest {
++    val helper = LocalChangeHelper()
++    var group = helper.createGroup("group-1", 1)
++
++    group = helper.updateGroup(group, 2, "Patient/patient-1")
++    helper.createObservation("observation-1", 3, "Patient/patient-1", "Encounter/encounter-1")
++    helper.createEncounter("encounter-1", 4, "Patient/patient-1")
++    helper.createPatient("patient-1", 5)
++
++    group = helper.updateGroup(group, 6, "Patient/patient-2")
++    helper.createObservation("observation-2", 7, "Patient/patient-2", "Encounter/encounter-2")
++    helper.createEncounter("encounter-2", 8, "Patient/patient-2")
++    helper.createPatient("patient-2", 9)
++
++    group = helper.updateGroup(group, 10, "Patient/patient-3")
++    helper.createObservation("observation-3", 11, "Patient/patient-3", "Encounter/encounter-3")
++    helper.createEncounter("encounter-3", 12, "Patient/patient-3")
++    helper.createPatient("patient-3", 13)
++
++    whenever(database.getLocalChangeResourceReferences(any()))
++      .thenReturn(helper.localChangeResourceReferences)
++
++    val result = patchGenerator.generate(helper.localChanges)
++
++    // This order is based on the current implementation of the topological sort in [PatchOrdering],
++    // it's entirely possible to generate different order here which is acceptable/correct, should
++    // we have a different implementation of the topological sort.
++    assertThat(result.map { it.generatedPatch.resourceId })
++      .containsExactly(
++        "patient-1",
++        "patient-2",
++        "patient-3",
++        "group-1",
++        "encounter-1",
++        "observation-1",
++        "encounter-2",
++        "observation-2",
++        "encounter-3",
++        "observation-3",
++      )
++      .inOrder()
++  }
++
++  @Test
++  fun `generate with cyclic references should throw exception`() = runTest {
++    val localChanges = LinkedList<LocalChange>()
++    val localChangeResourceReferences = mutableListOf<LocalChangeResourceReference>()
++
++    Patient()
++      .apply {
++        id = "patient-1"
++        addLink(
++          Patient.PatientLinkComponent().apply { other = Reference("RelatedPerson/related-1") },
++        )
++      }
++      .also {
++        localChanges.add(createInsertLocalChange(it, Random.nextLong()))
++        localChangeResourceReferences.add(
++          LocalChangeResourceReference(
++            localChanges.last().token.ids.first(),
++            "RelatedPerson/related-1",
++            "Patient.other",
++          ),
++        )
++      }
++
++    RelatedPerson()
++      .apply {
++        id = "related-1"
++        patient = Reference("Patient/patient-1")
++      }
++      .also {
++        localChanges.add(createInsertLocalChange(it))
++        localChangeResourceReferences.add(
++          LocalChangeResourceReference(
++            localChanges.last().token.ids.first(),
++            "Patient/patient-1",
++            "RelatedPerson.patient",
++          ),
++        )
++      }
++
++    whenever(database.getLocalChangeResourceReferences(any()))
++      .thenReturn(localChangeResourceReferences)
++
++    val errorMessage =
++      assertFailsWith<IllegalStateException> { patchGenerator.generate(localChanges) }
++        .localizedMessage
++
++    assertThat(errorMessage).isEqualTo("Detected a cycle.")
++  }
++
++  companion object {
++
++    private fun createUpdateLocalChange(
++      oldEntity: Resource,
++      updatedResource: Resource,
++      currentChangeId: Long,
++    ): LocalChange {
++      val jsonDiff = diff(jsonParser, oldEntity, updatedResource)
++      return LocalChange(
++        resourceId = oldEntity.logicalId,
++        resourceType = oldEntity.resourceType.name,
++        type = LocalChange.Type.UPDATE,
++        payload = jsonDiff.toString(),
++        versionId = oldEntity.versionId,
++        token = LocalChangeToken(listOf(currentChangeId)),
++        timestamp = Instant.now(),
++      )
++    }
++
++    private fun createInsertLocalChange(entity: Resource, currentChangeId: Long = 1): LocalChange {
++      return LocalChange(
++        resourceId = entity.logicalId,
++        resourceType = entity.resourceType.name,
++        type = LocalChange.Type.INSERT,
++        payload = jsonParser.encodeResourceToString(entity),
++        versionId = entity.versionId,
++        token = LocalChangeToken(listOf(currentChangeId)),
++        timestamp = Instant.now(),
++      )
++    }
++  }
++
++  internal class LocalChangeHelper {
++    val localChanges = LinkedList<LocalChange>()
++    val localChangeResourceReferences = mutableListOf<LocalChangeResourceReference>()
++
++    fun createGroup(
++      id: String,
++      changeId: Long,
++    ) =
++      Group()
++        .apply {
++          this.id = id
++          type = Group.GroupType.PERSON
++        }
++        .also { localChanges.add(createInsertLocalChange(it, changeId)) }
++
++    fun updateGroup(
++      group: Group,
++      changeId: Long,
++      member: String,
++    ) =
++      group
++        .copy()
++        .apply { addMember(Group.GroupMemberComponent(Reference(member))) }
++        .also {
++          localChanges.add(createUpdateLocalChange(group, it, changeId))
++          localChangeResourceReferences.add(
++            LocalChangeResourceReference(
++              changeId,
++              member,
++              "Group.member",
++            ),
++          )
++        }
++
++    fun createPatient(
++      id: String,
++      changeId: Long,
++    ) =
++      Patient()
++        .apply { this.id = id }
++        .also { localChanges.add(createInsertLocalChange(it, changeId)) }
++
++    fun updatePatient(
++      patient: Patient,
++      changeId: Long,
++    ) =
++      patient
++        .copy()
++        .apply { active = true }
++        .also { localChanges.add(createUpdateLocalChange(patient, it, changeId)) }
++
++    fun createEncounter(
++      id: String,
++      changeId: Long,
++      subject: String,
++    ) =
++      Encounter()
++        .apply {
++          this.id = id
++          this.subject = Reference(subject)
++        }
++        .also {
++          localChanges.add(createInsertLocalChange(it, changeId))
++          localChangeResourceReferences.add(
++            LocalChangeResourceReference(
++              changeId,
++              subject,
++              "Encounter.subject",
++            ),
++          )
++        }
++
++    fun createObservation(
++      id: String,
++      changeId: Long,
++      subject: String,
++      encounter: String,
++    ) =
++      Observation()
++        .apply {
++          this.id = id
++          this.subject = Reference(subject)
++          this.encounter = Reference(encounter)
++        }
++        .also {
++          localChanges.add(createInsertLocalChange(it, changeId))
++          localChangeResourceReferences.add(
++            LocalChangeResourceReference(
++              changeId,
++              subject,
++              "Observation.subject",
++            ),
++          )
++          localChangeResourceReferences.add(
++            LocalChangeResourceReference(
++              changeId,
++              encounter,
++              "Observation.encounter",
++            ),
++          )
++        }
++  }
++}
+diff --git a/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGeneratorTest.kt b/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGeneratorTest.kt
+index 5d8c8b0016..4860b66cdc 100644
+--- a/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGeneratorTest.kt
++++ b/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGeneratorTest.kt
+@@ -20,6 +20,7 @@ import ca.uhn.fhir.context.FhirContext
+ import ca.uhn.fhir.context.FhirVersionEnum
+ import com.google.android.fhir.LocalChange
+ import com.google.android.fhir.LocalChangeToken
++import com.google.android.fhir.db.Database
+ import com.google.android.fhir.db.impl.dao.diff
+ import com.google.android.fhir.db.impl.entities.LocalChangeEntity
+ import com.google.android.fhir.logicalId
+@@ -33,26 +34,42 @@ import com.google.common.truth.Truth.assertThat
+ import java.time.Instant
+ import java.util.Date
+ import java.util.UUID
++import kotlin.test.assertFailsWith
++import kotlinx.coroutines.test.runTest
+ import org.hl7.fhir.r4.model.HumanName
+ import org.hl7.fhir.r4.model.Meta
+ import org.hl7.fhir.r4.model.Patient
+ import org.hl7.fhir.r4.model.Resource
+ import org.hl7.fhir.r4.model.ResourceType
+ import org.json.JSONArray
+-import org.junit.Assert
++import org.junit.Before
+ import org.junit.Test
+ import org.junit.runner.RunWith
++import org.mockito.Mock
++import org.mockito.MockitoAnnotations
++import org.mockito.kotlin.any
++import org.mockito.kotlin.whenever
+ import org.robolectric.RobolectricTestRunner
+ 
+ @RunWith(RobolectricTestRunner::class)
+ class PerResourcePatchGeneratorTest {
+ 
++  @Mock private lateinit var database: Database
++  private lateinit var patchGenerator: PerResourcePatchGenerator
++
++  @Before
++  fun setUp() {
++    MockitoAnnotations.openMocks(this)
++    runTest { whenever(database.getLocalChangeResourceReferences(any())).thenReturn(emptyList()) }
++    patchGenerator = PerResourcePatchGenerator.with(database)
++  }
++
+   @Test
+-  fun `should generate a single insert patch if the resource is inserted`() {
++  fun `should generate a single insert patch if the resource is inserted`() = runTest {
+     val patient: Patient = readFromFile(Patient::class.java, "/date_test_patient.json")
+     val insertionLocalChange = createInsertLocalChange(patient)
+ 
+-    val patches = PerResourcePatchGenerator.generate(listOf(insertionLocalChange))
++    val patches = patchGenerator.generate(listOf(insertionLocalChange))
+ 
+     with(patches.single()) {
+       with(generatedPatch) {
+@@ -70,7 +87,7 @@ class PerResourcePatchGeneratorTest {
+   }
+ 
+   @Test
+-  fun `should generate a single update patch if the resource is updated`() {
++  fun `should generate a single update patch if the resource is updated`() = runTest {
+     val remoteMeta =
+       Meta().apply {
+         versionId = "patient-version-1"
+@@ -83,7 +100,7 @@ class PerResourcePatchGeneratorTest {
+     val updateLocalChange1 = createUpdateLocalChange(remotePatient, updatedPatient1, 1L)
+     val updatePatch = readJsonArrayFromFile("/update_patch_1.json")
+ 
+-    val patches = PerResourcePatchGenerator.generate(listOf(updateLocalChange1))
++    val patches = patchGenerator.generate(listOf(updateLocalChange1))
+ 
+     with(patches.single()) {
+       with(generatedPatch) {
+@@ -102,7 +119,7 @@ class PerResourcePatchGeneratorTest {
+   }
+ 
+   @Test
+-  fun `should generate a single delete patch if the resource is deleted`() {
++  fun `should generate a single delete patch if the resource is deleted`() = runTest {
+     val remoteMeta =
+       Meta().apply {
+         versionId = "patient-version-1"
+@@ -112,7 +129,7 @@ class PerResourcePatchGeneratorTest {
+     remotePatient.meta = remoteMeta
+     val deleteLocalChange = createDeleteLocalChange(remotePatient, 3L)
+ 
+-    val patches = PerResourcePatchGenerator.generate(listOf(deleteLocalChange))
++    val patches = patchGenerator.generate(listOf(deleteLocalChange))
+ 
+     with(patches.single()) {
+       with(generatedPatch) {
+@@ -131,15 +148,14 @@ class PerResourcePatchGeneratorTest {
+   }
+ 
+   @Test
+-  fun `should generate a single insert patch if the resource is inserted and updated`() {
++  fun `should generate a single insert patch if the resource is inserted and updated`() = runTest {
+     val patient: Patient = readFromFile(Patient::class.java, "/date_test_patient.json")
+     val insertionLocalChange = createInsertLocalChange(patient)
+     val updatedPatient = readFromFile(Patient::class.java, "/update_test_patient_1.json")
+     val updateLocalChange = createUpdateLocalChange(patient, updatedPatient, 1L)
+     val patientString = jsonParser.encodeResourceToString(updatedPatient)
+ 
+-    val patches =
+-      PerResourcePatchGenerator.generate(listOf(insertionLocalChange, updateLocalChange))
++    val patches = patchGenerator.generate(listOf(insertionLocalChange, updateLocalChange))
+ 
+     with(patches.single()) {
+       with(generatedPatch) {
+@@ -157,7 +173,7 @@ class PerResourcePatchGeneratorTest {
+   }
+ 
+   @Test
+-  fun `should generate no patch if the resource is inserted and deleted`() {
++  fun `should generate no patch if the resource is inserted and deleted`() = runTest {
+     val changes =
+       listOf(
+         LocalChangeEntity(
+@@ -196,13 +212,13 @@ class PerResourcePatchGeneratorTest {
+           .toLocalChange()
+           .apply { LocalChangeToken(listOf(2)) },
+       )
+-    val patchToUpload = PerResourcePatchGenerator.generate(changes)
++    val patchToUpload = patchGenerator.generate(changes)
+ 
+     assertThat(patchToUpload).isEmpty()
+   }
+ 
+   @Test
+-  fun `should generate no patch if the resource is inserted, updated, and deleted`() {
++  fun `should generate no patch if the resource is inserted, updated, and deleted`() = runTest {
+     val changes =
+       listOf(
+         LocalChangeEntity(
+@@ -274,13 +290,13 @@ class PerResourcePatchGeneratorTest {
+           .toLocalChange()
+           .apply { LocalChangeToken(listOf(3)) },
+       )
+-    val patchToUpload = PerResourcePatchGenerator.generate(changes)
++    val patchToUpload = patchGenerator.generate(changes)
+ 
+     assertThat(patchToUpload).isEmpty()
+   }
+ 
+   @Test
+-  fun `should generate a single update patch if the resource is updated twice`() {
++  fun `should generate a single update patch if the resource is updated twice`() = runTest {
+     val remoteMeta =
+       Meta().apply {
+         versionId = "patient-version-1"
+@@ -296,7 +312,7 @@ class PerResourcePatchGeneratorTest {
+     val updateLocalChange2 = createUpdateLocalChange(updatedPatient1, updatedPatient2, 2L)
+     val updatePatch = readJsonArrayFromFile("/update_patch_2.json")
+ 
+-    val patches = PerResourcePatchGenerator.generate(listOf(updateLocalChange1, updateLocalChange2))
++    val patches = patchGenerator.generate(listOf(updateLocalChange1, updateLocalChange2))
+ 
+     with(patches.single()) {
+       with(generatedPatch) {
+@@ -315,44 +331,44 @@ class PerResourcePatchGeneratorTest {
+   }
+ 
+   @Test
+-  fun `should generate a single update patch with three elements of two adds and one remove`() {
+-    val expectedPatch = readJsonArrayFromFile("/update_careplan_patch.json")
+-    val updatePatch1 = readJsonArrayFromFile("/update_careplan_patch_1.json")
+-    val updatePatch2 = readJsonArrayFromFile("/update_careplan_patch_2.json")
+-
+-    val updatedLocalChange1 =
+-      LocalChange(
+-        resourceType = "CarePlan",
+-        resourceId = "131b5257-a8b3-435a-8cb3-4cb1296be24a",
+-        type = LocalChange.Type.UPDATE,
+-        payload = updatePatch1.toString(),
+-        timestamp = Instant.now(),
+-        token = LocalChangeToken(listOf(1)),
+-      )
+-
+-    val updatedLocalChange2 =
+-      LocalChange(
+-        resourceType = "CarePlan",
+-        resourceId = "131b5257-a8b3-435a-8cb3-4cb1296be24a",
+-        type = LocalChange.Type.UPDATE,
+-        payload = updatePatch2.toString(),
+-        timestamp = Instant.now(),
+-        token = LocalChangeToken(listOf(1)),
+-      )
+-
+-    val patches =
+-      PerResourcePatchGenerator.generate(listOf(updatedLocalChange1, updatedLocalChange2))
+-
+-    with(patches.single().generatedPatch) {
+-      assertThat(type).isEqualTo(Patch.Type.UPDATE)
+-      assertThat(resourceId).isEqualTo("131b5257-a8b3-435a-8cb3-4cb1296be24a")
+-      assertThat(resourceType).isEqualTo("CarePlan")
+-      assertJsonArrayEqualsIgnoringOrder(JSONArray(payload), expectedPatch)
++  fun `should generate a single update patch with three elements of two adds and one remove`() =
++    runTest {
++      val expectedPatch = readJsonArrayFromFile("/update_careplan_patch.json")
++      val updatePatch1 = readJsonArrayFromFile("/update_careplan_patch_1.json")
++      val updatePatch2 = readJsonArrayFromFile("/update_careplan_patch_2.json")
++
++      val updatedLocalChange1 =
++        LocalChange(
++          resourceType = "CarePlan",
++          resourceId = "131b5257-a8b3-435a-8cb3-4cb1296be24a",
++          type = LocalChange.Type.UPDATE,
++          payload = updatePatch1.toString(),
++          timestamp = Instant.now(),
++          token = LocalChangeToken(listOf(1)),
++        )
++
++      val updatedLocalChange2 =
++        LocalChange(
++          resourceType = "CarePlan",
++          resourceId = "131b5257-a8b3-435a-8cb3-4cb1296be24a",
++          type = LocalChange.Type.UPDATE,
++          payload = updatePatch2.toString(),
++          timestamp = Instant.now(),
++          token = LocalChangeToken(listOf(1)),
++        )
++
++      val patches = patchGenerator.generate(listOf(updatedLocalChange1, updatedLocalChange2))
++
++      with(patches.single().generatedPatch) {
++        assertThat(type).isEqualTo(Patch.Type.UPDATE)
++        assertThat(resourceId).isEqualTo("131b5257-a8b3-435a-8cb3-4cb1296be24a")
++        assertThat(resourceType).isEqualTo("CarePlan")
++        assertJsonArrayEqualsIgnoringOrder(JSONArray(payload), expectedPatch)
++      }
+     }
+-  }
+ 
+   @Test
+-  fun `should generate a single delete patch if the resource is updated and deleted`() {
++  fun `should generate a single delete patch if the resource is updated and deleted`() = runTest {
+     val remoteMeta =
+       Meta().apply {
+         versionId = "patient-version-1"
+@@ -369,7 +385,7 @@ class PerResourcePatchGeneratorTest {
+     val deleteLocalChange = createDeleteLocalChange(updatedPatient2, 3L)
+ 
+     val patches =
+-      PerResourcePatchGenerator.generate(
++      patchGenerator.generate(
+         listOf(updateLocalChange1, updateLocalChange2, deleteLocalChange),
+       )
+ 
+@@ -390,7 +406,7 @@ class PerResourcePatchGeneratorTest {
+   }
+ 
+   @Test
+-  fun `should throw an error if a change is done after a resource is deleted locally`() {
++  fun `should throw an error if a change is done after a resource is deleted locally`() = runTest {
+     val changes =
+       listOf(
+         LocalChangeEntity(
+@@ -418,16 +434,14 @@ class PerResourcePatchGeneratorTest {
+       )
+ 
+     val errorMessage =
+-      Assert.assertThrows(IllegalArgumentException::class.java) {
+-          PerResourcePatchGenerator.generate(changes)
+-        }
++      assertFailsWith<IllegalArgumentException> { patchGenerator.generate(changes) }
+         .localizedMessage
+ 
+     assertThat(errorMessage).isEqualTo("Changes after deletion of resource are not permitted")
+   }
+ 
+   @Test
+-  fun `should throw an error if a change is done before a resource is created locally`() {
++  fun `should throw an error if a change is done before a resource is created locally`() = runTest {
+     val changes =
+       listOf(
+         LocalChangeEntity(
+@@ -466,11 +480,8 @@ class PerResourcePatchGeneratorTest {
+           .toLocalChange()
+           .apply { LocalChangeToken(listOf(2)) },
+       )
+-
+     val errorMessage =
+-      Assert.assertThrows(IllegalArgumentException::class.java) {
+-          PerResourcePatchGenerator.generate(changes)
+-        }
++      assertFailsWith<IllegalArgumentException> { patchGenerator.generate(changes) }
+         .localizedMessage
+ 
+     assertThat(errorMessage).isEqualTo("Changes before creation of resource are not permitted")
+@@ -493,14 +504,14 @@ class PerResourcePatchGeneratorTest {
+     )
+   }
+ 
+-  private fun createInsertLocalChange(entity: Resource): LocalChange {
++  private fun createInsertLocalChange(entity: Resource, currentChangeId: Long = 1): LocalChange {
+     return LocalChange(
+       resourceId = entity.logicalId,
+       resourceType = entity.resourceType.name,
+       type = LocalChange.Type.INSERT,
+       payload = jsonParser.encodeResourceToString(entity),
+       versionId = entity.versionId,
+-      token = LocalChangeToken(listOf(1L)),
++      token = LocalChangeToken(listOf(currentChangeId)),
+       timestamp = Instant.now(),
+     )
+   }

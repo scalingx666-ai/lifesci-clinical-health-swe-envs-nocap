@@ -1,0 +1,166 @@
+diff --git a/packages/server/src/workers/subscription.test.ts b/packages/server/src/workers/subscription.test.ts
+index ebe46d3dac3..87caef9c6d4 100644
+--- a/packages/server/src/workers/subscription.test.ts
++++ b/packages/server/src/workers/subscription.test.ts
+@@ -194,6 +194,42 @@ describe('Subscription Worker', () => {
+       await findAndExecSubscriptionJob(patient, 'delete');
+     }));
+ 
++  test('Logs Binary notification that includes embedded data', () =>
++    withTestContext(async () => {
++      const url = 'https://example.com/subscription';
++      const subscription = await repo.createResource<Subscription>({
++        resourceType: 'Subscription',
++        reason: 'test',
++        status: 'active',
++        criteria: 'Binary',
++        channel: { type: 'rest-hook', endpoint: url },
++      });
++      const warnSpy = vi.spyOn(globalLogger, 'warn');
++
++      const binary = await repo.createResource<Binary>({
++        resourceType: 'Binary',
++        contentType: ContentType.TEXT,
++        data: 'SGVsbG8gV29ybGQh',
++      });
++
++      fetchMock.mockImplementation(() => mockFetchStatus(200));
++      await findAndExecSubscriptionJob(binary, 'create');
++
++      expect(fetch).toHaveBeenCalledWith(url, expect.objectContaining({ method: 'POST' }));
++      const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string) as Binary;
++      expect(body.id).toStrictEqual(binary.id);
++      expect(body.contentType).toStrictEqual(ContentType.TEXT);
++      expect(body.data).toStrictEqual('SGVsbG8gV29ybGQh');
++      expect(warnSpy).toHaveBeenCalledWith('Subscription notification includes Binary.data', {
++        binary: binary.id,
++        project: binary.meta?.project,
++        channel: 'rest-hook',
++        subscriptions: [subscription.id],
++        suppressed: 0,
++      });
++      warnSpy.mockRestore();
++    }));
++
+   test('Does not send subscriptions when disabled', () =>
+     withTestContext(async () => {
+       await repo.createResource<Subscription>({
+@@ -2807,6 +2843,50 @@ describe('Subscription Worker', () => {
+       return authorRef;
+     }
+ 
++    test('Logs Binary notification that includes embedded data', () =>
++      withTestContext(async () => {
++        const {
++          repo: wsSubRepo,
++          project: wsProject,
++          membership,
++          login,
++        } = await createTestProject({
++          project: { name: 'WebSocket Binary Project', features: ['websocket-subscriptions'] },
++          withRepo: true,
++          withClient: true,
++          withAccessToken: true,
++        });
++        const subscription = await wsSubRepo.createResource<Subscription>({
++          resourceType: 'Subscription',
++          reason: 'test',
++          status: 'active',
++          criteria: 'Binary',
++          channel: { type: 'websocket' },
++        });
++        await bindSubscription(subscription, wsProject.id, login.id, membership.id);
++        const warnSpy = vi.spyOn(globalLogger, 'warn');
++
++        const nextArgsPromise = waitForNextSubNotification<Binary>();
++        const binary = await wsSubRepo.createResource<Binary>({
++          resourceType: 'Binary',
++          contentType: ContentType.TEXT,
++          data: 'SGVsbG8gV29ybGQh',
++        });
++        await findAndExecDispatchJob(binary, 'create');
++
++        const [resource] = await nextArgsPromise;
++        expect(resource.id).toStrictEqual(binary.id);
++        expect(resource.data).toStrictEqual('SGVsbG8gV29ybGQh');
++        expect(warnSpy).toHaveBeenCalledWith('Subscription notification includes Binary.data', {
++          binary: binary.id,
++          project: wsProject.id,
++          channel: 'websocket',
++          subscriptions: [subscription.id],
++          suppressed: 0,
++        });
++        warnSpy.mockRestore();
++      }));
++
+     test('Enabled', () =>
+       withTestContext(async () => {
+         const {
+diff --git a/packages/server/src/workers/subscription.ts b/packages/server/src/workers/subscription.ts
+index 1f6b79a7c22..faef51d9fc5 100644
+--- a/packages/server/src/workers/subscription.ts
++++ b/packages/server/src/workers/subscription.ts
+@@ -56,6 +56,7 @@ import type { ActiveSubscriptionEntry } from '../pubsub';
+ import { cleanupActiveSubs, getActiveSubscriptions, publish, removeActiveSubscriptions } from '../pubsub';
+ import { getCacheRedis } from '../redis';
+ import { AuditEventOutcome, createSubscriptionAuditEvent } from '../util/auditevent';
++import { LogThrottle } from '../util/logthrottle';
+ import { buildTraceparent } from '../util/tracing';
+ import { isAllowedOutboundUrlForQueue, safeFetch } from '../util/url';
+ import type { SubEventEntry, SubEventPayload } from '../ws/subscriptions';
+@@ -453,6 +454,11 @@ export async function addSubscriptionJobs(
+   }
+ 
+   if (wsSubEvents.length) {
++    logBinaryDataNotification(
++      resource,
++      'websocket',
++      wsSubEvents.map(([subscriptionId]) => subscriptionId)
++    );
+     await publish(
+       WEBSOCKET_SUB_PUBLISH_CHANNEL,
+       JSON.stringify({ resource, events: wsSubEvents } satisfies SubEventPayload)
+@@ -460,6 +466,31 @@ export async function addSubscriptionJobs(
+   }
+ }
+ 
++const binaryDataLogThrottle = new LogThrottle(10 * 60 * 1000); // 10 minute window
++
++/**
++ * Logs subscription notifications that include inline `Binary.data`.
++ * The content is also available from binary storage, so subscribers should not need it in the notification.
++ * @param resource - The resource sent to subscribers.
++ * @param channel - The notification channel.
++ * @param subscriptionIds - The subscriptions that receive the resource.
++ */
++function logBinaryDataNotification(resource: Resource, channel: string, subscriptionIds: string[]): void {
++  if (resource.resourceType !== 'Binary' || resource.data === undefined) {
++    return;
++  }
++  const project = resource.meta?.project;
++  binaryDataLogThrottle.maybeLog([project, channel, ...subscriptionIds].join('|'), (suppressed) => {
++    globalLogger.warn('Subscription notification includes Binary.data', {
++      binary: resource.id,
++      project,
++      channel,
++      subscriptions: subscriptionIds,
++      suppressed,
++    });
++  });
++}
++
+ /**
+  * Determines if the resource matches the subscription criteria.
+  * @param resource - The resource that was created or updated.
+@@ -741,6 +772,11 @@ async function deliverSubscriptionJob(job: Job<SubscriptionJobData>, summary: Su
+       using projectRepo = await getRepoForProject(versionedResource.meta.project);
+       rewrittenResource = await rewriteAttachments(RewriteMode.PRESIGNED_URL, projectRepo, versionedResource);
+     }
++    logBinaryDataNotification(
++      rewrittenResource,
++      subscription.channel.endpoint?.startsWith('Bot/') ? 'bot' : 'rest-hook',
++      [subscription.id]
++    );
+   } catch (err) {
+     if (job.attemptsMade < MAX_PREAMBLE_ATTEMPTS) {
+       throw err;

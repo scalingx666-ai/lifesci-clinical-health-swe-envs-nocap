@@ -1,0 +1,4454 @@
+diff --git a/docs/rest-service.md b/docs/rest-service.md
+index 6b1c56d8a..24b7cabf1 100644
+--- a/docs/rest-service.md
++++ b/docs/rest-service.md
+@@ -474,17 +474,42 @@ model/backend. While a breaker is open, model-backed endpoints return `503`
+ with error code `circuit_breaker_open` and a `Retry-After` header. See
+ [`Serving Resilience`](serving/resilience.md) for the full set of knobs.
+ 
+-Optional graceful-shutdown drain timeout:
++Optional graceful-shutdown drain budget:
+ 
+ ```bash
+-OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS=30 python -m openmed.service.logging --host 127.0.0.1 --port 8080
++OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS=30 \
++OPENMED_SERVICE_SHUTDOWN_RELEASE_SECONDS=5 \
++python -m openmed.service.logging --host 127.0.0.1 --port 8080
+ ```
+ 
+-`OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS` is a non-negative number of seconds.
+-During shutdown, readiness is flipped off, new model-backed work is rejected,
+-and the service waits up to this timeout for in-flight `/analyze`,
+-`/pii/extract`, `/pii/deidentify`, `/pii/deidentify/stream`, and
+-`/privacy-gateway/complete` requests to finish. The default is `30`.
++Shutdown (SIGTERM or the end of the ASGI lifespan) runs one coordinated drain
++in ordered phases, each bounded by the budget:
++
++1. Readiness drops first (`/readyz` returns `503`), then admission closes on
++   every surface. New model-backed REST and GraphQL requests, including
++   `/jobs` submissions, get `503 not_ready` with a `Retry-After` header and
++   `details.reason = "shutting_down"`. gRPC calls get `UNAVAILABLE` with
++   details `shutting_down` and a `grpc-retry-pushback-ms` trailer when the
++   server was built with `create_grpc_server` on the same runtime.
++   `/livez` stays `200` throughout.
++2. Accepted work may finish for up to `OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS`
++   (default `30`). Near the end of that window, NDJSON streams stop at their
++   next event and end with one `{"type":"error","error":{"code":"shutting_down",...}}`
++   line; buffered text that was not yet emitted is discarded, never flushed.
++   gRPC streams end the same way with `UNAVAILABLE`. Async jobs stop at their
++   next document boundary. A job still queued or running at the deadline is
++   recorded as `cancelled` with `error.code = "shutting_down"` and
++   `error.retryable = true`; a worker that finishes later cannot overwrite it.
++   Terminal job callbacks sent during a drain make one bounded attempt.
++3. Within `OPENMED_SERVICE_SHUTDOWN_RELEASE_SECONDS` (default `5`), batch queues
++   are flushed, the gRPC server stops, the model warm pool is closed and its
++   models are unloaded, and accelerator caches already in use are released.
++
++Both values are finite, non-negative seconds. Set the pod termination grace
++period above their sum. With `OPENMED_SERVICE_METRICS_ENABLED=true`,
++`openmed_service_draining`, `openmed_service_drain_participant_total`, and
++`openmed_service_drain_unfinished` report drain progress using only phase,
++participant-category, and outcome labels.
+ 
+ Optional pull-only Prometheus metrics endpoint:
+ 
+@@ -574,7 +599,7 @@ names, counts, labels, lengths, and durations. See
+ - Model load and inference work uses bounded retry and an in-process circuit
+   breaker. Open breakers fail fast with `503` and `Retry-After`.
+ - `/livez` reports process liveness, `/readyz` reports startup readiness, and `/health` remains the backward-compatible health alias.
+-- Graceful shutdown rejects new model-backed requests and drains in-flight model-backed requests for up to `OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS`.
++- Graceful shutdown drops readiness, refuses new work on REST, GraphQL and gRPC with a retryable `shutting_down` result, lets accepted requests, streams and jobs finish or end with a typed terminal result within `OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS`, then releases batchers, models and accelerators within `OPENMED_SERVICE_SHUTDOWN_RELEASE_SECONDS`.
+ - `/metrics` is opt-in, pull-only, and exposes aggregate counts, gauges, and latency histograms without PHI-derived labels.
+ - OpenTelemetry tracing is opt-in, honors incoming trace context, and exports only no-PHI span attributes when configured.
+ - Application endpoint errors and invalid Host headers use one JSON envelope
+diff --git a/openmed/service/app.py b/openmed/service/app.py
+index 603bc6e9b..129e36bd1 100644
+--- a/openmed/service/app.py
++++ b/openmed/service/app.py
+@@ -66,6 +66,17 @@
+     FHIRBulkJobManager,
+ )
+ from .coalesce import RequestCoalescer, coalescing_key
++from .drain import (
++    BackgroundJobsDrainParticipant,
++    BatcherDrainParticipant,
++    CallbackDrainParticipant,
++    DrainCoordinator,
++    HTTPRequestDrainParticipant,
++    JobQueueDrainParticipant,
++    NDJSONStreamDrainParticipant,
++    ServiceShuttingDownError,
++    shutting_down_details,
++)
+ from .governed_workflows import WorkflowGovernanceService, WorkflowHTTPPolicy
+ from .jobs import DeidentifyJobQueue, job_response_payload
+ from .journey_resources import (
+@@ -820,6 +831,93 @@ async def _batch_backpressure_check(request: Request) -> Optional[BackpressureEr
+     return await batcher.admission_error(_request_priority(request))
+ 
+ 
++def _shutting_down_response(retry_after_seconds: float) -> JSONResponse:
++    """Return the stable, retryable REST refusal used once admission closes."""
++    response = _error_response(
++        503,
++        "not_ready",
++        "Service is shutting down and not accepting new requests",
++        details=shutting_down_details(retry_after_seconds),
++    )
++    response.headers["Retry-After"] = format_retry_after(retry_after_seconds)
++    return response
++
++
++def _drain_retry_after(state: Any) -> float:
++    coordinator = getattr(state, "drain", None)
++    return float(getattr(coordinator, "retry_after_seconds", 1.0))
++
++
++def _drain_aware_stream(request: Request, events: Any) -> Any:
++    """Give an NDJSON body a bounded tail and a typed drain terminal event."""
++    streams = getattr(request.app.state, "drain_streams", None)
++    if not isinstance(streams, NDJSONStreamDrainParticipant):
++        return events
++    return streams.wrap(events)
++
++
++async def _stop_openhim_mediator(state: Any) -> None:
++    mediator = getattr(state, "openhim_mediator", None)
++    if mediator is not None:
++        await mediator.stop()
++
++
++def _shutdown_tracing(state: Any) -> None:
++    tracing = getattr(state, "tracing", None)
++    if tracing is not None:
++        tracing.shutdown()
++
++
++def _install_drain_coordinator(
++    app: FastAPI, runtime: ServiceRuntime
++) -> DrainCoordinator:
++    """Register REST lifecycle participants on the runtime's coordinator.
++
++    Participants look state up when the drain runs, so batchers, queues, and
++    managers swapped in after start-up are still drained. Participants added
++    with ``register_drain_participant(app, ...)`` join every lifespan.
++    """
++    state = app.state
++    coordinator = runtime.get_drain_coordinator()
++    coordinator.on_readiness_lost(lambda: setattr(state, "ready", False))
++    streams = NDJSONStreamDrainParticipant(
++        retry_after_seconds=coordinator.retry_after_seconds
++    )
++    state.drain = coordinator
++    state.drain_streams = streams
++    state.drain_report = None
++    for participant in (
++        HTTPRequestDrainParticipant(state),
++        CallbackDrainParticipant(
++            "openhim",
++            priority=15,
++            stop_admission=lambda _ctx: _stop_openhim_mediator(state),
++        ),
++        streams,
++        BatcherDrainParticipant(
++            lambda: (
++                getattr(state, "analyze_batcher", None),
++                getattr(state, "pii_extract_batcher", None),
++            )
++        ),
++        JobQueueDrainParticipant(lambda: getattr(state, "job_queue", None)),
++        BackgroundJobsDrainParticipant(
++            lambda: getattr(state, "smart_backend_jobs", None),
++            category="smart_jobs",
++        ),
++        BackgroundJobsDrainParticipant(
++            lambda: getattr(state, "fhir_bulk_jobs", None),
++            category="bulk_jobs",
++        ),
++        CallbackDrainParticipant(
++            "tracing", priority=70, flush=lambda _ctx: _shutdown_tracing(state)
++        ),
++        *tuple(getattr(state, "drain_participants", None) or ()),
++    ):
++        coordinator.register(participant)
++    return coordinator
++
++
+ def _metrics_route_label(request: Request) -> str:
+     route = request.scope.get("route")
+     route_path = getattr(route, "path", None)
+@@ -874,6 +972,7 @@ async def lifespan(fastapi_app: FastAPI):
+         fastapi_app.state.shutting_down = False
+         fastapi_app.state.inflight = 0
+         fastapi_app.state.openhim_mediator = None
++        coordinator = _install_drain_coordinator(fastapi_app, runtime)
+ 
+         if runtime.preload_models:
+             await run_in_threadpool(runtime.preload)
+@@ -892,31 +991,10 @@ async def lifespan(fastapi_app: FastAPI):
+         try:
+             yield
+         finally:
+-            fastapi_app.state.ready = False
+-            fastapi_app.state.shutting_down = True
+-            mediator = getattr(fastapi_app.state, "openhim_mediator", None)
+-            if mediator is not None:
+-                await mediator.stop()
+-            loop = asyncio.get_event_loop()
+-            deadline = loop.time() + float(
+-                getattr(runtime, "shutdown_drain_seconds", 0.0) or 0.0
+-            )
+-            while getattr(fastapi_app.state, "inflight", 0) > 0 and (
+-                loop.time() < deadline
+-            ):
+-                await asyncio.sleep(0.05)
+-            tracing = getattr(fastapi_app.state, "tracing", None)
+-            if tracing is not None:
+-                tracing.shutdown()
+-            manager = getattr(fastapi_app.state, "smart_backend_jobs", None)
+-            if manager is not None:
+-                await manager.cancel_all()
+-            bulk_manager = getattr(fastapi_app.state, "fhir_bulk_jobs", None)
+-            if bulk_manager is not None:
+-                await bulk_manager.cancel_all()
+-            job_queue = getattr(fastapi_app.state, "job_queue", None)
+-            if job_queue is not None:
+-                job_queue.shutdown()
++            # Readiness drops first; admission then closes on every surface,
++            # in-flight work finishes or ends with a typed result, and models
++            # and devices are released, each phase within its budget.
++            fastapi_app.state.drain_report = await coordinator.drain()
+ 
+     app = FastAPI(
+         title="OpenMed REST API",
+@@ -1051,12 +1129,7 @@ async def _readiness_middleware(request: Request, call_next):
+         if request_needs_admission(request):
+             state = request.app.state
+             if getattr(state, "shutting_down", False):
+-                return _error_response(
+-                    503,
+-                    "not_ready",
+-                    "Service is shutting down and not accepting new requests",
+-                    details=None,
+-                )
++                return _shutting_down_response(_drain_retry_after(state))
+             state.inflight = getattr(state, "inflight", 0) + 1
+             try:
+                 return await call_next(request)
+@@ -1225,6 +1298,13 @@ async def _circuit_breaker_handler(
+             headers={"Retry-After": retry_after},
+         )
+ 
++    @app.exception_handler(ServiceShuttingDownError)
++    async def _service_shutting_down_handler(
++        _: Request,
++        exc: ServiceShuttingDownError,
++    ) -> JSONResponse:
++        return _shutting_down_response(exc.retry_after_seconds)
++
+     @app.exception_handler(WarmPoolBackpressureError)
+     async def _warm_pool_backpressure_handler(
+         _: Request,
+@@ -1311,6 +1391,8 @@ async def livez() -> Dict[str, str]:
+     async def readyz(request: Request):
+         if getattr(request.app.state, "ready", False):
+             return {"status": "ready", "service": SERVICE_NAME}
++        if getattr(request.app.state, "shutting_down", False):
++            return _shutting_down_response(_drain_retry_after(request.app.state))
+         return _error_response(
+             503,
+             "not_ready",
+@@ -1723,7 +1805,10 @@ async def _events():
+                 event_payload["audit"] = event.to_audit_dict()
+                 yield json.dumps(event_payload, sort_keys=True) + "\n"
+ 
+-        return StreamingResponse(_events(), media_type="application/x-ndjson")
++        return StreamingResponse(
++            _drain_aware_stream(request, _events()),
++            media_type="application/x-ndjson",
++        )
+ 
+     @app.post("/pii/deidentify")
+     async def pii_deidentify(
+@@ -1768,7 +1853,10 @@ async def pii_deidentify_stream(
+         set_access_log_model_name(request, payload.model_name)
+         runtime = _get_service_runtime(request)
+         events = deidentify_ndjson_stream(payload, runtime)
+-        return StreamingResponse(events, media_type="application/x-ndjson")
++        return StreamingResponse(
++            _drain_aware_stream(request, events),
++            media_type="application/x-ndjson",
++        )
+ 
+     @app.post(_PRIVACY_GATEWAY_PATH)
+     async def privacy_gateway_complete(
+diff --git a/openmed/service/batcher.py b/openmed/service/batcher.py
+index dc3e6bc12..0f48f4cc0 100644
+--- a/openmed/service/batcher.py
++++ b/openmed/service/batcher.py
+@@ -11,6 +11,7 @@
+ from typing import Any, Awaitable, Callable, Generic, Optional, Sequence, TypeVar, Union
+ 
+ from .backpressure import AdmissionQueue, AdmissionSnapshot, BackpressureError
++from .drain import ServiceShuttingDownError
+ 
+ T = TypeVar("T")
+ R = TypeVar("R")
+@@ -43,6 +44,14 @@
+ }
+ _PRIORITY_RANK = {priority: index for index, priority in enumerate(PRIORITY_CLASSES)}
+ _ANY_BATCH_KEY = object()
++_DRAIN_POLL_SECONDS = 0.005
++
++
++class BatcherClosedError(ServiceShuttingDownError):
++    """Raised for submissions after close and for work left queued by a drain."""
++
++    def __init__(self) -> None:
++        super().__init__("batcher is closed")
+ 
+ 
+ def normalize_priority(priority: object = PRIORITY_INTERACTIVE) -> str:
+@@ -172,6 +181,7 @@ def __init__(
+         self._active_batches = 0
+         self._running_tasks: set[asyncio.Task[None]] = set()
+         self._closed = False
++        self._draining = False
+         self._queue_limits = _normalize_queue_limits(max_queue_size_per_priority)
+         admission_high = (
+             sum(self._queue_limits.values())
+@@ -234,8 +244,8 @@ async def submit(
+                 requested_priority = priority_handle.priority
+ 
+             async with self._lock:
+-                if self._closed:
+-                    raise RuntimeError("batcher is closed")
++                if self._closed or self._draining:
++                    raise BatcherClosedError()
+                 queue = self._queues[requested_priority]
+                 queue_limit = self._queue_limits[requested_priority]
+                 if len(queue) >= queue_limit:
+@@ -362,6 +372,63 @@ async def close(self) -> None:
+         if running:
+             await asyncio.gather(*running, return_exceptions=True)
+ 
++    def outstanding_count(self) -> int:
++        """Return queued jobs plus running batch dispatches (lock-free read)."""
++        return len(self._jobs) + len(self._running_tasks)
++
++    async def drain(self, timeout: Optional[float] = None) -> dict[str, int]:
++        """Stop admission, dispatch queued work, and wait for running batches.
++
++        Unlike :meth:`close`, queued jobs are dispatched rather than cancelled.
++        Jobs still queued when ``timeout`` elapses fail with
++        :class:`BatcherClosedError`, a typed retryable shutdown result. Running
++        dispatches keep their admission capacity until they finish.
++
++        Args:
++            timeout: Seconds to wait; ``None`` waits until the batcher is idle.
++
++        Returns:
++            Value-free counts: ``dispatched``, ``failed_queued``, ``running``.
++        """
++        loop = asyncio.get_running_loop()
++        async with self._lock:
++            self._draining = True
++            queued_at_start = len(self._jobs)
++            self._flush_locked(loop)
++        deadline = None if timeout is None else loop.time() + max(timeout, 0.0)
++        while self.outstanding_count():
++            if deadline is not None and loop.time() >= deadline:
++                break
++            async with self._lock:
++                self._flush_locked(loop)
++            await asyncio.sleep(_DRAIN_POLL_SECONDS)
++
++        failed = 0
++        async with self._lock:
++            self._closed = True
++            if self._timer is not None:
++                self._timer.cancel()
++                self._timer = None
++            for job in list(self._jobs.values()):
++                if job.wait_timeout is not None:
++                    job.wait_timeout.cancel()
++                if job.priority_handle is not None:
++                    job.priority_handle._clear(job.job_id)
++                self._release_admission_locked(job)
++                if not job.future.done():
++                    job.future.set_exception(BatcherClosedError())
++                    failed += 1
++            self._jobs.clear()
++            for priority, queue in self._queues.items():
++                queue.clear()
++                self._record_queue_depth(priority)
++            running = len(self._running_tasks)
++        return {
++            "dispatched": max(queued_at_start - failed, 0),
++            "failed_queued": failed,
++            "running": running,
++        }
++
+     def _schedule_wait_timeout_locked(
+         self,
+         job: _QueuedJob[T, R],
+diff --git a/openmed/service/bulk_data.py b/openmed/service/bulk_data.py
+index 5eb9825f4..b69bc40d5 100644
+--- a/openmed/service/bulk_data.py
++++ b/openmed/service/bulk_data.py
+@@ -371,6 +371,11 @@ async def cancel(self, job_id: str) -> FHIRBulkJobStatus:
+             await asyncio.gather(record.task, return_exceptions=True)
+         return record.status
+ 
++    def active_count(self) -> int:
++        """Return background jobs whose task has not finished."""
++
++        return sum(1 for record in self._jobs.values() if not record.task.done())
++
+     async def cancel_all(self) -> None:
+         """Cancel all in-flight jobs during service shutdown."""
+ 
+diff --git a/openmed/service/drain.py b/openmed/service/drain.py
+new file mode 100644
+index 000000000..1bedde6db
+--- /dev/null
++++ b/openmed/service/drain.py
+@@ -0,0 +1,1653 @@
++"""Coordinated, bounded drain for the OpenMed service lifecycle.
++
++One :class:`DrainCoordinator` owns the shutdown of a service process. Lifecycle
++participants register with it and take part in four ordered phases, each bound
++by the configured budget:
++
++1. ``stop_admission``: readiness drops first, then every surface stops admitting
++   new work (REST, GraphQL, gRPC, jobs, callbacks).
++2. ``finish_in_flight``: accepted work finishes or reaches a declared terminal
++   state. Participants run concurrently against one deadline. Streams and jobs
++   still running near the end of the window are told to stop at their next safe
++   boundary (stream event or job document) so they end with a typed, retryable
++   result instead of being dropped.
++3. ``flush``: queues, callbacks, and exporters flush what remains.
++4. ``release``: model references, accelerator memory, servers, and executors are
++   returned to zero or to a declared retained baseline.
++
++Hooks never receive or report request bodies, stream fragments, job payloads,
++model content, or identifiers. Evidence is limited to controlled participant
++categories, phases, outcomes, aggregate counts, durations, and reason codes.
++Liveness stays true while the drain runs; only readiness changes.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import inspect
++import json
++import logging
++import math
++import re
++import sys
++import threading
++import weakref
++from collections.abc import AsyncIterator, Callable, Iterable, Sequence
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import Any, Optional, Protocol, runtime_checkable
++
++SHUTTING_DOWN = "shutting_down"
++DRAIN_DEADLINE_EXCEEDED = "drain_deadline_exceeded"
++PARTICIPANT_FAILED = "participant_failed"
++DRAIN_REASON_CODES = frozenset(
++    {SHUTTING_DOWN, DRAIN_DEADLINE_EXCEEDED, PARTICIPANT_FAILED}
++)
++
++DEFAULT_DRAIN_SECONDS = 30.0
++DEFAULT_RELEASE_SECONDS = 5.0
++DEFAULT_SETTLE_SECONDS = 1.0
++DEFAULT_RETRY_AFTER_SECONDS = 1.0
++SHUTTING_DOWN_MESSAGE = "Service is shutting down; retry the request"
++
++_SETTLE_FRACTION = 0.25
++_HOOK_GRACE_SECONDS = 0.05
++_BLOCKING_FLOOR_SECONDS = 0.01
++_POLL_SECONDS = 0.01
++_MAX_COUNT = 1_000_000_000
++_CATEGORY_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
++_LOGGER = logging.getLogger(__name__)
++
++
++class DrainPhase(str, Enum):
++    """Ordered drain phases."""
++
++    STOP_ADMISSION = "stop_admission"
++    FINISH_IN_FLIGHT = "finish_in_flight"
++    FLUSH = "flush"
++    RELEASE = "release"
++
++
++DRAIN_PHASES: tuple[DrainPhase, ...] = tuple(DrainPhase)
++
++
++class DrainOutcome(str, Enum):
++    """Controlled outcome for one participant phase or a whole drain."""
++
++    COMPLETED = "completed"
++    CHECKPOINTED = "checkpointed"
++    CANCELLED = "cancelled"
++    DEADLINE_EXCEEDED = "deadline_exceeded"
++    FAILED = "failed"
++    SKIPPED = "skipped"
++
++
++_OUTCOME_SEVERITY = {
++    DrainOutcome.SKIPPED: 0,
++    DrainOutcome.COMPLETED: 1,
++    DrainOutcome.CHECKPOINTED: 2,
++    DrainOutcome.CANCELLED: 3,
++    DrainOutcome.DEADLINE_EXCEEDED: 4,
++    DrainOutcome.FAILED: 5,
++}
++
++
++class DrainState(str, Enum):
++    """Coarse lifecycle state exposed by a coordinator."""
++
++    SERVING = "serving"
++    DRAINING = "draining"
++    DRAINED = "drained"
++
++
++class ServiceShuttingDownError(RuntimeError):
++    """Typed, retryable refusal raised once a surface stops admitting work.
++
++    Args:
++        message: Fixed, value-free message.
++        retry_after_seconds: Hint for when a client may retry elsewhere.
++    """
++
++    reason_code = SHUTTING_DOWN
++
++    def __init__(
++        self,
++        message: str = SHUTTING_DOWN_MESSAGE,
++        *,
++        retry_after_seconds: float = DEFAULT_RETRY_AFTER_SECONDS,
++    ) -> None:
++        super().__init__(message)
++        self.retry_after_seconds = _non_negative_seconds(retry_after_seconds)
++
++    def to_details(self) -> dict[str, Any]:
++        """Return the value-free retry contract shared by every surface."""
++        return shutting_down_details(self.retry_after_seconds)
++
++
++def shutting_down_details(retry_after_seconds: float) -> dict[str, Any]:
++    """Return the value-free details attached to a shutdown refusal.
++
++    Args:
++        retry_after_seconds: Retry hint in seconds.
++
++    Returns:
++        Mapping with the reason code, retryability, and retry hint.
++    """
++    return {
++        "reason": SHUTTING_DOWN,
++        "retryable": True,
++        "retry_after_seconds": _non_negative_seconds(retry_after_seconds),
++    }
++
++
++def shutting_down_ndjson_line(
++    retry_after_seconds: float = DEFAULT_RETRY_AFTER_SECONDS,
++) -> str:
++    """Return the typed terminal NDJSON event for a stream ended by a drain.
++
++    Args:
++        retry_after_seconds: Retry hint in seconds.
++
++    Returns:
++        One newline-terminated JSON object with a ``shutting_down`` error code.
++    """
++    payload = {
++        "type": "error",
++        "error": {
++            "code": SHUTTING_DOWN,
++            "message": SHUTTING_DOWN_MESSAGE,
++            "details": {
++                "retryable": True,
++                "retry_after_seconds": _non_negative_seconds(retry_after_seconds),
++            },
++        },
++    }
++    return json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n"
++
++
++@dataclass(frozen=True)
++class DrainBudget:
++    """Bounded time budget for one drain.
++
++    Attributes:
++        drain_seconds: Window for stopping admission and finishing in-flight work.
++        release_seconds: Window, after in-flight work ends, for flush and release.
++        settle_seconds: Tail of the in-flight window reserved for streams and jobs
++            to reach a declared terminal state after they are asked to stop.
++            Defaults to ``min(1.0, drain_seconds / 4)``.
++    """
++
++    drain_seconds: float = DEFAULT_DRAIN_SECONDS
++    release_seconds: float = DEFAULT_RELEASE_SECONDS
++    settle_seconds: Optional[float] = None
++
++    def __post_init__(self) -> None:
++        drain = _non_negative_seconds(self.drain_seconds)
++        release = _non_negative_seconds(self.release_seconds)
++        settle = (
++            min(DEFAULT_SETTLE_SECONDS, drain * _SETTLE_FRACTION)
++            if self.settle_seconds is None
++            else min(_non_negative_seconds(self.settle_seconds), drain)
++        )
++        object.__setattr__(self, "drain_seconds", drain)
++        object.__setattr__(self, "release_seconds", release)
++        object.__setattr__(self, "settle_seconds", settle)
++
++    @property
++    def total_seconds(self) -> float:
++        """Return the hard bound across every phase, excluding hook grace."""
++        return self.drain_seconds + self.release_seconds
++
++    def to_dict(self) -> dict[str, float]:
++        """Return the budget as plain numbers."""
++        return {
++            "drain_seconds": self.drain_seconds,
++            "release_seconds": self.release_seconds,
++            "settle_seconds": float(self.settle_seconds or 0.0),
++        }
++
++
++@dataclass(frozen=True)
++class PhaseResult:
++    """Value-free result returned by one participant hook.
++
++    Attributes:
++        outcome: Controlled outcome for this participant and phase.
++        completed: Units of work that committed or ended normally.
++        cancelled: Units explicitly cancelled with a retryable result.
++        checkpointed: Units durably checkpointed for resume.
++        unfinished: Units still outstanding when the hook returned.
++        reason_code: Optional controlled reason code.
++    """
++
++    outcome: DrainOutcome = DrainOutcome.COMPLETED
++    completed: int = 0
++    cancelled: int = 0
++    checkpointed: int = 0
++    unfinished: int = 0
++    reason_code: Optional[str] = None
++
++    def __post_init__(self) -> None:
++        object.__setattr__(self, "outcome", DrainOutcome(self.outcome))
++        for name in ("completed", "cancelled", "checkpointed", "unfinished"):
++            object.__setattr__(self, name, _bounded_count(getattr(self, name)))
++        if self.reason_code is not None and self.reason_code not in (
++            DRAIN_REASON_CODES
++        ):
++            raise ValueError("drain reason code is not in the controlled vocabulary")
++
++    @classmethod
++    def from_counts(
++        cls,
++        *,
++        completed: int = 0,
++        cancelled: int = 0,
++        checkpointed: int = 0,
++        unfinished: int = 0,
++    ) -> "PhaseResult":
++        """Derive the outcome and reason code from aggregate counts.
++
++        Args:
++            completed: Units that ended normally.
++            cancelled: Units cancelled with a retryable result.
++            checkpointed: Units checkpointed for resume.
++            unfinished: Units still outstanding.
++
++        Returns:
++            A result whose outcome is the most severe one the counts imply.
++        """
++        if unfinished > 0:
++            outcome, reason = DrainOutcome.DEADLINE_EXCEEDED, DRAIN_DEADLINE_EXCEEDED
++        elif cancelled > 0:
++            outcome, reason = DrainOutcome.CANCELLED, SHUTTING_DOWN
++        elif checkpointed > 0:
++            outcome, reason = DrainOutcome.CHECKPOINTED, SHUTTING_DOWN
++        else:
++            outcome, reason = DrainOutcome.COMPLETED, None
++        return cls(
++            outcome=outcome,
++            completed=completed,
++            cancelled=cancelled,
++            checkpointed=checkpointed,
++            unfinished=unfinished,
++            reason_code=reason,
++        )
++
++
++@dataclass(frozen=True)
++class DrainEvent:
++    """One value-free progress record for a participant phase."""
++
++    phase: DrainPhase
++    participant: str
++    outcome: DrainOutcome
++    completed: int
++    cancelled: int
++    checkpointed: int
++    unfinished: int
++    budget_seconds: float
++    duration_seconds: float
++    reason_code: Optional[str] = None
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return a deterministic representation containing no work values."""
++        return {
++            "phase": self.phase.value,
++            "participant": self.participant,
++            "outcome": self.outcome.value,
++            "completed": self.completed,
++            "cancelled": self.cancelled,
++            "checkpointed": self.checkpointed,
++            "unfinished": self.unfinished,
++            "budget_seconds": round(self.budget_seconds, 3),
++            "duration_seconds": round(self.duration_seconds, 3),
++            "reason_code": self.reason_code,
++        }
++
++
++@dataclass(frozen=True)
++class DrainReport:
++    """Aggregate, value-free evidence for one completed drain."""
++
++    outcome: DrainOutcome
++    budget: DrainBudget
++    duration_seconds: float
++    events: tuple[DrainEvent, ...]
++
++    @property
++    def unfinished_participants(self) -> tuple[str, ...]:
++        """Return categories that still had outstanding work at their deadline."""
++        return tuple(
++            sorted({event.participant for event in self.events if event.unfinished})
++        )
++
++    def events_for(self, participant: str) -> tuple[DrainEvent, ...]:
++        """Return the events recorded for one participant category."""
++        return tuple(event for event in self.events if event.participant == participant)
++
++    def totals(self) -> dict[str, int]:
++        """Return aggregate counts across every participant."""
++        return {
++            name: sum(getattr(event, name) for event in self.events)
++            for name in ("completed", "cancelled", "checkpointed", "unfinished")
++        }
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return a deterministic, value-free evidence document."""
++        return {
++            "outcome": self.outcome.value,
++            "budget": self.budget.to_dict(),
++            "duration_seconds": round(self.duration_seconds, 3),
++            "totals": self.totals(),
++            "unfinished_participants": list(self.unfinished_participants),
++            "events": [event.to_dict() for event in self.events],
++        }
++
++
++@dataclass
++class DrainContext:
++    """Deadline information handed to one participant hook.
++
++    Attributes:
++        phase: Phase being executed.
++        deadline: Event-loop time by which the hook must return.
++        settle_deadline: Point after which streams and jobs are asked to stop.
++            Equal to ``deadline`` outside the in-flight phase.
++        retry_after_seconds: Retry hint attached to shutdown refusals.
++        budget: Budget of the drain this hook belongs to.
++    """
++
++    phase: DrainPhase
++    deadline: float
++    settle_deadline: float
++    retry_after_seconds: float = DEFAULT_RETRY_AFTER_SECONDS
++    budget: DrainBudget = field(default_factory=DrainBudget)
++
++    def remaining(self) -> float:
++        """Return seconds left before this hook's deadline."""
++        return max(self.deadline - asyncio.get_running_loop().time(), 0.0)
++
++    async def wait_until(
++        self,
++        predicate: Callable[[], bool],
++        *,
++        deadline: Optional[float] = None,
++    ) -> bool:
++        """Poll ``predicate`` until it is true or the deadline passes.
++
++        Args:
++            predicate: Cheap, non-blocking condition.
++            deadline: Optional earlier deadline in event-loop time.
++
++        Returns:
++            Whether the predicate held before the deadline.
++        """
++        limit = self.deadline if deadline is None else min(deadline, self.deadline)
++        loop = asyncio.get_running_loop()
++        while True:
++            if predicate():
++                return True
++            remaining = limit - loop.time()
++            if remaining <= 0:
++                return bool(predicate())
++            await asyncio.sleep(min(_POLL_SECONDS, remaining))
++
++    async def run_blocking(self, operation: Callable[[], Any]) -> Any:
++        """Run blocking cleanup in a daemon thread bounded by this deadline.
++
++        The thread is a daemon so a wedged device or server cannot keep the
++        process alive after the hard deadline.
++
++        Args:
++            operation: Blocking callable with no arguments.
++
++        Returns:
++            The callable's result.
++
++        Raises:
++            asyncio.TimeoutError: When the deadline passes first.
++        """
++        loop = asyncio.get_running_loop()
++        future: asyncio.Future[Any] = loop.create_future()
++
++        def resolve(error: Optional[BaseException], value: Any) -> None:
++            if future.done():
++                return
++            if error is None:
++                future.set_result(value)
++            else:
++                future.set_exception(error)
++
++        def target() -> None:
++            try:
++                value = operation()
++            except BaseException as exc:  # noqa: BLE001 - re-raised on the loop
++                outcome: tuple[Optional[BaseException], Any] = (exc, None)
++            else:
++                outcome = (None, value)
++            try:
++                loop.call_soon_threadsafe(resolve, *outcome)
++            except RuntimeError:
++                pass
++
++        threading.Thread(target=target, name="openmed-drain", daemon=True).start()
++        # A tiny floor lets an already-finished operation report success even
++        # when the budget is zero; the coordinator's hook bound still applies.
++        timeout = max(self.remaining(), _BLOCKING_FLOOR_SECONDS)
++        return await asyncio.wait_for(asyncio.shield(future), timeout)
++
++
++class DrainParticipant:
++    """Base class for lifecycle participants.
++
++    Subclasses override the phase hooks they take part in. A hook may be sync or
++    async, receives a :class:`DrainContext`, and returns a :class:`PhaseResult`
++    or ``None`` (recorded as skipped). Hooks must respect ``ctx.deadline``; the
++    coordinator also cancels an async hook shortly after it.
++
++    Args:
++        category: Controlled lowercase label such as ``"job_queue"``. It is used
++            as a metric label and must never carry request or model values.
++        priority: Ordering within sequential phases; lower runs first.
++    """
++
++    category: str = "participant"
++    priority: int = 100
++
++    def __init__(
++        self,
++        category: Optional[str] = None,
++        *,
++        priority: Optional[int] = None,
++    ) -> None:
++        if category is not None:
++            self.category = category
++        if priority is not None:
++            self.priority = int(priority)
++        validate_drain_category(self.category)
++
++    def handles(self, phase: DrainPhase) -> bool:
++        """Return whether this participant takes part in ``phase``."""
++        return getattr(type(self), phase.value) is not getattr(
++            DrainParticipant, phase.value
++        )
++
++    def stop_admission(self, ctx: DrainContext) -> Any:
++        """Stop admitting new work. Must not block."""
++        return None
++
++    def finish_in_flight(self, ctx: DrainContext) -> Any:
++        """Finish, checkpoint, or explicitly cancel accepted work."""
++        return None
++
++    def flush(self, ctx: DrainContext) -> Any:
++        """Flush queues, callbacks, or exporters."""
++        return None
++
++    def release(self, ctx: DrainContext) -> Any:
++        """Release references, devices, servers, and executors."""
++        return None
++
++    def outstanding(self) -> int:
++        """Return outstanding work units for deadline evidence."""
++        return 0
++
++
++class CallbackDrainParticipant(DrainParticipant):
++    """Participant assembled from optional per-phase callbacks.
++
++    Each callback receives the :class:`DrainContext` and may return a
++    :class:`PhaseResult`, ``None``, or an awaitable of either.
++
++    Args:
++        category: Controlled participant label.
++        priority: Ordering within sequential phases.
++        stop_admission: Optional admission hook.
++        finish_in_flight: Optional in-flight hook.
++        flush: Optional flush hook.
++        release: Optional release hook.
++        outstanding: Optional zero-argument count of outstanding work.
++    """
++
++    def __init__(
++        self,
++        category: str,
++        *,
++        priority: int = 100,
++        stop_admission: Optional[Callable[[DrainContext], Any]] = None,
++        finish_in_flight: Optional[Callable[[DrainContext], Any]] = None,
++        flush: Optional[Callable[[DrainContext], Any]] = None,
++        release: Optional[Callable[[DrainContext], Any]] = None,
++        outstanding: Optional[Callable[[], int]] = None,
++    ) -> None:
++        super().__init__(category, priority=priority)
++        self._hooks = {
++            phase: hook
++            for phase, hook in (
++                (DrainPhase.STOP_ADMISSION, stop_admission),
++                (DrainPhase.FINISH_IN_FLIGHT, finish_in_flight),
++                (DrainPhase.FLUSH, flush),
++                (DrainPhase.RELEASE, release),
++            )
++            if hook is not None
++        }
++        self._outstanding = outstanding
++
++    def handles(self, phase: DrainPhase) -> bool:
++        """Return whether a callback was supplied for ``phase``."""
++        return phase in self._hooks
++
++    async def _call(self, phase: DrainPhase, ctx: DrainContext) -> Any:
++        result = self._hooks[phase](ctx)
++        if inspect.isawaitable(result):
++            result = await result
++        return result if isinstance(result, PhaseResult) else PhaseResult()
++
++    async def stop_admission(self, ctx: DrainContext) -> Any:
++        """Run the supplied admission callback."""
++        return await self._call(DrainPhase.STOP_ADMISSION, ctx)
++
++    async def finish_in_flight(self, ctx: DrainContext) -> Any:
++        """Run the supplied in-flight callback."""
++        return await self._call(DrainPhase.FINISH_IN_FLIGHT, ctx)
++
++    async def flush(self, ctx: DrainContext) -> Any:
++        """Run the supplied flush callback."""
++        return await self._call(DrainPhase.FLUSH, ctx)
++
++    async def release(self, ctx: DrainContext) -> Any:
++        """Run the supplied release callback."""
++        return await self._call(DrainPhase.RELEASE, ctx)
++
++    def outstanding(self) -> int:
++        """Return the supplied outstanding count, if any."""
++        return 0 if self._outstanding is None else int(self._outstanding())
++
++
++class DrainRegistrationError(RuntimeError):
++    """Raised when a participant is registered after a drain started."""
++
++
++class DrainCoordinator:
++    """Run one bounded, ordered drain across registered participants.
++
++    The coordinator is single-shot: concurrent or repeated :meth:`drain` calls
++    share one run and return the same report, so a repeated signal never drains
++    work twice.
++
++    Args:
++        budget: Phase budget; defaults to :class:`DrainBudget`.
++        metrics: Optional registry exposing ``record_drain_event`` and
++            ``set_draining``.
++        retry_after_seconds: Retry hint attached to shutdown refusals.
++    """
++
++    def __init__(
++        self,
++        budget: Optional[DrainBudget] = None,
++        *,
++        metrics: Optional[Any] = None,
++        retry_after_seconds: float = DEFAULT_RETRY_AFTER_SECONDS,
++    ) -> None:
++        self.budget = budget or DrainBudget()
++        self.metrics = metrics
++        self.retry_after_seconds = _non_negative_seconds(retry_after_seconds)
++        self._participants: list[DrainParticipant] = []
++        self._readiness_callbacks: list[Callable[[], Any]] = []
++        self._listeners: list[Callable[[DrainEvent], Any]] = []
++        self._events: list[DrainEvent] = []
++        self._state = DrainState.SERVING
++        self._task: Optional[asyncio.Future[DrainReport]] = None
++        self._report: Optional[DrainReport] = None
++        self._lock = threading.Lock()
++
++    @property
++    def state(self) -> DrainState:
++        """Return the coarse lifecycle state."""
++        return self._state
++
++    @property
++    def ready(self) -> bool:
++        """Return whether the coordinator still advertises readiness."""
++        return self._state is DrainState.SERVING
++
++    @property
++    def live(self) -> bool:
++        """Return liveness, which stays true through a bounded drain."""
++        return True
++
++    @property
++    def report(self) -> Optional[DrainReport]:
++        """Return the finished report, if the drain completed."""
++        return self._report
++
++    @property
++    def events(self) -> tuple[DrainEvent, ...]:
++        """Return progress events recorded so far."""
++        return tuple(self._events)
++
++    def participants(self) -> tuple[DrainParticipant, ...]:
++        """Return registered participants in priority order."""
++        return tuple(sorted(self._participants, key=lambda item: item.priority))
++
++    def register(self, participant: DrainParticipant) -> DrainParticipant:
++        """Register a participant; registering the same object twice is a no-op.
++
++        Args:
++            participant: Participant to add.
++
++        Returns:
++            The registered participant.
++
++        Raises:
++            DrainRegistrationError: When the drain already started.
++            TypeError: When ``participant`` is not a :class:`DrainParticipant`.
++        """
++        if not isinstance(participant, DrainParticipant):
++            raise TypeError("drain participants must subclass DrainParticipant")
++        validate_drain_category(participant.category)
++        with self._lock:
++            if self._state is not DrainState.SERVING:
++                raise DrainRegistrationError("drain already started")
++            if not any(item is participant for item in self._participants):
++                self._participants.append(participant)
++        return participant
++
++    def on_readiness_lost(self, callback: Callable[[], Any]) -> None:
++        """Call ``callback`` first when a drain starts, before admission closes."""
++        self._readiness_callbacks.append(callback)
++
++    def add_listener(self, listener: Callable[[DrainEvent], Any]) -> None:
++        """Receive every value-free progress event as it is recorded."""
++        self._listeners.append(listener)
++
++    def snapshot(self) -> dict[str, Any]:
++        """Return the current state and outstanding counts per category."""
++        outstanding: dict[str, int] = {}
++        for participant in self.participants():
++            outstanding[participant.category] = outstanding.get(
++                participant.category, 0
++            ) + _safe_outstanding(participant)
++        return {"state": self._state.value, "outstanding": outstanding}
++
++    async def drain(self) -> DrainReport:
++        """Run the drain once and return its report.
++
++        Returns:
++            The value-free report for this coordinator's single drain.
++        """
++        if self._report is not None:
++            return self._report
++        if self._task is None:
++            self._task = asyncio.ensure_future(self._run())
++        return await asyncio.shield(self._task)
++
++    async def _run(self) -> DrainReport:
++        loop = asyncio.get_running_loop()
++        started = loop.time()
++        with self._lock:
++            self._state = DrainState.DRAINING
++        self._metric("set_draining", True)
++        for callback in tuple(self._readiness_callbacks):
++            try:
++                result = callback()
++                if inspect.isawaitable(result):
++                    await result
++            except Exception:
++                _LOGGER.warning("service drain readiness hook failed")
++
++        budget = self.budget
++        in_flight_deadline = started + budget.drain_seconds
++        settle_deadline = in_flight_deadline - float(budget.settle_seconds or 0.0)
++        await self._run_sequential(
++            DrainPhase.STOP_ADMISSION, in_flight_deadline, in_flight_deadline
++        )
++        await self._run_concurrent(
++            DrainPhase.FINISH_IN_FLIGHT, in_flight_deadline, settle_deadline
++        )
++        released_at = loop.time()
++        flush_deadline = released_at + budget.release_seconds / 2
++        release_deadline = released_at + budget.release_seconds
++        await self._run_sequential(DrainPhase.FLUSH, flush_deadline, flush_deadline)
++        await self._run_sequential(
++            DrainPhase.RELEASE, release_deadline, release_deadline
++        )
++
++        events = tuple(self._events)
++        outcome = max(
++            (event.outcome for event in events),
++            key=_OUTCOME_SEVERITY.__getitem__,
++            default=DrainOutcome.COMPLETED,
++        )
++        if outcome is DrainOutcome.SKIPPED:
++            outcome = DrainOutcome.COMPLETED
++        report = DrainReport(
++            outcome=outcome,
++            budget=budget,
++            duration_seconds=max(loop.time() - started, 0.0),
++            events=events,
++        )
++        self._report = report
++        with self._lock:
++            self._state = DrainState.DRAINED
++        self._metric("set_draining", False)
++        _LOGGER.info(
++            "service drain finished outcome=%s unfinished=%d",
++            report.outcome.value,
++            report.totals()["unfinished"],
++        )
++        return report
++
++    async def _run_sequential(
++        self, phase: DrainPhase, deadline: float, settle_deadline: float
++    ) -> None:
++        for participant in self.participants():
++            if participant.handles(phase):
++                await self._invoke(participant, phase, deadline, settle_deadline)
++
++    async def _run_concurrent(
++        self, phase: DrainPhase, deadline: float, settle_deadline: float
++    ) -> None:
++        invocations = [
++            self._invoke(participant, phase, deadline, settle_deadline)
++            for participant in self.participants()
++            if participant.handles(phase)
++        ]
++        if invocations:
++            await asyncio.gather(*invocations)
++
++    async def _invoke(
++        self,
++        participant: DrainParticipant,
++        phase: DrainPhase,
++        deadline: float,
++        settle_deadline: float,
++    ) -> None:
++        loop = asyncio.get_running_loop()
++        started = loop.time()
++        budget_seconds = max(deadline - started, 0.0)
++        ctx = DrainContext(
++            phase=phase,
++            deadline=deadline,
++            settle_deadline=min(settle_deadline, deadline),
++            retry_after_seconds=self.retry_after_seconds,
++            budget=self.budget,
++        )
++        result: Any
++        try:
++            result = getattr(participant, phase.value)(ctx)
++            if inspect.isawaitable(result):
++                result = await asyncio.wait_for(
++                    result, timeout=budget_seconds + _HOOK_GRACE_SECONDS
++                )
++        except asyncio.TimeoutError:
++            result = PhaseResult(
++                outcome=DrainOutcome.DEADLINE_EXCEEDED,
++                unfinished=max(_safe_outstanding(participant), 1),
++                reason_code=DRAIN_DEADLINE_EXCEEDED,
++            )
++        except Exception:
++            # Exception text can carry request values; record only the code.
++            result = PhaseResult(
++                outcome=DrainOutcome.FAILED,
++                unfinished=_safe_outstanding(participant),
++                reason_code=PARTICIPANT_FAILED,
++            )
++        if not isinstance(result, PhaseResult):
++            result = PhaseResult(outcome=DrainOutcome.SKIPPED)
++        self._record(
++            DrainEvent(
++                phase=phase,
++                participant=participant.category,
++                outcome=result.outcome,
++                completed=result.completed,
++                cancelled=result.cancelled,
++                checkpointed=result.checkpointed,
++                unfinished=result.unfinished,
++                budget_seconds=budget_seconds,
++                duration_seconds=max(loop.time() - started, 0.0),
++                reason_code=result.reason_code,
++            )
++        )
++
++    def _record(self, event: DrainEvent) -> None:
++        self._events.append(event)
++        self._metric("record_drain_event", event)
++        for listener in tuple(self._listeners):
++            try:
++                listener(event)
++            except Exception:
++                _LOGGER.warning("service drain listener failed")
++
++    def _metric(self, name: str, *args: Any) -> None:
++        recorder = getattr(self.metrics, name, None)
++        if callable(recorder):
++            try:
++                recorder(*args)
++            except Exception:
++                _LOGGER.warning("service drain metric update failed")
++
++
++def resolve_drain_coordinator(target: Any) -> DrainCoordinator:
++    """Return the coordinator owned by ``target``.
++
++    Args:
++        target: A :class:`DrainCoordinator`, an object exposing
++            ``get_drain_coordinator()`` (such as ``ServiceRuntime``), or an
++            application whose ``state.drain`` holds the active coordinator.
++
++    Returns:
++        The resolved coordinator.
++
++    Raises:
++        TypeError: When no coordinator can be resolved.
++    """
++    if isinstance(target, DrainCoordinator):
++        return target
++    getter = getattr(target, "get_drain_coordinator", None)
++    if callable(getter):
++        coordinator = getter()
++        if isinstance(coordinator, DrainCoordinator):
++            return coordinator
++    state = getattr(target, "state", None)
++    coordinator = getattr(state, "drain", None)
++    if isinstance(coordinator, DrainCoordinator):
++        return coordinator
++    raise TypeError("target does not own a drain coordinator")
++
++
++def register_drain_participant(
++    target: Any,
++    participant: DrainParticipant,
++) -> DrainParticipant:
++    """Register a lifecycle participant for a service drain.
++
++    For an application object (anything with ``state``), the participant is kept
++    in ``state.drain_participants`` and joins every lifespan's coordinator,
++    including the one currently serving when it has not started draining. For a
++    runtime or a coordinator, the participant joins that coordinator directly.
++
++    Args:
++        target: Application, ``ServiceRuntime``, or :class:`DrainCoordinator`.
++        participant: Participant to register.
++
++    Returns:
++        The registered participant.
++    """
++    if not isinstance(participant, DrainParticipant):
++        raise TypeError("drain participants must subclass DrainParticipant")
++    validate_drain_category(participant.category)
++    state = getattr(target, "state", None)
++    if state is not None and not isinstance(target, DrainCoordinator):
++        registered = getattr(state, "drain_participants", None)
++        if not isinstance(registered, list):
++            registered = []
++            state.drain_participants = registered
++        if not any(item is participant for item in registered):
++            registered.append(participant)
++        active = getattr(state, "drain", None)
++        if isinstance(active, DrainCoordinator) and active.state is DrainState.SERVING:
++            active.register(participant)
++        return participant
++    return resolve_drain_coordinator(target).register(participant)
++
++
++def validate_drain_category(category: Any) -> str:
++    """Reject participant labels that are not controlled lowercase tokens.
++
++    Args:
++        category: Candidate label.
++
++    Returns:
++        The validated label.
++
++    Raises:
++        ValueError: When the label could carry free text.
++    """
++    if type(category) is not str or not _CATEGORY_PATTERN.fullmatch(category):
++        raise ValueError("drain participant category must be a controlled label")
++    return category
++
++
++class HTTPRequestDrainParticipant(DrainParticipant):
++    """Drain REST and GraphQL requests tracked by the readiness middleware.
++
++    Reuses the existing ``state.ready``, ``state.shutting_down`` and
++    ``state.inflight`` counters.
++
++    Args:
++        state: Application state object.
++    """
++
++    category = "http_requests"
++    priority = 10
++
++    def __init__(self, state: Any) -> None:
++        super().__init__()
++        self._state = state
++        self._initial = 0
++
++    def stop_admission(self, ctx: DrainContext) -> PhaseResult:
++        """Drop readiness, then reject new model-backed requests."""
++        self._state.ready = False
++        self._state.shutting_down = True
++        self._initial = self.outstanding()
++        return PhaseResult()
++
++    async def finish_in_flight(self, ctx: DrainContext) -> PhaseResult:
++        """Wait for admitted requests until the in-flight deadline."""
++        await ctx.wait_until(lambda: self.outstanding() == 0)
++        unfinished = self.outstanding()
++        return PhaseResult.from_counts(
++            completed=max(self._initial - unfinished, 0), unfinished=unfinished
++        )
++
++    def outstanding(self) -> int:
++        """Return admitted requests that have not settled."""
++        return max(int(getattr(self._state, "inflight", 0) or 0), 0)
++
++
++class _StreamLease:
++    """Ownership of one stream slot; release is idempotent and thread-safe."""
++
++    __slots__ = ("_owner", "_released", "started")
++
++    def __init__(self, owner: "NDJSONStreamDrainParticipant") -> None:
++        self._owner = owner
++        self._released = False
++        self.started = False
++
++    def release(self) -> None:
++        with self._owner._lock:
++            if self._released:
++                return
++            self._released = True
++            self._owner._active -= 1
++
++    def release_if_unstarted(self) -> None:
++        if not self.started:
++            self.release()
++
++
++class NDJSONStreamDrainParticipant(DrainParticipant):
++    """Bound NDJSON stream tails and end them with a typed terminal event.
++
++    Streams keep running during the in-flight window. Streams still open at the
++    settle deadline stop at their next event boundary and end with one
++    ``shutting_down`` error line. Buffered, unflushed text is discarded rather
++    than emitted, and a running window is left to finish before the source is
++    closed, so model references are released only once the work settles.
++
++    Args:
++        retry_after_seconds: Retry hint written into the terminal event.
++    """
++
++    category = "ndjson_streams"
++    priority = 20
++
++    def __init__(
++        self, *, retry_after_seconds: float = DEFAULT_RETRY_AFTER_SECONDS
++    ) -> None:
++        super().__init__()
++        self._lock = threading.Lock()
++        self._active = 0
++        self._terminating = False
++        self._signal: Optional[asyncio.Event] = None
++        self._cleanup: set[asyncio.Task[None]] = set()
++        self.terminal_line = shutting_down_ndjson_line(retry_after_seconds)
++
++    @property
++    def active(self) -> int:
++        """Return open stream slots, including ones still settling."""
++        with self._lock:
++            return self._active
++
++    @property
++    def terminating(self) -> bool:
++        """Return whether open streams were told to stop."""
++        return self._terminating
++
++    def wrap(self, source: AsyncIterator[str]) -> AsyncIterator[str]:
++        """Return a drain-aware view of an NDJSON line iterator.
++
++        Args:
++            source: Async iterator of newline-terminated JSON lines.
++
++        Returns:
++            An async iterator that ends with the terminal event when drained.
++        """
++        with self._lock:
++            self._active += 1
++        lease = _StreamLease(self)
++        iterator = self._iterate(source, lease)
++        # A body that is never iterated still frees its slot when discarded.
++        weakref.finalize(iterator, lease.release_if_unstarted)
++        return iterator
++
++    def terminate(self) -> int:
++        """Ask every open stream to stop at its next boundary.
++
++        Returns:
++            Streams open when the signal was raised.
++        """
++        self._terminating = True
++        if self._signal is not None:
++            self._signal.set()
++        return self.active
++
++    async def finish_in_flight(self, ctx: DrainContext) -> PhaseResult:
++        """Let streams finish until the settle deadline, then end the rest."""
++        initial = self.active
++        await ctx.wait_until(lambda: self.active == 0, deadline=ctx.settle_deadline)
++        terminated = self.terminate() if self.active else 0
++        await ctx.wait_until(lambda: self.active == 0)
++        return PhaseResult.from_counts(
++            completed=max(initial - terminated, 0),
++            cancelled=terminated,
++            unfinished=self.active,
++        )
++
++    def outstanding(self) -> int:
++        """Return open stream slots."""
++        return self.active
++
++    def _event(self) -> asyncio.Event:
++        if self._signal is None:
++            self._signal = asyncio.Event()
++            if self._terminating:
++                self._signal.set()
++        return self._signal
++
++    async def _iterate(
++        self, source: AsyncIterator[str], lease: _StreamLease
++    ) -> AsyncIterator[str]:
++        lease.started = True
++        pending: Optional[asyncio.Future[str]] = None
++        exhausted = False
++        try:
++            while True:
++                if self._terminating:
++                    yield self.terminal_line
++                    return
++                pending = asyncio.ensure_future(source.__anext__())
++                if not await self._race(pending):
++                    yield self.terminal_line
++                    return
++                step, pending = pending, None
++                try:
++                    line = step.result()
++                except StopAsyncIteration:
++                    exhausted = True
++                    return
++                yield line
++        finally:
++            self._settle(source, pending, lease, exhausted)
++
++    async def _race(self, pending: asyncio.Future[str]) -> bool:
++        if pending.done():
++            return True
++        waiter = asyncio.ensure_future(self._event().wait())
++        try:
++            done, _ = await asyncio.wait(
++                {pending, waiter}, return_when=asyncio.FIRST_COMPLETED
++            )
++        finally:
++            if not waiter.done():
++                waiter.cancel()
++        return pending in done
++
++    def _settle(
++        self,
++        source: AsyncIterator[str],
++        pending: Optional[asyncio.Future[str]],
++        lease: _StreamLease,
++        exhausted: bool,
++    ) -> None:
++        if pending is None and exhausted:
++            lease.release()
++            return
++
++        async def cleanup() -> None:
++            try:
++                if pending is not None:
++                    await asyncio.wait({pending})
++                    if not pending.cancelled():
++                        pending.exception()
++                aclose = getattr(source, "aclose", None)
++                if callable(aclose):
++                    await aclose()
++            except Exception:
++                # Never log or surface stream content during cleanup.
++                pass
++            finally:
++                lease.release()
++
++        try:
++            loop = asyncio.get_running_loop()
++        except RuntimeError:
++            lease.release()
++            return
++        # Run outside the response task: its cancellation scope must not cut
++        # the wait for a running window short.
++        task = loop.create_task(cleanup())
++        self._cleanup.add(task)
++        task.add_done_callback(self._cleanup.discard)
++
++
++class CallAdmission:
++    """Thread-safe admission gate and in-flight counter for RPC surfaces.
++
++    Args:
++        retry_after_seconds: Retry hint attached to refusals.
++    """
++
++    def __init__(
++        self, *, retry_after_seconds: float = DEFAULT_RETRY_AFTER_SECONDS
++    ) -> None:
++        self.retry_after_seconds = _non_negative_seconds(retry_after_seconds)
++        self._lock = threading.Lock()
++        self._closed = False
++        self._terminating = False
++        self._unary = 0
++        self._streams = 0
++        self._terminated = 0
++
++    @property
++    def closed(self) -> bool:
++        """Return whether new calls are refused."""
++        return self._closed
++
++    @property
++    def streams_terminating(self) -> bool:
++        """Return whether open streams must stop at their next boundary."""
++        return self._terminating
++
++    @property
++    def active(self) -> int:
++        """Return in-flight unary calls plus open streams."""
++        with self._lock:
++            return self._unary + self._streams
++
++    @property
++    def active_streams(self) -> int:
++        """Return open streaming calls."""
++        with self._lock:
++            return self._streams
++
++    def try_enter(self, *, streaming: bool = False) -> bool:
++        """Admit one call unless admission is closed.
++
++        Args:
++            streaming: Whether the call is a server stream.
++
++        Returns:
++            ``True`` when admitted; the caller must later call :meth:`leave`.
++        """
++        with self._lock:
++            if self._closed:
++                return False
++            if streaming:
++                self._streams += 1
++            else:
++                self._unary += 1
++            return True
++
++    def leave(self, *, streaming: bool = False) -> None:
++        """Release one admitted call."""
++        with self._lock:
++            if streaming:
++                self._streams = max(self._streams - 1, 0)
++            else:
++                self._unary = max(self._unary - 1, 0)
++
++    def record_terminated_stream(self) -> None:
++        """Count one stream ended with a typed shutdown status."""
++        with self._lock:
++            self._terminated += 1
++
++    @property
++    def terminated_streams(self) -> int:
++        """Return streams ended by a drain."""
++        with self._lock:
++            return self._terminated
++
++    def close(self) -> None:
++        """Refuse new calls."""
++        with self._lock:
++            self._closed = True
++
++    def terminate_streams(self) -> int:
++        """Ask open streams to stop and return how many were open."""
++        with self._lock:
++            self._terminating = True
++            return self._streams
++
++
++class BatcherDrainParticipant(DrainParticipant):
++    """Flush micro-batchers: dispatch queued work, then fail the remainder.
++
++    Args:
++        resolver: Returns the batchers to drain; ``None`` entries are ignored.
++    """
++
++    category = "batcher"
++    priority = 40
++
++    def __init__(self, resolver: Callable[[], Iterable[Any]]) -> None:
++        super().__init__()
++        self._resolver = resolver
++
++    def _batchers(self) -> list[Any]:
++        return [item for item in self._resolver() or () if item is not None]
++
++    async def flush(self, ctx: DrainContext) -> Optional[PhaseResult]:
++        """Dispatch queued jobs and wait for running batches until the deadline."""
++        batchers = self._batchers()
++        if not batchers:
++            return None
++        cancelled = unfinished = completed = 0
++        for batcher in batchers:
++            stats = await batcher.drain(timeout=ctx.remaining())
++            completed += int(stats.get("dispatched", 0))
++            cancelled += int(stats.get("failed_queued", 0))
++            unfinished += int(stats.get("running", 0))
++        return PhaseResult.from_counts(
++            completed=completed, cancelled=cancelled, unfinished=unfinished
++        )
++
++    def outstanding(self) -> int:
++        """Return queued plus running batch work across batchers."""
++        return sum(int(item.outstanding_count()) for item in self._batchers())
++
++
++class JobQueueDrainParticipant(DrainParticipant):
++    """Drain the in-process public job queue without silent loss.
++
++    Running jobs may finish until the settle deadline. Afterwards they stop at
++    their next document boundary; at the deadline every job still queued or
++    running is fenced as ``cancelled`` with a retryable ``shutting_down`` code,
++    so a stale worker can never commit after the handoff.
++
++    Args:
++        resolver: Returns the job queue, or ``None`` when absent.
++    """
++
++    category = "job_queue"
++    priority = 50
++
++    def __init__(self, resolver: Callable[[], Any]) -> None:
++        super().__init__()
++        self._resolver = resolver
++
++    def stop_admission(self, ctx: DrainContext) -> Optional[PhaseResult]:
++        """Refuse new submissions and bound terminal callbacks."""
++        queue = self._resolver()
++        if queue is None:
++            return None
++        queue.close_admission(
++            callback_timeout_seconds=max(float(ctx.budget.settle_seconds or 0.0), 0.1)
++        )
++        return PhaseResult()
++
++    async def finish_in_flight(self, ctx: DrainContext) -> Optional[PhaseResult]:
++        """Finish, cooperatively cancel, then fence unfinished jobs."""
++        queue = self._resolver()
++        if queue is None:
++            return None
++        idle = lambda: queue.outstanding_count() == 0  # noqa: E731
++        if not await ctx.wait_until(idle, deadline=ctx.settle_deadline):
++            queue.request_cancel()
++            if not await ctx.wait_until(idle):
++                queue.cancel_outstanding()
++        stats = queue.drain_stats()
++        return PhaseResult.from_counts(
++            completed=int(stats.get("completed", 0)),
++            cancelled=int(stats.get("cancelled", 0)),
++            unfinished=queue.outstanding_count(),
++        )
++
++    def release(self, ctx: DrainContext) -> Optional[PhaseResult]:
++        """Shut the worker pool down without waiting on stale workers."""
++        queue = self._resolver()
++        if queue is None:
++            return None
++        queue.shutdown()
++        return PhaseResult.from_counts(unfinished=queue.outstanding_count())
++
++    def outstanding(self) -> int:
++        """Return queued, running, or callback-phase jobs."""
++        queue = self._resolver()
++        return 0 if queue is None else int(queue.outstanding_count())
++
++
++class BackgroundJobsDrainParticipant(DrainParticipant):
++    """Let SMART or bulk background jobs finish, then cancel them.
++
++    Cancelled ingestions keep their own committed checkpoints, so a resubmitted
++    job resumes from the last committed resource.
++
++    Args:
++        resolver: Returns a manager exposing ``active_count()`` and
++            ``cancel_all()``, or ``None``.
++        category: Controlled participant label.
++    """
++
++    priority = 60
++
++    def __init__(self, resolver: Callable[[], Any], *, category: str) -> None:
++        super().__init__(category)
++        self._resolver = resolver
++
++    async def finish_in_flight(self, ctx: DrainContext) -> Optional[PhaseResult]:
++        """Wait until the settle deadline, then cancel what is still running."""
++        manager = self._resolver()
++        if manager is None:
++            return None
++        initial = int(manager.active_count())
++        idle = lambda: manager.active_count() == 0  # noqa: E731
++        cancelled = 0
++        if not await ctx.wait_until(idle, deadline=ctx.settle_deadline):
++            cancelled = int(manager.active_count())
++            await asyncio.wait_for(manager.cancel_all(), timeout=ctx.remaining())
++        unfinished = int(manager.active_count())
++        return PhaseResult.from_counts(
++            completed=max(initial - cancelled, 0),
++            cancelled=max(cancelled - unfinished, 0),
++            unfinished=unfinished,
++        )
++
++    def outstanding(self) -> int:
++        """Return running background jobs."""
++        manager = self._resolver()
++        return 0 if manager is None else int(manager.active_count())
++
++
++class WarmPoolDrainParticipant(DrainParticipant):
++    """Fence model activation and release warm-pool references.
++
++    Active requests keep the model they hold until they finish; once the pool is
++    closed their last reference unloads the model instead of scheduling an idle
++    timer.
++
++    Args:
++        resolver: Returns the warm pool, or ``None`` when it was never created.
++    """
++
++    category = "warm_pool"
++    priority = 80
++
++    def __init__(self, resolver: Callable[[], Any]) -> None:
++        super().__init__()
++        self._resolver = resolver
++
++    async def release(self, ctx: DrainContext) -> Optional[PhaseResult]:
++        """Close the pool, unload inactive models, and wait for stragglers."""
++        pool = self._resolver()
++        if pool is None:
++            return None
++        summary = pool.close()
++        loop = asyncio.get_running_loop()
++        settle = loop.time() + ctx.remaining() / 2
++        await ctx.wait_until(lambda: pool.active_request_count() == 0, deadline=settle)
++        return PhaseResult.from_counts(
++            completed=int(summary.get("released_models", 0)),
++            unfinished=int(pool.active_request_count()),
++        )
++
++    def outstanding(self) -> int:
++        """Return active model references."""
++        pool = self._resolver()
++        return 0 if pool is None else int(pool.active_request_count())
++
++
++@runtime_checkable
++class AcceleratorDevice(Protocol):
++    """Minimal accelerator surface used to bound device release.
++
++    Attributes:
++        kind: Controlled device label such as ``"cpu"`` or ``"cuda"``.
++    """
++
++    kind: str
++
++    def allocated(self) -> int:
++        """Return currently held units (bytes or allocations)."""
++
++    def synchronize(self) -> None:
++        """Block until queued device work completes."""
++
++    def release(self) -> None:
++        """Return cached device memory to the driver."""
++
++
++class CPUAcceleratorDevice:
++    """CPU placeholder: nothing to synchronize and nothing retained."""
++
++    kind = "cpu"
++    blocking = False
++
++    def allocated(self) -> int:
++        """Return zero; host memory is reclaimed with the process."""
++        return 0
++
++    def synchronize(self) -> None:
++        """Do nothing."""
++
++    def release(self) -> None:
++        """Do nothing."""
++
++
++class TorchAcceleratorDevice:
++    """Torch CUDA or MPS device, only used when torch is already imported.
++
++    Args:
++        torch_module: The already-imported ``torch`` module.
++        kind: ``"cuda"`` or ``"mps"``.
++    """
++
++    def __init__(self, torch_module: Any, kind: str) -> None:
++        if kind not in {"cuda", "mps"}:
++            raise ValueError("unsupported torch accelerator kind")
++        self.kind = kind
++        self._backend = getattr(torch_module, kind)
++
++    def allocated(self) -> int:
++        """Return bytes currently allocated by tensors."""
++        name = "memory_allocated" if self.kind == "cuda" else "current_allocated_memory"
++        reader = getattr(self._backend, name, None)
++        return int(reader()) if callable(reader) else 0
++
++    def synchronize(self) -> None:
++        """Wait for queued kernels."""
++        sync = getattr(self._backend, "synchronize", None)
++        if callable(sync):
++            sync()
++
++    def release(self) -> None:
++        """Return cached allocator blocks."""
++        empty = getattr(self._backend, "empty_cache", None)
++        if callable(empty):
++            empty()
++
++
++class MLXAcceleratorDevice:
++    """MLX Metal device, only used when ``mlx.core`` is already imported.
++
++    Args:
++        mx: The already-imported ``mlx.core`` module.
++    """
++
++    kind = "mlx"
++
++    def __init__(self, mx: Any) -> None:
++        self._mx = mx
++
++    def allocated(self) -> int:
++        """Return active MLX memory in bytes."""
++        reader = getattr(self._mx, "get_active_memory", None)
++        if not callable(reader):
++            reader = getattr(
++                getattr(self._mx, "metal", None), "get_active_memory", None
++            )
++        return int(reader()) if callable(reader) else 0
++
++    def synchronize(self) -> None:
++        """Wait for queued MLX work."""
++        sync = getattr(self._mx, "synchronize", None)
++        if callable(sync):
++            sync()
++
++    def release(self) -> None:
++        """Clear the MLX buffer cache."""
++        clear = getattr(self._mx, "clear_cache", None)
++        if not callable(clear):
++            clear = getattr(getattr(self._mx, "metal", None), "clear_cache", None)
++        if callable(clear):
++            clear()
++
++
++def detect_accelerator_devices() -> tuple[Any, ...]:
++    """Return devices to release without importing any accelerator runtime.
++
++    Returns:
++        A CPU placeholder plus torch CUDA/MPS and MLX devices whose runtimes are
++        already imported and report themselves available.
++    """
++    devices: list[Any] = [CPUAcceleratorDevice()]
++    torch_module = sys.modules.get("torch")
++    if torch_module is not None:
++        for kind, probe in (("cuda", "is_initialized"), ("mps", "is_available")):
++            # CUDA is only touched once this process already created a context.
++            check = getattr(getattr(torch_module, kind, None), probe, None)
++            try:
++                if callable(check) and check():
++                    devices.append(TorchAcceleratorDevice(torch_module, kind))
++            except Exception:
++                continue
++    mx = sys.modules.get("mlx.core")
++    if mx is not None:
++        devices.append(MLXAcceleratorDevice(mx))
++    return tuple(devices)
++
++
++class AcceleratorDrainParticipant(DrainParticipant):
++    """Synchronize and release accelerators back to their start-up baseline.
++
++    The baseline is captured when the participant is created, so memory held
++    before the service started serving is declared retained, not leaked.
++
++    Args:
++        devices: Devices implementing :class:`AcceleratorDevice`.
++    """
++
++    category = "accelerator"
++    priority = 90
++
++    def __init__(self, devices: Sequence[Any]) -> None:
++        super().__init__()
++        self._devices = tuple(devices)
++        self._baseline = {id(device): _safe_allocated(device) for device in devices}
++
++    async def release(self, ctx: DrainContext) -> Optional[PhaseResult]:
++        """Bound synchronization, release caches, and compare to the baseline."""
++        if not self._devices:
++            return None
++        completed = unfinished = 0
++        for device in self._devices:
++            try:
++                if getattr(device, "blocking", True):
++                    await ctx.run_blocking(device.synchronize)
++                else:
++                    device.synchronize()
++            except asyncio.TimeoutError:
++                unfinished += 1
++                continue
++            device.release()
++            if _safe_allocated(device) > self._baseline.get(id(device), 0):
++                unfinished += 1
++            else:
++                completed += 1
++        return PhaseResult.from_counts(completed=completed, unfinished=unfinished)
++
++    def retained(self) -> dict[str, int]:
++        """Return units above baseline per device kind."""
++        result: dict[str, int] = {}
++        for device in self._devices:
++            excess = max(_safe_allocated(device) - self._baseline.get(id(device), 0), 0)
++            kind = str(getattr(device, "kind", "device"))
++            result[kind] = result.get(kind, 0) + excess
++        return result
++
++    def outstanding(self) -> int:
++        """Return devices still above their baseline."""
++        return sum(1 for value in self.retained().values() if value > 0)
++
++
++def _safe_allocated(device: Any) -> int:
++    try:
++        return max(int(device.allocated()), 0)
++    except Exception:
++        return 0
++
++
++def _safe_outstanding(participant: DrainParticipant) -> int:
++    try:
++        return _bounded_count(participant.outstanding())
++    except Exception:
++        return 0
++
++
++def _bounded_count(value: Any) -> int:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise ValueError("drain counts must be integers")
++    return min(max(value, 0), _MAX_COUNT)
++
++
++def _non_negative_seconds(value: Any) -> float:
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        raise ValueError("drain durations must be numbers")
++    seconds = float(value)
++    if not math.isfinite(seconds) or seconds < 0:
++        raise ValueError("drain durations must be finite and non-negative")
++    return seconds
++
++
++__all__ = [
++    "DEFAULT_DRAIN_SECONDS",
++    "DEFAULT_RELEASE_SECONDS",
++    "DEFAULT_RETRY_AFTER_SECONDS",
++    "DRAIN_PHASES",
++    "DRAIN_REASON_CODES",
++    "SHUTTING_DOWN",
++    "AcceleratorDevice",
++    "AcceleratorDrainParticipant",
++    "BackgroundJobsDrainParticipant",
++    "BatcherDrainParticipant",
++    "CPUAcceleratorDevice",
++    "CallAdmission",
++    "CallbackDrainParticipant",
++    "DrainBudget",
++    "DrainContext",
++    "DrainCoordinator",
++    "DrainEvent",
++    "DrainOutcome",
++    "DrainParticipant",
++    "DrainPhase",
++    "DrainRegistrationError",
++    "DrainReport",
++    "DrainState",
++    "HTTPRequestDrainParticipant",
++    "JobQueueDrainParticipant",
++    "MLXAcceleratorDevice",
++    "NDJSONStreamDrainParticipant",
++    "PhaseResult",
++    "ServiceShuttingDownError",
++    "TorchAcceleratorDevice",
++    "WarmPoolDrainParticipant",
++    "detect_accelerator_devices",
++    "register_drain_participant",
++    "resolve_drain_coordinator",
++    "shutting_down_details",
++    "shutting_down_ndjson_line",
++    "validate_drain_category",
++]
+diff --git a/openmed/service/graphql_app.py b/openmed/service/graphql_app.py
+index 27a12153c..15607aa40 100644
+--- a/openmed/service/graphql_app.py
++++ b/openmed/service/graphql_app.py
+@@ -10,6 +10,7 @@
+ from strawberry.http import GraphQLHTTPResponse
+ from strawberry.types import ExecutionResult
+ 
++from .drain import SHUTTING_DOWN, SHUTTING_DOWN_MESSAGE
+ from .graphql_schema import SAFE_RESOLVER_ERROR, OpenMedGraphQLContext, schema
+ from .journey_resources import JourneyAccessPolicy, JourneyResourceCatalog
+ from .runtime import ServiceRuntime
+@@ -85,6 +86,11 @@ def _safe_formatted_error(error: Any) -> dict[str, Any]:
+             "message": "Requested model is not served",
+             "extensions": {"code": "model_not_served"},
+         }
++    if error.extensions.get("code") == SHUTTING_DOWN:
++        return {
++            "message": SHUTTING_DOWN_MESSAGE,
++            "extensions": {"code": SHUTTING_DOWN, "retryable": True},
++        }
+     if error.original_error is None:
+         return formatted
+ 
+diff --git a/openmed/service/graphql_schema.py b/openmed/service/graphql_schema.py
+index a932ab76f..192a45d18 100644
+--- a/openmed/service/graphql_schema.py
++++ b/openmed/service/graphql_schema.py
+@@ -18,6 +18,7 @@
+ from openmed.risk import risk_report
+ 
+ from .auth import AuthPrincipal, scopes_satisfy
++from .drain import SHUTTING_DOWN, SHUTTING_DOWN_MESSAGE, ServiceShuttingDownError
+ from .journey_resources import (
+     JourneyAccessPolicy,
+     JourneyResourceCatalog,
+@@ -545,6 +546,10 @@ async def analyze(
+             raise GraphQLError(
+                 "Requested model is not served", extensions={"code": "model_not_served"}
+             ) from None
++        except ServiceShuttingDownError:
++            raise GraphQLError(
++                SHUTTING_DOWN_MESSAGE, extensions={"code": SHUTTING_DOWN}
++            ) from None
+         except Exception:
+             raise GraphQLError(
+                 SAFE_RESOLVER_ERROR,
+@@ -566,6 +571,10 @@ async def deidentify(
+             raise GraphQLError(
+                 "Requested model is not served", extensions={"code": "model_not_served"}
+             ) from None
++        except ServiceShuttingDownError:
++            raise GraphQLError(
++                SHUTTING_DOWN_MESSAGE, extensions={"code": SHUTTING_DOWN}
++            ) from None
+         except Exception:
+             raise GraphQLError(
+                 SAFE_RESOLVER_ERROR,
+diff --git a/openmed/service/grpc_server.py b/openmed/service/grpc_server.py
+index 58b1a31f3..3d2602c0d 100644
+--- a/openmed/service/grpc_server.py
++++ b/openmed/service/grpc_server.py
+@@ -12,43 +12,73 @@
+ from openmed.core.streaming import deidentify_stream
+ 
+ from .app import _analyze_payload, _pii_deidentify_payload, _pii_extract_payload
++from .drain import (
++    SHUTTING_DOWN,
++    CallAdmission,
++    DrainContext,
++    DrainParticipant,
++    PhaseResult,
++    ServiceShuttingDownError,
++    resolve_drain_coordinator,
++)
+ from .proto.generated import openmed_pb2, openmed_pb2_grpc
+ from .runtime import ModelNotServedError, ServiceRuntime
+ from .schemas import AnalyzeRequest, PIIDeidentifyRequest, PIIExtractRequest
+ 
+ DEFAULT_GRPC_ADDRESS = "[::]:50051"
+ DEFAULT_GRPC_MAX_WORKERS = 10
++GRPC_RETRY_PUSHBACK_METADATA_KEY = "grpc-retry-pushback-ms"
++GRPC_RETRYABLE_METADATA_KEY = "openmed-retryable"
+ 
+ 
+ class OpenMedGrpcServicer(openmed_pb2_grpc.OpenMedServiceServicer):
+-    """Synchronous grpcio servicer backed by the shared service runtime."""
+-
+-    def __init__(self, runtime: ServiceRuntime | None = None) -> None:
++    """Synchronous grpcio servicer backed by the shared service runtime.
++
++    Args:
++        runtime: Shared service runtime; created from the environment if absent.
++        admission: Admission gate shared with the drain coordinator. Once it
++            closes, new calls end with ``UNAVAILABLE`` and a retry hint.
++    """
++
++    def __init__(
++        self,
++        runtime: ServiceRuntime | None = None,
++        *,
++        admission: CallAdmission | None = None,
++    ) -> None:
+         self.runtime = runtime or ServiceRuntime.from_env()
++        self.admission = admission or CallAdmission()
+ 
+     def Analyze(self, request, context):
+         """Run the OpenMed analyze endpoint over gRPC."""
+-        return _run_unary(
+-            context,
+-            lambda: self._analyze(request),
+-        )
++        return self._unary(context, lambda: self._analyze(request))
+ 
+     def Extract(self, request, context):
+         """Run the OpenMed PII extraction endpoint over gRPC."""
+-        return _run_unary(
+-            context,
+-            lambda: self._extract(request),
+-        )
++        return self._unary(context, lambda: self._extract(request))
+ 
+     def Deidentify(self, request, context):
+         """Run the OpenMed de-identification endpoint over gRPC."""
+-        return _run_unary(
+-            context,
+-            lambda: self._deidentify(request),
+-        )
++        return self._unary(context, lambda: self._deidentify(request))
+ 
+     def StreamDeidentify(self, request, context):
+         """Stream redacted text fragments for chunked de-identification."""
++        if not self.admission.try_enter(streaming=True):
++            _abort_shutting_down(context, self.admission.retry_after_seconds)
++        try:
++            yield from self._stream_deidentify(request, context)
++        finally:
++            self.admission.leave(streaming=True)
++
++    def _unary(self, context: grpc.ServicerContext, operation: Callable[[], Any]):
++        if not self.admission.try_enter():
++            _abort_shutting_down(context, self.admission.retry_after_seconds)
++        try:
++            return _run_unary(context, operation)
++        finally:
++            self.admission.leave()
++
++    def _stream_deidentify(self, request, context):
+         chunks = _stream_chunks(request)
+         fallback_text = "".join(chunks) if chunks else request.request.text
+         try:
+@@ -69,8 +99,12 @@ def StreamDeidentify(self, request, context):
+             model_key = self.runtime.begin_model_request(payload.model_name)
+         except ModelNotServedError:
+             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "model_not_served")
++        except ServiceShuttingDownError as exc:
++            _abort_shutting_down(context, exc.retry_after_seconds)
++        terminated = False
++        events = None
+         try:
+-            for event in deidentify_stream(
++            events = deidentify_stream(
+                 chunks,
+                 max_buffer=max_buffer,
+                 method=payload.method,
+@@ -87,14 +121,26 @@ def StreamDeidentify(self, request, context):
+                 use_safety_sweep=payload.use_safety_sweep,
+                 loader=self.runtime.get_loader(),
+                 policy=payload.policy,
+-            ):
++            )
++            for event in events:
++                if self.admission.streams_terminating:
++                    # Drain boundary: drop the unsent event and never flush the
++                    # core buffer, so no unsafe partial tail reaches the client.
++                    terminated = True
++                    break
+                 yield _stream_response(event)
+         except ValueError:
+             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Invalid request")
+         except Exception:
+             context.abort(grpc.StatusCode.INTERNAL, "Internal server error")
+         finally:
++            close = getattr(events, "close", None)
++            if callable(close):
++                close()
+             self.runtime.finish_model_request(model_key, payload.keep_alive)
++        if terminated:
++            self.admission.record_terminated_stream()
++            _abort_shutting_down(context, self.admission.retry_after_seconds)
+ 
+     def _analyze(self, request) -> openmed_pb2.AnalyzeResponse:
+         payload = _parse_request(_analyze_request_from_proto, request)
+@@ -127,17 +173,99 @@ def _deidentify(self, request) -> openmed_pb2.DeidentifyResponse:
+         )
+ 
+ 
++class GrpcDrainParticipant(DrainParticipant):
++    """Drain gRPC unary calls and server streams within the drain budget.
++
++    Admission closes first, so new calls get ``UNAVAILABLE`` with a
++    ``grpc-retry-pushback-ms`` hint while the port stays open. In-flight calls
++    may finish until the settle deadline; open streams then stop at their next
++    event boundary with the same typed status. The flush phase finally calls
++    ``server.stop(grace)`` with the remaining budget.
++
++    Args:
++        admission: Admission gate shared with the servicer.
++        server: Optional server to stop during the flush phase.
++    """
++
++    category = "grpc"
++    priority = 30
++
++    def __init__(
++        self, admission: CallAdmission, server: grpc.Server | None = None
++    ) -> None:
++        super().__init__()
++        self.admission = admission
++        self.server = server
++        self._initial = 0
++
++    def stop_admission(self, ctx: DrainContext) -> PhaseResult:
++        """Refuse new unary and streaming calls."""
++        self._initial = self.admission.active
++        self.admission.close()
++        return PhaseResult()
++
++    async def finish_in_flight(self, ctx: DrainContext) -> PhaseResult:
++        """Wait for calls, then end streams that outlive the settle deadline."""
++        admission = self.admission
++        await ctx.wait_until(
++            lambda: admission.active == 0, deadline=ctx.settle_deadline
++        )
++        if admission.active_streams:
++            admission.terminate_streams()
++        await ctx.wait_until(lambda: admission.active == 0)
++        terminated = admission.terminated_streams
++        unfinished = admission.active
++        return PhaseResult.from_counts(
++            completed=max(self._initial - terminated - unfinished, 0),
++            cancelled=terminated,
++            unfinished=unfinished,
++        )
++
++    async def flush(self, ctx: DrainContext) -> PhaseResult | None:
++        """Stop the server, giving stragglers the remaining flush budget."""
++        if self.server is None:
++            return None
++        stopped = self.server.stop(grace=ctx.remaining())
++        try:
++            await ctx.run_blocking(stopped.wait)
++        except TimeoutError:
++            return PhaseResult.from_counts(unfinished=max(self.admission.active, 1))
++        return PhaseResult.from_counts(completed=1)
++
++    def outstanding(self) -> int:
++        """Return in-flight calls and open streams."""
++        return self.admission.active
++
++
+ def create_grpc_server(
+     *,
+     runtime: ServiceRuntime | None = None,
+     max_workers: int = DEFAULT_GRPC_MAX_WORKERS,
++    admission: CallAdmission | None = None,
+ ) -> grpc.Server:
+-    """Create a grpcio server with the OpenMed service registered."""
++    """Create a grpcio server with the OpenMed service registered.
++
++    The server joins the runtime's drain coordinator, so draining the runtime
++    (for example from the REST lifespan) closes gRPC admission at the same time
++    as REST and GraphQL.
++
++    Args:
++        runtime: Shared service runtime; created from the environment if absent.
++        max_workers: Worker threads for the synchronous server.
++        admission: Optional admission gate to share with other surfaces.
++
++    Returns:
++        The configured, not yet started server.
++    """
+     server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
+-    openmed_pb2_grpc.add_OpenMedServiceServicer_to_server(
+-        OpenMedGrpcServicer(runtime),
+-        server,
+-    )
++    servicer = OpenMedGrpcServicer(runtime, admission=admission)
++    openmed_pb2_grpc.add_OpenMedServiceServicer_to_server(servicer, server)
++    try:
++        coordinator = resolve_drain_coordinator(servicer.runtime)
++    except TypeError:
++        coordinator = None
++    if coordinator is not None:
++        coordinator.register(GrpcDrainParticipant(servicer.admission, server))
+     return server
+ 
+ 
+@@ -154,9 +282,29 @@ def serve(
+     return server
+ 
+ 
++def _abort_shutting_down(
++    context: grpc.ServicerContext, retry_after_seconds: float
++) -> None:
++    """End a call with ``UNAVAILABLE`` plus a standard retry pushback hint."""
++    setter = getattr(context, "set_trailing_metadata", None)
++    if callable(setter):
++        setter(
++            (
++                (
++                    GRPC_RETRY_PUSHBACK_METADATA_KEY,
++                    str(max(int(round(retry_after_seconds * 1000)), 0)),
++                ),
++                (GRPC_RETRYABLE_METADATA_KEY, "true"),
++            )
++        )
++    context.abort(grpc.StatusCode.UNAVAILABLE, SHUTTING_DOWN)
++
++
+ def _run_unary(context: grpc.ServicerContext, operation: Callable[[], Any]) -> Any:
+     try:
+         return operation()
++    except ServiceShuttingDownError as exc:
++        _abort_shutting_down(context, exc.retry_after_seconds)
+     except ModelNotServedError:
+         context.abort(grpc.StatusCode.INVALID_ARGUMENT, "model_not_served")
+     except ValueError:
+@@ -452,6 +600,9 @@ def _chunk_text(text: str, chunk_size: int) -> Iterable[str]:
+ __all__ = [
+     "DEFAULT_GRPC_ADDRESS",
+     "DEFAULT_GRPC_MAX_WORKERS",
++    "GRPC_RETRYABLE_METADATA_KEY",
++    "GRPC_RETRY_PUSHBACK_METADATA_KEY",
++    "GrpcDrainParticipant",
+     "OpenMedGrpcServicer",
+     "create_grpc_server",
+     "serve",
+diff --git a/openmed/service/jobs.py b/openmed/service/jobs.py
+index 74e491060..d2c067ffe 100644
+--- a/openmed/service/jobs.py
++++ b/openmed/service/jobs.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import copy
++import inspect
+ import json
+ import os
+ import tempfile
+@@ -12,11 +13,12 @@
+ from dataclasses import dataclass, field
+ from datetime import datetime, timezone
+ from pathlib import Path
+-from typing import Any, Callable, Optional
++from typing import Any, Callable, Collection, Optional
+ 
+ import openmed
+ from openmed.core.audit import hash_text
+ 
++from .drain import SHUTTING_DOWN, ServiceShuttingDownError
+ from .runtime import ServiceRuntime
+ from .schemas import DeidentifyJobDocument, DeidentifyJobRequest, JobWebhookRequest
+ from .webhooks import WebhookDeliveryResult, deliver_webhook
+@@ -26,12 +28,20 @@
+ SERVICE_JOBS_WORKERS_ENV_VAR = "OPENMED_SERVICE_JOBS_WORKERS"
+ DEFAULT_JOBS_TTL_SECONDS = 24 * 60 * 60
+ DEFAULT_JOBS_WORKERS = 2
+-TERMINAL_STATUSES = frozenset({"done", "failed"})
++TERMINAL_STATUSES = frozenset({"done", "failed", "cancelled"})
++ACTIVE_STATUSES = frozenset({"queued", "running"})
+ 
+ 
+ WebhookSender = Callable[..., WebhookDeliveryResult]
+ 
+ 
++class JobQueueClosedError(ServiceShuttingDownError):
++    """Raised when a job is submitted after the queue stopped admitting work."""
++
++    def __init__(self) -> None:
++        super().__init__("Job queue is shutting down")
++
++
+ @dataclass(frozen=True)
+ class _JobWorkItem:
+     job_id: str
+@@ -144,6 +154,36 @@ def update(self, job_id: str, **changes: Any) -> dict[str, Any]:
+             self._publish_locked(previous)
+             return _copy_record(record)
+ 
++    def update_if(
++        self,
++        job_id: str,
++        *,
++        expected_statuses: Collection[str],
++        **changes: Any,
++    ) -> Optional[dict[str, Any]]:
++        """Apply changes only while the record is in an expected status.
++
++        This is the commit fence for job lifecycle transitions: once a drain
++        marks a job ``cancelled``, a stale worker's later update is refused.
++
++        Args:
++            job_id: Record identifier.
++            expected_statuses: Statuses the record must currently have.
++            **changes: Fields to update.
++
++        Returns:
++            The updated record, or ``None`` when the fence refused the change.
++        """
++        with self._lock:
++            record = self._records.get(job_id)
++            if record is None or record.get("status") not in expected_statuses:
++                return None
++            previous = _copy_record(self._records)
++            record.update(_copy_record(changes))
++            record["updated_at"] = _isoformat(self.clock())
++            self._publish_locked(previous)
++            return _copy_record(record)
++
+     def cleanup_expired(self) -> None:
+         """Remove terminal records whose TTL has elapsed."""
+         with self._lock:
+@@ -245,6 +285,12 @@ def __init__(
+         )
+         self._shutdown = False
+         self._lock = threading.Lock()
++        self._admission_closed = False
++        self._cancel_requested = threading.Event()
++        self._callback_timeout_seconds: Optional[float] = None
++        self._active: dict[str, str] = {}
++        self._drain_completed = 0
++        self._drain_cancelled = 0
+ 
+     @classmethod
+     def from_env(cls, runtime: ServiceRuntime) -> "DeidentifyJobQueue":
+@@ -263,10 +309,11 @@ def submit(self, payload: DeidentifyJobRequest) -> dict[str, Any]:
+         """Submit one de-identification job and return its initial metadata."""
+         self.runtime.validate_served_model(payload.model_name)
+         with self._lock:
+-            if self._shutdown:
+-                raise RuntimeError("Job queue is shutting down")
++            if self._shutdown or self._admission_closed:
++                raise JobQueueClosedError()
+             record = self._new_record(payload)
+             self.store.create(record)
++            self._active[record["id"]] = "queued"
+             self._executor.submit(self._run_job, _JobWorkItem(record["id"], payload))
+             return _copy_record(record)
+ 
+@@ -275,10 +322,90 @@ def get(self, job_id: str) -> Optional[dict[str, Any]]:
+         return self.store.get(job_id)
+ 
+     def shutdown(self) -> None:
+-        """Stop accepting work and request worker shutdown."""
++        """Stop accepting work and request worker shutdown.
++
++        Jobs whose worker never started are marked ``cancelled`` with a
++        retryable ``shutting_down`` code instead of being left ``queued``.
++        """
+         with self._lock:
+             self._shutdown = True
+         self._executor.shutdown(wait=False, cancel_futures=True)
++        self._cancel_jobs(phases=("queued",))
++
++    def close_admission(
++        self, *, callback_timeout_seconds: Optional[float] = None
++    ) -> None:
++        """Refuse new jobs and bound terminal callbacks sent while draining.
++
++        Args:
++            callback_timeout_seconds: Per-attempt timeout for callbacks; while
++                draining each terminal callback makes a single attempt.
++        """
++        with self._lock:
++            self._admission_closed = True
++            self._callback_timeout_seconds = callback_timeout_seconds
++
++    def request_cancel(self) -> None:
++        """Ask workers to stop at their next document (checkpoint) boundary."""
++        self._cancel_requested.set()
++
++    def cancel_outstanding(self) -> int:
++        """Fence every queued or running job as cancelled.
++
++        A worker that is still inside a model call can no longer commit its
++        result: every later status-bearing update is refused by the store.
++
++        Returns:
++            Jobs moved to ``cancelled`` by this call.
++        """
++        return self._cancel_jobs(phases=("queued", "running"))
++
++    def outstanding_count(self) -> int:
++        """Return jobs that are queued, running, or sending their callback."""
++        with self._lock:
++            return len(self._active)
++
++    def drain_stats(self) -> dict[str, int]:
++        """Return value-free terminal counts recorded since admission closed."""
++        with self._lock:
++            return {
++                "completed": self._drain_completed,
++                "cancelled": self._drain_cancelled,
++            }
++
++    def _cancel_jobs(self, *, phases: tuple[str, ...]) -> int:
++        with self._lock:
++            targets = [
++                (job_id, phase)
++                for job_id, phase in self._active.items()
++                if phase in phases
++            ]
++        cancelled = 0
++        for job_id, phase in targets:
++            if self._mark_cancelled(job_id, expected=ACTIVE_STATUSES):
++                cancelled += 1
++            if phase == "queued":
++                with self._lock:
++                    if self._active.get(job_id) == "queued":
++                        self._active.pop(job_id, None)
++        return cancelled
++
++    def _mark_cancelled(self, job_id: str, *, expected: Collection[str]) -> bool:
++        now = self.clock()
++        updated = self.store.update_if(
++            job_id,
++            expected_statuses=expected,
++            status="cancelled",
++            error=_shutdown_error(),
++            completed_at=_isoformat(now),
++            expires_at=self._expiry_timestamp(now),
++        )
++        if updated is None:
++            return False
++        with self._lock:
++            if self._admission_closed or self._shutdown:
++                self._drain_cancelled += 1
++        return True
+ 
+     def _expiry_timestamp(self, moment: datetime) -> str:
+         """Return the metadata expiry for a record that reached *moment*."""
+@@ -315,17 +442,35 @@ def _new_record(self, payload: DeidentifyJobRequest) -> dict[str, Any]:
+         }
+ 
+     def _run_job(self, item: _JobWorkItem) -> None:
++        try:
++            self._run_job_fenced(item)
++        finally:
++            with self._lock:
++                self._active.pop(item.job_id, None)
++
++    def _run_job_fenced(self, item: _JobWorkItem) -> None:
++        if self._cancel_requested.is_set():
++            self._mark_cancelled(item.job_id, expected=("queued",))
++            return
+         started_at = self.clock()
+-        self.store.update(
++        started = self.store.update_if(
+             item.job_id,
++            expected_statuses=("queued",),
+             status="running",
+             started_at=_isoformat(started_at),
+             progress_percent=0.0,
+         )
++        if started is None:
++            return
++        self._set_phase(item.job_id, "running")
+         summary = _JobSummary(total=len(item.payload.documents))
+         error: Optional[dict[str, str]] = None
+ 
+         for index, document in enumerate(item.payload.documents):
++            if self._cancel_requested.is_set():
++                # Document boundary: the last progress update is the checkpoint.
++                self._mark_cancelled(item.job_id, expected=("running",))
++                return
+             document_id = _document_id(index, document)
+             try:
+                 result = self._deidentify_document(item.payload, document)
+@@ -334,20 +479,39 @@ def _run_job(self, item: _JobWorkItem) -> None:
+                 summary.failed_count += 1
+                 error = _safe_error(exc)
+ 
+-            self.store.update(item.job_id, **summary.to_progress_record())
++            progress = self.store.update_if(
++                item.job_id,
++                expected_statuses=("running",),
++                **summary.to_progress_record(),
++            )
++            if progress is None:
++                return
+ 
+         completed_at = self.clock()
+         status = "failed" if summary.failed_count else "done"
+-        final_record = self.store.update(
++        final_record = self.store.update_if(
+             item.job_id,
++            expected_statuses=("running",),
+             status=status,
+             progress_percent=100.0,
+             error=error,
+             completed_at=_isoformat(completed_at),
+             expires_at=self._expiry_timestamp(completed_at),
+         )
++        if final_record is None:
++            # A drain fenced this job while its last document ran.
++            return
++        with self._lock:
++            if self._admission_closed or self._shutdown:
++                self._drain_completed += 1
++        self._set_phase(item.job_id, "callback")
+         self._send_terminal_webhook(item.payload.webhook, final_record)
+ 
++    def _set_phase(self, job_id: str, phase: str) -> None:
++        with self._lock:
++            if job_id in self._active or phase == "running":
++                self._active[job_id] = phase
++
+     def _deidentify_document(
+         self,
+         payload: DeidentifyJobRequest,
+@@ -386,14 +550,24 @@ def _send_terminal_webhook(
+         if webhook is None:
+             return
+         payload = webhook_payload(record)
++        options: dict[str, Any] = {
++            "secret": webhook.secret,
++            "max_attempts": webhook.max_attempts,
++            "backoff_seconds": webhook.backoff_seconds,
++        }
++        with self._lock:
++            draining = self._admission_closed or self._shutdown
++            callback_timeout = self._callback_timeout_seconds
++        if draining:
++            # One bounded attempt: a drain never waits on retry backoff.
++            options["max_attempts"] = 1
++            options["backoff_seconds"] = 0.0
++            if callback_timeout is not None and _accepts_keyword(
++                self.webhook_sender, "timeout_seconds"
++            ):
++                options["timeout_seconds"] = callback_timeout
+         try:
+-            result = self.webhook_sender(
+-                webhook.url,
+-                payload,
+-                secret=webhook.secret,
+-                max_attempts=webhook.max_attempts,
+-                backoff_seconds=webhook.backoff_seconds,
+-            )
++            result = self.webhook_sender(webhook.url, payload, **options)
+         except Exception as exc:
+             result = WebhookDeliveryResult(
+                 success=False,
+@@ -495,6 +669,26 @@ def _safe_error(exc: Exception) -> dict[str, str]:
+     }
+ 
+ 
++def _shutdown_error() -> dict[str, Any]:
++    return {
++        "type": "ServiceShuttingDown",
++        "code": SHUTTING_DOWN,
++        "message": "Job was cancelled because the service shut down; resubmit it",
++        "retryable": True,
++    }
++
++
++def _accepts_keyword(function: Callable[..., Any], name: str) -> bool:
++    try:
++        parameters = inspect.signature(function).parameters.values()
++    except (TypeError, ValueError):
++        return False
++    return any(
++        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == name
++        for parameter in parameters
++    )
++
++
+ def webhook_payload(record: dict[str, Any]) -> dict[str, Any]:
+     """Build a no-PHI terminal webhook payload from a persisted record."""
+     return {
+diff --git a/openmed/service/metrics.py b/openmed/service/metrics.py
+index 4f26b09db..01a64157c 100644
+--- a/openmed/service/metrics.py
++++ b/openmed/service/metrics.py
+@@ -4,6 +4,7 @@
+ 
+ import math
+ import os
++import re
+ import threading
+ from typing import Mapping
+ 
+@@ -49,6 +50,10 @@
+ SPECULATIVE_AVERAGE_DEPTH_NAME = "openmed_mlx_speculative_average_depth"
+ OPERATIONAL_TOTAL_NAME = "openmed_service_operational_total"
+ OPERATIONAL_DURATION_NAME = "openmed_service_operational_duration_seconds"
++DRAINING_NAME = "openmed_service_draining"
++DRAIN_PARTICIPANT_TOTAL_NAME = "openmed_service_drain_participant_total"
++DRAIN_UNFINISHED_NAME = "openmed_service_drain_unfinished"
++_DRAIN_LABEL_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
+ 
+ _ENABLED_VALUES = {"1", "true", "yes", "on", "enabled"}
+ _DISABLED_VALUES = {"0", "false", "no", "off", "disabled"}
+@@ -147,6 +152,9 @@ def __init__(self, duration_buckets: tuple[float, ...] | None = None) -> None:
+         self._operational_total: dict[tuple[str, str, str], int] = {}
+         self._operational_duration_count: dict[tuple[str, str, str], int] = {}
+         self._operational_duration_sum: dict[tuple[str, str, str], float] = {}
++        self._draining = 0
++        self._drain_participant_total: dict[tuple[str, str, str], int] = {}
++        self._drain_unfinished: dict[str, int] = {}
+         self._lock = threading.RLock()
+ 
+     def request_started(self) -> None:
+@@ -393,6 +401,30 @@ def record_operational_event(self, event: OperationalEvent) -> None:
+                 self._operational_duration_sum.get(key, 0.0) + event.duration_seconds
+             )
+ 
++    def set_draining(self, draining: bool) -> None:
++        """Set the gauge reporting whether a service drain is running."""
++        with self._lock:
++            self._draining = 1 if draining else 0
++
++    def record_drain_event(self, event: object) -> None:
++        """Record one value-free drain progress event.
++
++        Only the controlled phase, participant category, outcome, and the
++        unfinished count are kept; anything outside that vocabulary is dropped.
++        """
++        phase = _drain_label(getattr(event, "phase", None))
++        participant = _drain_label(getattr(event, "participant", None))
++        outcome = _drain_label(getattr(event, "outcome", None))
++        if phase is None or participant is None or outcome is None:
++            return
++        unfinished = _non_negative_int(getattr(event, "unfinished", 0))
++        key = (phase, participant, outcome)
++        with self._lock:
++            self._drain_participant_total[key] = (
++                self._drain_participant_total.get(key, 0) + 1
++            )
++            self._drain_unfinished[participant] = unfinished
++
+     def render(self) -> str:
+         """Render metrics using the Prometheus 0.0.4 text format."""
+         with self._lock:
+@@ -439,6 +471,9 @@ def render(self) -> str:
+             operational_total = dict(self._operational_total)
+             operational_duration_count = dict(self._operational_duration_count)
+             operational_duration_sum = dict(self._operational_duration_sum)
++            draining = self._draining
++            drain_participant_total = dict(self._drain_participant_total)
++            drain_unfinished = dict(self._drain_unfinished)
+ 
+         lines: list[str] = []
+         _append_family_header(
+@@ -831,6 +866,38 @@ def render(self) -> str:
+                 f"{_format_sample_value(operational_duration_sum[key])}"
+             )
+ 
++        _append_family_header(
++            lines,
++            DRAINING_NAME,
++            "Whether a bounded service drain is running (1) or not (0).",
++            "gauge",
++        )
++        lines.append(f"{DRAINING_NAME} {draining}")
++
++        _append_family_header(
++            lines,
++            DRAIN_PARTICIPANT_TOTAL_NAME,
++            "Drain phase results by controlled phase, participant, and outcome.",
++            "counter",
++        )
++        for (phase, participant, outcome), value in sorted(
++            drain_participant_total.items()
++        ):
++            labels = _label_suffix(
++                {"phase": phase, "participant": participant, "outcome": outcome}
++            )
++            lines.append(f"{DRAIN_PARTICIPANT_TOTAL_NAME}{labels} {value}")
++
++        _append_family_header(
++            lines,
++            DRAIN_UNFINISHED_NAME,
++            "Work units still outstanding after a participant's last drain phase.",
++            "gauge",
++        )
++        for participant, value in sorted(drain_unfinished.items()):
++            labels = _label_suffix({"participant": participant})
++            lines.append(f"{DRAIN_UNFINISHED_NAME}{labels} {value}")
++
+         return "\n".join(lines) + "\n"
+ 
+ 
+@@ -857,6 +924,13 @@ def _escape_label_value(value: str) -> str:
+     return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+ 
+ 
++def _drain_label(value: object) -> str | None:
++    label = getattr(value, "value", value)
++    if isinstance(label, str) and _DRAIN_LABEL_PATTERN.fullmatch(label):
++        return label
++    return None
++
++
+ def _admission_queue_label(value: object) -> str:
+     normalized = str(value).strip().casefold()
+     if normalized in ADMISSION_QUEUE_LABELS:
+diff --git a/openmed/service/resilience.py b/openmed/service/resilience.py
+index 0cf0390da..f0e3e9475 100644
+--- a/openmed/service/resilience.py
++++ b/openmed/service/resilience.py
+@@ -10,6 +10,8 @@
+ from dataclasses import dataclass, field
+ from typing import Any, Optional
+ 
++from .drain import ServiceShuttingDownError
++
+ CIRCUIT_CLOSED = "closed"
+ CIRCUIT_OPEN = "open"
+ CIRCUIT_HALF_OPEN = "half_open"
+@@ -258,5 +260,9 @@ def circuit_breaker_details(exc: CircuitBreakerOpenError) -> dict[str, Any]:
+ 
+ 
+ def _is_retryable_exception(exc: BaseException) -> bool:
+-    """Return whether an exception looks like backend/load infrastructure failure."""
+-    return not isinstance(exc, ValueError)
++    """Return whether an exception looks like backend/load infrastructure failure.
++
++    A shutdown refusal is a lifecycle state, not a backend fault: it is neither
++    retried in-process nor counted against a circuit breaker.
++    """
++    return not isinstance(exc, (ValueError, ServiceShuttingDownError))
+diff --git a/openmed/service/runtime.py b/openmed/service/runtime.py
+index b75a46aa2..1a0b69a23 100644
+--- a/openmed/service/runtime.py
++++ b/openmed/service/runtime.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import math
+ import os
+ import re
+ import threading
+@@ -13,6 +14,14 @@
+ from openmed.mlx.lm import PagedKVCacheConfig
+ from openmed.utils.validation import validate_batch_size, validate_model_name
+ 
++from .drain import (
++    DEFAULT_RELEASE_SECONDS,
++    AcceleratorDrainParticipant,
++    DrainBudget,
++    DrainCoordinator,
++    WarmPoolDrainParticipant,
++    detect_accelerator_devices,
++)
+ from .keep_alive import parse_keep_alive
+ from .resilience import ResilienceManager, ServiceResilienceConfig
+ from .warm_pool import (
+@@ -47,6 +56,7 @@
+ SERVICE_BATCH_MAX_QUEUE_WAIT_MS_ENV_VAR = "OPENMED_SERVICE_BATCH_MAX_QUEUE_WAIT_MS"
+ SERVICE_COALESCING_ENABLED_ENV_VAR = "OPENMED_SERVICE_COALESCING_ENABLED"
+ SERVICE_SHUTDOWN_DRAIN_ENV_VAR = "OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS"
++SERVICE_SHUTDOWN_RELEASE_ENV_VAR = "OPENMED_SERVICE_SHUTDOWN_RELEASE_SECONDS"
+ SERVICE_RATE_LIMIT_RPS_ENV_VAR = "OPENMED_SERVICE_RATE_LIMIT_RPS"
+ SERVICE_RATE_LIMIT_BURST_ENV_VAR = "OPENMED_SERVICE_RATE_LIMIT_BURST"
+ SERVICE_MAX_CONCURRENCY_ENV_VAR = "OPENMED_SERVICE_RATE_LIMIT_MAX_CONCURRENCY"
+@@ -84,6 +94,7 @@
+ DEFAULT_SERVICE_BATCH_LOW_WATERMARK = DEFAULT_SERVICE_BATCH_HIGH_WATERMARK // 2
+ DEFAULT_SERVICE_BATCH_MAX_QUEUE_WAIT_MS = 1000.0
+ DEFAULT_SERVICE_SHUTDOWN_DRAIN_SECONDS = 30.0
++DEFAULT_SERVICE_SHUTDOWN_RELEASE_SECONDS = DEFAULT_RELEASE_SECONDS
+ DEFAULT_SERVICE_CONCURRENCY_WAIT_SECONDS = 0.05
+ DEFAULT_MLX_PAGED_KV_CACHE_PAGE_TOKENS = 128
+ DEFAULT_MLX_PAGED_KV_CACHE_CHUNK_TOKENS = 512
+@@ -443,6 +454,27 @@ def parse_shutdown_drain_seconds(raw_value: Optional[str]) -> float:
+         raise ValueError(
+             f"{SERVICE_SHUTDOWN_DRAIN_ENV_VAR} must be greater than or equal to 0"
+         )
++    if not math.isfinite(parsed):
++        raise ValueError(f"{SERVICE_SHUTDOWN_DRAIN_ENV_VAR} must be a finite number")
++    return parsed
++
++
++def parse_shutdown_release_seconds(raw_value: Optional[str]) -> float:
++    """Parse the flush-and-release window that follows the in-flight drain.
++
++    Args:
++        raw_value: Raw ``OPENMED_SERVICE_SHUTDOWN_RELEASE_SECONDS`` value.
++
++    Returns:
++        Finite, non-negative seconds; defaults to 5.
++    """
++    parsed = _parse_non_negative_float(
++        raw_value,
++        env_var=SERVICE_SHUTDOWN_RELEASE_ENV_VAR,
++        default=DEFAULT_SERVICE_SHUTDOWN_RELEASE_SECONDS,
++    )
++    if not math.isfinite(parsed):
++        raise ValueError(f"{SERVICE_SHUTDOWN_RELEASE_ENV_VAR} must be a finite number")
+     return parsed
+ 
+ 
+@@ -743,6 +775,9 @@ class ServiceRuntime:
+     model_admission_wait_seconds: float = DEFAULT_MEMORY_ADMISSION_WAIT_SECONDS
+     default_keep_alive_seconds: Optional[float] = None
+     shutdown_drain_seconds: float = DEFAULT_SERVICE_SHUTDOWN_DRAIN_SECONDS
++    shutdown_release_seconds: float = field(
++        default=DEFAULT_SERVICE_SHUTDOWN_RELEASE_SECONDS, kw_only=True
++    )
+     batching: ServiceBatchingConfig = field(default_factory=ServiceBatchingConfig)
+     coalescing: ServiceCoalescingConfig = field(default_factory=ServiceCoalescingConfig)
+     throttle: ServiceThrottleConfig = field(default_factory=ServiceThrottleConfig)
+@@ -761,6 +796,7 @@ class ServiceRuntime:
+         init=False,
+         repr=False,
+     )
++    _drain: Optional[DrainCoordinator] = field(default=None, init=False, repr=False)
+ 
+     metrics: Optional[Any] = None
+ 
+@@ -817,6 +853,9 @@ def from_env(cls, *, metrics: Optional[Any] = None) -> "ServiceRuntime":
+             shutdown_drain_seconds=parse_shutdown_drain_seconds(
+                 os.getenv(SERVICE_SHUTDOWN_DRAIN_ENV_VAR)
+             ),
++            shutdown_release_seconds=parse_shutdown_release_seconds(
++                os.getenv(SERVICE_SHUTDOWN_RELEASE_ENV_VAR)
++            ),
+             batching=batching,
+             coalescing=coalescing,
+             throttle=throttle,
+@@ -864,6 +903,37 @@ def get_resilience(self) -> ResilienceManager:
+                     self._resilience = ResilienceManager(self.resilience_config)
+         return self._resilience
+ 
++    def get_drain_coordinator(self) -> DrainCoordinator:
++        """Return this runtime's single-shot drain coordinator.
++
++        The coordinator is created on first use with the configured drain and
++        release windows. The runtime registers the resources it owns: the warm
++        pool (fenced and released) and accelerators already in use (released
++        back to the baseline captured here). REST, GraphQL, gRPC, jobs, and
++        other surfaces built on this runtime register their own participants.
++
++        Returns:
++            The shared coordinator.
++        """
++        if self._drain is None:
++            with self._loader_lock:
++                if self._drain is None:
++                    coordinator = DrainCoordinator(
++                        DrainBudget(
++                            drain_seconds=self.shutdown_drain_seconds,
++                            release_seconds=self.shutdown_release_seconds,
++                        ),
++                        metrics=self.metrics,
++                    )
++                    coordinator.register(
++                        WarmPoolDrainParticipant(lambda: self._warm_pool)
++                    )
++                    coordinator.register(
++                        AcceleratorDrainParticipant(detect_accelerator_devices())
++                    )
++                    self._drain = coordinator
++        return self._drain
++
+     def preload(self) -> None:
+         """Warm configured model pipelines during service startup."""
+         if not self.preload_models:
+diff --git a/openmed/service/smart_backend.py b/openmed/service/smart_backend.py
+index 7539406ec..43df694bb 100644
+--- a/openmed/service/smart_backend.py
++++ b/openmed/service/smart_backend.py
+@@ -835,6 +835,11 @@ async def cancel(self, job_id: str) -> SMARTBackendJobStatus:
+             await asyncio.gather(record.task, return_exceptions=True)
+         return record.status
+ 
++    def active_count(self) -> int:
++        """Return background jobs whose task has not finished."""
++
++        return sum(1 for record in self._jobs.values() if not record.task.done())
++
+     async def cancel_all(self) -> None:
+         """Cancel any still-running background jobs during service shutdown."""
+ 
+diff --git a/openmed/service/warm_pool.py b/openmed/service/warm_pool.py
+index 4a1d3b70c..d5436ef08 100644
+--- a/openmed/service/warm_pool.py
++++ b/openmed/service/warm_pool.py
+@@ -11,6 +11,7 @@
+ 
+ from openmed.utils.validation import validate_model_name
+ 
++from .drain import ServiceShuttingDownError
+ from .keep_alive import parse_keep_alive
+ 
+ DEFAULT_WARM_PIPELINE_TASK = "token-classification"
+@@ -150,6 +151,13 @@ def __init__(
+         )
+ 
+ 
++class WarmPoolClosedError(ServiceShuttingDownError):
++    """Raised when a model activation or cold load is attempted after close."""
++
++    def __init__(self) -> None:
++        super().__init__("Model warm pool is closed for shutdown")
++
++
+ @dataclass
+ class WarmPoolEntry:
+     """Resident model bookkeeping tracked by :class:`WarmPool`."""
+@@ -198,6 +206,7 @@ class WarmPool:
+     _entries: dict[str, WarmPoolEntry] = field(default_factory=dict, repr=False)
+     _timers: dict[str, threading.Timer] = field(default_factory=dict, repr=False)
+     _local: threading.local = field(default_factory=threading.local, repr=False)
++    _closed: bool = field(default=False, init=False, repr=False)
+ 
+     def __post_init__(self) -> None:
+         self.max_resident_models = parse_max_resident_models(self.max_resident_models)
+@@ -232,6 +241,8 @@ def begin_request(self, model_name: str) -> str:
+         """Mark a model as active for one service request."""
+         model_key = self.resolve_model_name(model_name)
+         with self._lock:
++            if self._closed:
++                raise WarmPoolClosedError()
+             now = self.clock()
+             self._drop_expired_locked(now)
+             entry = self._entry_for_model_locked(model_key, now)
+@@ -276,6 +287,14 @@ def _finish_model_request_locked(
+         if entry.active_requests:
+             return
+ 
++        if self._closed:
++            # The last reference of a drained generation releases its model.
++            if entry.resident:
++                self._unload_entry_locked(model_key)
++            else:
++                self._entries.pop(model_key, None)
++            return
++
+         if keep_alive_seconds is None:
+             entry.keep_alive_deadline = None
+         elif keep_alive_seconds <= 0:
+@@ -374,6 +393,16 @@ def _get_or_load_handle(
+         reserved_bytes = 0
+         while True:
+             with self._lock:
++                if self._closed:
++                    cached = self._entries.get(model_key)
++                    if not (
++                        reuse_cached
++                        and cached is not None
++                        and cache_key in cached.handles
++                    ):
++                        # Never cold-load after release; stragglers may only
++                        # reuse handles they already share.
++                        raise WarmPoolClosedError()
+                 now = self.clock()
+                 self._drop_expired_locked(now)
+                 entry = self._entry_for_model_locked(model_key, now)
+@@ -580,6 +609,37 @@ def unload_all_models(self) -> dict[str, Any]:
+                 "active_models": active_models,
+             }
+ 
++    @property
++    def closed(self) -> bool:
++        """Return whether the pool was closed for shutdown."""
++        return self._closed
++
++    def close(self) -> dict[str, int]:
++        """Fence new model activations and release every inactive model.
++
++        Requests that are still active keep the handles they hold; when the
++        last one finishes, its model is unloaded instead of being kept warm.
++
++        Returns:
++            Value-free counts of released components and retained references.
++        """
++        with self._lock:
++            self._closed = True
++            for model_name in list(self._timers):
++                self._cancel_timer_locked(model_name)
++        result = self.unload_all_models()
++        released = result.get("released", {})
++        return {
++            "released_models": int(released.get("models", 0)),
++            "released_pipelines": int(released.get("pipelines", 0)),
++            "active_requests": self.active_request_count(),
++        }
++
++    def active_request_count(self) -> int:
++        """Return active model references across every entry."""
++        with self._lock:
++            return sum(entry.active_requests for entry in self._entries.values())
++
+     def drop_expired(self) -> list[str]:
+         """Drop idle entries whose keep-alive deadlines have expired."""
+         with self._lock:
+diff --git a/tests/integration/test_service_drain.py b/tests/integration/test_service_drain.py
+new file mode 100644
+index 000000000..80124b249
+--- /dev/null
++++ b/tests/integration/test_service_drain.py
+@@ -0,0 +1,1281 @@
++"""Offline lifecycle tests for the coordinated service drain.
++
++Every workload here is synthetic. Tests prove ordering, typed refusals, and the
++absence of lost or duplicate work by observing outcomes and counts; they never
++assert wall-clock durations. Small drain budgets only keep the suite fast, and
++any wait on a condition has a generous safety bound.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import signal
++import subprocess
++import sys
++import textwrap
++import threading
++from datetime import datetime
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any, Callable, Optional
++
++import grpc
++import httpx
++import pytest
++from fastapi.testclient import TestClient
++
++import openmed
++from openmed.core import pii as pii_core
++from openmed.core.pii import DeidentificationResult
++from openmed.core.streaming import StreamingDeidentificationEvent
++from openmed.processing.outputs import PredictionResult
++from openmed.service import jobs
++from openmed.service import runtime as service_runtime
++from openmed.service.app import create_app
++from openmed.service.batcher import BatcherClosedError, DynamicBatcher
++from openmed.service.drain import (
++    SHUTTING_DOWN,
++    AcceleratorDrainParticipant,
++    CallbackDrainParticipant,
++    DrainBudget,
++    DrainCoordinator,
++    DrainOutcome,
++    DrainParticipant,
++    DrainPhase,
++    DrainRegistrationError,
++    DrainState,
++    JobQueueDrainParticipant,
++    PhaseResult,
++    ServiceShuttingDownError,
++    WarmPoolDrainParticipant,
++    register_drain_participant,
++    shutting_down_ndjson_line,
++)
++from openmed.service.grpc_server import (
++    GRPC_RETRY_PUSHBACK_METADATA_KEY,
++    GrpcDrainParticipant,
++    create_grpc_server,
++)
++from openmed.service.metrics import PrometheusMetricsRegistry
++from openmed.service.proto.generated import openmed_pb2, openmed_pb2_grpc
++from openmed.service.schemas import (
++    DeidentifyJobDocument,
++    DeidentifyJobRequest,
++    JobWebhookRequest,
++)
++from openmed.service.warm_pool import WarmPool, WarmPoolClosedError
++from openmed.service.webhooks import WebhookDeliveryResult
++
++LOOPBACK_BASE_URL = "http://127.0.0.1"
++_SYNTHETIC_PHI = ("Maria Garcia", "555-0100", "MRN-0042")
++_SERVICE_ENV_VARS = (
++    "OPENMED_SERVICE_PRELOAD_MODELS",
++    "OPENMED_SERVICE_KEEP_ALIVE",
++    "OPENMED_SERVICE_MAX_RESIDENT_MODELS",
++    "OPENMED_SERVICE_MODEL_MEMORY_BUDGET_BYTES",
++    "OPENMED_SERVICE_MAX_TEXT_LENGTH",
++    "OPENMED_SERVICE_CORS_ORIGINS",
++    "OPENMED_SERVICE_TRUSTED_HOSTS",
++    "OPENMED_SERVICE_BATCHING_ENABLED",
++    "OPENMED_SERVICE_BATCH_MAX_SIZE",
++    "OPENMED_SERVICE_BATCH_MAX_WAIT_MS",
++    "OPENMED_SERVICE_BATCH_MAX_QUEUE_SIZE",
++    "OPENMED_SERVICE_COALESCING_ENABLED",
++    "OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS",
++    "OPENMED_SERVICE_SHUTDOWN_RELEASE_SECONDS",
++    "OPENMED_SERVICE_RATE_LIMIT_RPS",
++    "OPENMED_SERVICE_RATE_LIMIT_BURST",
++    "OPENMED_SERVICE_RATE_LIMIT_MAX_CONCURRENCY",
++    "OPENMED_SERVICE_THROTTLE_KEY",
++    "OPENMED_SERVICE_CONCURRENCY_WAIT_SECONDS",
++    "OPENMED_SERVICE_JOBS_WORKERS",
++    "OPENMED_SERVICE_METRICS_ENABLED",
++)
++
++
++class FakeLoader:
++    """Loader double; models are opaque objects and nothing is downloaded."""
++
++    def __init__(self, config: Any) -> None:
++        self.config = config
++
++    def resolve_model_name(self, model_name: str) -> str:
++        return model_name
++
++    def create_pipeline(self, model_name: str, **_: Any) -> object:
++        return object()
++
++    def loaded_models(self) -> dict[str, Any]:
++        return {}
++
++    def unload_model(self, model_name: str) -> dict[str, Any]:
++        return {"model_name": model_name, "models": 0, "tokenizers": 0, "pipelines": 0}
++
++    def unload_all_models(self) -> dict[str, int]:
++        return {"models": 0, "tokenizers": 0, "pipelines": 0}
++
++
++@pytest.fixture(autouse=True)
++def service_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
++    monkeypatch.setenv("OPENMED_PROFILE", "test")
++    for name in _SERVICE_ENV_VARS:
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.setenv("OPENMED_SERVICE_JOBS_STORE_PATH", str(tmp_path / "jobs.json"))
++    monkeypatch.setattr(service_runtime, "ModelLoader", FakeLoader)
++
++
++def _deid_result(text: str) -> DeidentificationResult:
++    return DeidentificationResult(
++        original_text=text,
++        deidentified_text="[REDACTED]",
++        pii_entities=[],
++        method="mask",
++        timestamp=datetime(2026, 1, 1),
++        metadata={},
++    )
++
++
++async def _until(predicate: Callable[[], bool], *, bound: float = 10.0) -> None:
++    """Wait for a condition; ``bound`` is a hang guard, not a timing assertion."""
++    loop = asyncio.get_running_loop()
++    limit = loop.time() + bound
++    while not predicate():
++        if loop.time() > limit:
++            raise AssertionError("condition was not reached")
++        await asyncio.sleep(0.005)
++
++
++def _wait_sync(predicate: Callable[[], bool], *, bound: float = 10.0) -> None:
++    done = threading.Event()
++    for _ in range(int(bound / 0.005)):
++        if predicate():
++            return
++        done.wait(0.005)
++    raise AssertionError("condition was not reached")
++
++
++def _signature(report: Any) -> list[tuple[Any, ...]]:
++    return [
++        (
++            event.phase.value,
++            event.participant,
++            event.outcome.value,
++            event.completed,
++            event.cancelled,
++            event.unfinished,
++            event.reason_code,
++        )
++        for event in report.events
++    ]
++
++
++def _assert_value_free(document: Any) -> None:
++    dumped = json.dumps(document, sort_keys=True)
++    for value in _SYNTHETIC_PHI:
++        assert value not in dumped
++
++
++# ---------------------------------------------------------------------------
++# Coordinator contract
++# ---------------------------------------------------------------------------
++
++
++class _Recorder(DrainParticipant):
++    def __init__(self, category: str, priority: int, log: list[tuple[str, str]]):
++        super().__init__(category, priority=priority)
++        self.log = log
++
++    def stop_admission(self, ctx):
++        self.log.append(("stop_admission", self.category))
++        return PhaseResult()
++
++    async def finish_in_flight(self, ctx):
++        self.log.append(("finish_in_flight", self.category))
++        return PhaseResult.from_counts(completed=1)
++
++    def flush(self, ctx):
++        self.log.append(("flush", self.category))
++        return None
++
++    def release(self, ctx):
++        self.log.append(("release", self.category))
++        return PhaseResult()
++
++
++def test_phases_run_in_order_after_readiness_drops_and_drain_runs_once():
++    log: list[tuple[str, str]] = []
++    coordinator = DrainCoordinator(DrainBudget(drain_seconds=1, release_seconds=1))
++    coordinator.on_readiness_lost(lambda: log.append(("readiness_lost", "")))
++    coordinator.register(_Recorder("second", 20, log))
++    first = coordinator.register(_Recorder("first", 10, log))
++    coordinator.register(first)  # duplicate registration is a no-op
++    assert coordinator.ready and coordinator.live
++
++    async def scenario():
++        one, two = await asyncio.gather(coordinator.drain(), coordinator.drain())
++        return one, two, await coordinator.drain()
++
++    one, two, three = asyncio.run(scenario())
++
++    assert one is two is three
++    assert log[0] == ("readiness_lost", "")
++    assert log[1:] == [
++        ("stop_admission", "first"),
++        ("stop_admission", "second"),
++        ("finish_in_flight", "first"),
++        ("finish_in_flight", "second"),
++        ("flush", "first"),
++        ("flush", "second"),
++        ("release", "first"),
++        ("release", "second"),
++    ]
++    assert coordinator.state is DrainState.DRAINED
++    assert not coordinator.ready and coordinator.live
++    assert one.outcome is DrainOutcome.COMPLETED
++    assert {event.outcome for event in one.events if event.phase.value == "flush"} == {
++        DrainOutcome.SKIPPED
++    }
++    with pytest.raises(DrainRegistrationError):
++        coordinator.register(_Recorder("late", 1, log))
++
++
++def test_wedged_and_failing_participants_are_bounded_with_value_free_evidence():
++    class Wedged(DrainParticipant):
++        category = "wedged"
++
++        async def finish_in_flight(self, ctx):
++            await asyncio.Event().wait()  # never finishes on its own
++
++        def outstanding(self) -> int:
++            return 2
++
++    class Broken(DrainParticipant):
++        category = "broken"
++
++        def release(self, ctx):
++            raise RuntimeError(f"Patient {_SYNTHETIC_PHI[0]} {_SYNTHETIC_PHI[2]}")
++
++    class Quick(DrainParticipant):
++        category = "quick"
++
++        async def finish_in_flight(self, ctx):
++            return PhaseResult.from_counts(completed=3)
++
++    signatures = []
++    for _ in range(3):
++        coordinator = DrainCoordinator(
++            DrainBudget(drain_seconds=0.05, release_seconds=0.05)
++        )
++        for participant in (Wedged(), Broken(), Quick()):
++            coordinator.register(participant)
++        report = asyncio.run(coordinator.drain())
++        signatures.append(_signature(report))
++
++        wedged = report.events_for("wedged")[0]
++        assert wedged.outcome is DrainOutcome.DEADLINE_EXCEEDED
++        assert wedged.unfinished == 2
++        assert wedged.reason_code == "drain_deadline_exceeded"
++        assert wedged.budget_seconds <= report.budget.drain_seconds
++        broken = report.events_for("broken")[0]
++        assert broken.outcome is DrainOutcome.FAILED
++        assert broken.reason_code == "participant_failed"
++        assert broken.budget_seconds <= report.budget.release_seconds
++        assert report.events_for("quick")[0].completed == 3
++        assert report.outcome is DrainOutcome.FAILED
++        assert report.unfinished_participants == ("wedged",)
++        document = report.to_dict()
++        _assert_value_free(document)
++        assert set(document["events"][0]) == {
++            "phase",
++            "participant",
++            "outcome",
++            "completed",
++            "cancelled",
++            "checkpointed",
++            "unfinished",
++            "budget_seconds",
++            "duration_seconds",
++            "reason_code",
++        }
++
++    # Deadline handling is deterministic: the same work yields the same evidence.
++    assert signatures[0] == signatures[1] == signatures[2]
++
++
++def test_participant_labels_and_budgets_are_controlled(subtests):
++    for label in ("Maria Garcia", "UPPER", "", "x" * 64, "has-dash", 7):
++        with subtests.test(label=str(label)):
++            with pytest.raises(ValueError):
++                DrainParticipant(label)  # type: ignore[arg-type]
++    for bad in (-1, float("inf"), float("nan")):
++        with subtests.test(budget=str(bad)):
++            with pytest.raises(ValueError):
++                DrainBudget(drain_seconds=bad)
++    with pytest.raises(TypeError):
++        DrainCoordinator().register(object())  # type: ignore[arg-type]
++    with pytest.raises(ValueError):
++        PhaseResult(reason_code="free text")
++    budget = DrainBudget(drain_seconds=2, release_seconds=1)
++    assert budget.settle_seconds == 0.5
++    assert budget.total_seconds == 3
++
++
++def test_release_window_is_configurable_and_bounded(monkeypatch):
++    assert service_runtime.parse_shutdown_release_seconds(None) == 5.0
++    assert service_runtime.parse_shutdown_release_seconds("0.5") == 0.5
++    for raw in ("-1", "inf", "nan", "soon"):
++        with pytest.raises(ValueError):
++            service_runtime.parse_shutdown_release_seconds(raw)
++    with pytest.raises(ValueError):
++        service_runtime.parse_shutdown_drain_seconds("inf")
++    monkeypatch.setenv("OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS", "3")
++    monkeypatch.setenv("OPENMED_SERVICE_SHUTDOWN_RELEASE_SECONDS", "2")
++    runtime = service_runtime.ServiceRuntime.from_env()
++    coordinator = runtime.get_drain_coordinator()
++    assert coordinator is runtime.get_drain_coordinator()
++    assert coordinator.budget.drain_seconds == 3
++    assert coordinator.budget.release_seconds == 2
++    categories = {item.category for item in coordinator.participants()}
++    assert {"warm_pool", "accelerator"} <= categories
++
++
++def test_drain_metrics_use_controlled_labels_only():
++    registry = PrometheusMetricsRegistry()
++    coordinator = DrainCoordinator(
++        DrainBudget(drain_seconds=0.05, release_seconds=0.05), metrics=registry
++    )
++    coordinator.register(
++        CallbackDrainParticipant(
++            "quick",
++            finish_in_flight=lambda ctx: PhaseResult.from_counts(completed=1),
++        )
++    )
++    asyncio.run(coordinator.drain())
++    registry.record_drain_event(
++        SimpleNamespace(
++            phase="release", participant=_SYNTHETIC_PHI[0], outcome="completed"
++        )
++    )
++    rendered = registry.render()
++
++    assert "openmed_service_draining 0" in rendered
++    assert (
++        'openmed_service_drain_participant_total{phase="finish_in_flight",'
++        'participant="quick",outcome="completed"} 1'
++    ) in rendered
++    assert 'openmed_service_drain_unfinished{participant="quick"} 0' in rendered
++    assert _SYNTHETIC_PHI[0] not in rendered
++
++
++# ---------------------------------------------------------------------------
++# REST and GraphQL
++# ---------------------------------------------------------------------------
++
++
++def test_rest_graphql_and_jobs_refuse_new_work_while_accepted_request_commits_once(
++    monkeypatch,
++):
++    monkeypatch.setenv("OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS", "10")
++    entered, release = threading.Event(), threading.Event()
++    calls: list[int] = []
++
++    def fake_deidentify(text: str, **_: Any) -> DeidentificationResult:
++        calls.append(len(text))
++        entered.set()
++        release.wait(timeout=10)
++        return _deid_result(text)
++
++    monkeypatch.setattr(openmed, "deidentify", fake_deidentify)
++    app = create_app()
++
++    async def scenario():
++        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
++        async with httpx.AsyncClient(
++            transport=transport, base_url=LOOPBACK_BASE_URL
++        ) as client:
++            lifespan = app.router.lifespan_context(app)
++            await lifespan.__aenter__()
++            accepted = asyncio.create_task(
++                client.post(
++                    "/pii/deidentify",
++                    json={"text": f"Patient {_SYNTHETIC_PHI[0]}", "method": "mask"},
++                )
++            )
++            await _until(entered.is_set)
++            drain = asyncio.create_task(lifespan.__aexit__(None, None, None))
++            await _until(lambda: bool(getattr(app.state, "shutting_down", False)))
++            probes = {
++                "livez": await client.get("/livez"),
++                "readyz": await client.get("/readyz"),
++                "rest": await client.post("/analyze", json={"text": "synthetic"}),
++                "graphql": await client.post(
++                    "/graphql", json={"query": "{ entityTypes { label } }"}
++                ),
++                "jobs": await client.post(
++                    "/jobs", json={"documents": [{"text": "synthetic"}]}
++                ),
++            }
++            still_running = not accepted.done()
++            release.set()
++            response = await accepted
++            await drain
++            return probes, still_running, response
++
++    probes, still_running, response = asyncio.run(scenario())
++
++    assert probes["livez"].status_code == 200
++    for name in ("readyz", "rest", "graphql", "jobs"):
++        refused = probes[name]
++        assert refused.status_code == 503, name
++        error = refused.json()["error"]
++        assert error["code"] == "not_ready"
++        assert error["details"]["reason"] == SHUTTING_DOWN
++        assert error["details"]["retryable"] is True
++        assert refused.headers["Retry-After"] == "1"
++    assert still_running
++    assert response.status_code == 200
++    assert response.json()["deidentified_text"] == "[REDACTED]"
++    assert len(calls) == 1  # committed once, never retried by the drain
++
++    report = app.state.drain_report
++    http = report.events_for("http_requests")
++    assert http[-1].phase is DrainPhase.FINISH_IN_FLIGHT
++    assert (http[-1].completed, http[-1].unfinished) == (1, 0)
++    assert report.outcome is DrainOutcome.COMPLETED
++    assert app.state.inflight == 0
++    pool = app.state.runtime.get_loader()
++    assert pool.closed and pool.active_request_count() == 0
++    _assert_value_free(report.to_dict())
++
++
++def test_batched_requests_queued_at_drain_dispatch_exactly_once(monkeypatch):
++    monkeypatch.setenv("OPENMED_SERVICE_BATCHING_ENABLED", "true")
++    monkeypatch.setenv("OPENMED_SERVICE_BATCH_MAX_SIZE", "2")
++    monkeypatch.setenv("OPENMED_SERVICE_BATCH_MAX_WAIT_MS", "1")
++    monkeypatch.setenv("OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS", "10")
++    entered, release = threading.Event(), threading.Event()
++    dispatched: list[str] = []
++    lock = threading.Lock()
++
++    def fake_extract_batch(texts, **_: Any):
++        batch = list(texts)
++        with lock:
++            dispatched.extend(batch)
++        entered.set()
++        release.wait(timeout=10)
++        return [
++            PredictionResult(
++                text=text,
++                entities=[],
++                model_name="synthetic",
++                timestamp=datetime(2026, 1, 1).isoformat(),
++            )
++            for text in batch
++        ]
++
++    monkeypatch.setattr(pii_core, "_extract_pii_batch", fake_extract_batch)
++    app = create_app()
++    texts = ["alpha", "bravo", "charlie", "delta"]
++
++    async def scenario():
++        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
++        async with httpx.AsyncClient(
++            transport=transport, base_url=LOOPBACK_BASE_URL
++        ) as client:
++            lifespan = app.router.lifespan_context(app)
++            await lifespan.__aenter__()
++            requests = [
++                asyncio.create_task(client.post("/pii/extract", json={"text": text}))
++                for text in texts
++            ]
++            await _until(entered.is_set)
++            # Every request is admitted before the drain starts.
++            await _until(lambda: app.state.inflight == len(texts))
++            drain = asyncio.create_task(lifespan.__aexit__(None, None, None))
++            await _until(lambda: bool(getattr(app.state, "shutting_down", False)))
++            release.set()
++            responses = await asyncio.gather(*requests)
++            await drain
++            return responses
++
++    responses = asyncio.run(scenario())
++
++    assert [response.status_code for response in responses] == [200] * len(texts)
++    assert [response.json()["text"] for response in responses] == texts
++    assert sorted(dispatched) == sorted(texts)  # no loss, no duplicate dispatch
++    batcher = app.state.pii_extract_batcher
++    assert batcher.outstanding_count() == 0
++    with pytest.raises(BatcherClosedError):
++        asyncio.run(batcher.submit(object()))
++
++
++def test_batcher_drain_fails_leftovers_with_a_typed_retryable_result():
++    async def scenario():
++        gate = asyncio.Event()
++        dispatched: list[int] = []
++
++        async def dispatch(items):
++            dispatched.extend(items)
++            await gate.wait()
++            return [item * 10 for item in items]
++
++        within = DynamicBatcher(
++            dispatch,
++            max_batch_size=2,
++            max_wait_ms=60_000,
++            max_concurrent_batches=1,
++            max_queue_wait_ms=60_000,
++        )
++        tasks = [asyncio.create_task(within.submit(index)) for index in range(5)]
++        # One full batch runs (concurrency 1) while three jobs stay queued.
++        await _until(lambda: dispatched == [0, 1] and within.outstanding_count() == 4)
++        draining = asyncio.create_task(within.drain(timeout=10))
++        await _until(lambda: within._draining)
++        with pytest.raises(BatcherClosedError):
++            await within.submit(99)
++        gate.set()
++        stats = await draining
++        results = await asyncio.gather(*tasks)
++        snapshot = await within.admission_snapshot()
++
++        gate.clear()
++        dispatched.clear()
++        bounded = DynamicBatcher(
++            dispatch,
++            max_batch_size=2,
++            max_wait_ms=60_000,
++            max_concurrent_batches=1,
++            max_queue_wait_ms=60_000,
++        )
++        late = [asyncio.create_task(bounded.submit(index)) for index in range(5)]
++        await _until(lambda: dispatched == [0, 1] and bounded.outstanding_count() == 4)
++        bounded_stats = await bounded.drain(timeout=0.05)
++        gate.set()
++        settled = await asyncio.gather(*late, return_exceptions=True)
++        return stats, results, snapshot, bounded_stats, settled, list(dispatched)
++
++    stats, results, snapshot, bounded_stats, settled, late_dispatch = asyncio.run(
++        scenario()
++    )
++
++    assert results == [0, 10, 20, 30, 40]
++    assert stats == {"dispatched": 3, "failed_queued": 0, "running": 0}
++    assert snapshot.depth == 0
++    assert bounded_stats == {"dispatched": 0, "failed_queued": 3, "running": 1}
++    assert settled[:2] == [0, 10]
++    for outcome in settled[2:]:
++        assert isinstance(outcome, BatcherClosedError)
++        assert isinstance(outcome, ServiceShuttingDownError)
++    assert late_dispatch == [0, 1]  # leftovers were never dispatched late
++
++
++# ---------------------------------------------------------------------------
++# NDJSON streams
++# ---------------------------------------------------------------------------
++
++
++def _stalling_stream(stalled: threading.Event, release: threading.Event):
++    def stream(*_: Any, **__: Any):
++        yield StreamingDeidentificationEvent(redacted_text="Patient [NAME] ")
++        stalled.set()
++        release.wait(timeout=10)
++        # Stand-in for an unflushed buffer: it must never reach the client.
++        yield StreamingDeidentificationEvent(redacted_text=f"TAIL {_SYNTHETIC_PHI[0]}")
++        yield StreamingDeidentificationEvent(
++            redacted_text="",
++            final=True,
++            audit_record={"span_count": 0, "spans": []},
++        )
++
++    return stream
++
++
++def _run_stream_drain(app, stalled, release, *, release_before_settle: bool):
++    async def scenario():
++        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
++        async with httpx.AsyncClient(
++            transport=transport, base_url=LOOPBACK_BASE_URL
++        ) as client:
++            lifespan = app.router.lifespan_context(app)
++            await lifespan.__aenter__()
++            streaming = asyncio.create_task(
++                client.post(
++                    "/pii/deidentify/stream",
++                    json={"text": f"Patient {_SYNTHETIC_PHI[0]}", "chunk_size": 4},
++                )
++            )
++            await _until(stalled.is_set)
++            drain = asyncio.create_task(lifespan.__aexit__(None, None, None))
++            await _until(lambda: bool(getattr(app.state, "shutting_down", False)))
++            if release_before_settle:
++                release.set()
++            response = await streaming
++            release.set()
++            await drain
++            streams = app.state.drain_streams
++            pool = app.state.runtime.get_loader()
++            await _until(lambda: streams.active == 0)
++            await _until(lambda: pool.active_request_count() == 0)
++            return response
++
++    return asyncio.run(scenario())
++
++
++def test_running_stream_ends_with_typed_terminal_event_and_no_unsafe_tail(
++    monkeypatch,
++):
++    monkeypatch.setenv("OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS", "1")
++    stalled, release = threading.Event(), threading.Event()
++    monkeypatch.setattr(
++        "openmed.service.streaming.deidentify_stream",
++        _stalling_stream(stalled, release),
++    )
++    app = create_app()
++
++    response = _run_stream_drain(app, stalled, release, release_before_settle=False)
++
++    assert response.status_code == 200
++    lines = [json.loads(line) for line in response.text.splitlines()]
++    assert lines == [
++        {"type": "chunk", "index": 0, "redacted_text": "Patient [NAME] "},
++        json.loads(shutting_down_ndjson_line(1.0)),
++    ]
++    assert lines[-1]["error"]["code"] == SHUTTING_DOWN
++    assert "TAIL" not in response.text
++    _assert_value_free(response.text)
++    streams = app.state.drain_report.events_for("ndjson_streams")[0]
++    assert streams.cancelled == 1
++    assert app.state.runtime.get_loader().active_request_count() == 0
++
++
++def test_stream_finishing_inside_the_budget_keeps_its_final_event(monkeypatch):
++    monkeypatch.setenv("OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS", "10")
++    stalled, release = threading.Event(), threading.Event()
++    monkeypatch.setattr(
++        "openmed.service.streaming.deidentify_stream",
++        _stalling_stream(stalled, release),
++    )
++    app = create_app()
++
++    response = _run_stream_drain(app, stalled, release, release_before_settle=True)
++
++    types = [json.loads(line)["type"] for line in response.text.splitlines()]
++    assert types == ["chunk", "chunk", "final"]
++    streams = app.state.drain_report.events_for("ndjson_streams")[0]
++    assert (streams.completed, streams.cancelled, streams.unfinished) == (1, 0, 0)
++
++
++def test_stream_opened_at_the_drain_boundary_returns_only_the_terminal_event():
++    app = create_app()
++    with TestClient(app, base_url=LOOPBACK_BASE_URL) as client:
++        streams = app.state.drain_streams
++        streams.terminate()
++        response = client.post("/pii/extract/stream", json={"text": "synthetic note"})
++        assert response.text == shutting_down_ndjson_line(1.0)
++        _wait_sync(lambda: streams.active == 0)
++
++
++# ---------------------------------------------------------------------------
++# gRPC
++# ---------------------------------------------------------------------------
++
++
++def _grpc_runtime(monkeypatch, drain_seconds: str):
++    monkeypatch.setenv("OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS", drain_seconds)
++    monkeypatch.setenv("OPENMED_SERVICE_SHUTDOWN_RELEASE_SECONDS", "2")
++    runtime = service_runtime.ServiceRuntime.from_env()
++    server = create_grpc_server(runtime=runtime, max_workers=4)
++    port = server.add_insecure_port("127.0.0.1:0")
++    server.start()
++    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
++    participant = next(
++        item
++        for item in runtime.get_drain_coordinator().participants()
++        if isinstance(item, GrpcDrainParticipant)
++    )
++    return (
++        runtime,
++        server,
++        channel,
++        openmed_pb2_grpc.OpenMedServiceStub(channel),
++        (participant),
++    )
++
++
++def test_grpc_refuses_new_calls_with_retry_hint_and_finishes_in_flight_unary(
++    monkeypatch,
++):
++    entered, release = threading.Event(), threading.Event()
++    calls: list[int] = []
++
++    def fake_deidentify(text: str, **_: Any) -> DeidentificationResult:
++        calls.append(len(text))
++        entered.set()
++        release.wait(timeout=10)
++        return _deid_result(text)
++
++    monkeypatch.setattr(openmed, "deidentify", fake_deidentify)
++    runtime, server, channel, stub, participant = _grpc_runtime(monkeypatch, "10")
++    coordinator = runtime.get_drain_coordinator()
++
++    async def scenario():
++        accepted = stub.Deidentify.future(
++            openmed_pb2.DeidentifyRequest(text="synthetic note", method="mask")
++        )
++        await _until(entered.is_set)
++        drain = asyncio.create_task(coordinator.drain())
++        await _until(lambda: participant.admission.closed)
++        with pytest.raises(grpc.RpcError) as refused:
++            await asyncio.to_thread(
++                stub.Analyze, openmed_pb2.AnalyzeRequest(text="synthetic")
++            )
++        release.set()
++        response = await asyncio.to_thread(accepted.result, 10)
++        return refused.value, response, await drain
++
++    try:
++        refused, response, report = asyncio.run(scenario())
++    finally:
++        release.set()
++        channel.close()
++        server.stop(0).wait()
++
++    assert refused.code() is grpc.StatusCode.UNAVAILABLE
++    assert refused.details() == SHUTTING_DOWN
++    metadata = dict(refused.trailing_metadata())
++    assert metadata[GRPC_RETRY_PUSHBACK_METADATA_KEY] == "1000"
++    assert metadata["openmed-retryable"] == "true"
++    assert response.deidentified_text == "[REDACTED]"
++    assert len(calls) == 1
++    events = {event.phase: event for event in report.events_for("grpc")}
++    assert events[DrainPhase.FINISH_IN_FLIGHT].completed == 1
++    assert events[DrainPhase.FINISH_IN_FLIGHT].unfinished == 0
++    assert events[DrainPhase.FLUSH].completed == 1  # server stopped in budget
++    assert participant.admission.active == 0
++
++
++def test_grpc_stream_ends_with_unavailable_and_never_flushes_its_tail(monkeypatch):
++    stalled, release = threading.Event(), threading.Event()
++
++    def stream(chunks, **_: Any):
++        del chunks
++        yield StreamingDeidentificationEvent(redacted_text="Patient [NAME] ")
++        stalled.set()
++        release.wait(timeout=10)
++        yield StreamingDeidentificationEvent(redacted_text=f"TAIL {_SYNTHETIC_PHI[0]}")
++        yield StreamingDeidentificationEvent(redacted_text="", final=True)
++
++    monkeypatch.setattr("openmed.service.grpc_server.deidentify_stream", stream)
++    runtime, server, channel, stub, participant = _grpc_runtime(monkeypatch, "0.4")
++    coordinator = runtime.get_drain_coordinator()
++    received: list[Any] = []
++
++    def consume() -> grpc.RpcError:
++        try:
++            for item in stub.StreamDeidentify(
++                openmed_pb2.DeidentifyStreamRequest(
++                    request=openmed_pb2.DeidentifyRequest(method="mask"),
++                    chunks=["Patient ", "note"],
++                )
++            ):
++                received.append(item)
++        except grpc.RpcError as exc:
++            return exc
++        raise AssertionError("stream ended without a terminal status")
++
++    async def scenario():
++        consumer = asyncio.create_task(asyncio.to_thread(consume))
++        await _until(stalled.is_set)
++        drain = asyncio.create_task(coordinator.drain())
++        await _until(lambda: participant.admission.streams_terminating)
++        release.set()
++        return await consumer, await drain
++
++    try:
++        error, report = asyncio.run(scenario())
++    finally:
++        release.set()
++        channel.close()
++        server.stop(0).wait()
++
++    assert error.code() is grpc.StatusCode.UNAVAILABLE
++    assert error.details() == SHUTTING_DOWN
++    assert [item.redacted_text for item in received] == ["Patient [NAME] "]
++    assert not any(item.final for item in received)
++    finish = [
++        event
++        for event in report.events_for("grpc")
++        if event.phase is DrainPhase.FINISH_IN_FLIGHT
++    ][0]
++    assert finish.cancelled == 1
++    assert runtime.get_loader().active_request_count() == 0
++
++
++# ---------------------------------------------------------------------------
++# Public job queue: every lifecycle boundary
++# ---------------------------------------------------------------------------
++
++
++class _GatedStore(jobs.LocalJobStore):
++    """Store that can pause one transition and logs every status commit."""
++
++    def __init__(self, path: Path) -> None:
++        super().__init__(path)
++        self.pause: Callable[[dict[str, Any]], Optional[threading.Event]] = (
++            lambda changes: None
++        )
++        self.transitions: list[tuple[str, str]] = []
++        self._log_lock = threading.Lock()
++
++    def update_if(self, job_id, *, expected_statuses, **changes):
++        gate = self.pause(changes)
++        if gate is not None:
++            gate.wait(timeout=10)
++        updated = super().update_if(
++            job_id, expected_statuses=expected_statuses, **changes
++        )
++        if updated is not None and "status" in changes:
++            with self._log_lock:
++                self.transitions.append((job_id, changes["status"]))
++        return updated
++
++
++def _job_payload(documents: int, *, webhook: bool = False) -> DeidentifyJobRequest:
++    return DeidentifyJobRequest(
++        documents=[
++            DeidentifyJobDocument(id=f"synthetic-{index}", text="synthetic note")
++            for index in range(documents)
++        ],
++        webhook=(
++            JobWebhookRequest(
++                url="https://callbacks.example.test/openmed",
++                secret="synthetic-secret",
++                max_attempts=3,
++                backoff_seconds=0.5,
++            )
++            if webhook
++            else None
++        ),
++    )
++
++
++def _job_harness(tmp_path: Path, name: str):
++    store = _GatedStore(tmp_path / f"{name}.json")
++    webhooks: list[dict[str, Any]] = []
++
++    def webhook_sender(url, payload, *, secret, max_attempts, backoff_seconds, **rest):
++        webhooks.append(
++            {
++                "status": payload["status"],
++                "max_attempts": max_attempts,
++                "backoff_seconds": backoff_seconds,
++                **rest,
++            }
++        )
++        return WebhookDeliveryResult(success=True, attempts=1, status_code=204)
++
++    queue = jobs.DeidentifyJobQueue(
++        SimpleNamespace(validate_served_model=lambda model_name: model_name),
++        store=store,
++        max_workers=1,
++        webhook_sender=webhook_sender,
++    )
++    coordinator = DrainCoordinator(DrainBudget(drain_seconds=0.2, release_seconds=0.2))
++    coordinator.register(JobQueueDrainParticipant(lambda: queue))
++    return store, queue, coordinator, webhooks
++
++
++def _assert_single_terminal(store: _GatedStore, job_id: str) -> str:
++    terminal = [
++        status
++        for recorded_id, status in store.transitions
++        if recorded_id == job_id and status in jobs.TERMINAL_STATUSES
++    ]
++    assert len(terminal) == 1, terminal
++    record = store.get(job_id)
++    assert record is not None and record["status"] == terminal[0]
++    return terminal[0]
++
++
++def test_drain_at_every_job_boundary_never_loses_or_duplicates_work(tmp_path, subtests):
++    with subtests.test(boundary="admission"):
++        store, queue, coordinator, webhooks = _job_harness(tmp_path, "admission")
++        asyncio.run(coordinator.drain())
++        with pytest.raises(jobs.JobQueueClosedError):
++            queue.submit(_job_payload(1))
++        assert store._records == {}
++
++    with subtests.test(boundary="queue_and_dispatch"):
++        store, queue, coordinator, webhooks = _job_harness(tmp_path, "dispatch")
++        hold = threading.Event()
++        processed: list[str] = []
++
++        def blocking(_payload, document):
++            processed.append(document.id or "")
++            hold.wait(timeout=10)
++            return SimpleNamespace(pii_entities=[])
++
++        queue._deidentify_document = blocking  # type: ignore[method-assign]
++        running = queue.submit(_job_payload(1, webhook=True))
++        queued = queue.submit(_job_payload(1, webhook=True))
++        _wait_sync(lambda: bool(processed))
++        report = asyncio.run(coordinator.drain())
++        hold.set()  # the stale worker resumes after the handoff
++        _wait_sync(lambda: queue.outstanding_count() == 0)
++
++        assert _assert_single_terminal(store, running["id"]) == "cancelled"
++        assert _assert_single_terminal(store, queued["id"]) == "cancelled"
++        assert store.get(queued["id"])["started_at"] is None
++        for job_id in (running["id"], queued["id"]):
++            error = store.get(job_id)["error"]
++            assert error["code"] == SHUTTING_DOWN and error["retryable"] is True
++        assert processed == ["synthetic-0"]  # the queued job never ran
++        assert webhooks == []
++        event = report.events_for("job_queue")[1]
++        assert event.cancelled == 2
++
++    with subtests.test(boundary="checkpoint"):
++        store, queue, coordinator, webhooks = _job_harness(tmp_path, "checkpoint")
++        processed = []
++
++        def quick(_payload, document):
++            processed.append(document.id or "")
++            return SimpleNamespace(pii_entities=[])
++
++        queue._deidentify_document = quick  # type: ignore[method-assign]
++        # Pause the first progress commit until the drain asks for a stop.
++        store.pause = lambda changes: (
++            queue._cancel_requested
++            if changes.get("processed_count") == 1 and "status" not in changes
++            else None
++        )
++        job = queue.submit(_job_payload(3))
++        _wait_sync(lambda: bool(processed))
++        asyncio.run(coordinator.drain())
++        _wait_sync(lambda: queue.outstanding_count() == 0)
++
++        assert _assert_single_terminal(store, job["id"]) == "cancelled"
++        record = store.get(job["id"])
++        assert record["processed_count"] == 1  # last committed checkpoint
++        assert processed == ["synthetic-0"]
++
++    with subtests.test(boundary="commit"):
++        store, queue, coordinator, webhooks = _job_harness(tmp_path, "commit")
++        hold = threading.Event()
++        queue._deidentify_document = (  # type: ignore[method-assign]
++            lambda _payload, _document: SimpleNamespace(pii_entities=[])
++        )
++        store.pause = lambda changes: (
++            hold if changes.get("status") in {"done", "failed"} else None
++        )
++        job = queue.submit(_job_payload(1, webhook=True))
++        _wait_sync(lambda: store.get(job["id"])["processed_count"] == 1)
++        asyncio.run(coordinator.drain())
++        hold.set()  # a stale terminal commit arrives after the fence
++        _wait_sync(lambda: queue.outstanding_count() == 0)
++
++        assert _assert_single_terminal(store, job["id"]) == "cancelled"
++        assert webhooks == []
++
++    with subtests.test(boundary="callback"):
++        store, queue, coordinator, webhooks = _job_harness(tmp_path, "callback")
++        drain_started = threading.Event()
++        # Runs right after the queue closes admission (job_queue priority is 50).
++        coordinator.register(
++            CallbackDrainParticipant(
++                "drain_probe",
++                priority=60,
++                stop_admission=lambda ctx: drain_started.set(),
++            )
++        )
++
++        def after_drain_starts(_payload, _document):
++            drain_started.wait(timeout=10)
++            return SimpleNamespace(pii_entities=[])
++
++        queue._deidentify_document = after_drain_starts  # type: ignore[method-assign]
++        job = queue.submit(_job_payload(1, webhook=True))
++        report = asyncio.run(coordinator.drain())
++
++        assert _assert_single_terminal(store, job["id"]) == "done"
++        assert len(webhooks) == 1
++        assert webhooks[0]["status"] == "done"
++        # A drain bounds callbacks to one attempt with no retry backoff.
++        assert webhooks[0]["max_attempts"] == 1
++        assert webhooks[0]["backoff_seconds"] == 0.0
++        assert webhooks[0]["timeout_seconds"] == pytest.approx(0.1)
++        assert store.get(job["id"])["webhook_delivery"]["success"] is True
++        event = report.events_for("job_queue")[1]
++        assert (event.completed, event.cancelled, event.unfinished) == (1, 0, 0)
++
++    persisted = (tmp_path / "callback.json").read_text(encoding="utf-8")
++    _assert_value_free(persisted)
++    assert "synthetic-secret" not in persisted
++    assert "callbacks.example.test" not in persisted
++
++
++# ---------------------------------------------------------------------------
++# Warm pool and accelerators
++# ---------------------------------------------------------------------------
++
++
++class _ResidencyLoader:
++    def __init__(self) -> None:
++        self.resident: set[str] = set()
++
++    def resolve_model_name(self, model_name: str) -> str:
++        return model_name
++
++    def create_pipeline(self, model_name: str, **_: Any) -> object:
++        self.resident.add(model_name)
++        return object()
++
++    def loaded_models(self) -> dict[str, Any]:
++        return {
++            name: {"models": 1, "tokenizers": 0, "pipelines": 1}
++            for name in self.resident
++        }
++
++    def unload_model(self, model_name: str) -> dict[str, Any]:
++        removed = int(model_name in self.resident)
++        self.resident.discard(model_name)
++        return {
++            "model_name": model_name,
++            "models": removed,
++            "tokenizers": 0,
++            "pipelines": removed,
++        }
++
++
++class _FakeAccelerator:
++    blocking = True
++
++    def __init__(self, kind: str, *, baseline: int, wedge: bool = False) -> None:
++        self.kind = kind
++        self.units = baseline
++        self.cached = 0
++        self.wedge = threading.Event() if wedge else None
++
++    def allocated(self) -> int:
++        return self.units + self.cached
++
++    def synchronize(self) -> None:
++        if self.wedge is not None:
++            self.wedge.wait(timeout=10)
++
++    def release(self) -> None:
++        self.cached = 0
++
++
++def test_warm_pool_and_accelerators_return_to_their_declared_baseline():
++    loader = _ResidencyLoader()
++    pool = WarmPool(lambda: loader, default_keep_alive_seconds=300)
++    active = pool.begin_request("synthetic/active")
++    pool.create_pipeline("synthetic/active")
++    idle = pool.begin_request("synthetic/idle")
++    pool.create_pipeline("synthetic/idle")
++    pool.finish_request(idle, None)
++    assert loader.resident == {"synthetic/active", "synthetic/idle"}
++
++    device = _FakeAccelerator("fake_gpu", baseline=64)
++    wedged = _FakeAccelerator("wedged_gpu", baseline=0, wedge=True)
++    accelerators = AcceleratorDrainParticipant([device, wedged])
++    device.cached = 4096  # cache grown while serving; released on drain
++    coordinator = DrainCoordinator(DrainBudget(drain_seconds=0.05, release_seconds=0.2))
++    coordinator.register(WarmPoolDrainParticipant(lambda: pool))
++    coordinator.register(accelerators)
++
++    try:
++        report = asyncio.run(coordinator.drain())
++    finally:
++        assert wedged.wedge is not None
++        wedged.wedge.set()
++
++    pool_event = report.events_for("warm_pool")[0]
++    assert pool_event.completed == 1  # the idle model was released
++    assert pool_event.unfinished == 1  # the active request keeps its model
++    assert loader.resident == {"synthetic/active"}
++    with pytest.raises(WarmPoolClosedError):
++        pool.begin_request("synthetic/idle")
++    with pytest.raises(WarmPoolClosedError):
++        pool.create_pipeline("synthetic/cold")
++
++    pool.finish_request(active, None)  # last reference of the drained generation
++    assert pool.active_request_count() == 0
++    assert loader.resident == set()
++
++    accelerator = report.events_for("accelerator")[0]
++    assert (accelerator.completed, accelerator.unfinished) == (1, 1)
++    assert accelerator.outcome is DrainOutcome.DEADLINE_EXCEEDED
++    assert accelerators.retained() == {"fake_gpu": 0, "wedged_gpu": 0}
++    assert device.allocated() == 64
++
++
++# ---------------------------------------------------------------------------
++# Restart cycles and process signals
++# ---------------------------------------------------------------------------
++
++
++def test_repeated_start_drain_restart_cycles_return_resources_to_zero(monkeypatch):
++    monkeypatch.setenv("OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS", "0.3")
++    monkeypatch.setenv("OPENMED_SERVICE_SHUTDOWN_RELEASE_SECONDS", "0.4")
++    monkeypatch.setenv("OPENMED_SERVICE_JOBS_WORKERS", "1")
++    hold = threading.Event()
++    cycle_calls: list[str] = []
++
++    def fake_deidentify(text: str, **_: Any) -> DeidentificationResult:
++        if text == "slow synthetic note":
++            hold.wait(timeout=10)
++        return _deid_result(text)
++
++    monkeypatch.setattr(openmed, "deidentify", fake_deidentify)
++    app = create_app()
++    register_drain_participant(
++        app,
++        CallbackDrainParticipant(
++            "cycle_probe",
++            release=lambda ctx: cycle_calls.append("release"),
++        ),
++    )
++    coordinators = []
++    reports = []
++    interrupted_job = None
++    for cycle in range(3):
++        with TestClient(app, base_url=LOOPBACK_BASE_URL) as client:
++            assert client.get("/readyz").status_code == 200
++            response = client.post(
++                "/pii/deidentify", json={"text": "synthetic note", "method": "mask"}
++            )
++            assert response.status_code == 200
++            if cycle == 0:
++                created = client.post(
++                    "/jobs", json={"documents": [{"text": "slow synthetic note"}]}
++                )
++                assert created.status_code == 202
++                interrupted_job = created.json()["id"]
++            if cycle == 1:
++                record = client.get(f"/jobs/{interrupted_job}").json()
++                assert record["status"] == "cancelled"
++                assert record["error"]["code"] == SHUTTING_DOWN
++                assert record["error"]["retryable"] is True
++            coordinators.append(app.state.drain)
++        hold.set()  # release the cycle-0 straggler only after its drain fenced it
++        reports.append(app.state.drain_report)
++        assert app.state.inflight == 0
++        assert app.state.drain_streams.active == 0
++        pool = app.state.runtime.get_loader()
++        _wait_sync(lambda: pool.active_request_count() == 0)
++
++    assert len({id(item) for item in coordinators}) == 3
++    assert cycle_calls == ["release"] * 3
++    assert reports[0].events_for("job_queue")[1].cancelled == 1
++    assert [report.outcome for report in reports[1:]] == [DrainOutcome.COMPLETED] * 2
++    _wait_sync(
++        lambda: (
++            not any(
++                thread.name.startswith("openmed-job") and thread.is_alive()
++                for thread in threading.enumerate()
++            )
++        )
++    )
++
++
++_SIGNAL_PROBE = textwrap.dedent(
++    """
++    import asyncio
++    import json
++
++    import uvicorn
++
++    from openmed.service import runtime as service_runtime
++    from openmed.service.app import create_app
++    from openmed.service.drain import CallbackDrainParticipant, register_drain_participant
++
++
++    class FakeLoader:
++        def __init__(self, config):
++            self.config = config
++
++        def resolve_model_name(self, model_name):
++            return model_name
++
++        def loaded_models(self):
++            return {}
++
++
++    service_runtime.ModelLoader = FakeLoader
++    app = create_app()
++
++
++    def record(phase):
++        def hook(ctx):
++            print(json.dumps({"phase": phase}), flush=True)
++
++        return hook
++
++
++    register_drain_participant(
++        app,
++        CallbackDrainParticipant(
++            "signal_probe",
++            stop_admission=record("stop_admission"),
++            finish_in_flight=record("finish_in_flight"),
++            flush=record("flush"),
++            release=record("release"),
++        ),
++    )
++    server = uvicorn.Server(
++        uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
++    )
++
++
++    async def main():
++        serving = asyncio.ensure_future(server.serve())
++        while not server.started:
++            await asyncio.sleep(0.01)
++        print(json.dumps({"ready": True}), flush=True)
++        await serving
++
++
++    asyncio.run(main())
++    """
++)
++
++
++@pytest.mark.slow
++@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
++def test_sigterm_runs_the_ordered_drain_before_the_process_exits(tmp_path):
++    script = tmp_path / "signal_probe.py"
++    script.write_text(_SIGNAL_PROBE, encoding="utf-8")
++    env = dict(os.environ)
++    env.update(
++        {
++            "OPENMED_PROFILE": "test",
++            "OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS": "1",
++            "OPENMED_SERVICE_SHUTDOWN_RELEASE_SECONDS": "1",
++            "OPENMED_SERVICE_JOBS_STORE_PATH": str(tmp_path / "jobs.json"),
++            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
++        }
++    )
++    process = subprocess.Popen(
++        [sys.executable, str(script)],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.DEVNULL,
++        text=True,
++        env=env,
++    )
++    try:
++        assert process.stdout is not None
++        assert json.loads(process.stdout.readline()) == {"ready": True}
++        process.send_signal(signal.SIGTERM)
++        output, _ = process.communicate(timeout=60)
++    finally:
++        if process.poll() is None:
++            process.kill()
++            process.wait()
++
++    phases = [json.loads(line)["phase"] for line in output.splitlines() if line]
++    assert phases == ["stop_admission", "finish_in_flight", "flush", "release"]
++    assert process.returncode in {0, -signal.SIGTERM}

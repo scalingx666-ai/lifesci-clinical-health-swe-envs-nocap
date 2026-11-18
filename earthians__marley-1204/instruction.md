@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** fix: validate patient date of birth (backport #1203)
+
+## Description
+
+- validate patient date of birth to be greater than today<hr>This is an automatic backport of pull request #1203 done by [Mergify](https://mergify.com).
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `934d6c162868`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

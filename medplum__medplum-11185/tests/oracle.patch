@@ -1,0 +1,205 @@
+diff --git a/packages/docs/content/docs/auth/direct-external-auth.md b/packages/docs/content/docs/auth/direct-external-auth.md
+index 23534939b4e..affdd4201e3 100644
+--- a/packages/docs/content/docs/auth/direct-external-auth.md
++++ b/packages/docs/content/docs/auth/direct-external-auth.md
+@@ -133,6 +133,6 @@ Medplum caches external auth results in Redis for 1 hour to minimize calls to th
+ | **Endpoint** | `/oauth2/userinfo` | `/oauth2/token` |
+ | **Configuration** | Server-level `externalAuthProviders` | Per-`ClientApplication` identity provider |
+ | **Token format** | Uses external JWT directly | Exchanges for Medplum access token |
+-| **User lookup** | `fhirUser` claim or `sub` / `externalId` | Email or `sub` (via `useSubject` flag) |
++| **User lookup** | `fhirUser` claim or `sub` / `externalId` | Email or `sub` (via `identitySource` / `identityMappingMode`, or the legacy `useSubject` flag) |
+ 
+ Choose **Direct External Auth** when you want to use external JWTs directly without an explicit token exchange step. Choose **Token Exchange** when you need a standard Medplum access token or when the auth flow is scoped to a specific `ClientApplication`.
+diff --git a/packages/docs/content/docs/user-management/external-ids.md b/packages/docs/content/docs/user-management/external-ids.md
+index 563a889d8e3..c989cf78f24 100644
+--- a/packages/docs/content/docs/user-management/external-ids.md
++++ b/packages/docs/content/docs/user-management/external-ids.md
+@@ -15,7 +15,7 @@ Find your Client Application.
+ 
+ Set `ClientApplication.identityProvider.useSubject` to `true`.
+ 
+-The external IDP callback also supports explicit `identitySource` and `identityMappingMode` settings. If supplied, keep them set to `subject` and `project-membership-external-id` for subject matching. Token exchange selects its matching mode using `useSubject`.
++The external IDP callback and token exchange also support explicit `identitySource` and `identityMappingMode` settings, which take precedence over `useSubject`. If supplied, keep them set to `subject` and `project-membership-external-id` for subject matching.
+ 
+ ## Invite user
+ 
+diff --git a/packages/server/src/auth/exchange.test.ts b/packages/server/src/auth/exchange.test.ts
+index 711cd4a7950..f95052f5603 100644
+--- a/packages/server/src/auth/exchange.test.ts
++++ b/packages/server/src/auth/exchange.test.ts
+@@ -2,7 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ import type { WithId } from '@medplum/core';
+ import { ContentType } from '@medplum/core';
+-import type { ClientApplication, Project, User } from '@medplum/fhirtypes';
++import type { ClientApplication, IdentityProvider, Project, User } from '@medplum/fhirtypes';
+ import { randomUUID } from 'crypto';
+ import express from 'express';
+ import request from 'supertest';
+@@ -281,6 +281,69 @@ describe('Token Exchange', () => {
+     expect(res.body.access_token).toBeTruthy();
+   });
+ 
++  test('Identity source and mapping mode are honored without useSubject', async () => {
++    const systemRepo = await getProjectSystemRepo(project);
++    const client = await withTestContext(() =>
++      createClient(systemRepo, {
++        project,
++        name: 'Identity Source Client',
++        redirectUri,
++        identityProvider: {
++          ...identityProvider,
++          identitySource: 'subject',
++          identityMappingMode: 'project-membership-external-id',
++        },
++      })
++    );
++
++    // The subject and email claims name different users; the subject is used
++    fetchMock.mockImplementation(() => mockFetchJson({ email, sub: externalId }));
++
++    const res = await request(app).post('/auth/exchange').type('json').send({
++      externalAccessToken: 'xyz',
++      clientId: client.id,
++    });
++    expect(res).toHaveStatus(200);
++    expect(res.body.profile.reference).toMatch(/^Patient\//);
++
++    // No subject claim
++    fetchMock.mockImplementation(() => mockFetchJson({ email }));
++
++    const res2 = await request(app).post('/auth/exchange').type('json').send({
++      externalAccessToken: 'xyz',
++      clientId: client.id,
++    });
++    expect(res2).toHaveStatus(400);
++    expect(res2.body.error).toBe('invalid_request');
++    expect(res2.body.error_description).toBe('External token does not contain subject');
++  });
++
++  test.each<Partial<IdentityProvider>>([
++    { identitySource: 'fhir-user' },
++    { identitySource: 'subject', identityMappingMode: 'user-email' },
++    { identitySource: 'email', identityMappingMode: 'project-membership-external-id' },
++  ])('Unsupported identity provider configuration %j', async (identityMapping) => {
++    const systemRepo = await getProjectSystemRepo(project);
++    const client = await withTestContext(() =>
++      createClient(systemRepo, {
++        project,
++        name: 'Unsupported Identity Mapping Client',
++        redirectUri,
++        identityProvider: { ...identityProvider, ...identityMapping },
++      })
++    );
++
++    fetchMock.mockImplementation(() => mockFetchJson({ email, sub: externalId }));
++
++    const res = await request(app).post('/auth/exchange').type('json').send({
++      externalAccessToken: 'xyz',
++      clientId: client.id,
++    });
++    expect(res).toHaveStatus(400);
++    expect(res.body.error).toBe('invalid_request');
++    expect(res.body.error_description).toBe('Unsupported identity provider configuration');
++  });
++
+   test('GCIP subject auth success', async () => {
+     fetchMock.mockImplementation(() => mockFetchJson({ users: [{ email: '', localId: externalId }] }));
+ 
+diff --git a/packages/server/src/auth/external.ts b/packages/server/src/auth/external.ts
+index 2a382f6c8ab..161ebf9ad5f 100644
+--- a/packages/server/src/auth/external.ts
++++ b/packages/server/src/auth/external.ts
+@@ -48,7 +48,7 @@ export interface ExternalAuthState {
+ type IdentitySource = NonNullable<IdentityProvider['identitySource']>;
+ type IdentityMappingMode = NonNullable<IdentityProvider['identityMappingMode']>;
+ 
+-interface ExternalLoginIdentity {
++export interface ExternalLoginIdentity {
+   email?: string;
+   externalId?: string;
+ }
+@@ -229,7 +229,14 @@ async function getIdentityProvider(
+   return { idp, client };
+ }
+ 
+-async function resolveExternalLoginIdentity(
++/**
++ * Maps the claims from an external identity provider to the identity used to look up the Medplum user.
++ * Every flow that signs in a user from external claims must use this, so that they agree on who the user is.
++ * @param idp - The identity provider configuration.
++ * @param userInfo - The claims from the external identity provider.
++ * @returns The email or external ID to log in with.
++ */
++export async function resolveExternalLoginIdentity(
+   idp: IdentityProvider,
+   userInfo: Record<string, unknown>
+ ): Promise<ExternalLoginIdentity> {
+diff --git a/packages/server/src/oauth/token.ts b/packages/server/src/oauth/token.ts
+index 41d33480eab..3ad1c96b3a5 100644
+--- a/packages/server/src/oauth/token.ts
++++ b/packages/server/src/oauth/token.ts
+@@ -31,6 +31,8 @@ import type { Request, RequestHandler, Response } from 'express';
+ import type { JWTVerifyOptions } from 'jose';
+ import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
+ import { createHash, randomUUID } from 'node:crypto';
++import type { ExternalLoginIdentity } from '../auth/external';
++import { resolveExternalLoginIdentity } from '../auth/external';
+ import { getUserConfiguration } from '../auth/me';
+ import { getProjectIdByClientId } from '../auth/utils';
+ import { getConfig } from '../config/loader';
+@@ -592,7 +594,12 @@ export async function exchangeExternalAuthToken(
+     return;
+   }
+ 
+-  if (!idp.useSubject && isExternalEmailUnverified(userInfo)) {
++  const identity = await tryResolveExternalLoginIdentity(res, idp, userInfo);
++  if (!identity) {
++    return;
++  }
++
++  if (identity.email && isExternalEmailUnverified(userInfo)) {
+     getLogger().warn('External identity provider reported unverified email', {
+       clientId,
+       projectId,
+@@ -600,11 +607,10 @@ export async function exchangeExternalAuthToken(
+     });
+   }
+ 
+-  const { email, externalId } = getExternalAuthLoginIdentity(idp, userInfo);
+   const login = await tryLogin({
+     authMethod: 'exchange',
+-    email,
+-    externalId,
++    email: identity.email,
++    externalId: identity.externalId,
+     projectId,
+     clientId: client?.id,
+     scope: req.body.scope || 'openid offline_access',
+@@ -677,15 +683,20 @@ async function tryGetExternalUserInfo(
+   }
+ }
+ 
+-function getExternalAuthLoginIdentity(
++async function tryResolveExternalLoginIdentity(
++  res: Response,
+   idp: IdentityProvider,
+   userInfo: JWTPayload
+-): { email?: string; externalId?: string } {
+-  if (idp.useSubject) {
+-    return { externalId: userInfo.sub };
++): Promise<ExternalLoginIdentity | undefined> {
++  try {
++    return await resolveExternalLoginIdentity(idp, userInfo);
++  } catch (err) {
++    if (err instanceof OperationOutcomeError) {
++      sendTokenError(res, 'invalid_request', normalizeErrorString(err), getStatus(err.outcome));
++      return undefined;
++    }
++    throw err;
+   }
+-
+-  return { email: userInfo.email as string };
+ }
+ 
+ function resolveExternalAuthProvider(clientId: string, client?: ClientApplication): IdentityProvider | undefined {

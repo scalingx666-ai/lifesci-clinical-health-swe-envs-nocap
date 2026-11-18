@@ -1,0 +1,687 @@
+diff --git a/packages/api/src/external/commonwell-v1/admin/find-patient-duplicates.ts b/packages/api/src/external/commonwell-v1/admin/find-patient-duplicates.ts
+deleted file mode 100644
+index 51f3aeebeb..0000000000
+--- a/packages/api/src/external/commonwell-v1/admin/find-patient-duplicates.ts
++++ /dev/null
+@@ -1,225 +0,0 @@
+-import {
+-  CommonWellAPI,
+-  getPersonId,
+-  PatientLinkSearchResp,
+-  Person,
+-} from "@metriport/commonwell-sdk-v1";
+-import { Patient } from "@metriport/core/domain/patient";
+-import { out } from "@metriport/core/util/log";
+-import { capture } from "@metriport/core/util/notifications";
+-import { sleepRandom } from "@metriport/shared";
+-import stringify from "json-stringify-safe";
+-import { chunk, groupBy } from "lodash";
+-import { PatientModel } from "../../../models/medical/patient";
+-import { filterTruthy } from "../../../shared/filter-map-utils";
+-import { getCWAccessForPatient } from "./shared";
+-
+-const MAX_QUERIES_IN_PARALLEL = 10;
+-
+-const JITTER_DELAY_MAX_MS = 500; // in milliseconds
+-const JITTER_DELAY_MIN_PCT = 30; // 1-100% of max delay
+-
+-const CHUNK_DELAY_MAX_MS = 500; // in milliseconds
+-const CHUNK_DELAY_MIN_PCT = 50; // 1-100% of max delay
+-
+-const undetermined = "unknown";
+-
+-// TODO ENG-554 Remove this file entirely once we've migrated to CWv2
+-// TODO ENG-554 Remove this file entirely once we've migrated to CWv2
+-// TODO ENG-554 Remove this file entirely once we've migrated to CWv2
+-
+-/**
+- * personId might be the actual personId or "falsy" to indicate that the personId is `null | undefined`
+- */
+-export type DuplicatedPersonsOfPatient = {
+-  // each person ID and the number of links it has to patients
+-  [personId: string]: {
+-    amountOfLinks?: number | string;
+-    enrolled?: boolean | string;
+-    enroller?: string;
+-    enrollmentDate?: string;
+-    /**
+-     * Indicates whether this element is related to metriport (when more than one personId or when this
+-     * represents an error/failure)
+-     */
+-    isMetriport?: true;
+-    /**
+-     * If there's no duplicate but person IDs don't match, this represents the local person ID
+-     */
+-    mismatchLocalId?: {
+-      id: string;
+-      amountOfLinks?: number | string;
+-      enroller?: string;
+-      enrollmentDate?: string;
+-    };
+-  };
+-};
+-export type DuplicatedPersons = {
+-  [cxId: string]: {
+-    [patientId: string]: DuplicatedPersonsOfPatient | undefined;
+-  };
+-};
+-
+-/**
+- * Checks for duplicated persons in CommonWell.
+- */
+-export async function findDuplicatedPersons(cxId: string): Promise<DuplicatedPersons> {
+-  const { log } = out(`findDuplicatedPersons`);
+-  log(`Querying patients of cxId ${cxId}...`);
+-
+-  // TODO paginate this
+-  // Don't move this to a command as we shouldn't easily allow to search Patients for all cxs
+-  const patients = await PatientModel.findAll({
+-    where: { cxId },
+-  });
+-  const patientsByCustomer = groupBy(patients, "cxId");
+-
+-  const res: DuplicatedPersons = {};
+-
+-  for (const [cxId, patients] of Object.entries(patientsByCustomer)) {
+-    log(`Found ${patients.length} patients for cxId ${cxId}`);
+-    const personByCx: Record<string, DuplicatedPersonsOfPatient | undefined> = {};
+-
+-    // TODO move to executeAsynchronously() from core
+-    const chunks = chunk(patients, MAX_QUERIES_IN_PARALLEL);
+-    const n = chunks.length;
+-    for (const [i, chunk] of chunks.entries()) {
+-      log(`Running chunk ${i + 1}/${n}...`);
+-
+-      await Promise.allSettled(
+-        chunk.map(async patient => {
+-          await jitterInsideChunk(); // add some randomness before each request
+-          personByCx[patient.id] = await findDuplicatedPersonsByPatient(patient, log);
+-        })
+-      );
+-      await sleepBetweenChunks();
+-    }
+-
+-    res[cxId] = personByCx;
+-  }
+-
+-  return res;
+-}
+-
+-const failed = (reason: string, isMetriport?: true): DuplicatedPersonsOfPatient => ({
+-  [reason]: { isMetriport },
+-});
+-
+-async function findDuplicatedPersonsByPatient(
+-  patient: Patient,
+-  log: typeof console.log
+-): Promise<DuplicatedPersonsOfPatient | undefined> {
+-  const simpleErrorLog = (op: string) => (err: unknown) => {
+-    log(`[patient ${patient.id}] Failed/error to ${op}: ${err}`);
+-    return undefined;
+-  };
+-  let commonWell: CommonWellAPI | undefined;
+-  try {
+-    const cwAccess = await getCWAccessForPatient(patient);
+-    if (cwAccess.error != null) return failed(cwAccess.error, true);
+-
+-    const { queryMeta, cwPatientId, cwPersonId: storedPersonId } = cwAccess;
+-    commonWell = cwAccess.commonWell;
+-
+-    const respSearch = await commonWell.searchPersonByPatientDemo(queryMeta, cwPatientId);
+-
+-    const persons = respSearch._embedded?.person
+-      ? respSearch._embedded.person.flatMap(p => (p && getPersonId(p) ? p : []))
+-      : [];
+-    const filteredPersons = persons.flatMap(filterTruthy);
+-    if (filteredPersons.length === 1) {
+-      const thePerson = filteredPersons[0];
+-      const foundPersonId = getPersonId(thePerson);
+-      if (foundPersonId === storedPersonId && storedPersonId != undefined) {
+-        log(`Good! No duplicates found for patient ${patient.id} AND person IDs match!`);
+-        return undefined;
+-      } else {
+-        log(
+-          `No duplicates found for patient ${patient.id}, but person IDs dont match or are falsy (stored: ${storedPersonId}, found: ${foundPersonId})`
+-        );
+-        const [foundPersonLinks, storedPerson, storedPersonLinks] = await Promise.all([
+-          foundPersonId
+-            ? commonWell
+-                .getPatientLinks(queryMeta, foundPersonId)
+-                .catch(simpleErrorLog(`getPatientLinks, person ${foundPersonId}`))
+-            : undefined,
+-          storedPersonId
+-            ? commonWell
+-                .getPersonById(queryMeta, storedPersonId)
+-                .catch(simpleErrorLog(`getPersonById, person ${storedPersonId}`))
+-            : undefined,
+-          storedPersonId
+-            ? commonWell
+-                .getPatientLinks(queryMeta, storedPersonId)
+-                .catch(simpleErrorLog(`getPatientLinks, person ${storedPersonId}`))
+-            : undefined,
+-        ]);
+-        return {
+-          [foundPersonId ?? "falsy"]: {
+-            ...getLinkInfo(thePerson, foundPersonLinks),
+-            mismatchLocalId: {
+-              id: storedPersonId ?? "falsy",
+-              ...getLinkInfo(storedPerson, storedPersonLinks),
+-            },
+-          },
+-        };
+-      }
+-    } else if (filteredPersons.length < 1) {
+-      log(`Ouch, no person found for patient ${patient.id} - we should look into this!`);
+-      return failed("no-person-found-at-cw");
+-    }
+-    log(`Found ${filteredPersons.length} persons for patient ${patient.id}`);
+-
+-    const personIds = filteredPersons.map(getPersonId).flatMap(filterTruthy);
+-    if (personIds.length < 1) {
+-      log(`Got FALSY person IDs for patient ${patient.id} - we should look into this!`);
+-      return failed("falsy-person-id");
+-    }
+-
+-    const res: DuplicatedPersonsOfPatient = {};
+-
+-    // for each person, get their enrolment details
+-    for (const person of filteredPersons) {
+-      const personId = getPersonId(person);
+-      if (!personId) {
+-        log(`Got a person without ID for patient ${patient.id}, skipping - ${stringify(person)}`);
+-        continue;
+-      }
+-      const patientLinks = await commonWell
+-        .getPatientLinks(queryMeta, personId)
+-        .catch(simpleErrorLog(`getPatientLinks, person ${personId}`));
+-      res[personId] = {
+-        ...getLinkInfo(person, patientLinks),
+-        ...(storedPersonId === personId ? { isMetriport: true } : {}),
+-      };
+-    }
+-    return res;
+-  } catch (error) {
+-    const msg = "Error while checking duplicates for patient";
+-    log(`${msg} ${patient.id} - error: ${error}`);
+-    capture.error(msg, {
+-      extra: {
+-        context: `findDuplicatedPersonsByPatient`,
+-        patient,
+-        cwReference: commonWell?.lastReferenceHeader,
+-        error,
+-      },
+-    });
+-    return undefined;
+-  }
+-}
+-
+-const getLinkInfo = (person?: Person, links?: PatientLinkSearchResp) => ({
+-  amountOfLinks: links?._embedded?.patientLink?.length ?? undetermined,
+-  enrolled: person?.enrolled ?? undetermined,
+-  enroller: person?.enrollmentSummary?.enroller || undetermined,
+-  enrollmentDate: person?.enrollmentSummary?.dateEnrolled || undetermined,
+-});
+-
+-async function jitterInsideChunk(): Promise<void> {
+-  return sleepRandom(JITTER_DELAY_MAX_MS, JITTER_DELAY_MIN_PCT / 100);
+-}
+-
+-async function sleepBetweenChunks(): Promise<void> {
+-  return sleepRandom(CHUNK_DELAY_MAX_MS, CHUNK_DELAY_MIN_PCT / 100);
+-}
+diff --git a/packages/api/src/external/commonwell-v1/admin/patch-patient-duplicates.ts b/packages/api/src/external/commonwell-v1/admin/patch-patient-duplicates.ts
+deleted file mode 100644
+index bfcc4c24d3..0000000000
+--- a/packages/api/src/external/commonwell-v1/admin/patch-patient-duplicates.ts
++++ /dev/null
+@@ -1,132 +0,0 @@
+-import { getPersonId, getPersonIdFromUrl } from "@metriport/commonwell-sdk-v1";
+-import { out } from "@metriport/core/util/log";
+-import { capture } from "@metriport/core/util/notifications";
+-import { getPatientOrFail } from "../../../command/medical/patient/get-patient";
+-import MetriportError from "../../../errors/metriport-error";
+-import {
+-  updateCommonwellIdsAndStatus,
+-  updatePatientDiscoveryStatus,
+-} from "../../commonwell/patient/patient-external-data";
+-import { validateCwLinksBelongToPatient } from "../../hie/validate-patient-links";
+-import {
+-  autoUpgradeNetworkLinks,
+-  cwLinkToPatientData,
+-  getPatientsNetworkLinks,
+-} from "../link/shared";
+-import { isEnrolledBy } from "../person-shared";
+-import { getCWAccessForPatient } from "./shared";
+-
+-/**
+- * TODO ENG-554 Remove entirely once we've migrated to CWv2
+- *
+- * IMPORTANT: This is an Admin-only function, it should not be executed outside of internal endpoints.
+- *
+- * Patch duplicated persons in CommonWell - sibling of find-patient-duplicates.ts
+- *
+- * Links the patient to the chosen person.
+- * Additionally, unenroll those enrolled by Metriport:
+- * - any other person linked to the patient; AND
+- * - all other persons matching the patient's demographics if the `unenrollByDemographics`
+- *   param is set to true (defaults to false).
+- */
+-export async function patchDuplicatedPersonsForPatient(
+-  cxId: string,
+-  patientId: string,
+-  chosenPersonId: string,
+-  unenrollByDemographics = false,
+-  orgIdExcludeList: () => Promise<string[]>
+-): Promise<void> {
+-  const context = "patchDuplicatedPersonsForPatient";
+-  const { log } = out(`${context} ${patientId}`);
+-
+-  const patient = await getPatientOrFail({ cxId, id: patientId });
+-  const cwAccess = await getCWAccessForPatient(patient);
+-  if (cwAccess.error != null) throw new MetriportError(cwAccess.error);
+-  const { commonWell, queryMeta, cwPatientId, orgName } = cwAccess;
+-
+-  try {
+-    // make sure the person exists @ CW
+-    await commonWell.getPersonById(queryMeta, chosenPersonId);
+-
+-    // get the linked person
+-    const cwPatient = await commonWell.getPatient(queryMeta, cwPatientId);
+-    const cwPatientUri = cwPatient._links?.self?.href;
+-    if (!cwPatientUri) throw new Error(`Missing patient URI for patient ${cwPatientId}`);
+-    const currentLinkedPersonId = cwPatient._links?.person?.href
+-      ? getPersonIdFromUrl(cwPatient._links.person?.href)
+-      : undefined;
+-
+-    // if not the same, unlink/unenroll the currently linked person
+-    if (currentLinkedPersonId && currentLinkedPersonId !== chosenPersonId) {
+-      log(`unlinking/unenrolling current person ${currentLinkedPersonId}...`);
+-      await commonWell.resetPatientLink(queryMeta, currentLinkedPersonId, cwPatientId);
+-      const currentLinkedPerson = await commonWell.getPersonById(queryMeta, currentLinkedPersonId);
+-      if (isEnrolledBy(orgName, currentLinkedPerson)) {
+-        await commonWell.unenrollPerson(queryMeta, currentLinkedPersonId);
+-        await commonWell.deletePerson(queryMeta, currentLinkedPersonId);
+-      }
+-    }
+-
+-    // link the chosen person to the patient...
+-    await commonWell.addPatientLink(queryMeta, chosenPersonId, cwPatientUri);
+-
+-    // get the network links for the patient
+-    const networkLinks = await getPatientsNetworkLinks(commonWell, queryMeta, cwPatientId);
+-
+-    // validate the links belong to the patient
+-    const { validNetworkLinks, invalidLinks } = await validateCwLinksBelongToPatient(
+-      cxId,
+-      networkLinks,
+-      patient.data,
+-      cwLinkToPatientData
+-    );
+-
+-    // ...and upgrade the network links w/ that person's patients
+-    await autoUpgradeNetworkLinks(
+-      commonWell,
+-      queryMeta,
+-      validNetworkLinks,
+-      invalidLinks,
+-      cwPatientId,
+-      chosenPersonId,
+-      context,
+-      orgIdExcludeList
+-    );
+-
+-    // update Metriport's DB
+-    await updateCommonwellIdsAndStatus({
+-      patient,
+-      commonwellPatientId: cwPatientId,
+-      commonwellPersonId: chosenPersonId,
+-    });
+-    await updatePatientDiscoveryStatus({ patient, status: "completed" });
+-
+-    if (unenrollByDemographics) {
+-      log(`unenrolling by demographics...`);
+-      const respSearch = await commonWell.searchPersonByPatientDemo(queryMeta, cwPatientId);
+-      const persons = respSearch._embedded?.person
+-        ? respSearch._embedded.person.flatMap(p => (p && getPersonId(p) ? p : []))
+-        : [];
+-      for (const person of persons) {
+-        const personId = getPersonId(person);
+-        if (!personId) continue;
+-        if (personId === chosenPersonId) continue; // don't unenroll the chosen person!
+-        if (isEnrolledBy(orgName, person)) {
+-          await commonWell.unenrollPerson(queryMeta, personId);
+-        }
+-      }
+-    }
+-  } catch (error) {
+-    const msg = `Error on patchDuplicatedPersonsForPatient`;
+-    log(`${msg}. Error: ${error}`);
+-    capture.error(msg, {
+-      extra: {
+-        patientId: patient.id,
+-        cxId: patient.cxId,
+-        cwReference: commonWell.lastReferenceHeader,
+-        error,
+-      },
+-    });
+-    throw error;
+-  }
+-}
+diff --git a/packages/api/src/external/commonwell-v1/admin/recreate-patients-at-hies.ts b/packages/api/src/external/commonwell-v1/admin/recreate-patients-at-hies.ts
+deleted file mode 100644
+index 635bce5b18..0000000000
+--- a/packages/api/src/external/commonwell-v1/admin/recreate-patients-at-hies.ts
++++ /dev/null
+@@ -1,174 +0,0 @@
+-import { CommonWellAPI, organizationQueryMeta } from "@metriport/commonwell-sdk-v1";
+-import { isCWEnabledForCx } from "@metriport/core/command/feature-flags/domain-ffs";
+-import { addOidPrefix } from "@metriport/core/domain/oid";
+-import { Patient } from "@metriport/core/domain/patient";
+-import { out } from "@metriport/core/util/log";
+-import { capture } from "@metriport/core/util/notifications";
+-import { groupBy } from "lodash";
+-import { PatientModel } from "../../../models/medical/patient";
+-import { getCqOrgIdsToDenyOnCw } from "../../hie/cross-hie-ids";
+-import { makeCommonWellAPI } from "../api";
+-import { getCWData } from "../patient";
+-import { create } from "../../commonwell/patient/patient";
+-import { getCwInitiator } from "../shared";
+-
+-export type RecreateResultOfPatient = {
+-  originalCWPatientId: string | undefined;
+-  newCWPatientId: string;
+-};
+-export type RecreateResult = {
+-  [cxId: string]: {
+-    [patientId: string]: RecreateResultOfPatient | undefined;
+-  };
+-};
+-
+-/**
+- * ADMIN-only!
+- *
+- * Recreates patients at CommonWell.
+- *
+- * This should never be called within the application flow, this is an admin-only command.
+- */
+-export async function recreatePatientsAtCW(cxId?: string): Promise<RecreateResult> {
+-  const { log } = out(`recreatePatientsAtCW`);
+-  log(cxId ? `Querying patients of cxId ${cxId}...` : `Querying all patients...`);
+-
+-  // TODO paginate this
+-  // Don't move this to a command as we shouldn't easily allow to search Patients for all cxs
+-  const patients = await PatientModel.findAll({
+-    where: {
+-      ...(cxId ? { cxId } : undefined),
+-    },
+-  });
+-  if (patients.length < 1) {
+-    log(`No patients found, leaving...`);
+-    return {};
+-  }
+-  const patientsByCustomer = groupBy(patients, "cxId");
+-
+-  const res: RecreateResult = {};
+-  for (const [cxId, patients] of Object.entries(patientsByCustomer)) {
+-    log(`Found ${patients.length} patients for cxId ${cxId}`);
+-    const cxRes: Record<string, RecreateResultOfPatient | undefined> = {};
+-    // TODO consider moving this to Promise.all()
+-    for (const patient of patients) {
+-      cxRes[patient.id] = await recreatePatientAtCW(patient, getCqOrgIdsToDenyOnCw);
+-    }
+-    res[cxId] = cxRes;
+-  }
+-  log(`Done.`);
+-  return res;
+-}
+-
+-async function recreatePatientAtCW(
+-  patient: Patient,
+-  getOrgIdExcludeList: () => Promise<string[]>
+-): Promise<RecreateResultOfPatient | undefined> {
+-  const { log } = out(`recreatePatientAtCW - ${patient.id}`);
+-
+-  const isCwEnabledForCx = await isCWEnabledForCx(patient.cxId);
+-  if (!isCwEnabledForCx) {
+-    log(`CW disabled for cx ${patient.cxId}, skipping...`);
+-    return undefined;
+-  }
+-
+-  let commonWell: CommonWellAPI | undefined;
+-  try {
+-    const facilityId = patient.facilityIds[0];
+-    if (!facilityId) {
+-      const msg = `Patient has no facilityId`;
+-      log(msg + ", skipping...");
+-      capture.message(msg, { extra: { patient }, level: "error" });
+-      return undefined;
+-    }
+-    const commonwellData = patient.data.externalData
+-      ? getCWData(patient.data.externalData)
+-      : undefined;
+-    if (!commonwellData) {
+-      const msg = `Patient has no externalData for CommonWell`;
+-      log(msg + ", creating a new patient @ CW...");
+-      capture.message(msg, { extra: { patient }, level: "warning" });
+-    }
+-    const originalPersonId = commonwellData?.personId ?? undefined;
+-    const originalCWPatientId = commonwellData?.patientId ?? undefined;
+-    if (originalPersonId && originalCWPatientId && originalCWPatientId.includes(patient.id)) {
+-      const msg = `Patient ID and CW patientId already match`;
+-      log(msg + ", skipping...");
+-      capture.message(msg, { extra: { patient }, level: "info" });
+-      return undefined;
+-    }
+-
+-    const initiator = await getCwInitiator(patient, facilityId);
+-    commonWell = makeCommonWellAPI(initiator.name, addOidPrefix(initiator.oid));
+-    const queryMeta = organizationQueryMeta(initiator.name, { npi: initiator.npi });
+-
+-    // create new patient, including linkint to person and network link to other patients
+-    log(`Creating new patient at CW...`);
+-    // WARNING This could overwrite the status for any currently running PD
+-    // TODO Internal #1832 (rework)
+-    const cwIds = await create({
+-      patient,
+-      facilityId,
+-      getOrgIdExcludeList,
+-      initiator,
+-    });
+-
+-    if (!cwIds) {
+-      log(`Missing CW IDs while recreating patient at CW`);
+-      return undefined;
+-    }
+-
+-    const { commonwellPatientId: newCWPatientId } = cwIds;
+-
+-    if (originalCWPatientId) {
+-      const extra = {
+-        patientId: patient.id,
+-        originalCWPatientId,
+-        newCWPatientId,
+-        originalPersonId,
+-        // newPersonId,
+-      };
+-      if (originalCWPatientId === newCWPatientId) {
+-        const msg = `Patient created/updated with the same ID`;
+-        log(msg);
+-        capture.message(msg, { extra, level: "error" });
+-
+-        // TODO: 983 - UPDATE THIS IS NEEDED
+-        // TODO: 983 - UPDATE THIS IS NEEDED
+-        // TODO: 983 - UPDATE THIS IS NEEDED
+-        // } else if (!originalPersonId && !newPersonId) {
+-        //   const msg = `Patient had no personId and we could not determine one again`;
+-        //   log(msg);
+-        //   capture.message(msg, { extra, level: "error" });
+-        // } else if (originalPersonId && !newPersonId) {
+-        //   const msg = `Patient had a personId but we could not determine one while recreating`;
+-        //   log(`${msg} - original person ID: ${originalPersonId}`);
+-        //   capture.message(msg, { extra, level: "error" });
+-        // } else if (!originalPersonId && newPersonId) {
+-        //   log(`Good news: patient had no personId but we got one now`);
+-        // } else if (originalPersonId !== newPersonId) {
+-        //   const msg = `Patient original and new person ID do not match while recreating`;
+-        //   log(`${msg} - original person ID: ${originalPersonId}, new person ID: ${newPersonId}`);
+-        //   capture.message(msg, { extra, level: "error" });
+-      }
+-
+-      // remove old patient
+-      log(`Deleting old patient from CW...`);
+-      await commonWell.deletePatient(queryMeta, originalCWPatientId);
+-    }
+-
+-    return { originalCWPatientId, newCWPatientId };
+-  } catch (error) {
+-    const msg = `Error while recreating patient at CW`;
+-    log(`${msg}. Error: ${error}`);
+-    capture.error(msg, {
+-      extra: {
+-        patientId: patient.id,
+-        cxId: patient.cxId,
+-        cwReference: commonWell?.lastReferenceHeader,
+-        error,
+-      },
+-    });
+-    return undefined;
+-  }
+-}
+diff --git a/packages/api/src/routes/internal/medical/patient.ts b/packages/api/src/routes/internal/medical/patient.ts
+index 16f1677225..b759191b19 100644
+--- a/packages/api/src/routes/internal/medical/patient.ts
++++ b/packages/api/src/routes/internal/medical/patient.ts
+@@ -26,7 +26,6 @@ import duration from "dayjs/plugin/duration";
+ import { Request, Response } from "express";
+ import Router from "express-promise-router";
+ import status from "http-status";
+-import stringify from "json-stringify-safe";
+ import { chunk } from "lodash";
+ import { z } from "zod";
+ import {
+@@ -65,9 +64,6 @@ import { Pagination } from "../../../command/pagination";
+ import { getFacilityIdOrFail } from "../../../domain/medical/patient-facility";
+ import { PatientUpdaterCarequality } from "../../../external/carequality/patient-updater-carequality";
+ import cwCommands from "../../../external/commonwell";
+-import { findDuplicatedPersons } from "../../../external/commonwell-v1/admin/find-patient-duplicates";
+-import { patchDuplicatedPersonsForPatient } from "../../../external/commonwell-v1/admin/patch-patient-duplicates";
+-import { recreatePatientsAtCW } from "../../../external/commonwell-v1/admin/recreate-patients-at-hies";
+ import { PatientUpdaterCommonWell } from "../../../external/commonwell/patient/patient-updater-commonwell";
+ import { getCqOrgIdsToDenyOnCw } from "../../../external/hie/cross-hie-ids";
+ import { runOrSchedulePatientDiscoveryAcrossHies } from "../../../external/hie/run-or-schedule-patient-discovery";
+@@ -396,115 +392,6 @@ router.delete(
+   })
+ );
+ 
+-/** ---------------------------------------------------------------------------
+- * TODO ENG-554 Remove entirely once we've migrated to CWv2
+- *
+- * GET /internal/patient/duplicates
+- * *
+- * @param req.query.cxId The customer ID (optional, defaults to all customers).
+- *
+- * @return list of cxs with patients that have duplicated persons, along w/ each
+- *         person, who enrolled and when
+- */
+-router.get(
+-  "/duplicates",
+-  requestLogger,
+-  asyncHandler(async (req: Request, res: Response) => {
+-    const cxId = getUUIDFrom("query", req, "cxId").orFail();
+-    const result = await findDuplicatedPersons(cxId);
+-    console.log(`Result: ${stringify(result)}`);
+-    return res.status(status.OK).json(result);
+-  })
+-);
+-
+-// Zod schema to validate the request body based on the response of GET /duplicates
+-const patchDuplicatesSchema = z.record(
+-  // cx
+-  z.record(
+-    // patient
+-    z.record(
+-      z
+-        .object({
+-          // person
+-        })
+-        .nullish()
+-    )
+-  )
+-);
+-
+-/** ---------------------------------------------------------------------------
+- * PATCH /internal/patient/duplicates
+- *
+- * Links the patient to the chosen person.
+- * Additionally, unenroll those enrolled by Metriport:
+- * - any other person linked to the patient; AND
+- * - all other persons matching the patient's demographics if the `unenrollByDemographics`
+- *   query param is set to true (defaults to false).
+- *
+- * @param req.body The request body in the same format of the output of "GET /duplicates".
+- *     Each patient must have one chosen person. Less than one it gets skipped; more
+- *     than one it throws an error.
+- */
+-router.patch(
+-  "/duplicates",
+-  requestLogger,
+-  asyncHandler(async (req: Request, res: Response) => {
+-    const unenrollByDemographics = stringToBoolean(
+-      getFrom("query").optional("unenrollByDemographics", req)
+-    );
+-    const payload = patchDuplicatesSchema.parse(req.body);
+-
+-    const result = await Promise.allSettled(
+-      Object.entries(payload).flatMap(([cxId, patients]) => {
+-        return Object.entries(patients).flatMap(async ([patientId, persons]) => {
+-          const personEntries = Object.entries(persons);
+-          if (personEntries.length < 1) return;
+-          if (personEntries.length > 1)
+-            throw new BadRequestError(
+-              `Failed to patch patient ${patientId} - One chosen person per patient allowed`
+-            );
+-          const personId = personEntries[0][0] as string;
+-          return patchDuplicatedPersonsForPatient(
+-            cxId,
+-            patientId,
+-            personId,
+-            unenrollByDemographics,
+-            getCqOrgIdsToDenyOnCw
+-          ).catch(e => {
+-            console.log(`Error: ${e}, ${String(e)}`);
+-            throw `Failed to patch patient ${patientId} - ${String(e)}`;
+-          });
+-        });
+-      })
+-    );
+-    const succeded = result.filter(r => r.status === "fulfilled");
+-    const failed = result.flatMap(r => (r.status === "rejected" ? r.reason : []));
+-    return res.status(status.OK).json({
+-      succededCount: succeded.length,
+-      failedCount: failed.length,
+-      failed,
+-    });
+-  })
+-);
+-
+-/** ---------------------------------------------------------------------------
+- * POST /internal/patient/recreate-at-hies
+- *
+- * Recreates patients at HIEs.
+- *
+- * @param req.query.cxId The customer ID (optional, default to all cxs).
+- * @return 200 OK
+- */
+-router.post(
+-  "/recreate-at-hies",
+-  requestLogger,
+-  asyncHandler(async (req: Request, res: Response) => {
+-    const cxId = getUUIDFrom("query", req, "cxId").optional();
+-    const resultCW = await recreatePatientsAtCW(cxId);
+-    return res.status(status.OK).json(resultCW);
+-  })
+-);
+-
+ const consolidationConversionTypeSchema = z.enum(consolidationConversionType);
+ 
+ /** ---------------------------------------------------------------------------

@@ -1,0 +1,193 @@
+diff --git a/backend/app/repositories/event_record_repository.py b/backend/app/repositories/event_record_repository.py
+index be347d282..b8007d9ce 100644
+--- a/backend/app/repositories/event_record_repository.py
++++ b/backend/app/repositories/event_record_repository.py
+@@ -201,6 +201,24 @@ def get_by_external_ids(
+             query = query.filter(DataSource.provider == provider)
+         return {record.external_id: record for record in query if record.external_id}
+ 
++    def sleep_windows(
++        self, db_session: DbSession, user_id: UUID, start: datetime, end: datetime, provider: str
++    ) -> list[tuple[datetime, datetime]]:
++        """Start and end of the user's sleep sessions from this provider that overlap [start, end]."""
++        rows = (
++            db_session.query(self.model.start_datetime, self.model.end_datetime)
++            .join(DataSource, self.model.data_source_id == DataSource.id)
++            .filter(
++                DataSource.user_id == user_id,
++                DataSource.provider == provider,
++                self.model.category == EventCategory.SLEEP,
++                self.model.start_datetime < end,
++                self.model.end_datetime > start,
++            )
++            .all()
++        )
++        return [(row.start_datetime, row.end_datetime) for row in rows]
++
+     def main_sleep_ended_before(
+         self, db_session: DbSession, user_id: UUID, at: datetime, within: timedelta, provider: str
+     ) -> EventRecord | None:
+diff --git a/backend/app/services/providers/polar/data_247.py b/backend/app/services/providers/polar/data_247.py
+index 18f7261e3..5c1281a2f 100644
+--- a/backend/app/services/providers/polar/data_247.py
++++ b/backend/app/services/providers/polar/data_247.py
+@@ -165,10 +165,40 @@ def _parse(self, raw: dict[str, Any], schema: type[_T], user_id: UUID, context:
+     # Sleep - GET /v3/users/sleep, GET /v3/users/sleep/{date} and GET /v3/users/sleep/available
+     # -------------------------------------------------------------------------
+ 
+-    def _get_available_sleep_dates(self, db: DbSession, user_id: UUID) -> set[date]:
++    @staticmethod
++    def _night_window(night: dict[str, Any]) -> tuple[datetime, datetime] | None:
++        try:
++            start, end = datetime.fromisoformat(night["start_time"]), datetime.fromisoformat(night["end_time"])
++        except (KeyError, TypeError, ValueError):
++            return None
++        return (start, end) if start.tzinfo and end.tzinfo else None
++
++    def _get_available_sleep(self, db: DbSession, user_id: UUID) -> dict[date, tuple[datetime, datetime] | None]:
++        """Dates with sleep in the last 28 days, with the night's start and end when Polar gives them."""
+         response = self._make_api_request(db, user_id, "/v3/users/sleep/available")
+         nights = (response or {}).get("available", [])
+-        return {date.fromisoformat(night["date"]) for night in nights if night.get("date")}
++        return {date.fromisoformat(night["date"]): self._night_window(night) for night in nights if night.get("date")}
++
++    @staticmethod
++    def _unstored_late_nights(
++        db: DbSession, user_id: UUID, late: dict[date, tuple[datetime, datetime] | None]
++    ) -> set[date]:
++        """Late nights with no stored Polar sleep by id or, as after a merge with the next night, by overlap."""
++        stored_ids = event_record_service.crud.get_by_external_ids(
++            db, user_id, [f"sleep-{d}" for d in late], provider=ProviderName.POLAR
++        )
++        late = {d: window for d, window in late.items() if f"sleep-{d}" not in stored_ids}
++        windows = [window for window in late.values() if window]
++        if not windows:
++            return set(late)
++        stored = event_record_service.crud.sleep_windows(
++            db, user_id, min(s for s, _ in windows), max(e for _, e in windows), ProviderName.POLAR
++        )
++        return {
++            d
++            for d, window in late.items()
++            if window is None or not any(s < window[1] and e > window[0] for s, e in stored)
++        }
+ 
+     def get_sleep_data(
+         self,
+@@ -180,9 +210,12 @@ def get_sleep_data(
+         date_range = {
+             start_time.date() + timedelta(days=i) for i in range((end_time.date() - start_time.date()).days + 1)
+         }
+-        available_dates = self._get_available_sleep_dates(db, user_id)
++        available = self._get_available_sleep(db, user_id)
++        # Nights show up in /sleep/available after the watch syncs, often after their date left the window
++        late = {d: window for d, window in available.items() if d not in date_range}
++        late_dates = self._unstored_late_nights(db, user_id, late) if late else set()
+         sleep_data = []
+-        for d in date_range.intersection(available_dates):
++        for d in sorted(date_range.intersection(available) | late_dates):
+             response = self._make_api_request(db, user_id, f"/v3/users/sleep/{d.isoformat()}")
+             if response:
+                 sleep_data.append(response)
+diff --git a/backend/tests/providers/polar/test_polar_247.py b/backend/tests/providers/polar/test_polar_247.py
+index 118f4e7d1..e0ac9686d 100644
+--- a/backend/tests/providers/polar/test_polar_247.py
++++ b/backend/tests/providers/polar/test_polar_247.py
+@@ -363,6 +363,82 @@ def test_a_moved_webhook_resync_links_its_score_to_the_stored_night(
+ # ---------------------------------------------------------------------------
+ 
+ 
++class TestPolar247LateSleep:
++    """Nights that reach /sleep/available after their date left the sync window."""
++
++    WINDOW = (datetime(2024, 1, 20, tzinfo=timezone.utc), datetime(2024, 1, 21, tzinfo=timezone.utc))
++
++    @staticmethod
++    def _night(day: str) -> dict:
++        """A night from 23:00 the evening before to 07:00 on day."""
++        bed = date.fromisoformat(day) - timedelta(days=1)
++        return {
++            **TestPolar247SleepSave.NIGHT,
++            "date": day,
++            "sleep_start_time": f"{bed}T23:00:00+02:00",
++            "sleep_end_time": f"{day}T07:00:00+02:00",
++        }
++
++    def _fetch(self, db: Session, data_247: Polar247Data, user_id: UUID, available: list[str]) -> list[str]:
++        """Run get_sleep_data against a fake AccessLink; returns the nights it fetched."""
++        fetched: list[str] = []
++
++        def api(_db: Session, _user_id: UUID, path: str, **_: object) -> dict:
++            if path.endswith("/available"):
++                nights = [self._night(d) for d in available]
++                return {
++                    "available": [
++                        {"date": n["date"], "start_time": n["sleep_start_time"], "end_time": n["sleep_end_time"]}
++                        for n in nights
++                    ]
++                }
++            day = path.rsplit("/", 1)[1]
++            fetched.append(day)
++            return self._night(day)
++
++        with patch.object(data_247, "_make_api_request", side_effect=api):
++            data_247.get_sleep_data(db, user_id, *self.WINDOW)
++        return sorted(fetched)
++
++    def test_late_night_outside_the_window_is_fetched(self, db: Session, data_247: Polar247Data) -> None:
++        user = UserFactory()
++        fetched = self._fetch(db, data_247, user.id, ["2024-01-12", "2024-01-20"])
++        assert fetched == ["2024-01-12", "2024-01-20"]
++
++    def test_late_night_already_stored_is_not_fetched_again(self, db: Session, data_247: Polar247Data) -> None:
++        user = UserFactory()
++        with patch.object(data_247, "get_sleep_data", return_value=[self._night("2024-01-12")]):
++            data_247._save_sleep(db, user.id, *self.WINDOW)
++
++        fetched = self._fetch(db, data_247, user.id, ["2024-01-12", "2024-01-20"])
++        # The window night is always re-fetched (Polar may still update it); the stored late one is not.
++        assert fetched == ["2024-01-20"]
++
++    def test_another_users_night_does_not_count_as_stored(self, db: Session, data_247: Polar247Data) -> None:
++        other, user = UserFactory(), UserFactory()
++        with patch.object(data_247, "get_sleep_data", return_value=[self._night("2024-01-12")]):
++            data_247._save_sleep(db, other.id, *self.WINDOW)
++
++        assert self._fetch(db, data_247, user.id, ["2024-01-12"]) == ["2024-01-12"]
++
++    def test_late_night_merged_into_the_next_one_is_not_fetched_again(
++        self, db: Session, data_247: Polar247Data
++    ) -> None:
++        user = UserFactory()
++        late = self._night("2024-01-12")
++        next_night = {
++            **self._night("2024-01-13"),
++            "sleep_start_time": "2024-01-12T08:30:00+02:00",
++            "sleep_end_time": "2024-01-12T12:00:00+02:00",
++        }
++        with patch.object(data_247, "get_sleep_data", return_value=[late, next_night]):
++            data_247._save_sleep(db, user.id, *self.WINDOW)
++        [merged] = TestPolar247SleepSave._sleep_records(db, user.id)
++        assert merged.external_id == "sleep-2024-01-13"
++
++        assert self._fetch(db, data_247, user.id, ["2024-01-12", "2024-01-20"]) == ["2024-01-20"]
++
++
+ class TestPolar247DailyActivityNormalization:
+     @pytest.fixture
+     def sample_activity(self) -> dict:
+diff --git a/docs/providers/polar-api-integration.mdx b/docs/providers/polar-api-integration.mdx
+index c63aebcd3..573e6941b 100644
+--- a/docs/providers/polar-api-integration.mdx
++++ b/docs/providers/polar-api-integration.mdx
+@@ -44,6 +44,10 @@ Polar provides access to exercise, daily activity, sleep, and heart rate data fr
+ | **Polling (pull) — 24/7 data** | Sleep, daily activity, continuous HR, Nightly Recharge, cardio load, and Elixir/Sleepwise metrics are fetched via range endpoints covering the last 90 days. |
+ | **Webhooks (push)** | Polar sends a lightweight notification on each event (exercise, sleep, activity, etc.). Open Wearables acknowledges immediately and enqueues a targeted sync for the affected data type. |
+ 
++<Note>
++A sleep night appears in AccessLink only after the device syncs with Polar Flow, which can be days later. Each sync therefore also fetches any night Polar still lists as available (AccessLink keeps nights for 28 days) that is not stored yet: neither under its `sleep-<date>` id nor overlapping a stored Polar sleep.
++</Note>
++
+ <Note>
+ Webhook delivery requires a registered webhook subscription and `POLAR_WEBHOOK_SIGNATURE_SECRET` set in your environment. See the configuration step below.
+ </Note>

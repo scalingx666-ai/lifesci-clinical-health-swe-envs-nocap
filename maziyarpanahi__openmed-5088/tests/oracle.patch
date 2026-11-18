@@ -1,0 +1,1793 @@
+diff --git a/docs/serving/async-jobs.md b/docs/serving/async-jobs.md
+index 8a956fbea..a5d4884fe 100644
+--- a/docs/serving/async-jobs.md
++++ b/docs/serving/async-jobs.md
+@@ -49,6 +49,12 @@ Progress is updated after each document. Terminal records include:
+ The job API does not return raw redacted text. Use synchronous
+ `POST /pii/deidentify` when a caller needs the redacted payload in the response.
+ 
++When service authentication is enabled, a job is visible only to the principal
++that submitted it and to principals holding `jobs:admin`; every other caller
++receives `404`. See [Job Ownership](authentication.md#job-ownership) for the
++required `OPENMED_SERVICE_DIGEST_KEY` setting and how older records are
++handled.
++
+ ## Webhook Payloads
+ 
+ Terminal jobs trigger a signed webhook when `webhook` is provided. The payload
+diff --git a/docs/serving/authentication.md b/docs/serving/authentication.md
+index 8da2e069d..ef81912c2 100644
+--- a/docs/serving/authentication.md
++++ b/docs/serving/authentication.md
+@@ -106,6 +106,66 @@ routes with an unrelated scope must receive the matching grant. `*` and
+ `namespace:*` still work. The deny-by-default setting remains available for
+ unmatched requests; it does not disable declared route scopes.
+ 
++## Job Ownership
++
++When API-key, JWT or mTLS authentication is enabled, every record created by
++`POST /jobs`, `POST /fhir/bulk/exports`, `POST /fhir/bulk/imports` and
++`POST /fhir/smart-backend/ingestions` is bound to the principal that submitted
++it. Only that principal can read or cancel the record afterwards:
++
++| Route | Owner check |
++|---|---|
++| `GET /jobs/{job_id}` | owner or `jobs:admin` |
++| `GET` bulk export/import status, `/manifest` and `/report` | owner or `bulk:admin` |
++| `DELETE` bulk export/import | owner or `bulk:admin` |
++| `GET` SMART ingestion status and `/summary`, `DELETE` ingestion | owner or `bulk:admin` |
++
++Any other authenticated principal receives the same `404` envelope as a
++request for an unknown job id, so job ids cannot be used to probe whether
++another caller's job exists. A non-owner never learns that a job is still
++running either: the `409` "not completed" answer is reserved for callers who
++may see the job.
++
++The owner is the credential type, the JWT issuer when present, and the subject
++(the API-key `principal`, the JWT `sub`, or the mapped mTLS principal). API-key
++ids are not part of the owner, so rotating a key for the same configured
++principal keeps access to its jobs. `jobs:admin` and `bulk:admin` are matched
++literally and are needed in addition to the route's read or write scope;
++wildcard grants such as `*` or `jobs:*` do not override ownership.
++
++The service never stores the principal itself. It stores a keyed,
++domain-separated HMAC-SHA256 digest with `alg` and `key_id` markers, which
++cannot be mapped back to a principal name without the deployment key. The
++digest is internal state: it is not returned by any job, bulk or SMART route,
++not included in webhook payloads, and not logged.
++
++Configure the digest key whenever authentication is enabled:
++
++```bash
++OPENMED_SERVICE_DIGEST_KEY="$(openssl rand -hex 32)" \
++OPENMED_SERVICE_DIGEST_KEY_ID=jobs-2026-11 \
++OPENMED_SERVICE_AUTH_ENABLED=true \
++python -m openmed.service.logging --host 127.0.0.1 --port 8080
++```
++
++`OPENMED_SERVICE_DIGEST_KEY` must contain at least 32 bytes and is used as-is
++(its UTF-8 bytes). `OPENMED_SERVICE_DIGEST_KEY_ID` is optional; without it the
++service derives a public key id from the key. Outside the `dev` and `test`
++profiles the service refuses to start with authentication enabled and no
++digest key. In `dev` and `test` it falls back to a random per-process key, so
++`/jobs` records persisted by one process are visible only to administrators
++after a restart. Changing the key has the same effect: records whose digest
++was made by another key fail closed and remain visible to administrators until
++their TTL expires.
++
++Records created while authentication was disabled, and `/jobs` records written
++by releases before this binding existed, have no owner. The local job store
++upgrades its file to schema version 2 and marks such records as unowned. Once
++authentication is enabled they are visible only to `jobs:admin` principals,
++except in the `dev` and `test` profiles where any authenticated caller with
++`jobs:read` can still read them. With authentication disabled, job routes
++behave exactly as before.
++
+ ## Errors and Failed Attempts
+ 
+ Missing or invalid credentials return the standard service error envelope with
+diff --git a/openmed/service/app.py b/openmed/service/app.py
+index 15fe451a7..9139d1e03 100644
+--- a/openmed/service/app.py
++++ b/openmed/service/app.py
+@@ -47,6 +47,7 @@
+ 
+ from .auth import (
+     ROUTE_POLICIES,
++    AuthPrincipal,
+     ServiceAuth,
+     parse_service_auth_config,
+     request_needs_admission,
+@@ -67,7 +68,8 @@
+ )
+ from .coalesce import RequestCoalescer, coalescing_key
+ from .governed_workflows import WorkflowGovernanceService, WorkflowHTTPPolicy
+-from .jobs import DeidentifyJobQueue, job_response_payload
++from .job_ownership import BULK_ADMIN_SCOPE, JOBS_ADMIN_SCOPE, JobOwnershipPolicy
++from .jobs import OWNER_DIGEST_FIELD, DeidentifyJobQueue, job_response_payload
+ from .journey_resources import (
+     JourneyAccessPolicy,
+     JourneyResourceCatalog,
+@@ -742,6 +744,54 @@ def _get_job_queue(request: Request) -> DeidentifyJobQueue:
+     return queue
+ 
+ 
++def _get_job_ownership(request: Request) -> JobOwnershipPolicy:
++    policy = getattr(request.app.state, "job_ownership", None)
++    if policy is None:
++        raise InternalError(
++            "The job ownership policy is not initialized. Restart the service "
++            "and report the startup invariant if it recurs."
++        )
++    return policy
++
++
++def _submitting_owner_digest(request: Request) -> Optional[dict[str, str]]:
++    """Return the keyed digest of the authenticated submitter, if any."""
++    return _get_job_ownership(request).owner_digest(request.scope.get("openmed.auth"))
++
++
++def _job_visible(
++    request: Request,
++    *,
++    admin_scope: str,
++    owner_digest: Callable[[], Any],
++) -> bool:
++    """Return whether the caller may read or cancel a job record.
++
++    The owner lookup is deferred so auth-disabled requests never consult it.
++    Callers answer ``False`` exactly like an unknown job id, so other
++    principals cannot probe which ids exist.
++    """
++    policy = _get_job_ownership(request)
++    principal = request.scope.get("openmed.auth")
++    if not isinstance(principal, AuthPrincipal):
++        return policy.permits(None, None, admin_scope=admin_scope)
++    return policy.permits(principal, owner_digest(), admin_scope=admin_scope)
++
++
++def _require_visible_bulk_job(
++    request: Request,
++    manager: FHIRBulkJobManager | SMARTBackendJobManager,
++    job_id: str,
++) -> None:
++    """Raise ``KeyError`` for an unknown job or one the caller does not own."""
++    if not _job_visible(
++        request,
++        admin_scope=BULK_ADMIN_SCOPE,
++        owner_digest=lambda: manager.owner_digest(job_id),
++    ):
++        raise KeyError(job_id)
++
++
+ def _get_journey_resource_catalog(request: Request) -> JourneyResourceCatalog:
+     catalog = getattr(request.app.state, "journey_resources", None)
+     if catalog is None:
+@@ -928,6 +978,9 @@ async def lifespan(fastapi_app: FastAPI):
+         parse_service_mtls_config(),
+         error_response=_error_response,
+     )
++    app.state.job_ownership = JobOwnershipPolicy.from_env(
++        authentication_enabled=app.state.auth.enabled or app.state.mtls.enabled
++    )
+     app.state.metrics = (
+         PrometheusMetricsRegistry() if metrics_enabled_from_env() else None
+     )
+@@ -1848,8 +1901,10 @@ async def fhir_bulk_job_status(
+         job_id: str,
+         request: Request,
+     ) -> Dict[str, Any]:
++        manager = _get_fhir_bulk_manager(request)
+         try:
+-            return _get_fhir_bulk_manager(request).get(job_id).to_dict()
++            _require_visible_bulk_job(request, manager, job_id)
++            return manager.get(job_id).to_dict()
+         except KeyError as exc:
+             raise StarletteHTTPException(
+                 status_code=404,
+@@ -1868,8 +1923,10 @@ async def fhir_bulk_job_manifest(
+         job_id: str,
+         request: Request,
+     ) -> Dict[str, Any]:
++        manager = _get_fhir_bulk_manager(request)
+         try:
+-            return _get_fhir_bulk_manager(request).manifest(job_id)
++            _require_visible_bulk_job(request, manager, job_id)
++            return manager.manifest(job_id)
+         except KeyError as exc:
+             raise StarletteHTTPException(
+                 status_code=404,
+@@ -1890,8 +1947,10 @@ async def fhir_bulk_job_report(
+         job_id: str,
+         request: Request,
+     ) -> Dict[str, Any]:
++        manager = _get_fhir_bulk_manager(request)
+         try:
+-            return _get_fhir_bulk_manager(request).report(job_id)
++            _require_visible_bulk_job(request, manager, job_id)
++            return manager.report(job_id)
+         except KeyError as exc:
+             raise StarletteHTTPException(
+                 status_code=404,
+@@ -1914,8 +1973,10 @@ async def cancel_fhir_bulk_job(
+         job_id: str,
+         request: Request,
+     ) -> Dict[str, Any]:
++        manager = _get_fhir_bulk_manager(request)
+         try:
+-            status = await _get_fhir_bulk_manager(request).cancel(job_id)
++            _require_visible_bulk_job(request, manager, job_id)
++            status = await manager.cancel(job_id)
+             return status.to_dict()
+         except KeyError as exc:
+             raise StarletteHTTPException(
+@@ -1966,15 +2027,22 @@ async def start_smart_backend_ingestion(
+         )
+         config = replace(config, output_dir=output, checkpoint_path=checkpoint)
+         deidentifier = _smart_backend_deidentifier(payload, runtime)
+-        return manager.start(config, deidentifier=deidentifier, job_id=job_id).to_dict()
++        return manager.start(
++            config,
++            deidentifier=deidentifier,
++            job_id=job_id,
++            owner_digest=_submitting_owner_digest(request),
++        ).to_dict()
+ 
+     @app.get("/fhir/smart-backend/ingestions/{job_id}")
+     async def smart_backend_ingestion_status(
+         job_id: str,
+         request: Request,
+     ) -> Dict[str, Any]:
++        manager = _get_smart_backend_manager(request)
+         try:
+-            return _get_smart_backend_manager(request).get(job_id).to_dict()
++            _require_visible_bulk_job(request, manager, job_id)
++            return manager.get(job_id).to_dict()
+         except KeyError as exc:
+             raise StarletteHTTPException(
+                 status_code=404,
+@@ -1986,8 +2054,10 @@ async def smart_backend_ingestion_summary(
+         job_id: str,
+         request: Request,
+     ) -> Dict[str, Any]:
++        manager = _get_smart_backend_manager(request)
+         try:
+-            return _get_smart_backend_manager(request).summary(job_id).to_dict()
++            _require_visible_bulk_job(request, manager, job_id)
++            return manager.summary(job_id).to_dict()
+         except KeyError as exc:
+             raise StarletteHTTPException(
+                 status_code=404,
+@@ -2008,8 +2078,10 @@ async def cancel_smart_backend_ingestion(
+         job_id: str,
+         request: Request,
+     ) -> Dict[str, Any]:
++        manager = _get_smart_backend_manager(request)
+         try:
+-            return (await _get_smart_backend_manager(request).cancel(job_id)).to_dict()
++            _require_visible_bulk_job(request, manager, job_id)
++            return (await manager.cancel(job_id)).to_dict()
+         except KeyError as exc:
+             raise StarletteHTTPException(
+                 status_code=404,
+@@ -2023,14 +2095,18 @@ async def create_job(
+     ) -> Dict[str, Any]:
+         _get_service_runtime(request).validate_served_model(payload.model_name)
+         queue = _get_job_queue(request)
+-        record = queue.submit(payload)
++        record = queue.submit(payload, owner_digest=_submitting_owner_digest(request))
+         return job_response_payload(record, status_url=f"/jobs/{record['id']}")
+ 
+     @app.get("/jobs/{job_id}")
+     async def get_job(job_id: str, request: Request) -> Dict[str, Any]:
+         queue = _get_job_queue(request)
+         record = queue.get(job_id)
+-        if record is None:
++        if record is None or not _job_visible(
++            request,
++            admin_scope=JOBS_ADMIN_SCOPE,
++            owner_digest=lambda: record.get(OWNER_DIGEST_FIELD),
++        ):
+             raise HTTPException(status_code=404, detail="job not found")
+         return job_response_payload(record, status_url=f"/jobs/{job_id}")
+ 
+@@ -2682,7 +2758,12 @@ def _start_fhir_bulk_job(
+     )
+     configured_deidentifier = getattr(request.app.state, "fhir_bulk_deidentifier", None)
+     deidentifier = configured_deidentifier or _fhir_bulk_deidentifier(payload, runtime)
+-    return manager.start(config, deidentifier=deidentifier, job_id=job_id)
++    return manager.start(
++        config,
++        deidentifier=deidentifier,
++        job_id=job_id,
++        owner_digest=_submitting_owner_digest(request),
++    )
+ 
+ 
+ def _fhir_bulk_deidentifier(
+diff --git a/openmed/service/bulk_data.py b/openmed/service/bulk_data.py
+index 5eb9825f4..e34eab5e7 100644
+--- a/openmed/service/bulk_data.py
++++ b/openmed/service/bulk_data.py
+@@ -289,6 +289,7 @@ class _JobRecord:
+     status: FHIRBulkJobStatus
+     task: asyncio.Task[Any]
+     cancel_event: Event
++    owner_digest: dict[str, str] | None = None
+ 
+ 
+ class FHIRBulkJobManager:
+@@ -310,8 +311,20 @@ def start(
+         *,
+         deidentifier: Any = None,
+         job_id: str | None = None,
++        owner_digest: dict[str, str] | None = None,
+     ) -> FHIRBulkJobStatus:
+-        """Start one asynchronous job and return its polling status."""
++        """Start one asynchronous job and return its polling status.
++
++        Args:
++            config: Validated job configuration.
++            deidentifier: Optional de-identification callable.
++            job_id: Optional pre-reserved job id.
++            owner_digest: Keyed digest of the submitting principal, kept out
++                of every status payload; ``None`` when auth is disabled.
++
++        Returns:
++            The initial polling status.
++        """
+ 
+         self._validate_config(config)
+         run_id = job_id or uuid.uuid4().hex
+@@ -330,6 +343,7 @@ def start(
+             status=status,
+             task=task,
+             cancel_event=cancel_event,
++            owner_digest=None if owner_digest is None else dict(owner_digest),
+         )
+         return status
+ 
+@@ -341,6 +355,18 @@ def get(self, job_id: str) -> FHIRBulkJobStatus:
+             raise KeyError(job_id)
+         return record.status
+ 
++    def owner_digest(self, job_id: str) -> dict[str, str] | None:
++        """Return the stored owner digest of one job.
++
++        Raises:
++            KeyError: If the job does not exist.
++        """
++
++        record = self._jobs.get(job_id)
++        if record is None:
++            raise KeyError(job_id)
++        return None if record.owner_digest is None else dict(record.owner_digest)
++
+     def report(self, job_id: str) -> dict[str, Any]:
+         """Return the completed PHI-free report."""
+ 
+diff --git a/openmed/service/job_ownership.py b/openmed/service/job_ownership.py
+new file mode 100644
+index 000000000..4694ec609
+--- /dev/null
++++ b/openmed/service/job_ownership.py
+@@ -0,0 +1,158 @@
++"""Object-level ownership for asynchronous service job records.
++
++Async de-identification jobs, FHIR Bulk Data exports/imports and SMART backend
++ingestions record a keyed digest of the submitting principal. Status, manifest,
++report, summary and cancel routes then answer only that principal, or one that
++holds an explicit administrative scope, and treat every other caller exactly
++like a request for an unknown job id. The raw principal identity is never
++stored; the digest cannot be mapped back to it without the deployment key.
++"""
++
++from __future__ import annotations
++
++import os
++from collections.abc import Mapping
++from dataclasses import dataclass
++from typing import Any, Final, Optional
++
++from openmed.core.config import PROFILE_ENV_VAR
++
++from .auth import AuthPrincipal
++from .keyed_digest import (
++    DEVELOPMENT_PROFILES,
++    KeyedDigest,
++    ServiceDigestKey,
++    encode_digest_fields,
++    resolve_service_digest_key,
++)
++
++JOB_OWNER_DIGEST_DOMAIN: Final = "job-owner"
++JOBS_ADMIN_SCOPE: Final = "jobs:admin"
++BULK_ADMIN_SCOPE: Final = "bulk:admin"
++
++
++def principal_digest_material(principal: AuthPrincipal) -> bytes:
++    """Return the canonical identity bytes digested for job ownership.
++
++    The material binds the credential type, the JWT issuer when present and
++    the subject. API-key ids are excluded so rotating a key for the same
++    configured principal keeps ownership.
++
++    Args:
++        principal: Authenticated principal attached by the auth or mTLS layer.
++
++    Returns:
++        Canonical digest material.
++
++    Raises:
++        ValueError: If the principal does not carry string identity fields.
++    """
++    if type(principal.subject) is not str or type(principal.credential_type) is not str:
++        raise ValueError("principal identity is malformed")
++    issuer: Optional[str] = None
++    if principal.credential_type == "jwt" and isinstance(principal.claims, Mapping):
++        raw_issuer = principal.claims.get("iss")
++        issuer = raw_issuer if type(raw_issuer) is str else None
++    return encode_digest_fields(principal.credential_type, issuer, principal.subject)
++
++
++@dataclass(frozen=True, eq=False)
++class JobOwnershipPolicy:
++    """Bind service job records to the principal that submitted them.
++
++    Attributes:
++        key: Deployment digest key used for owner digests.
++        enforced: Whether service authentication is active, so requests
++            without a principal must not see owned records.
++        allow_unowned: Whether records without an owner digest remain visible
++            to any authenticated caller. Only the ``dev`` and ``test`` profiles
++            allow this; elsewhere such legacy records are administrator-only.
++    """
++
++    key: ServiceDigestKey
++    enforced: bool = False
++    allow_unowned: bool = False
++
++    @classmethod
++    def from_env(
++        cls,
++        *,
++        authentication_enabled: bool,
++        environ: Optional[Mapping[str, str]] = None,
++    ) -> "JobOwnershipPolicy":
++        """Build the policy from service environment settings.
++
++        Args:
++            authentication_enabled: Whether API-key/JWT or mTLS authentication
++                is enabled for the service.
++            environ: Environment mapping; defaults to the process environment.
++
++        Returns:
++            The configured ownership policy.
++
++        Raises:
++            DigestKeyError: If authentication is enabled outside the ``dev``
++                and ``test`` profiles without ``OPENMED_SERVICE_DIGEST_KEY``,
++                or if the configured key is invalid.
++        """
++        env = os.environ if environ is None else environ
++        profile = (env.get(PROFILE_ENV_VAR) or "prod").strip()
++        return cls(
++            key=resolve_service_digest_key(
++                profile=profile,
++                required=authentication_enabled,
++                environ=env,
++            ),
++            enforced=authentication_enabled,
++            allow_unowned=profile in DEVELOPMENT_PROFILES,
++        )
++
++    def owner_digest(self, principal: Any) -> Optional[dict[str, str]]:
++        """Return the stored owner digest for a submitting principal.
++
++        Args:
++            principal: Value of ``request.scope["openmed.auth"]``, if any.
++
++        Returns:
++            A JSON-safe keyed digest, or ``None`` when no principal is
++            authenticated (authentication disabled).
++        """
++        if not isinstance(principal, AuthPrincipal):
++            return None
++        material = principal_digest_material(principal)
++        return self.key.digest(JOB_OWNER_DIGEST_DOMAIN, material).to_dict()
++
++    def permits(self, principal: Any, owner: Any, *, admin_scope: str) -> bool:
++        """Return whether *principal* may read or cancel a record.
++
++        Args:
++            principal: Value of ``request.scope["openmed.auth"]``, if any.
++            owner: The record's stored owner digest, or ``None`` if unowned.
++            admin_scope: Literal scope that overrides ownership. Wildcard
++                grants such as ``*`` or ``jobs:*`` do not count.
++
++        Returns:
++            ``True`` for the owner, an administrator, and every caller when
++            authentication is disabled.
++        """
++        if not isinstance(principal, AuthPrincipal):
++            return not self.enforced
++        if admin_scope in principal.scopes:
++            return True
++        if owner is None:
++            return self.allow_unowned
++        try:
++            candidate = KeyedDigest.from_dict(owner)
++            material = principal_digest_material(principal)
++        except ValueError:
++            return False
++        return self.key.verify(candidate, JOB_OWNER_DIGEST_DOMAIN, material)
++
++
++__all__ = [
++    "BULK_ADMIN_SCOPE",
++    "JOBS_ADMIN_SCOPE",
++    "JOB_OWNER_DIGEST_DOMAIN",
++    "JobOwnershipPolicy",
++    "principal_digest_material",
++]
+diff --git a/openmed/service/jobs.py b/openmed/service/jobs.py
+index 74e491060..307861f56 100644
+--- a/openmed/service/jobs.py
++++ b/openmed/service/jobs.py
+@@ -27,6 +27,9 @@
+ DEFAULT_JOBS_TTL_SECONDS = 24 * 60 * 60
+ DEFAULT_JOBS_WORKERS = 2
+ TERMINAL_STATUSES = frozenset({"done", "failed"})
++# Version 2 adds the keyed submitting-principal digest to every record.
++JOB_STORE_SCHEMA_VERSION = 2
++OWNER_DIGEST_FIELD = "owner_digest"
+ 
+ 
+ WebhookSender = Callable[..., WebhookDeliveryResult]
+@@ -177,11 +180,18 @@ def _load(self) -> dict[str, dict[str, Any]]:
+             raise ValueError("Job metadata store must contain a jobs object")
+         if any(not isinstance(record, dict) for record in jobs.values()):
+             raise ValueError("Job metadata store contains an invalid job record")
+-        return {str(job_id): dict(record) for job_id, record in jobs.items()}
++        version = raw.get("schema_version", 1)
++        if type(version) is not int or not 1 <= version <= JOB_STORE_SCHEMA_VERSION:
++            raise ValueError("Job metadata store has an unsupported schema version")
++        records = {str(job_id): dict(record) for job_id, record in jobs.items()}
++        for record in records.values():
++            # Version 1 records predate ownership; mark them explicitly unowned.
++            record.setdefault(OWNER_DIGEST_FIELD, None)
++        return records
+ 
+     def _persist_locked(self) -> None:
+         self.path.parent.mkdir(parents=True, exist_ok=True)
+-        payload = {"jobs": self._records}
++        payload = {"jobs": self._records, "schema_version": JOB_STORE_SCHEMA_VERSION}
+         temp_name: str | None = None
+         try:
+             with tempfile.NamedTemporaryFile(
+@@ -259,13 +269,27 @@ def from_env(cls, runtime: ServiceRuntime) -> "DeidentifyJobQueue":
+             max_workers=parse_jobs_workers(os.getenv(SERVICE_JOBS_WORKERS_ENV_VAR)),
+         )
+ 
+-    def submit(self, payload: DeidentifyJobRequest) -> dict[str, Any]:
+-        """Submit one de-identification job and return its initial metadata."""
++    def submit(
++        self,
++        payload: DeidentifyJobRequest,
++        *,
++        owner_digest: Optional[dict[str, str]] = None,
++    ) -> dict[str, Any]:
++        """Submit one de-identification job and return its initial metadata.
++
++        Args:
++            payload: Validated job request; raw text stays in memory only.
++            owner_digest: Keyed digest of the submitting principal, or ``None``
++                when authentication is disabled.
++
++        Returns:
++            The persisted initial record.
++        """
+         self.runtime.validate_served_model(payload.model_name)
+         with self._lock:
+             if self._shutdown:
+                 raise RuntimeError("Job queue is shutting down")
+-            record = self._new_record(payload)
++            record = self._new_record(payload, owner_digest=owner_digest)
+             self.store.create(record)
+             self._executor.submit(self._run_job, _JobWorkItem(record["id"], payload))
+             return _copy_record(record)
+@@ -288,7 +312,12 @@ def _expiry_timestamp(self, moment: datetime) -> str:
+         )
+         return _isoformat(expires_at)
+ 
+-    def _new_record(self, payload: DeidentifyJobRequest) -> dict[str, Any]:
++    def _new_record(
++        self,
++        payload: DeidentifyJobRequest,
++        *,
++        owner_digest: Optional[dict[str, str]] = None,
++    ) -> dict[str, Any]:
+         now = self.clock()
+         documents = [
+             _document_metadata(index, document)
+@@ -312,6 +341,7 @@ def _new_record(self, payload: DeidentifyJobRequest) -> dict[str, Any]:
+             "started_at": None,
+             "completed_at": None,
+             "expires_at": self._expiry_timestamp(now),
++            OWNER_DIGEST_FIELD: None if owner_digest is None else dict(owner_digest),
+         }
+ 
+     def _run_job(self, item: _JobWorkItem) -> None:
+@@ -518,8 +548,13 @@ def job_response_payload(
+     *,
+     status_url: Optional[str] = None,
+ ) -> dict[str, Any]:
+-    """Return the public REST representation of a job record."""
++    """Return the public REST representation of a job record.
++
++    The stored owner digest is internal authorization state and is never
++    returned to callers.
++    """
+     payload = _copy_record(record)
++    payload.pop(OWNER_DIGEST_FIELD, None)
+     if status_url is not None:
+         payload["status_url"] = status_url
+     return payload
+diff --git a/openmed/service/keyed_digest.py b/openmed/service/keyed_digest.py
+new file mode 100644
+index 000000000..70e375897
+--- /dev/null
++++ b/openmed/service/keyed_digest.py
+@@ -0,0 +1,289 @@
++"""Keyed, domain-separated digests for service records.
++
++Service records sometimes need a stable reference to a value that must never be
++stored or returned in plaintext, such as the principal that submitted a job.
++Unkeyed hashes of low-entropy values can be reversed with a dictionary, so this
++module computes HMAC-SHA256 digests under a deployment key and mixes a fixed
++domain label into every message. A digest made for one purpose therefore never
++verifies for another, and each stored digest names its algorithm and key id so
++a rotated or ephemeral key fails closed instead of matching by accident.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import hmac
++import json
++import os
++import re
++import secrets
++from collections.abc import Mapping
++from dataclasses import dataclass, field
++from typing import Any, Final, Optional
++
++SERVICE_DIGEST_KEY_ENV_VAR: Final = "OPENMED_SERVICE_DIGEST_KEY"
++SERVICE_DIGEST_KEY_ID_ENV_VAR: Final = "OPENMED_SERVICE_DIGEST_KEY_ID"
++KEYED_DIGEST_ALGORITHM: Final = "hmac-sha256"
++MIN_DIGEST_KEY_BYTES: Final = 32
++DEVELOPMENT_PROFILES: Final = frozenset({"dev", "test"})
++
++_MESSAGE_PREFIX: Final = b"openmed.service.keyed-digest.v1"
++_KEY_ID_LABEL: Final = b"openmed.service.keyed-digest.key-id.v1"
++_DOMAIN_RE: Final = re.compile(r"[a-z0-9][a-z0-9._:-]{0,63}\Z")
++_KEY_ID_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
++_VALUE_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
++
++
++class DigestKeyError(ValueError):
++    """Value-free failure while configuring the service digest key.
++
++    Attributes:
++        code: Stable reason code safe to log or surface to operators.
++    """
++
++    def __init__(self, code: str, message: str) -> None:
++        self.code = code
++        super().__init__(message)
++
++
++@dataclass(frozen=True)
++class KeyedDigest:
++    """One stored keyed digest with its algorithm and key markers.
++
++    Attributes:
++        alg: Digest algorithm marker, currently always ``hmac-sha256``.
++        key_id: Identifier of the deployment key that produced the digest.
++        value: Lowercase hexadecimal HMAC output.
++    """
++
++    alg: str
++    key_id: str
++    value: str
++
++    def to_dict(self) -> dict[str, str]:
++        """Return the JSON-safe stored representation."""
++        return {"alg": self.alg, "key_id": self.key_id, "value": self.value}
++
++    @classmethod
++    def from_dict(cls, raw: Any) -> "KeyedDigest":
++        """Parse a stored digest, rejecting anything malformed.
++
++        Args:
++            raw: Mapping previously produced by :meth:`to_dict`.
++
++        Returns:
++            The parsed digest.
++
++        Raises:
++            ValueError: If the mapping is not a well-formed keyed digest.
++        """
++        if not isinstance(raw, Mapping) or set(raw) != {"alg", "key_id", "value"}:
++            raise ValueError("keyed digest is malformed")
++        alg, key_id, value = raw["alg"], raw["key_id"], raw["value"]
++        if (
++            type(alg) is not str
++            or alg != KEYED_DIGEST_ALGORITHM
++            or type(key_id) is not str
++            or not _KEY_ID_RE.fullmatch(key_id)
++            or type(value) is not str
++            or not _VALUE_RE.fullmatch(value)
++        ):
++            raise ValueError("keyed digest is malformed")
++        return cls(alg=alg, key_id=key_id, value=value)
++
++
++@dataclass(frozen=True, eq=False)
++class ServiceDigestKey:
++    """Deployment secret used for keyed, domain-separated digests.
++
++    Attributes:
++        secret: Secret key material; never included in ``repr`` output.
++        key_id: Public identifier recorded next to every digest.
++        ephemeral: Whether the key was generated for this process only.
++    """
++
++    secret: bytes = field(repr=False)
++    key_id: str
++    ephemeral: bool = False
++
++    def __post_init__(self) -> None:
++        _require_secret(self.secret)
++        if type(self.key_id) is not str or not _KEY_ID_RE.fullmatch(self.key_id):
++            raise DigestKeyError(
++                "digest_key_id_invalid",
++                f"{SERVICE_DIGEST_KEY_ID_ENV_VAR} must be 1-64 letters, digits, "
++                "dots, underscores or hyphens",
++            )
++
++    @classmethod
++    def from_secret(
++        cls,
++        secret: bytes,
++        *,
++        key_id: Optional[str] = None,
++    ) -> "ServiceDigestKey":
++        """Build a configured key, deriving a key id when none is given.
++
++        Args:
++            secret: At least 32 bytes of secret key material.
++            key_id: Optional operator-chosen key identifier.
++
++        Returns:
++            A non-ephemeral digest key.
++
++        Raises:
++            DigestKeyError: If the secret is too short or the key id is invalid.
++        """
++        _require_secret(secret)
++        return cls(secret=secret, key_id=key_id or "k-" + _fingerprint(secret))
++
++    @classmethod
++    def generate(cls) -> "ServiceDigestKey":
++        """Return a random key that lives only as long as this process."""
++        secret = secrets.token_bytes(MIN_DIGEST_KEY_BYTES)
++        return cls(
++            secret=secret,
++            key_id="ephemeral-" + _fingerprint(secret),
++            ephemeral=True,
++        )
++
++    def digest(self, domain: str, material: bytes) -> KeyedDigest:
++        """Return the keyed digest of *material* within *domain*.
++
++        Args:
++            domain: Fixed purpose label such as ``job-owner``.
++            material: Canonical bytes to digest; see :func:`encode_digest_fields`.
++
++        Returns:
++            Digest carrying this key's algorithm and key id markers.
++
++        Raises:
++            ValueError: If the domain label is invalid.
++            TypeError: If the material is not bytes.
++        """
++        mac = hmac.new(self.secret, _message(domain, material), hashlib.sha256)
++        return KeyedDigest(
++            alg=KEYED_DIGEST_ALGORITHM,
++            key_id=self.key_id,
++            value=mac.hexdigest(),
++        )
++
++    def verify(self, candidate: KeyedDigest, domain: str, material: bytes) -> bool:
++        """Return whether *candidate* is this key's digest of *material*.
++
++        A digest made by a different algorithm or key id never verifies, so
++        records written before a key rotation fail closed.
++
++        Args:
++            candidate: Previously stored digest.
++            domain: Purpose label the digest was created for.
++            material: Canonical bytes to compare against.
++
++        Returns:
++            ``True`` only for an exact match under this key and domain.
++        """
++        if candidate.alg != KEYED_DIGEST_ALGORITHM or not hmac.compare_digest(
++            candidate.key_id, self.key_id
++        ):
++            return False
++        expected = self.digest(domain, material).value
++        return hmac.compare_digest(candidate.value, expected)
++
++
++def encode_digest_fields(*fields: Optional[str]) -> bytes:
++    """Encode ordered string fields as unambiguous digest material.
++
++    Args:
++        *fields: Strings or ``None`` values, in a fixed caller-defined order.
++
++    Returns:
++        Canonical ASCII JSON array bytes.
++
++    Raises:
++        TypeError: If a field is neither a string nor ``None``.
++    """
++    if any(item is not None and type(item) is not str for item in fields):
++        raise TypeError("digest fields must be strings or None")
++    return json.dumps(list(fields), ensure_ascii=True, separators=(",", ":")).encode(
++        "ascii"
++    )
++
++
++def resolve_service_digest_key(
++    *,
++    profile: str,
++    required: bool,
++    environ: Optional[Mapping[str, str]] = None,
++) -> ServiceDigestKey:
++    """Resolve the deployment digest key from the environment.
++
++    ``OPENMED_SERVICE_DIGEST_KEY`` supplies the secret (its UTF-8 bytes, at
++    least 32) and ``OPENMED_SERVICE_DIGEST_KEY_ID`` an optional public key id.
++    Without a configured key the service uses a random per-process key, except
++    when *required* is set outside the ``dev`` and ``test`` profiles.
++
++    Args:
++        profile: Active service profile name.
++        required: Whether durable keyed digests are needed, for example
++            because authentication is enabled.
++        environ: Environment mapping; defaults to the process environment.
++
++    Returns:
++        The configured key, or an ephemeral key where that is allowed.
++
++    Raises:
++        DigestKeyError: If the configured key is invalid, or missing when
++            required outside the development profiles.
++    """
++    env = os.environ if environ is None else environ
++    raw_secret = env.get(SERVICE_DIGEST_KEY_ENV_VAR)
++    if raw_secret is not None and raw_secret.strip():
++        raw_key_id = env.get(SERVICE_DIGEST_KEY_ID_ENV_VAR)
++        key_id = raw_key_id.strip() if raw_key_id and raw_key_id.strip() else None
++        return ServiceDigestKey.from_secret(
++            raw_secret.strip().encode("utf-8"),
++            key_id=key_id,
++        )
++    if required and profile not in DEVELOPMENT_PROFILES:
++        raise DigestKeyError(
++            "digest_key_required",
++            f"{SERVICE_DIGEST_KEY_ENV_VAR} must be set when service authentication "
++            "is enabled outside the dev and test profiles",
++        )
++    return ServiceDigestKey.generate()
++
++
++def _message(domain: str, material: bytes) -> bytes:
++    if type(domain) is not str or not _DOMAIN_RE.fullmatch(domain):
++        raise ValueError("digest domain is invalid")
++    if type(material) is not bytes:
++        raise TypeError("digest material must be bytes")
++    # The domain grammar excludes NUL, so the framing below is unambiguous.
++    return _MESSAGE_PREFIX + b"\x00" + domain.encode("ascii") + b"\x00" + material
++
++
++def _require_secret(secret: Any) -> None:
++    if type(secret) is not bytes or len(secret) < MIN_DIGEST_KEY_BYTES:
++        raise DigestKeyError(
++            "digest_key_too_short",
++            f"{SERVICE_DIGEST_KEY_ENV_VAR} must contain at least "
++            f"{MIN_DIGEST_KEY_BYTES} bytes",
++        )
++
++
++def _fingerprint(secret: bytes) -> str:
++    return hmac.new(secret, _KEY_ID_LABEL, hashlib.sha256).hexdigest()[:16]
++
++
++__all__ = [
++    "DEVELOPMENT_PROFILES",
++    "KEYED_DIGEST_ALGORITHM",
++    "MIN_DIGEST_KEY_BYTES",
++    "SERVICE_DIGEST_KEY_ENV_VAR",
++    "SERVICE_DIGEST_KEY_ID_ENV_VAR",
++    "DigestKeyError",
++    "KeyedDigest",
++    "ServiceDigestKey",
++    "encode_digest_fields",
++    "resolve_service_digest_key",
++]
+diff --git a/openmed/service/smart_backend.py b/openmed/service/smart_backend.py
+index 7539406ec..1de2cddf3 100644
+--- a/openmed/service/smart_backend.py
++++ b/openmed/service/smart_backend.py
+@@ -768,6 +768,7 @@ def to_dict(self) -> dict[str, Any]:
+ class _JobRecord:
+     status: SMARTBackendJobStatus
+     task: asyncio.Task[Any]
++    owner_digest: dict[str, str] | None = None
+ 
+ 
+ class SMARTBackendJobManager:
+@@ -789,8 +790,20 @@ def start(
+         *,
+         deidentifier: Deidentifier | None = None,
+         job_id: str | None = None,
++        owner_digest: dict[str, str] | None = None,
+     ) -> SMARTBackendJobStatus:
+-        """Start one background ingestion job."""
++        """Start one background ingestion job.
++
++        Args:
++            config: SMART backend configuration.
++            deidentifier: Optional de-identification callable.
++            job_id: Optional pre-reserved job id.
++            owner_digest: Keyed digest of the submitting principal, kept out
++                of every status payload; ``None`` when auth is disabled.
++
++        Returns:
++            The initial job status.
++        """
+ 
+         run_id = job_id or uuid.uuid4().hex
+         if run_id in self._jobs:
+@@ -803,7 +816,11 @@ def start(
+             updated_at=now,
+         )
+         task = asyncio.create_task(self._run(run_id, config, deidentifier))
+-        self._jobs[run_id] = _JobRecord(status=status, task=task)
++        self._jobs[run_id] = _JobRecord(
++            status=status,
++            task=task,
++            owner_digest=None if owner_digest is None else dict(owner_digest),
++        )
+         return status
+ 
+     def get(self, job_id: str) -> SMARTBackendJobStatus:
+@@ -814,6 +831,18 @@ def get(self, job_id: str) -> SMARTBackendJobStatus:
+             raise KeyError(job_id)
+         return record.status
+ 
++    def owner_digest(self, job_id: str) -> dict[str, str] | None:
++        """Return the stored owner digest of one ingestion job.
++
++        Raises:
++            KeyError: If the job does not exist.
++        """
++
++        record = self._jobs.get(job_id)
++        if record is None:
++            raise KeyError(job_id)
++        return None if record.owner_digest is None else dict(record.owner_digest)
++
+     def summary(self, job_id: str) -> SMARTBackendIngestionSummary:
+         """Return the completed job summary."""
+ 
+diff --git a/tests/unit/service/test_job_ownership.py b/tests/unit/service/test_job_ownership.py
+new file mode 100644
+index 000000000..6d97de25f
+--- /dev/null
++++ b/tests/unit/service/test_job_ownership.py
+@@ -0,0 +1,764 @@
++"""Object-level ownership for async job, bulk and SMART ingestion records."""
++
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import json
++import logging
++import threading
++import time
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Callable, Iterator
++
++import httpx
++import pytest
++from fastapi.testclient import TestClient
++
++import openmed
++from openmed.service import jobs
++from openmed.service import runtime as service_runtime
++from openmed.service.app import create_app
++from openmed.service.auth import AuthPrincipal, hash_api_key
++from openmed.service.job_ownership import (
++    BULK_ADMIN_SCOPE,
++    JOB_OWNER_DIGEST_DOMAIN,
++    JOBS_ADMIN_SCOPE,
++    JobOwnershipPolicy,
++    principal_digest_material,
++)
++from openmed.service.keyed_digest import (
++    KEYED_DIGEST_ALGORITHM,
++    SERVICE_DIGEST_KEY_ENV_VAR,
++    SERVICE_DIGEST_KEY_ID_ENV_VAR,
++    DigestKeyError,
++    KeyedDigest,
++    ServiceDigestKey,
++    encode_digest_fields,
++    resolve_service_digest_key,
++)
++from openmed.service.smart_backend import SMARTBackendJobManager
++
++LOOPBACK_BASE_URL = "http://127.0.0.1"
++SYNTHETIC_DIGEST_KEY = "synthetic-digest-key-" + "a" * 40
++SYNTHETIC_ROTATED_KEY = "synthetic-digest-key-" + "b" * 40
++SYNTHETIC_KEY_ID = "synthetic-key-1"
++_ALL_SCOPES = ["jobs:read", "jobs:write", "bulk:read", "bulk:write"]
++_PRINCIPALS = {
++    "owner": ("synthetic-owner-key", "synthetic-owner", _ALL_SCOPES),
++    "owner-rotated": ("synthetic-owner-key-2", "synthetic-owner", _ALL_SCOPES),
++    "other": ("synthetic-other-key", "synthetic-other", _ALL_SCOPES),
++    "admin": (
++        "synthetic-admin-key",
++        "synthetic-admin",
++        [*_ALL_SCOPES, JOBS_ADMIN_SCOPE, BULK_ADMIN_SCOPE],
++    ),
++    "wildcard": ("synthetic-wildcard-key", "synthetic-wildcard", ["*"]),
++}
++_SERVICE_ENV_VARS = (
++    "OPENMED_PROFILE",
++    "OPENMED_SERVICE_PRELOAD_MODELS",
++    "OPENMED_SERVICE_RATE_LIMIT_RPS",
++    "OPENMED_SERVICE_RATE_LIMIT_BURST",
++    "OPENMED_SERVICE_RATE_LIMIT_MAX_CONCURRENCY",
++    "OPENMED_SERVICE_AUTH_ENABLED",
++    "OPENMED_SERVICE_AUTH_API_KEYS",
++    "OPENMED_SERVICE_AUTH_ROUTE_SCOPES",
++    "OPENMED_SERVICE_MTLS_ENABLED",
++    "OPENMED_SERVICE_JOBS_STORE_PATH",
++    "OPENMED_SERVICE_JOBS_WORKERS",
++    "OPENMED_SERVICE_BULK_INPUT_ROOTS",
++    "OPENMED_SERVICE_BULK_OUTPUT_ROOT",
++    SERVICE_DIGEST_KEY_ENV_VAR,
++    SERVICE_DIGEST_KEY_ID_ENV_VAR,
++)
++
++
++class FakeLoader:
++    """Minimal model loader double; no model weights are loaded."""
++
++    def __init__(self, config: Any) -> None:
++        self.config = config
++
++    def resolve_model_name(self, model_name: str) -> str:
++        return model_name
++
++    def loaded_models(self) -> dict[str, dict[str, int]]:
++        return {}
++
++
++@dataclass
++class _FakeResult:
++    deidentified_text: str
++    pii_entities: tuple[()] = ()
++
++
++def _fake_deidentify(text: str, **_: Any) -> _FakeResult:
++    return _FakeResult(deidentified_text=text.replace("Jane Roe", "[NAME]"))
++
++
++@pytest.fixture(autouse=True)
++def clean_service_env(monkeypatch: pytest.MonkeyPatch) -> None:
++    for env_var in _SERVICE_ENV_VARS:
++        monkeypatch.delenv(env_var, raising=False)
++    monkeypatch.setattr(service_runtime, "ModelLoader", FakeLoader)
++    monkeypatch.setattr(openmed, "deidentify", _fake_deidentify)
++
++
++def _configure(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++    *,
++    profile: str = "test",
++    auth: bool = True,
++    digest_key: str | None = SYNTHETIC_DIGEST_KEY,
++) -> Path:
++    store_path = tmp_path / "jobs.json"
++    monkeypatch.setenv("OPENMED_PROFILE", profile)
++    monkeypatch.setenv("OPENMED_SERVICE_JOBS_STORE_PATH", str(store_path))
++    monkeypatch.setenv("OPENMED_SERVICE_JOBS_WORKERS", "1")
++    monkeypatch.setenv("OPENMED_SERVICE_BULK_INPUT_ROOTS", str(tmp_path))
++    monkeypatch.setenv("OPENMED_SERVICE_BULK_OUTPUT_ROOT", str(tmp_path))
++    if digest_key is not None:
++        monkeypatch.setenv(SERVICE_DIGEST_KEY_ENV_VAR, digest_key)
++        monkeypatch.setenv(SERVICE_DIGEST_KEY_ID_ENV_VAR, SYNTHETIC_KEY_ID)
++    if auth:
++        monkeypatch.setenv("OPENMED_SERVICE_AUTH_ENABLED", "true")
++        monkeypatch.setenv(
++            "OPENMED_SERVICE_AUTH_API_KEYS",
++            json.dumps(
++                [
++                    {
++                        "id": f"{name}-id",
++                        "key_hash": hash_api_key(raw_key),
++                        "principal": principal,
++                        "scopes": scopes,
++                    }
++                    for name, (raw_key, principal, scopes) in _PRINCIPALS.items()
++                ]
++            ),
++        )
++    return store_path
++
++
++def _as(name: str) -> dict[str, str]:
++    return {"X-API-Key": _PRINCIPALS[name][0]}
++
++
++def _write_export(path: Path, count: int = 1) -> None:
++    path.mkdir(parents=True, exist_ok=True)
++    (path / "Patient.ndjson").write_text(
++        "".join(
++            json.dumps(
++                {
++                    "resourceType": "Patient",
++                    "id": f"patient-{index}",
++                    "name": [{"text": "Jane Roe"}],
++                },
++                separators=(",", ":"),
++            )
++            + "\n"
++            for index in range(count)
++        ),
++        encoding="utf-8",
++    )
++
++
++def _wait(predicate: Callable[[], bool]) -> None:
++    for _ in range(300):
++        if predicate():
++            return
++        time.sleep(0.01)
++    raise AssertionError("condition was not reached")
++
++
++def _not_found(client: TestClient, method: str, path: str, who: str) -> None:
++    response = client.request(method, path, headers=_as(who))
++    assert response.status_code == 404, (method, path, who, response.status_code)
++
++
++def _error_body(response: httpx.Response) -> dict[str, Any]:
++    """Return the error envelope without its per-request correlation id."""
++    payload = response.json()
++    payload["error"].pop("request_id", None)
++    return payload
++
++
++def _missing_body(client: TestClient, method: str, path: str) -> dict[str, Any]:
++    response = client.request(method, path, headers=_as("other"))
++    assert response.status_code == 404
++    return _error_body(response)
++
++
++@pytest.fixture
++def gate() -> Iterator[threading.Event]:
++    event = threading.Event()
++    try:
++        yield event
++    finally:
++        event.set()
++
++
++# --- keyed digest helper -------------------------------------------------
++
++
++def test_keyed_digest_is_domain_separated_and_carries_markers() -> None:
++    key = ServiceDigestKey.from_secret(SYNTHETIC_DIGEST_KEY.encode(), key_id="k1")
++    material = encode_digest_fields("api_key", None, "synthetic-owner")
++    digest = key.digest(JOB_OWNER_DIGEST_DOMAIN, material)
++
++    assert digest.alg == KEYED_DIGEST_ALGORITHM
++    assert digest.key_id == "k1"
++    assert digest == key.digest(JOB_OWNER_DIGEST_DOMAIN, material)
++    assert digest != key.digest("span-text", material)
++    assert key.verify(digest, JOB_OWNER_DIGEST_DOMAIN, material)
++    assert not key.verify(digest, "span-text", material)
++    assert not key.verify(
++        digest,
++        JOB_OWNER_DIGEST_DOMAIN,
++        encode_digest_fields("api_key", None, "synthetic-other"),
++    )
++    assert KeyedDigest.from_dict(digest.to_dict()) == digest
++    # Unkeyed hashes of the identity never match the stored value.
++    assert digest.value != hashlib.sha256(material).hexdigest()
++    assert digest.value != hashlib.sha256(b"synthetic-owner").hexdigest()
++
++
++def test_keyed_digest_fails_closed_across_keys_and_bad_records(subtests) -> None:
++    material = encode_digest_fields("api_key", None, "synthetic-owner")
++    key = ServiceDigestKey.from_secret(SYNTHETIC_DIGEST_KEY.encode())
++    rotated = ServiceDigestKey.from_secret(SYNTHETIC_ROTATED_KEY.encode())
++    same_id_other_secret = ServiceDigestKey.from_secret(
++        SYNTHETIC_ROTATED_KEY.encode(), key_id=key.key_id
++    )
++    digest = key.digest(JOB_OWNER_DIGEST_DOMAIN, material)
++
++    assert key.key_id.startswith("k-") and key.key_id != rotated.key_id
++    assert not rotated.verify(digest, JOB_OWNER_DIGEST_DOMAIN, material)
++    assert not same_id_other_secret.verify(digest, JOB_OWNER_DIGEST_DOMAIN, material)
++    assert SYNTHETIC_DIGEST_KEY not in repr(key)
++
++    for raw in (
++        None,
++        "hmac-sha256:abc",
++        {"alg": "sha256", "key_id": "k1", "value": "0" * 64},
++        {"alg": KEYED_DIGEST_ALGORITHM, "key_id": "", "value": "0" * 64},
++        {"alg": KEYED_DIGEST_ALGORITHM, "key_id": "k1", "value": "Z" * 64},
++        {"alg": KEYED_DIGEST_ALGORITHM, "key_id": "k1", "value": "0" * 64, "x": 1},
++    ):
++        with subtests.test(raw=repr(raw)[:40]):
++            with pytest.raises(ValueError):
++                KeyedDigest.from_dict(raw)
++    with pytest.raises(ValueError):
++        key.digest("Bad Domain", material)
++    with pytest.raises(TypeError):
++        key.digest(JOB_OWNER_DIGEST_DOMAIN, "not-bytes")  # type: ignore[arg-type]
++    assert encode_digest_fields("a,b", None) != encode_digest_fields("a", "b,")
++    with pytest.raises(TypeError):
++        encode_digest_fields("a", 1)  # type: ignore[arg-type]
++
++
++def test_digest_key_resolution_requires_durable_key_in_prod(subtests) -> None:
++    configured = resolve_service_digest_key(
++        profile="prod",
++        required=True,
++        environ={
++            SERVICE_DIGEST_KEY_ENV_VAR: SYNTHETIC_DIGEST_KEY + "\n",
++            SERVICE_DIGEST_KEY_ID_ENV_VAR: SYNTHETIC_KEY_ID,
++        },
++    )
++    assert configured.key_id == SYNTHETIC_KEY_ID
++    assert configured.ephemeral is False
++    assert configured.secret == SYNTHETIC_DIGEST_KEY.encode()
++
++    for profile, required in (("dev", True), ("test", True), ("prod", False)):
++        with subtests.test(profile=profile, required=required):
++            key = resolve_service_digest_key(
++                profile=profile, required=required, environ={}
++            )
++            assert key.ephemeral is True
++            assert key.key_id.startswith("ephemeral-")
++
++    for profile in ("prod", "low_resource"):
++        with subtests.test(profile=profile):
++            with pytest.raises(DigestKeyError) as error:
++                resolve_service_digest_key(profile=profile, required=True, environ={})
++            assert error.value.code == "digest_key_required"
++
++    with pytest.raises(DigestKeyError) as short:
++        resolve_service_digest_key(
++            profile="dev",
++            required=False,
++            environ={SERVICE_DIGEST_KEY_ENV_VAR: "synthetic-short-key"},
++        )
++    assert short.value.code == "digest_key_too_short"
++    assert "synthetic-short-key" not in str(short.value)
++    with pytest.raises(DigestKeyError) as bad_id:
++        resolve_service_digest_key(
++            profile="dev",
++            required=False,
++            environ={
++                SERVICE_DIGEST_KEY_ENV_VAR: SYNTHETIC_DIGEST_KEY,
++                SERVICE_DIGEST_KEY_ID_ENV_VAR: "bad key id",
++            },
++        )
++    assert bad_id.value.code == "digest_key_id_invalid"
++
++
++def test_prod_service_with_auth_refuses_to_start_without_digest_key(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    _configure(monkeypatch, tmp_path, profile="prod", digest_key=None)
++    with pytest.raises(DigestKeyError) as error:
++        create_app()
++    assert error.value.code == "digest_key_required"
++    assert "synthetic" not in str(error.value)
++
++    # Auth disabled: the prod service starts exactly as before.
++    monkeypatch.delenv("OPENMED_SERVICE_AUTH_ENABLED")
++    app = create_app()
++    assert app.state.job_ownership.enforced is False
++
++
++# --- principal binding policy --------------------------------------------
++
++
++def _principal(
++    subject: str,
++    *,
++    credential_type: str = "api_key",
++    scopes: tuple[str, ...] = (),
++    key_id: str | None = None,
++    claims: dict[str, Any] | None = None,
++) -> AuthPrincipal:
++    return AuthPrincipal(
++        subject=subject,
++        credential_type=credential_type,
++        scopes=scopes,
++        key_id=key_id,
++        claims=claims or {},
++    )
++
++
++def test_policy_binds_identity_not_key_id_and_separates_credential_types() -> None:
++    key = ServiceDigestKey.from_secret(SYNTHETIC_DIGEST_KEY.encode())
++    policy = JobOwnershipPolicy(key=key, enforced=True)
++    owner = policy.owner_digest(_principal("synthetic-owner", key_id="a"))
++    assert owner is not None
++    assert "synthetic-owner" not in json.dumps(owner)
++
++    assert policy.permits(
++        _principal("synthetic-owner", key_id="b"), owner, admin_scope=JOBS_ADMIN_SCOPE
++    )
++    for stranger in (
++        _principal("synthetic-other"),
++        _principal("synthetic-owner", credential_type="jwt"),
++        _principal("synthetic-owner", credential_type="mtls"),
++        _principal("synthetic-wildcard", scopes=("*", "jobs:*")),
++        _principal("synthetic-other", scopes=(BULK_ADMIN_SCOPE,)),
++    ):
++        assert not policy.permits(stranger, owner, admin_scope=JOBS_ADMIN_SCOPE)
++    assert policy.permits(
++        _principal("synthetic-admin", scopes=(JOBS_ADMIN_SCOPE,)),
++        owner,
++        admin_scope=JOBS_ADMIN_SCOPE,
++    )
++
++    first = _principal("sub-1", credential_type="jwt", claims={"iss": "issuer-a"})
++    second = _principal("sub-1", credential_type="jwt", claims={"iss": "issuer-b"})
++    assert principal_digest_material(first) != principal_digest_material(second)
++    jwt_owner = policy.owner_digest(first)
++    assert policy.permits(first, jwt_owner, admin_scope=JOBS_ADMIN_SCOPE)
++    assert not policy.permits(second, jwt_owner, admin_scope=JOBS_ADMIN_SCOPE)
++
++
++def test_policy_handles_unowned_rotated_and_anonymous_records() -> None:
++    key = ServiceDigestKey.from_secret(SYNTHETIC_DIGEST_KEY.encode())
++    owner_principal = _principal("synthetic-owner")
++    admin = _principal("synthetic-admin", scopes=(JOBS_ADMIN_SCOPE,))
++    prod = JobOwnershipPolicy(key=key, enforced=True, allow_unowned=False)
++    dev = JobOwnershipPolicy(key=key, enforced=True, allow_unowned=True)
++    rotated = JobOwnershipPolicy(
++        key=ServiceDigestKey.from_secret(SYNTHETIC_ROTATED_KEY.encode()),
++        enforced=True,
++    )
++    owner = prod.owner_digest(owner_principal)
++
++    # Legacy records without an owner are admin-only outside dev/test.
++    assert not prod.permits(owner_principal, None, admin_scope=JOBS_ADMIN_SCOPE)
++    assert prod.permits(admin, None, admin_scope=JOBS_ADMIN_SCOPE)
++    assert dev.permits(owner_principal, None, admin_scope=JOBS_ADMIN_SCOPE)
++    # A rotated key cannot verify old digests: fail closed, admins still see it.
++    assert not rotated.permits(owner_principal, owner, admin_scope=JOBS_ADMIN_SCOPE)
++    assert rotated.permits(admin, owner, admin_scope=JOBS_ADMIN_SCOPE)
++    # Malformed stored owners never match.
++    assert not prod.permits(owner_principal, "corrupt", admin_scope=JOBS_ADMIN_SCOPE)
++    # Without a principal: allowed only when authentication is disabled.
++    assert not prod.permits(None, owner, admin_scope=JOBS_ADMIN_SCOPE)
++    disabled = JobOwnershipPolicy(key=key, enforced=False)
++    assert disabled.owner_digest(None) is None
++    assert disabled.permits(None, owner, admin_scope=JOBS_ADMIN_SCOPE)
++
++
++# --- /jobs ---------------------------------------------------------------
++
++
++def test_jobs_routes_return_404_to_other_principals(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    store_path = _configure(monkeypatch, tmp_path)
++    caplog.set_level(logging.DEBUG)
++    app = create_app()
++
++    with TestClient(app, base_url=LOOPBACK_BASE_URL) as client:
++        created = client.post(
++            "/jobs",
++            json={"documents": [{"id": "doc-1", "text": "Patient Jane Roe"}]},
++            headers=_as("owner"),
++        )
++        assert created.status_code == 202
++        job_id = created.json()["id"]
++        path = f"/jobs/{job_id}"
++        _wait(
++            lambda: (
++                client.get(path, headers=_as("owner")).json()["status"]
++                in jobs.TERMINAL_STATUSES
++            )
++        )
++        responses = {
++            who: client.get(path, headers=_as(who))
++            for who in ("owner", "owner-rotated", "admin", "other", "wildcard")
++        }
++        missing = _missing_body(client, "GET", "/jobs/" + "0" * 32)
++
++    for who in ("owner", "owner-rotated", "admin"):
++        assert responses[who].status_code == 200, who
++        assert responses[who].json()["id"] == job_id
++    for who in ("other", "wildcard"):
++        assert responses[who].status_code == 404, who
++        assert _error_body(responses[who]) == missing
++
++    stored = json.loads(store_path.read_text(encoding="utf-8"))
++    assert stored["schema_version"] == jobs.JOB_STORE_SCHEMA_VERSION
++    owner = stored["jobs"][job_id][jobs.OWNER_DIGEST_FIELD]
++    assert owner["alg"] == KEYED_DIGEST_ALGORITHM
++    assert owner["key_id"] == SYNTHETIC_KEY_ID
++    rendered = json.dumps(
++        [created.json(), *(response.json() for response in responses.values())]
++    )
++    assert jobs.OWNER_DIGEST_FIELD not in rendered
++    assert owner["value"] not in rendered
++    assert owner["value"] not in caplog.text
++    store_text = store_path.read_text(encoding="utf-8")
++    for principal in ("synthetic-owner", "synthetic-other", "synthetic-admin"):
++        assert principal not in store_text
++
++
++def test_job_webhook_and_response_payloads_exclude_owner_digest() -> None:
++    record = {
++        "id": "synthetic-job",
++        "status": "done",
++        "progress_percent": 100.0,
++        "document_count": 0,
++        "processed_count": 0,
++        "failed_count": 0,
++        "label_histogram": {},
++        "spans": [],
++        "documents": [],
++        "error": None,
++        "completed_at": "2026-01-01T00:00:00Z",
++        jobs.OWNER_DIGEST_FIELD: {
++            "alg": KEYED_DIGEST_ALGORITHM,
++            "key_id": SYNTHETIC_KEY_ID,
++            "value": "1" * 64,
++        },
++    }
++
++    for payload in (jobs.webhook_payload(record), jobs.job_response_payload(record)):
++        assert jobs.OWNER_DIGEST_FIELD not in payload
++        assert "1" * 64 not in json.dumps(payload)
++    assert jobs.OWNER_DIGEST_FIELD in record
++
++
++def test_legacy_job_store_records_are_migrated_as_admin_only_in_prod(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    legacy_id = "1" * 32
++    for profile, visible_to_others in (("prod", False), ("test", True)):
++        case = tmp_path / profile
++        case.mkdir()
++        store_path = _configure(monkeypatch, case, profile=profile)
++        store_path.write_text(
++            json.dumps(
++                {
++                    "jobs": {
++                        legacy_id: {
++                            "id": legacy_id,
++                            "status": "done",
++                            "expires_at": "2999-01-01T00:00:00Z",
++                        }
++                    }
++                }
++            ),
++            encoding="utf-8",
++        )
++        loaded = jobs.LocalJobStore(store_path).get(legacy_id)
++        assert loaded is not None and loaded[jobs.OWNER_DIGEST_FIELD] is None
++
++        app = create_app()
++        with TestClient(app, base_url=LOOPBACK_BASE_URL) as client:
++            owner = client.get(f"/jobs/{legacy_id}", headers=_as("owner"))
++            admin = client.get(f"/jobs/{legacy_id}", headers=_as("admin"))
++
++        assert admin.status_code == 200
++        assert jobs.OWNER_DIGEST_FIELD not in admin.json()
++        assert owner.status_code == (200 if visible_to_others else 404)
++
++
++def test_job_store_writes_schema_version_and_rejects_unknown_versions(
++    tmp_path: Path,
++) -> None:
++    store_path = tmp_path / "jobs.json"
++    store = jobs.LocalJobStore(store_path)
++    store.create({"id": "synthetic", "status": "queued"})
++    assert json.loads(store_path.read_text(encoding="utf-8"))["schema_version"] == 2
++
++    for version in (0, 99, "2", True):
++        store_path.write_text(
++            json.dumps({"jobs": {}, "schema_version": version}), encoding="utf-8"
++        )
++        with pytest.raises(ValueError, match="unsupported schema version"):
++            jobs.LocalJobStore(store_path)
++
++
++def test_auth_disabled_job_routes_are_unchanged(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    store_path = _configure(monkeypatch, tmp_path, auth=False, digest_key=None)
++    app = create_app()
++
++    with TestClient(app, base_url=LOOPBACK_BASE_URL) as client:
++        created = client.post("/jobs", json={"documents": [{"text": "synthetic"}]})
++        job_id = created.json()["id"]
++        status = client.get(f"/jobs/{job_id}")
++
++    assert created.status_code == 202
++    assert status.status_code == 200
++    assert jobs.OWNER_DIGEST_FIELD not in status.json()
++    stored = json.loads(store_path.read_text(encoding="utf-8"))["jobs"][job_id]
++    assert stored[jobs.OWNER_DIGEST_FIELD] is None
++
++
++# --- /fhir/bulk/* ---------------------------------------------------------
++
++
++def test_bulk_routes_return_404_to_other_principals(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++    gate: threading.Event,
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    _configure(monkeypatch, tmp_path)
++    caplog.set_level(logging.DEBUG)
++    app = create_app()
++
++    def gated_deidentify(text: str, **kwargs: Any) -> _FakeResult:
++        gate.wait(5)
++        return _fake_deidentify(text, **kwargs)
++
++    app.state.fhir_bulk_deidentifier = gated_deidentify
++    _write_export(tmp_path / "synthetic-source")
++    prefixes = ("/fhir/bulk/exports", "/fhir/bulk/imports")
++
++    with TestClient(app, base_url=LOOPBACK_BASE_URL) as client:
++        started = client.post(
++            "/fhir/bulk/exports",
++            json={"input_dir": "synthetic-source", "output_dir": "synthetic-out"},
++            headers=_as("owner"),
++        )
++        assert started.status_code == 202
++        job_id = started.json()["job_id"]
++        manager = app.state.fhir_bulk_jobs
++
++        # While running: non-owners cannot even learn that it is incomplete.
++        for prefix in prefixes:
++            for suffix in ("/manifest", "/report"):
++                path = f"{prefix}/{job_id}{suffix}"
++                assert client.get(path, headers=_as("owner")).status_code == 409
++                assert client.get(path, headers=_as("admin")).status_code == 409
++                for who in ("other", "wildcard"):
++                    _not_found(client, "GET", path, who)
++            for who in ("other", "wildcard"):
++                _not_found(client, "DELETE", f"{prefix}/{job_id}", who)
++                _not_found(client, "GET", f"{prefix}/{job_id}", who)
++        assert manager.get(job_id).status == "running"
++
++        gate.set()
++        _wait(lambda: manager.get(job_id).status == "succeeded")
++        missing = {
++            suffix: _missing_body(client, "GET", f"{prefixes[0]}/{'0' * 32}{suffix}")
++            for suffix in ("", "/manifest", "/report")
++        }
++        allowed: list[httpx.Response] = []
++        for prefix in prefixes:
++            for suffix in ("", "/manifest", "/report"):
++                path = f"{prefix}/{job_id}{suffix}"
++                for who in ("owner", "owner-rotated", "admin"):
++                    response = client.get(path, headers=_as(who))
++                    assert response.status_code == 200, (path, who)
++                    allowed.append(response)
++                for who in ("other", "wildcard"):
++                    response = client.get(path, headers=_as(who))
++                    assert response.status_code == 404
++                    assert _error_body(response) == missing[suffix]
++        cancelled = client.delete(f"{prefixes[0]}/{job_id}", headers=_as("owner"))
++        admin_cancel = client.delete(f"{prefixes[1]}/{job_id}", headers=_as("admin"))
++
++    assert cancelled.status_code == 202
++    assert admin_cancel.status_code == 202
++    owner = manager.owner_digest(job_id)
++    assert owner is not None and owner["key_id"] == SYNTHETIC_KEY_ID
++    rendered = json.dumps(
++        [started.json(), cancelled.json(), *(item.json() for item in allowed)]
++    )
++    assert owner["value"] not in rendered
++    assert "owner_digest" not in rendered
++    assert owner["value"] not in caplog.text
++    assert "synthetic-owner" not in rendered
++
++
++def test_bulk_cancel_by_other_principal_does_not_cancel(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++    gate: threading.Event,
++) -> None:
++    _configure(monkeypatch, tmp_path)
++    app = create_app()
++
++    def gated_deidentify(text: str, **kwargs: Any) -> _FakeResult:
++        gate.wait(5)
++        return _fake_deidentify(text, **kwargs)
++
++    app.state.fhir_bulk_deidentifier = gated_deidentify
++    _write_export(tmp_path / "synthetic-source")
++
++    with TestClient(app, base_url=LOOPBACK_BASE_URL) as client:
++        job_id = client.post(
++            "/fhir/bulk/imports",
++            json={"source_dir": "synthetic-source", "output_dir": "synthetic-out"},
++            headers=_as("owner"),
++        ).json()["job_id"]
++        foreign = client.delete(f"/fhir/bulk/imports/{job_id}", headers=_as("other"))
++        still_running = app.state.fhir_bulk_jobs.get(job_id).status
++        owned = client.delete(f"/fhir/bulk/imports/{job_id}", headers=_as("owner"))
++        gate.set()
++
++    assert foreign.status_code == 404
++    assert still_running == "running"
++    assert owned.status_code == 202
++    assert owned.json()["status"] == "cancelled"
++
++
++# --- /fhir/smart-backend/ingestions ---------------------------------------
++
++
++def test_smart_ingestion_routes_return_404_to_other_principals(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++    gate: threading.Event,
++) -> None:
++    _configure(monkeypatch, tmp_path)
++    app = create_app()
++
++    async def blocked(_: httpx.Request) -> httpx.Response:
++        while not gate.is_set():
++            await asyncio.sleep(0.01)
++        return httpx.Response(503)
++
++    manager = SMARTBackendJobManager(
++        transport=httpx.MockTransport(blocked),
++        client_assertion_builder=lambda _: "synthetic-client-assertion",
++    )
++    app.state.smart_backend_jobs = manager
++    payload = {
++        "fhir_base_url": "https://fhir.example.test",
++        "token_url": "https://auth.example.test/token",
++        "client_id": "synthetic-client",
++        "private_key_pem": "synthetic-private-key-secret",
++        "output_dir": "synthetic-smart-out",
++    }
++    base = "/fhir/smart-backend/ingestions"
++
++    with TestClient(app, base_url=LOOPBACK_BASE_URL) as client:
++        started = client.post(base, json=payload, headers=_as("owner"))
++        assert started.status_code == 200
++        job_id = started.json()["job_id"]
++        missing = {
++            suffix: _missing_body(client, "GET", f"{base}/{'0' * 32}{suffix}")
++            for suffix in ("", "/summary")
++        }
++        for who in ("owner", "owner-rotated", "admin"):
++            assert client.get(f"{base}/{job_id}", headers=_as(who)).status_code == 200
++            summary = client.get(f"{base}/{job_id}/summary", headers=_as(who))
++            assert summary.status_code == 409
++        for who in ("other", "wildcard"):
++            for suffix in ("", "/summary"):
++                response = client.get(f"{base}/{job_id}{suffix}", headers=_as(who))
++                assert response.status_code == 404
++                assert _error_body(response) == missing[suffix]
++            _not_found(client, "DELETE", f"{base}/{job_id}", who)
++        assert manager.get(job_id).status == "running"
++        cancelled = client.delete(f"{base}/{job_id}", headers=_as("owner"))
++        gate.set()
++
++    assert cancelled.status_code == 202
++    assert cancelled.json()["status"] == "cancelled"
++    owner = manager.owner_digest(job_id)
++    assert owner is not None
++    rendered = json.dumps([started.json(), cancelled.json()])
++    assert owner["value"] not in rendered
++    assert "synthetic-private-key-secret" not in rendered
++
++
++def test_auth_disabled_bulk_and_smart_records_have_no_owner(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    _configure(monkeypatch, tmp_path, auth=False, digest_key=None)
++    app = create_app()
++    app.state.fhir_bulk_deidentifier = _fake_deidentify
++    manager = SMARTBackendJobManager(
++        transport=httpx.MockTransport(lambda _: httpx.Response(503)),
++        client_assertion_builder=lambda _: "synthetic-client-assertion",
++    )
++    app.state.smart_backend_jobs = manager
++    _write_export(tmp_path / "synthetic-source")
++
++    with TestClient(app, base_url=LOOPBACK_BASE_URL) as client:
++        bulk_id = client.post(
++            "/fhir/bulk/exports",
++            json={"input_dir": "synthetic-source", "output_dir": "synthetic-out"},
++        ).json()["job_id"]
++        smart_id = client.post(
++            "/fhir/smart-backend/ingestions",
++            json={
++                "fhir_base_url": "https://fhir.example.test",
++                "token_url": "https://auth.example.test/token",
++                "client_id": "synthetic-client",
++                "private_key_pem": "synthetic-private-key-secret",
++                "output_dir": "synthetic-smart-out",
++            },
++        ).json()["job_id"]
++        bulk_status = client.get(f"/fhir/bulk/exports/{bulk_id}")
++        smart_status = client.get(f"/fhir/smart-backend/ingestions/{smart_id}")
++
++    assert bulk_status.status_code == 200
++    assert smart_status.status_code == 200
++    assert app.state.fhir_bulk_jobs.owner_digest(bulk_id) is None
++    assert manager.owner_digest(smart_id) is None
+diff --git a/tests/unit/service/test_smart_backend.py b/tests/unit/service/test_smart_backend.py
+index c44837a10..2594ff083 100644
+--- a/tests/unit/service/test_smart_backend.py
++++ b/tests/unit/service/test_smart_backend.py
+@@ -596,7 +596,8 @@ def __init__(self) -> None:
+             summary=self.completed_summary,
+         )
+ 
+-    def start(self, config, *, deidentifier=None, job_id=None):
++    def start(self, config, *, deidentifier=None, job_id=None, owner_digest=None):
++        del owner_digest
+         self.started = True
+         self.started_config = config
+         return self.status
+diff --git a/tests/unit/service/test_system_one.py b/tests/unit/service/test_system_one.py
+index 8160c5325..3220d4258 100644
+--- a/tests/unit/service/test_system_one.py
++++ b/tests/unit/service/test_system_one.py
+@@ -46,6 +46,8 @@ def configured(monkeypatch, *, scopes=("decisions:write", "pii:write"), burst=20
+     monkeypatch.setenv("OPENMED_SERVICE_SYSTEM_ONE", "1")
+     monkeypatch.setenv("OPENMED_OFFLINE", "1")
+     monkeypatch.setenv("OPENMED_SERVICE_AUTH_ENABLED", "1")
++    # The default prod profile requires a durable job-ownership digest key.
++    monkeypatch.setenv("OPENMED_SERVICE_DIGEST_KEY", "synthetic-digest-key-" + "0" * 32)
+     monkeypatch.setenv(
+         "OPENMED_SERVICE_AUTH_API_KEYS",
+         json.dumps(

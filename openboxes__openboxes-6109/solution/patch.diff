@@ -1,0 +1,1193 @@
+diff --git a/src/main/groovy/org/pih/warehouse/core/validation/Validator.groovy b/src/main/groovy/org/pih/warehouse/core/validation/Validator.groovy
+index 9046a337bb7..613350a3147 100644
+--- a/src/main/groovy/org/pih/warehouse/core/validation/Validator.groovy
++++ b/src/main/groovy/org/pih/warehouse/core/validation/Validator.groovy
+@@ -100,6 +100,21 @@ abstract class Validator<T> {
+                 errorCode)  // If we don't resolve the errorCode, display the code itself. This helps us catch typos.
+     }
+ 
++    /**
++     * Mark a field of the object as invalid.
++     *
++     * For use when we don't need the message to be localized, such as for developer-facing errors.
++     *
++     * @param fieldName The name of the field that failed validation
++     * @param plainTextErrorMessage The message to display when rendering the errors of the entity.
++     */
++    FieldError rejectField(String fieldName, String plainTextErrorMessage) {
++        return new FieldError(
++                "Object",  // objectName will be set automatically when adding the errors to the object being validated.
++                fieldName,
++                plainTextErrorMessage)
++    }
++
+     /**
+      * Mark the object itself as invalid. For use when not validating a specific field.
+      *
+diff --git a/src/main/groovy/org/pih/warehouse/exporter/BulkDataExportComponentResolver.groovy b/src/main/groovy/org/pih/warehouse/exporter/BulkDataExportComponentResolver.groovy
+new file mode 100644
+index 00000000000..06b9e182066
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/exporter/BulkDataExportComponentResolver.groovy
+@@ -0,0 +1,68 @@
++package org.pih.warehouse.exporter
++
++import org.apache.commons.collections4.map.MultiKeyMap
++import org.springframework.stereotype.Component
++
++import org.pih.warehouse.core.http.ContentType
++import org.pih.warehouse.importer.BulkDataType
++
++/**
++ * Holds a map of configurer components relating to bulk data exports.
++ *
++ * This makes it easy to fetch the configuration to use for a given feature and content type.
++ *
++ * It also saves us from needing to manually maintain a collection of all the configurer components and avoids an
++ * ugly switch statement when resolving those components during the generic export flow.
++ */
++@Component
++class BulkDataExportComponentResolver {
++
++    private final MultiKeyMap<Object, ConfiguresBulkDataWriter> writerConfigsByDataAndContentType = [:]
++    private final HashMap<ContentType, BulkDataWriter> writerByContentType = [:]
++
++    // Components are wrapped with optional to avoid an error when no implementations are defined.
++    BulkDataExportComponentResolver(final Optional<List<ConfiguresBulkDataWriter>> writerConfigs,
++                                    final Optional<List<BulkDataWriter>> writers) {
++        populateWriterConfigMap(writerConfigs.orElse([]))
++        populateWriterMap(writers.orElse([]))
++    }
++
++    private void populateWriterConfigMap(List<ConfiguresBulkDataWriter> writerConfigs) {
++        for (writerConfig in writerConfigs) {
++            BulkDataType bulkDataType = writerConfig.bulkDataType
++            for (contentType in writerConfig.supportedContentTypes) {
++                if (writerConfigsByDataAndContentType.containsKey(bulkDataType, contentType)) {
++                    throw new RuntimeException("Found multiple bulk data writer configurers for data type " +
++                            "${bulkDataType} and content type ${contentType}. Only one is allowed.")
++                }
++                writerConfigsByDataAndContentType.put(bulkDataType, contentType, writerConfig)
++            }
++        }
++    }
++
++    private void populateWriterMap(List<BulkDataWriter> writers) {
++        for (writer in writers) {
++            for (contentType in writer.supportedContentTypes) {
++                if (writerByContentType.containsKey(contentType)) {
++                    throw new RuntimeException("Found multiple bulk data writers for content type ${contentType}. " +
++                            "Only one is allowed.")
++                }
++                writerByContentType.put(contentType, writer)
++            }
++        }
++    }
++
++    /**
++     * @return The writer configuration associated with the given feature and content type.
++     */
++    BulkDataWriterConfig getBulkDataWriterConfig(BulkDataType bulkDataType, ContentType contentType) {
++        writerConfigsByDataAndContentType.get(bulkDataType, contentType)?.getBulkDataWriterConfig(contentType)
++    }
++
++    /**
++     * @return The writer associated with the given content type.
++     */
++    BulkDataWriter getBulkDataWriter(ContentType contentType) {
++        writerByContentType.get(contentType)
++    }
++}
+diff --git a/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriter.groovy b/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriter.groovy
+new file mode 100644
+index 00000000000..73f40d41b16
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriter.groovy
+@@ -0,0 +1,163 @@
++package org.pih.warehouse.exporter
++
++import grails.validation.ValidationException
++import org.apache.commons.lang.StringUtils
++import org.springframework.context.ApplicationContext
++import org.springframework.context.annotation.Lazy
++
++import org.pih.warehouse.core.formatter.DefaultTypeFormatter
++import org.pih.warehouse.core.formatter.Formatter
++import org.pih.warehouse.core.http.ContentType
++import org.pih.warehouse.core.localization.MessageLocalizer
++import org.pih.warehouse.importer.BulkDataType
++
++/**
++ * Writes a List of rows to an output document, often a file.
++ */
++abstract class BulkDataWriter<OutputType, Config extends BulkDataWriterConfig> {
++
++    final ApplicationContext context
++    final BulkDataExportComponentResolver componentResolver
++    final DefaultTypeFormatter defaultTypeFormatter
++    final MessageLocalizer messageLocalizer
++
++    // The component resolver is annotated with @Lazy because it wires in the writers, creating a circular dependency.
++    // Fortunately the writer doesn't immediately use the component resolver so we can simply delay fetching it.
++    BulkDataWriter(final ApplicationContext context,
++                   @Lazy final BulkDataExportComponentResolver componentResolver,
++                   final DefaultTypeFormatter defaultTypeFormatter,
++                   final MessageLocalizer messageLocalizer) {
++        this.context = context
++        this.componentResolver = componentResolver
++        this.defaultTypeFormatter = defaultTypeFormatter
++        this.messageLocalizer = messageLocalizer
++    }
++
++    /**
++     * @return The list of content types that the writer can handle.
++     */
++    abstract List<ContentType> getSupportedContentTypes()
++
++    /**
++     * @return The value to put in a cell to represent a null/empty cell.
++     */
++    abstract Object getEmptyCellValue()
++
++    /**
++     * Writes the given rows to an output document of the given content type.
++     * Contains the writer logic that is specific to the bulk data writer implementation.
++     *
++     * @param rowsToWrite The list of "unbound" objects to be converted to rows in the output document.
++     * @param contentType The file type of the output document.
++     * @param config Configuration for how the writer should process the rows.
++     */
++    protected abstract BulkDataWriterResult<OutputType> doWrite(List<Map<String, Object>> rowsToWrite,
++                                                                ContentType contentType,
++                                                                Config config)
++
++    /**
++     * Writes the given rows to an output document of the given content type.
++     *
++     * For use when we want to provide custom writer configuration that overrides the default.
++     *
++     * @param rowsToWrite The list of "unbound" objects to be converted to rows in the output document.
++     * @param contentType The file type of the output document.
++     * @param config Configuration for how the writer should process the rows.
++     */
++    BulkDataWriterResult<OutputType> write(List<Map<String, Object>> rowsToWrite,
++                                           ContentType contentType,
++                                           Config config) {
++        validateConfig(contentType, config)
++        return doWrite(rowsToWrite, contentType, config)
++    }
++
++    /**
++     * Writes the given rows to an output document of the given content type.
++     *
++     * For use when we want to rely on the default writer configuration for a given bulk data type.
++     *
++     * @param rowsToWrite The list of "unbound" objects to be converted to rows in the output document.
++     * @param bulkDataType Determines which configurer to use when writing the data.
++     * @param contentType The file type of the output document.
++     */
++    BulkDataWriterResult<OutputType> write(List<Map<String, Object>> rowsToWrite,
++                                           BulkDataType bulkDataType,
++                                           ContentType contentType) {
++        Config writerConfig = componentResolver.getBulkDataWriterConfig(bulkDataType, contentType) as Config
++        return write(rowsToWrite, contentType, writerConfig)
++    }
++
++
++    private void validateConfig(ContentType contentType, Config config) {
++        if (!config?.validate()) {
++            throw new ValidationException("Config is invalid", config?.errors)
++        }
++
++        if (!supportedContentTypes.contains(contentType)) {
++            throw new IllegalArgumentException("Writer does not support content-type ${contentType}. " +
++                    "Only the following content-types are allowed: ${supportedContentTypes}")
++        }
++    }
++
++    /**
++     * @return A header row to be written to the output.
++     */
++    protected List<String> buildHeaderRow(List<Map<String, Object>> rowsToWrite, Config config) {
++        List<BulkDataWriterFieldConfig> fieldConfigsOrdered = getOrderedFieldConfigs(rowsToWrite, config)
++        List<String> headerRow = []
++        for (fieldConfig in fieldConfigsOrdered) {
++            if (StringUtils.isNotBlank(fieldConfig.headerMessageCode)) {
++                headerRow.add(messageLocalizer.localize(fieldConfig.headerMessageCode))
++                continue
++            }
++            if (StringUtils.isNotBlank(fieldConfig.headerPlainText)) {
++                headerRow.add(fieldConfig.headerPlainText)
++                continue
++            }
++            headerRow.add(fieldConfig.fieldName)
++        }
++        return headerRow
++    }
++
++    /**
++     * @return An ordered list of field configs. If no config exists, will construct a basic one from the field
++     *         names of one of the rows.
++     */
++    protected List<BulkDataWriterFieldConfig> getOrderedFieldConfigs(List<Map<String, Object>> rowsToWrite,
++                                                                     Config config) {
++        Map<String, Object> exampleRow = rowsToWrite?.find()
++        return config.fields ? config.fieldConfigsInOrder: initFieldConfigFromRow(exampleRow)
++    }
++
++    private List<BulkDataWriterFieldConfig> initFieldConfigFromRow(Map<String, Object> exampleRow) {
++        if (!exampleRow) {
++            return []
++        }
++        return exampleRow.keySet().collect { new BulkDataWriterFieldConfig(fieldName: it) }
++    }
++
++    /**
++     * @return A cell value formatted for use in the output.
++     */
++    protected Object formatCellValue(Object value, BulkDataWriterFieldConfig config) {
++        if (value == null) {
++            return emptyCellValue
++        }
++
++        // If the config contains a specific Formatter to use for the field, use it.
++        if (config?.formatter != null) {
++            Formatter formatter = context.getBean(config.formatter)
++            return formatter.format(value, config.formatterContext)
++        }
++
++        // If a default formatter is associated with the type, use it.
++        try {
++            return defaultTypeFormatter.format(value)
++        } catch (IllegalArgumentException ignore) {
++            // There was no default formatter for the value type.
++        }
++
++        // Otherwise simply stringify the value.
++        return value.toString()
++    }
++}
+diff --git a/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriterConfig.groovy b/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriterConfig.groovy
+new file mode 100644
+index 00000000000..fad580ccec0
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriterConfig.groovy
+@@ -0,0 +1,39 @@
++package org.pih.warehouse.exporter
++
++import org.apache.commons.lang.StringUtils
++
++import org.pih.warehouse.core.validation.ObjectValidatable
++
++/**
++ * Configuration for writing bulk data to files.
++ */
++class BulkDataWriterConfig implements ObjectValidatable<BulkDataWriterConfigValidator> {
++
++    /**
++     * Will be concatenated to construct the file name of the file being output.
++     * Only needed if we are writing to a file.
++     */
++    Collection<Object> fileNameArgs = []
++
++    /**
++     * True if we should create a header row (constructed using the field config)
++     */
++    boolean addHeaderRow = true
++
++    /**
++     * The configuration to use when writing each of the fields in the bulk data.
++     */
++    List<BulkDataWriterFieldConfig> fields = []
++
++    /**
++     * @return The field configurations, in the column order that they should be written to.
++     */
++    List<BulkDataWriterFieldConfig> getFieldConfigsInOrder() {
++        return isFieldConfigOrdinal() ? fields : fields.sort { it.columnIndex }
++    }
++
++    private boolean isFieldConfigOrdinal() {
++        BulkDataWriterFieldConfig fieldConfig = fields.find()
++        return !fieldConfig || StringUtils.isBlank(fieldConfig.columnIndex)
++    }
++}
+diff --git a/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriterConfigValidator.groovy b/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriterConfigValidator.groovy
+new file mode 100644
+index 00000000000..01416aa9e51
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriterConfigValidator.groovy
+@@ -0,0 +1,62 @@
++package org.pih.warehouse.exporter
++
++import org.apache.commons.lang.StringUtils
++import org.springframework.stereotype.Component
++import org.springframework.validation.ObjectError
++
++import org.pih.warehouse.core.validation.ObjectValidationResult
++import org.pih.warehouse.core.validation.ObjectValidator
++
++/**
++ * Validates that a writer config is formatted correctly.
++ */
++@Component
++class BulkDataWriterConfigValidator extends ObjectValidator<BulkDataWriterConfig> {
++
++    @Override
++    protected ObjectValidationResult doValidate(BulkDataWriterConfig toValidate) {
++        return new ObjectValidationResult(
++                validateFields(toValidate),
++        )
++    }
++
++    private ObjectError validateFields(BulkDataWriterConfig toValidate) {
++        List<BulkDataWriterFieldConfig> fields = toValidate.fields
++        if (!fields) {
++            return null
++        }
++
++        Set<String> indexes = []
++        List<String> duplicates = []
++        boolean usingOrdinalIndexes = false
++        for (field in fields) {
++            if (field == null) {
++                return rejectField("fields", "Null field configs are not allowed.")
++            }
++
++            String columnIndex = field.columnIndex
++            if (StringUtils.isNotBlank(columnIndex)) {
++                if (indexes.contains(columnIndex)) {
++                    duplicates.add(columnIndex)
++                    continue
++                }
++
++                indexes.add(columnIndex)
++                continue
++            }
++
++            usingOrdinalIndexes = true
++        }
++
++        if (duplicates) {
++            return rejectField("fields", "Fields config contains duplicate columnIndex values: ${duplicates}.")
++        }
++
++        if (indexes && usingOrdinalIndexes) {
++            return rejectField("fields",
++                    "All field configs must either define a unique columnIndex, or all must leave the field null.")
++        }
++
++        return null
++    }
++}
+diff --git a/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriterFieldConfig.groovy b/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriterFieldConfig.groovy
+new file mode 100644
+index 00000000000..5911c08b871
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriterFieldConfig.groovy
+@@ -0,0 +1,46 @@
++package org.pih.warehouse.exporter
++
++import org.pih.warehouse.core.formatter.Formatter
++import org.pih.warehouse.core.formatter.FormatterContext
++
++/**
++ * Field-specific configuration for writing bulk data to files.
++ */
++class BulkDataWriterFieldConfig {
++
++    /**
++     * The name of the field in the source object.
++     */
++    String fieldName
++
++    /**
++     * The index of the column in the output document.
++     */
++    String columnIndex
++
++    /**
++     * A non-localizable, plain text String value to use as the column header in the output document.
++     * Overridden by headerMessageCode if it is specified.
++     */
++    String headerPlainText
++
++    /**
++     * A localizable message code to use as the column header in the output document.
++     * If specified, will override headerPlainText
++     */
++    String headerMessageCode
++
++    /**
++     * Overrides the formatter class to use when binding the field.
++     *
++     * This is only required if you don't want to use the default formatter associated with the field.
++     */
++    Class<Formatter> formatter
++
++    /**
++     * Defines any custom behaviour when formatting the field.
++     *
++     * If null, will use the default context for the formatter.
++     */
++    FormatterContext formatterContext
++}
+diff --git a/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriterResult.groovy b/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriterResult.groovy
+new file mode 100644
+index 00000000000..d0e50b952b4
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/exporter/BulkDataWriterResult.groovy
+@@ -0,0 +1,23 @@
++package org.pih.warehouse.exporter
++
++/**
++ * The result of writing some bulk data to a file.
++ */
++abstract class BulkDataWriterResult<T> {
++
++    /**
++     * The resulting object/file that is returned from the writer. If the result is an output document,
++     * make sure to call the close() method once it has been fully processed.
++     */
++    T result
++
++    /**
++     * Closes the output document (such as a file) that wraps the result. Failing to call close can result
++     * in memory or other system resources not being freed so it's important that anything that calls into
++     * a writer eventually calls close.
++     *
++     * Not all writers will contain an output document that needs to be closed, but we provide the close method
++     * here so that we can abstract away the behaviour from the caller.
++     */
++    abstract void close()
++}
+diff --git a/src/main/groovy/org/pih/warehouse/exporter/ConfiguresBulkDataWriter.groovy b/src/main/groovy/org/pih/warehouse/exporter/ConfiguresBulkDataWriter.groovy
+new file mode 100644
+index 00000000000..81bb479ea53
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/exporter/ConfiguresBulkDataWriter.groovy
+@@ -0,0 +1,26 @@
++package org.pih.warehouse.exporter
++
++import org.pih.warehouse.core.http.ContentType
++import org.pih.warehouse.importer.BulkDataType
++
++/**
++ * Customizes the bulk data writer, configuring it for a specific feature.
++ */
++trait ConfiguresBulkDataWriter {
++
++    /**
++     * @return The configuration to use when writing the bulk data.
++     */
++    abstract BulkDataWriterConfig getBulkDataWriterConfig(ContentType contentType)
++
++    /**
++     * @return the data type that this configuration is meant to be used for. Bulk data type has a one-to-one
++     *         map to a configurer.
++     */
++    abstract BulkDataType getBulkDataType()
++
++    /**
++     * @return The set of content types that can be handled by the writer.
++     */
++    abstract Set<ContentType> getSupportedContentTypes()
++}
+diff --git a/src/main/groovy/org/pih/warehouse/exporter/ConfiguresCsvWriter.groovy b/src/main/groovy/org/pih/warehouse/exporter/ConfiguresCsvWriter.groovy
+new file mode 100644
+index 00000000000..ab9fb8a6b75
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/exporter/ConfiguresCsvWriter.groovy
+@@ -0,0 +1,25 @@
++package org.pih.warehouse.exporter
++
++import org.pih.warehouse.core.http.ContentType
++
++/**
++ * Customizes the CSV file writer, configuring it for a specific feature.
++ */
++trait ConfiguresCsvWriter implements ConfiguresBulkDataWriter {
++
++    /**
++     * @return The configuration to use when writing the bulk data to CSV.
++     */
++    abstract CsvWriterConfig getCsvWriterConfig()
++
++    @Override
++    BulkDataWriterConfig getBulkDataWriterConfig(ContentType contentType) {
++        // Ignore the given content type. We're a CSV writer so always return the CSV config
++        return getCsvWriterConfig()
++    }
++
++    @Override
++    Set<ContentType> getSupportedContentTypes() {
++        return [ContentType.CSV]
++    }
++}
+diff --git a/src/main/groovy/org/pih/warehouse/exporter/CsvWriter.groovy b/src/main/groovy/org/pih/warehouse/exporter/CsvWriter.groovy
+new file mode 100644
+index 00000000000..e3eec9b0be8
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/exporter/CsvWriter.groovy
+@@ -0,0 +1,77 @@
++package org.pih.warehouse.exporter
++
++import org.apache.commons.csv.CSVFormat
++import org.apache.commons.csv.CSVPrinter
++import org.apache.commons.lang.StringEscapeUtils
++import org.springframework.context.ApplicationContext
++import org.springframework.context.annotation.Lazy
++import org.springframework.stereotype.Component
++
++import org.pih.warehouse.core.formatter.DefaultTypeFormatter
++import org.pih.warehouse.core.http.ContentType
++import org.pih.warehouse.core.localization.MessageLocalizer
++import org.pih.warehouse.importer.CSVUtils
++
++/**
++ * For converting objects into a CSV formatted String.
++ */
++@Component
++class CsvWriter extends BulkDataWriter<String, CsvWriterConfig> {
++
++    // The component resolver is annotated with @Lazy because it wires in the writers, creating a circular dependency.
++    // Fortunately the writer doesn't immediately use the component resolver so we can simply delay fetching it.
++    CsvWriter(final ApplicationContext context,
++              @Lazy final BulkDataExportComponentResolver componentResolver,
++              final DefaultTypeFormatter defaultTypeFormatter,
++              final MessageLocalizer messageLocalizer) {
++        super(context, componentResolver, defaultTypeFormatter, messageLocalizer)
++    }
++
++    @Override
++    List<ContentType> getSupportedContentTypes() {
++        return [ContentType.CSV]
++    }
++
++    @Override
++    def getEmptyCellValue() {
++        // CSVs don't handle nulls gracefully so we need to set a non-null cell value to create a blank field.
++        return ''
++    }
++
++    @Override
++    BulkDataWriterResult<String> doWrite(List<Map<String, Object>> rowsToWrite,
++                                         ContentType contentType,
++                                         CsvWriterConfig config) {
++        // CSVPrinter writes data row by row (instead of keeping the whole thing in memory) and so does not have
++        // memory issues with large data sets.
++        CSVPrinter printer = null
++        try {
++            StringWriter stringWriter = new StringWriter()
++            printer = new CSVPrinter(stringWriter, CSVFormat.DEFAULT.builder()
++                    .setDelimiter(config.delimiter)
++                    .build())
++
++            if (config.addHeaderRow) {
++                printer.printRecord(buildHeaderRow(rowsToWrite, config))
++            }
++
++            List<BulkDataWriterFieldConfig> fieldConfigsOrdered = getOrderedFieldConfigs(rowsToWrite, config)
++            for (rowToWrite in rowsToWrite) {
++                List<String> formattedRow = []
++                for (fieldConfig in fieldConfigsOrdered) {
++                    Object cellValue = rowToWrite.get(fieldConfig.fieldName)
++                    String cellValueFormatted = formatCellValue(cellValue, fieldConfig)
++                    formattedRow.add(StringEscapeUtils.escapeCsv(cellValueFormatted))
++                }
++                printer.printRecord(formattedRow)
++            }
++
++            // BOM == Byte Order Mark. A "Zero-Width No-Break Space" (ZWNBSP) unicode character that tells programs
++            // like Excel that the CSV is UTF-8 encoded.
++            return new CsvWriterResult(result: CSVUtils.prependBomToCsvString(stringWriter.toString()))
++        } finally {
++            // The StringWriter doesn't need to be closed but the CSVPrinter does.
++            printer?.close()
++        }
++    }
++}
+diff --git a/src/main/groovy/org/pih/warehouse/exporter/CsvWriterConfig.groovy b/src/main/groovy/org/pih/warehouse/exporter/CsvWriterConfig.groovy
+new file mode 100644
+index 00000000000..857285b94d1
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/exporter/CsvWriterConfig.groovy
+@@ -0,0 +1,14 @@
++package org.pih.warehouse.exporter
++
++/**
++ * Configuration for writing data to CSV.
++ */
++class CsvWriterConfig extends BulkDataWriterConfig {
++
++    private static final String DEFAULT_DELIMITER = ","
++
++    /**
++     * The character(s) that separate the columns within the data.
++     */
++    String delimiter = DEFAULT_DELIMITER
++}
+diff --git a/src/main/groovy/org/pih/warehouse/exporter/CsvWriterResult.groovy b/src/main/groovy/org/pih/warehouse/exporter/CsvWriterResult.groovy
+new file mode 100644
+index 00000000000..686654697cf
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/exporter/CsvWriterResult.groovy
+@@ -0,0 +1,13 @@
++package org.pih.warehouse.exporter
++
++/**
++ * The result of writing to a CSV String.
++ */
++class CsvWriterResult extends BulkDataWriterResult<String> {
++
++    @Override
++    void close() {
++        // The CSV writer outputs a String and the CSVPrinter is closed automatically by the writer
++        // so there's nothing left to do.
++    }
++}
+diff --git a/src/test/groovy/org/pih/warehouse/exporter/BulkDataWriterConfigValidatorSpec.groovy b/src/test/groovy/org/pih/warehouse/exporter/BulkDataWriterConfigValidatorSpec.groovy
+new file mode 100644
+index 00000000000..e5cb620985a
+--- /dev/null
++++ b/src/test/groovy/org/pih/warehouse/exporter/BulkDataWriterConfigValidatorSpec.groovy
+@@ -0,0 +1,163 @@
++package org.pih.warehouse.exporter
++
++import org.springframework.validation.FieldError
++import spock.lang.Shared
++import spock.lang.Specification
++import spock.lang.Unroll
++
++import org.pih.warehouse.core.validation.ObjectValidationResult
++
++@Unroll
++class BulkDataWriterConfigValidatorSpec extends Specification {
++
++    @Shared
++    BulkDataWriterConfigValidator validator
++
++    void setup() {
++        validator = new BulkDataWriterConfigValidator()
++    }
++
++    void "validate succeeds with all default values and no field config"() {
++        given:
++        BulkDataWriterConfig config = new CsvWriterConfig()
++
++        expect:
++        assert validator.validate(config).isValid()
++    }
++
++    void "validate succeeds with a delimiter: #delimiter and addHeaderRow: #addHeaderRow"() {
++        given:
++        BulkDataWriterConfig config = new CsvWriterConfig(
++                delimiter: delimiter,
++                addHeaderRow: addHeaderRow,
++        )
++
++        expect:
++        assert validator.validate(config).isValid()
++
++        where:
++        delimiter | addHeaderRow
++        ","       | true
++        ","       | false
++        ":"       | true
++        "\t"      | true
++        "‍"     | true
++    }
++
++    void "validate succeeds with fields that do not specify a columnIndex"() {
++        given:
++        BulkDataWriterConfig config = new CsvWriterConfig(
++                fields: [
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "field1",
++                                headerPlainText: "Field1 Header",
++                        ),
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "field2",
++                                headerPlainText: "Field2 Header",
++                        ),
++                ],
++        )
++
++        expect:
++        assert validator.validate(config).isValid()
++    }
++
++    void "validate succeeds with fields that specify a columnIndex"() {
++        given:
++        BulkDataWriterConfig config = new CsvWriterConfig(
++                fields: [
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "field1",
++                                headerPlainText: "Field1 Header",
++                                columnIndex: 0,
++                        ),
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "field2",
++                                headerPlainText: "Field2 Header",
++                                columnIndex: 1,
++                        ),
++                ],
++        )
++
++        expect:
++        assert validator.validate(config).isValid()
++    }
++
++    void "validate fails with a null in the field config"() {
++        given:
++        BulkDataWriterConfig config = new CsvWriterConfig(
++                fields: [null],
++        )
++
++        when:
++        ObjectValidationResult result = validator.validate(config, false)
++
++        then:
++        assert result.errors.size() == 1
++        assert result.errors[0] instanceof FieldError
++
++        FieldError error = result.errors[0] as FieldError
++        assert error.field == "fields"
++        assert error.defaultMessage == "Null field configs are not allowed."
++    }
++
++    void "validate fails when we have duplicate columnIndex values in the field config"() {
++        given:
++        BulkDataWriterConfig config = new CsvWriterConfig(
++                fields: [
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "field1",
++                                headerPlainText: "Field1 Header",
++                                columnIndex: 0,
++                        ),
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "field2",
++                                headerPlainText: "Field2 Header",
++                                columnIndex: 0,
++                        ),
++                ],
++        )
++
++        when:
++        ObjectValidationResult result = validator.validate(config, false)
++
++        then:
++        assert result.errors.size() == 1
++        assert result.errors[0] instanceof FieldError
++
++        FieldError error = result.errors[0] as FieldError
++        assert error.field == "fields"
++        assert error.defaultMessage == "Fields config contains duplicate columnIndex values: [0]."
++    }
++
++    void "validate fails when we only define columnIndex for some fields"() {
++        given:
++        BulkDataWriterConfig config = new CsvWriterConfig(
++                fields: [
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "field1",
++                                headerPlainText: "Field1 Header",
++                                columnIndex: 0,
++                        ),
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "field2",
++                                headerPlainText: "Field2 Header",
++                                columnIndex: null,  // Invalid since we've defined a columnIndex for another field.
++                        ),
++                ],
++        )
++
++        when:
++        ObjectValidationResult result = validator.validate(config, false)
++
++        then:
++        assert result.errors.size() == 1
++        assert result.errors[0] instanceof FieldError
++
++        FieldError error = result.errors[0] as FieldError
++        assert error.field == "fields"
++        assert error.defaultMessage == "All field configs must either define a unique columnIndex, or all must " +
++                "leave the field null."
++    }
++}
+diff --git a/src/test/groovy/org/pih/warehouse/exporter/CsvWriterSpec.groovy b/src/test/groovy/org/pih/warehouse/exporter/CsvWriterSpec.groovy
+new file mode 100644
+index 00000000000..b6c1ad674c1
+--- /dev/null
++++ b/src/test/groovy/org/pih/warehouse/exporter/CsvWriterSpec.groovy
+@@ -0,0 +1,370 @@
++package org.pih.warehouse.exporter
++
++import org.springframework.context.ApplicationContext
++import spock.lang.Shared
++import spock.lang.Specification
++import spock.lang.Unroll
++import testutil.MessageLocalizerStub
++
++import org.pih.warehouse.core.formatter.DefaultTypeFormatter
++import org.pih.warehouse.core.formatter.Formatter
++import org.pih.warehouse.core.formatter.FormatterContext
++import org.pih.warehouse.core.http.ContentType
++
++@Unroll
++class CsvWriterSpec extends Specification {
++
++    private static final String STUB_STRING_FORMATTER_RESULT = "FORMATTED!"
++
++    @Shared
++    CsvWriter writer
++
++    void setup() {
++        ApplicationContext applicationContextStub = Stub(ApplicationContext) {
++            getBean(StubStringFormatter) >> new StubStringFormatter()
++        }
++
++        writer = new CsvWriter(
++                applicationContextStub,
++                Stub(BulkDataExportComponentResolver),
++                // We're not testing the DefaultTypeFormatter so let it always fail to find a formatter.
++                new DefaultTypeFormatter(Optional.empty()),
++                MessageLocalizerStub.MESSAGE_LOCALIZER_STUB)
++    }
++
++    void "write succeeds with default formatters and no columnIndex specified for fields"() {
++        given:
++        List<Map> toWrite = [
++                [string: "A", integer: 1],
++                [string: "B", integer: 2],
++        ]
++
++        and: "a valid config"
++        CsvWriterConfig config = initConfig(true, new CsvWriterConfig(
++                delimiter: ",",
++                addHeaderRow: true,
++                fields: [
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "string",
++                                headerPlainText: "String Header",
++                        ),
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "integer",
++                                headerPlainText: "Integer Header",
++                        ),
++                ],
++        ))
++
++        when:
++        BulkDataWriterResult<String> result = writer.write(toWrite, ContentType.CSV, config)
++
++        then:
++        assert result.result == "﻿" +
++                "String Header,Integer Header\r\n" +
++                "A,1\r\n" +
++                "B,2\r\n"
++    }
++
++    void "write succeeds when we exclude the header row"() {
++        given:
++        List<Map> toWrite = [
++                [string: "A", integer: 1],
++                [string: "B", integer: 2],
++        ]
++
++        and: "a valid config"
++        CsvWriterConfig config = initConfig(true, new CsvWriterConfig(
++                delimiter: ",",
++                addHeaderRow: false,
++                fields: [
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "string",
++                                headerPlainText: "String Header",
++                        ),
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "integer",
++                                headerPlainText: "Integer Header",
++                        ),
++                ],
++        ))
++
++        when:
++        BulkDataWriterResult<String> result = writer.write(toWrite, ContentType.CSV, config)
++
++        then:
++        assert result.result == "﻿" +
++                "A,1\r\n" +
++                "B,2\r\n"
++    }
++
++    void "write can handle a '#delimiter' delimiter"() {
++        given:
++        List<Map> toWrite = [
++                [string: "A", integer: 1],
++                [string: "B", integer: 2],
++        ]
++
++        and: "a valid config"
++        CsvWriterConfig config = initConfig(true, new CsvWriterConfig(
++                delimiter: delimiter,
++                addHeaderRow: true,
++                fields: [
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "string",
++                                headerPlainText: "String Header",
++                        ),
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "integer",
++                                headerPlainText: "Integer Header",
++                        ),
++                ],
++        ))
++
++        when:
++        BulkDataWriterResult<String> result = writer.write(toWrite, ContentType.CSV, config)
++
++        then:
++        assert result.result == "﻿" +
++                "String Header${delimiter}Integer Header\r\n" +
++                "A${delimiter}1\r\n" +
++                "B${delimiter}2\r\n"
++
++        where:
++        delimiter << ["|", ";", "\t", "‍"]
++    }
++
++    void "write correctly orders fields based on config"() {
++        given:
++        List<Map> toWrite = [
++                [string: "A", integer: 1],
++                [string: "B", integer: 2],
++        ]
++
++        and: "a valid config but the fields are defined out of order"
++        CsvWriterConfig config = initConfig(true, new CsvWriterConfig(
++                delimiter: ",",
++                addHeaderRow: true,
++                fields: [
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "string",
++                                headerPlainText: "String Header",
++                                columnIndex: 1,  // Is first in the list but has index 1. columnIndex will be used
++                        ),
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "integer",
++                                headerPlainText: "Integer Header",
++                                columnIndex: 0,  // Is second in the list but has index 0. columnIndex will be used
++                        ),
++                ],
++        ))
++
++        when:
++        BulkDataWriterResult<String> result = writer.write(toWrite, ContentType.CSV, config)
++
++        then:
++        assert result.result == "﻿" +
++                "Integer Header,String Header\r\n" +
++                "1,A\r\n" +
++                "2,B\r\n"
++    }
++
++    void "write succeeds with a custom formatter"() {
++        given:
++        List<Map> toWrite = [
++                [string: "A", integer: 1],
++                [string: "B", integer: 2],
++        ]
++
++        and: "a valid config"
++        CsvWriterConfig config = initConfig(true, new CsvWriterConfig(
++                delimiter: ",",
++                addHeaderRow: true,
++                fields: [
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "string",
++                                headerPlainText: "String Header",
++                                formatter: StubStringFormatter,  // A custom formatter
++                                formatterContext: null,  // Context doesn't matter here since the formatter is stubbed
++                        ),
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "integer",
++                                headerPlainText: "Integer Header",
++                        ),
++                ],
++        ))
++
++        when:
++        BulkDataWriterResult<String> result = writer.write(toWrite, ContentType.CSV, config)
++
++        then:
++        assert result.result == "﻿" +
++                "String Header,Integer Header\r\n" +
++                "${STUB_STRING_FORMATTER_RESULT},1\r\n" +
++                "${STUB_STRING_FORMATTER_RESULT},2\r\n"
++    }
++
++    void "write succeeds for unicode Strings"() {
++        given:
++        List<Map> toWrite = [
++                [string: "苹果"],
++                [string: "jabłko"],
++        ]
++
++        and: "a valid config"
++        CsvWriterConfig config = initConfig(true, new CsvWriterConfig(
++                addHeaderRow: true,
++                fields: [
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "string",
++                                headerPlainText: "String Header",
++                        )
++                ],
++        ))
++
++        when:
++        BulkDataWriterResult<String> result = writer.write(toWrite, ContentType.CSV, config)
++
++        then:
++        assert result.result == "﻿" +
++                "String Header\r\n" +
++                "苹果\r\n" +
++                "jabłko\r\n"
++    }
++
++    void "write succeeds with an empty dataset"() {
++        given:
++        List<Map> toWrite = []
++
++        and: "a valid config"
++        CsvWriterConfig config = initConfig(true, new CsvWriterConfig(
++                addHeaderRow: true,
++                fields: [
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "string",
++                                headerPlainText: "String Header",
++                        ),
++                ],
++        ))
++
++        when:
++        BulkDataWriterResult<String> result = writer.write(toWrite, ContentType.CSV, config)
++
++        then:
++        assert result.result == "﻿" +
++                "String Header\r\n"
++    }
++
++    void "write succeeds with an empty dataset and no header"() {
++        given:
++        List<Map> toWrite = []
++
++        and: "a valid config"
++        CsvWriterConfig config = initConfig(true, new CsvWriterConfig(
++                addHeaderRow: false,
++                fields: [
++                        new BulkDataWriterFieldConfig(fieldName: "string"),
++                ],
++        ))
++
++        when:
++        BulkDataWriterResult<String> result = writer.write(toWrite, ContentType.CSV, config)
++
++        then:
++        assert result.result == "﻿"
++    }
++
++    void "write succeeds with no field config"() {
++        given:
++        List<Map> toWrite = [
++                [string: "A", integer: 1],
++                [string: "B", integer: 2],
++        ]
++
++        and: "a valid config"
++        CsvWriterConfig config = initConfig(true, new CsvWriterConfig(
++                delimiter: ",",
++                addHeaderRow: true,
++                fields: [],  // By not defining the fields, it will use the field names as the header
++        ))
++
++        when:
++        BulkDataWriterResult<String> result = writer.write(toWrite, ContentType.CSV, config)
++
++        then:
++        assert result.result == "﻿" +
++                "string,integer\r\n" +
++                "A,1\r\n" +
++                "B,2\r\n"
++    }
++
++    void "write succeeds with localized headers"() {
++        given:
++        List<Map> toWrite = [
++                [string: "A", integer: 1],
++                [string: "B", integer: 2],
++        ]
++
++        and: "a valid config"
++        CsvWriterConfig config = initConfig(true, new CsvWriterConfig(
++                delimiter: ",",
++                addHeaderRow: true,
++                fields: [
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "string",
++                                // The exact value doesn't matter since the localizer is stubbed.
++                                headerMessageCode: "some.code",
++                        ),
++                        new BulkDataWriterFieldConfig(
++                                fieldName: "integer",
++                                headerPlainText: "Integer Header",
++                        ),
++                ],
++        ))
++
++        when:
++        BulkDataWriterResult<String> result = writer.write(toWrite, ContentType.CSV, config)
++
++        then:
++        assert result.result == "﻿" +
++                "some.code,Integer Header\r\n" +
++                "A,1\r\n" +
++                "B,2\r\n"
++    }
++
++    void "write fails for an unsupported content type"() {
++        given:
++        List<Map> toWrite = [
++                [string: "A"],
++        ]
++
++        and: "a valid config"
++        CsvWriterConfig config = initConfig(true, new CsvWriterConfig(
++                fields: [
++                        new BulkDataWriterFieldConfig(fieldName: "string"),
++                ],
++        ))
++
++        when:
++        writer.write(toWrite, ContentType.PDF, config)
++
++        then:
++        thrown(IllegalArgumentException)
++    }
++
++    private CsvWriterConfig initConfig(boolean isValid, CsvWriterConfig config) {
++        CsvWriterConfig configStub = Spy(config)
++
++        // We're not testing the validator, so simply stub its result.
++        configStub.validate() >> isValid
++
++        return configStub
++    }
++
++    // For testing custom formatters
++    static class StubStringFormatter extends Formatter<String, FormatterContext> {
++        @Override
++        protected String doFormat(String toFormat, FormatterContext context) {
++            return STUB_STRING_FORMATTER_RESULT
++        }
++    }
++}

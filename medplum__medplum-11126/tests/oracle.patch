@@ -1,0 +1,176 @@
+diff --git a/packages/server/src/fhir/smart.test.ts b/packages/server/src/fhir/smart.test.ts
+index 66e630eb327..ac91882da41 100644
+--- a/packages/server/src/fhir/smart.test.ts
++++ b/packages/server/src/fhir/smart.test.ts
+@@ -10,7 +10,7 @@ import { loadTestConfig } from '../config/loader';
+ import type { AuthState } from '../oauth/middleware';
+ import { createTestProject } from '../test.setup';
+ import type { PopulatedAccessPolicy } from './accesspolicy';
+-import { applySmartScopes, parseSmartScopes } from './smart';
++import { applySmartScopes, getPartialPermissionScopes, parseSmartScopes } from './smart';
+ 
+ describe('SMART on FHIR', () => {
+   test('Parse empty', () => {
+@@ -84,6 +84,23 @@ describe('SMART on FHIR', () => {
+     ]);
+   });
+ 
++  test.each<[string, string[]]>([
++    ['openid offline_access', []],
++    ['patient/Observation.rs patient/Patient.read', []],
++    ['patient/Observation.read patient/Observation.write', []],
++    ['patient/Observation.r patient/Observation.s', []],
++    ['user/*.*', []],
++    ['patient/Observation.r', ['patient/Observation.r']],
++    ['patient/Observation.s', ['patient/Observation.s']],
++    ['user/Patient.c openid', ['user/Patient.c']],
++    ['patient/Observation.write', ['patient/Observation.cud']],
++    ['patient/Observation.c patient/Observation.rs', ['patient/Observation.crs']],
++    ['user/*.* user/Patient.c', []],
++    ['user/*.c user/Patient.rs', ['user/*.c', 'user/Patient.crs']],
++  ])('Partial permission scopes for %s', (scope, expected) => {
++    expect(getPartialPermissionScopes(scope)).toStrictEqual(expected);
++  });
++
+   describe('applySmartScopes()', () => {
+     let project: WithId<Project>;
+     let login: WithId<Login>;
+diff --git a/packages/server/src/fhir/smart.ts b/packages/server/src/fhir/smart.ts
+index cf931c6c822..6895ff6b383 100644
+--- a/packages/server/src/fhir/smart.ts
++++ b/packages/server/src/fhir/smart.ts
+@@ -171,6 +171,38 @@ export function parseSmartScopeString(scope: string): SmartScope | undefined {
+   };
+ }
+ 
++/**
++ * Returns the SMART scopes whose combined permissions, per permission type and resource type, are
++ * neither read-only (`rs`) nor full access (`cruds`).
++ * @param scope - The OAuth scope string.
++ * @returns The partial permission scopes, such as `patient/Observation.cs`.
++ */
++export function getPartialPermissionScopes(scope: string | undefined): string[] {
++  const permissions = new Map<string, Set<string>>();
++  for (const smartScope of parseSmartScopes(scope)) {
++    const key = `${smartScope.permissionType}/${smartScope.resourceType}`;
++    let letters = permissions.get(key);
++    if (!letters) {
++      letters = new Set<string>();
++      permissions.set(key, letters);
++    }
++    for (const letter of smartScope.scope) {
++      letters.add(letter);
++    }
++  }
++
++  const result: string[] = [];
++  for (const [key, letters] of permissions) {
++    // Wildcard scopes also apply to each concrete resource type of the same permission type
++    const wildcard = permissions.get(key.split('/')[0] + '/*');
++    const combined = [...'cruds'].filter((letter) => letters.has(letter) || wildcard?.has(letter)).join('');
++    if (combined !== 'rs' && combined !== 'cruds') {
++      result.push(`${key}.${combined}`);
++    }
++  }
++  return result;
++}
++
+ function normalizeV2ScopeString(str: string): string {
+   switch (str) {
+     case '*':
+diff --git a/packages/server/src/oauth/utils.test.ts b/packages/server/src/oauth/utils.test.ts
+index 2a6631af1a9..ced608b96df 100644
+--- a/packages/server/src/oauth/utils.test.ts
++++ b/packages/server/src/oauth/utils.test.ts
+@@ -577,6 +577,54 @@ describe('OAuth utils', () => {
+       });
+     });
+ 
++    test.each(['login', 'membership', 'unavailable'])(
++      'Logs partial SMART permissions with project %s',
++      async (source) => {
++        const { user, login, patient } = await withTestContext(async () => {
++          const user = await systemRepo.createResource<User>({
++            resourceType: 'User',
++            firstName: 'Test',
++            lastName: 'User',
++          });
++          const patient = await repo.createResource<Patient>({ resourceType: 'Patient' });
++          const membership = await systemRepo.createResource<ProjectMembership>({
++            resourceType: 'ProjectMembership',
++            user: createReference(user),
++            profile: createReference(patient),
++            project: createReference(project),
++          });
++          const login = await systemRepo.createResource<Login>({
++            resourceType: 'Login',
++            authMethod: 'password',
++            user: createReference(user),
++            membership: createReference(membership),
++            project: source === 'login' ? createReference(project) : undefined,
++            scope: 'openid user/Patient.c',
++            granted: true,
++            authTime: new Date().toISOString(),
++            nonce: randomUUID(),
++          });
++          return { user, login, patient };
++        });
++
++        if (source === 'unavailable') {
++          login.membership = { reference: `ProjectMembership/${randomUUID()}` };
++        }
++        const warnSpy = vi.spyOn(globalLogger, 'warn');
++        try {
++          const tokens = await getAuthTokens(user, login, createReference(patient));
++          expect((await verifyJwt(tokens.accessToken)).payload.scope).toBe(login.scope);
++          expect(warnSpy).toHaveBeenCalledWith('SMART scopes with partial permissions', {
++            clientId: undefined,
++            projectId: source === 'unavailable' ? undefined : project.id,
++            scopes: ['user/Patient.c'],
++          });
++        } finally {
++          warnSpy.mockRestore();
++        }
++      }
++    );
++
+     test('Access token includes email when email scope is requested for User', async () => {
+       await withTestContext(async () => {
+         // Create a User with email
+diff --git a/packages/server/src/oauth/utils.ts b/packages/server/src/oauth/utils.ts
+index 3ab3a783c1c..53c2b5c839a 100644
+--- a/packages/server/src/oauth/utils.ts
++++ b/packages/server/src/oauth/utils.ts
+@@ -51,7 +51,7 @@ import type { Repository, SystemRepository } from '../fhir/repo';
+ import { getGlobalSystemRepo, getProjectSystemRepo, getShardSystemRepo } from '../fhir/repo';
+ import { TODO_SHARD_ID } from '../fhir/sharding';
+ import type { SmartScope } from '../fhir/smart';
+-import { parseSmartScopes, parseSmartScopeString } from '../fhir/smart';
++import { getPartialPermissionScopes, parseSmartScopes, parseSmartScopeString } from '../fhir/smart';
+ import { getLogger } from '../logger';
+ import { getCacheRedis } from '../redis';
+ import {
+@@ -741,6 +741,23 @@ export async function getAuthTokens(
+     throw new OperationOutcomeError(badRequest('Login missing profile'));
+   }
+ 
++  const partialPermissionScopes = getPartialPermissionScopes(login.scope);
++  if (partialPermissionScopes.length > 0) {
++    let projectId = resolveId(login.project);
++    if (!projectId) {
++      // A logging lookup must not prevent token issuance.
++      const membership = await getGlobalSystemRepo()
++        .readReference(login.membership)
++        .catch(() => undefined);
++      projectId = resolveId(membership?.project);
++    }
++    getLogger().warn('SMART scopes with partial permissions', {
++      clientId,
++      projectId,
++      scopes: partialPermissionScopes,
++    });
++  }
++
+   if (!login.granted) {
+     const systemRepo = getGlobalSystemRepo();
+     await systemRepo.updateResource<Login>({

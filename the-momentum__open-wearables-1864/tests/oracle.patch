@@ -1,0 +1,554 @@
+diff --git a/backend/AGENTS.md b/backend/AGENTS.md
+index d17f453cd4..659da21517 100644
+--- a/backend/AGENTS.md
++++ b/backend/AGENTS.md
+@@ -262,6 +262,11 @@ idempotent and support a `--dry-run` flag, and its **module docstring is the sou
+ of truth** for the rationale (the problem it fixes, what it changes, and any details
+ such as conflict handling) — put it there, not in the docs.
+ 
++A script whose idle run is expensive (it has to scan a large table to find there is nothing
++to do) runs through `data_migration_service.run`, which records a clean run in the
++`data_migration` table and skips the script afterwards. Cheap scripts stay unrecorded, so they
++keep catching rows an old pod writes during a rolling deploy.
++
+ See `docs/dev-guides/data-migrations.mdx` for how to run them and how they're wired
+ into startup.
+ 
+diff --git a/backend/app/models/__init__.py b/backend/app/models/__init__.py
+index 92ef67141f..4b7258d619 100644
+--- a/backend/app/models/__init__.py
++++ b/backend/app/models/__init__.py
+@@ -1,6 +1,7 @@
+ from .api_key import ApiKey
+ from .application import Application
+ from .archival_setting import ArchivalSetting
++from .data_migration import DataMigration
+ from .data_point_series import DataPointSeries
+ from .data_point_series_archive import DataPointSeriesArchive
+ from .data_source import DataSource
+@@ -37,6 +38,7 @@
+     "ApiKey",
+     "Application",
+     "ArchivalSetting",
++    "DataMigration",
+     "Developer",
+     "DataSource",
+     "DataPointSeriesArchive",
+diff --git a/backend/app/models/data_migration.py b/backend/app/models/data_migration.py
+new file mode 100644
+index 0000000000..ad29dcb7e2
+--- /dev/null
++++ b/backend/app/models/data_migration.py
+@@ -0,0 +1,16 @@
++from sqlalchemy.orm import Mapped
++
++from app.database import BaseDbModel
++from app.mappings import PrimaryKey, str_100
++
++
++class DataMigration(BaseDbModel):
++    """A one-off data migration script that ran to completion on this instance.
++
++    The row is written only on a clean run, so created_at (from BaseDbModel) is when it completed.
++    Deleting the row makes the script run again on the next startup.
++    """
++
++    __tablename__ = "data_migration"
++
++    name: Mapped[PrimaryKey[str_100]]
+diff --git a/backend/app/repositories/data_migration_repository.py b/backend/app/repositories/data_migration_repository.py
+new file mode 100644
+index 0000000000..8df77a4b71
+--- /dev/null
++++ b/backend/app/repositories/data_migration_repository.py
+@@ -0,0 +1,25 @@
++from sqlalchemy import text
++from sqlalchemy.dialects.postgresql import insert
++
++from app.database import DbSession
++from app.models import DataMigration
++
++_LOCK_KEY = "data_migration:{name}"
++
++
++class DataMigrationRepository:
++    """Completion markers of one-off data migrations and the lock that keeps replicas from running one twice."""
++
++    def is_completed(self, db: DbSession, name: str) -> bool:
++        return db.get(DataMigration, name) is not None
++
++    def mark_completed(self, db: DbSession, name: str) -> None:
++        db.execute(insert(DataMigration).values(name=name).on_conflict_do_nothing())
++
++    def try_lock(self, db: DbSession, name: str) -> bool:
++        """Session-level lock, held across the migration's own commits until unlock."""
++        statement = text("SELECT pg_try_advisory_lock(hashtextextended(:key, 0))")
++        return bool(db.execute(statement, {"key": _LOCK_KEY.format(name=name)}).scalar())
++
++    def unlock(self, db: DbSession, name: str) -> None:
++        db.execute(text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"), {"key": _LOCK_KEY.format(name=name)})
+diff --git a/backend/app/services/data_migration_service.py b/backend/app/services/data_migration_service.py
+new file mode 100644
+index 0000000000..e81c0d6d22
+--- /dev/null
++++ b/backend/app/services/data_migration_service.py
+@@ -0,0 +1,46 @@
++from collections.abc import Callable
++
++from app.database import DbSession
++from app.repositories.data_migration_repository import DataMigrationRepository
++
++
++class DataMigrationService:
++    """Runs one-off data migration scripts at most once per instance.
++
++    The scripts run at startup and report on stdout, so this prints rather than logs.
++    """
++
++    def __init__(self) -> None:
++        self.repo = DataMigrationRepository()
++
++    def run(self, db: DbSession, name: str, migrate: Callable[[], bool], *, dry_run: bool = False) -> None:
++        """Run migrate unless it already completed here or another instance is running it.
++
++        migrate returns True when it ran cleanly; only then is the migration recorded, so a failed
++        or interrupted run is retried on the next startup. The session must stay on one connection,
++        since the lock belongs to it.
++        """
++        if self.repo.is_completed(db, name):
++            print(f"{name}: already completed, skipping.")
++            return
++        if dry_run:
++            migrate()
++            return
++        if not self.repo.try_lock(db, name):
++            print(f"{name}: running on another instance, skipping.")
++            return
++        try:
++            # Another instance may have finished between the check above and taking the lock
++            if self.repo.is_completed(db, name):
++                print(f"{name}: already completed, skipping.")
++                return
++            if migrate():
++                self.repo.mark_completed(db, name)
++                db.commit()
++        finally:
++            db.rollback()
++            self.repo.unlock(db, name)
++            db.commit()
++
++
++data_migration_service = DataMigrationService()
+diff --git a/backend/migrations/versions/2026_10_14_1558-b679f6226f99_data_migration.py b/backend/migrations/versions/2026_10_14_1558-b679f6226f99_data_migration.py
+new file mode 100644
+index 0000000000..249e645f25
+--- /dev/null
++++ b/backend/migrations/versions/2026_10_14_1558-b679f6226f99_data_migration.py
+@@ -0,0 +1,34 @@
++"""data migration
++
++Revision ID: b679f6226f99
++Revises: 76f7f8b66312
++
++"""
++
++from typing import Sequence, Union
++
++import sqlalchemy as sa
++from alembic import op
++
++# revision identifiers, used by Alembic.
++revision: str = "b679f6226f99"
++down_revision: Union[str, None] = "76f7f8b66312"
++branch_labels: Union[str, Sequence[str], None] = None
++depends_on: Union[str, Sequence[str], None] = None
++
++
++def upgrade() -> None:
++    # ### commands auto generated by Alembic - please adjust! ###
++    op.create_table(
++        "data_migration",
++        sa.Column("name", sa.String(length=100), nullable=False),
++        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
++        sa.PrimaryKeyConstraint("name"),
++    )
++    # ### end Alembic commands ###
++
++
++def downgrade() -> None:
++    # ### commands auto generated by Alembic - please adjust! ###
++    op.drop_table("data_migration")
++    # ### end Alembic commands ###
+diff --git a/backend/scripts/data_migrations/backfill_whoop_strain_event_record.py b/backend/scripts/data_migrations/backfill_whoop_strain_event_record.py
+index 8373fd6526..970184fa84 100755
+--- a/backend/scripts/data_migrations/backfill_whoop_strain_event_record.py
++++ b/backend/scripts/data_migrations/backfill_whoop_strain_event_record.py
+@@ -39,7 +39,8 @@
+ from sqlalchemy.orm import Session
+ from sqlalchemy.sql.elements import TextClause
+ 
+-from app.database import SessionLocal
++from app.database import engine
++from app.services.data_migration_service import data_migration_service
+ 
+ # Legacy rows in scope: Whoop strain, unlinked, carrying the workout-only marker.
+ _ELIGIBLE = """
+@@ -145,13 +146,22 @@ def backfill_whoop_strain(db: Session, *, dry_run: bool) -> int:
+     return linked
+ 
+ 
+-def main(dry_run: bool) -> None:
+-    with SessionLocal() as db:
+-        linked = backfill_whoop_strain(db, dry_run=dry_run)
+-        if dry_run or not linked:
+-            return
++def _migrate(db: Session, dry_run: bool) -> bool:
++    linked = backfill_whoop_strain(db, dry_run=dry_run)
++    if dry_run:
++        return False
++    if linked:
+         db.commit()
+         print("Done.")
++    # Scores that cannot be linked never resolve on their own, so they do not keep the migration open
++    return True
++
++
++def main(dry_run: bool) -> None:
++    with engine.connect() as connection, Session(bind=connection) as db:
++        data_migration_service.run(
++            db, "backfill_whoop_strain_event_record", lambda: _migrate(db, dry_run), dry_run=dry_run
++        )
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/backend/scripts/data_migrations/merge_duplicate_data_sources.py b/backend/scripts/data_migrations/merge_duplicate_data_sources.py
+index 19b1d1b98d..12aba72499 100644
+--- a/backend/scripts/data_migrations/merge_duplicate_data_sources.py
++++ b/backend/scripts/data_migrations/merge_duplicate_data_sources.py
+@@ -16,7 +16,8 @@
+ touched here: overlapping samples across sources are different writers, not duplicates.
+ 
+ Idempotent: renamed rows no longer match phase 1 and duplicates are gone, so re-runs are no-ops.
+-Phase 2 scans every event, so it only runs while phase 1 finds sources; later startups skip it.
++Phase 2 scans every event, so startup runs the script once: a clean run is recorded in data_migration
++and skipped afterwards, while a run with failures is retried on the next startup.
+ Samples, archive rows and duplicate events are processed in committed batches, so a run that is
+ interrupted keeps its progress and the next one continues where it stopped.
+ 
+@@ -37,6 +38,7 @@
+ 
+ from app.constants.devices_map.device_types import DEVICE_MODEL_PLACEHOLDERS
+ from app.database import engine
++from app.services.data_migration_service import data_migration_service
+ from app.utils.sentry_helpers import log_and_capture_error
+ 
+ logger = getLogger(__name__)
+@@ -292,8 +294,7 @@ def merge_duplicate_data_sources(db: Session, *, dry_run: bool) -> dict[str, int
+     db.execute(_LOCK_TIMEOUT)
+     params = {"placeholders": sorted(DEVICE_MODEL_PLACEHOLDERS), "platforms": list(GOOGLE_PLATFORMS)}
+     renamed = merged = failed = 0
+-    candidates = db.execute(_RENAME_CANDIDATES, params).mappings().all()
+-    for row in candidates:
++    for row in db.execute(_RENAME_CANDIDATES, params).mappings().all():
+         src: UUID = row["id"]
+         target = db.execute(
+             _TARGET,
+@@ -332,9 +333,9 @@ def merge_duplicate_data_sources(db: Session, *, dry_run: bool) -> dict[str, int
+             merged += 1
+ 
+     duplicates = 0
+-    if candidates and dry_run:
++    if dry_run:
+         duplicates = db.execute(_DUPLICATE_COUNT).scalar() or 0
+-    elif candidates:
++    else:
+         try:
+             duplicates = _remove_duplicate_events(db)
+         except SQLAlchemyError as e:
+@@ -342,7 +343,12 @@ def merge_duplicate_data_sources(db: Session, *, dry_run: bool) -> dict[str, int
+             failed += 1
+             log_and_capture_error(e, logger, f"Skipped removing duplicate events: {e}")
+ 
+-    result = {"renamed_sources": renamed, "merged_sources": merged, "duplicate_events_removed": duplicates}
++    result = {
++        "renamed_sources": renamed,
++        "merged_sources": merged,
++        "duplicate_events_removed": duplicates,
++        "failed": failed,
++    }
+     verb = "Would" if dry_run else "Did"
+     print(
+         f"{verb}: rename {renamed} data source(s), merge {merged} into an existing one, "
+@@ -353,15 +359,20 @@ def merge_duplicate_data_sources(db: Session, *, dry_run: bool) -> dict[str, int
+     return result
+ 
+ 
++def _migrate(db: Session, dry_run: bool) -> bool:
++    result = merge_duplicate_data_sources(db, dry_run=dry_run)
++    if dry_run:
++        return False
++    if not any(result.values()):
++        print("Nothing to do — no split data sources or duplicate events found.")
++    elif not result["failed"]:
++        print("Done.")
++    return not result["failed"]
++
++
+ def main(dry_run: bool) -> None:
+     with engine.connect() as connection, Session(bind=connection) as db:
+-        result = merge_duplicate_data_sources(db, dry_run=dry_run)
+-        if dry_run:
+-            return
+-        if not any(result.values()):
+-            print("Nothing to do — no split data sources or duplicate events found.")
+-            return
+-        print("Done.")
++        data_migration_service.run(db, "merge_duplicate_data_sources", lambda: _migrate(db, dry_run), dry_run=dry_run)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/backend/scripts/data_migrations/rekey_whoop_cycle_days.py b/backend/scripts/data_migrations/rekey_whoop_cycle_days.py
+index 951f3ff413..4c4fc9f23f 100644
+--- a/backend/scripts/data_migrations/rekey_whoop_cycle_days.py
++++ b/backend/scripts/data_migrations/rekey_whoop_cycle_days.py
+@@ -33,7 +33,8 @@
+ from sqlalchemy import text
+ from sqlalchemy.orm import Session
+ 
+-from app.database import SessionLocal
++from app.database import engine
++from app.services.data_migration_service import data_migration_service
+ 
+ # Whoop's longest real cycle is ~29h; past that the next onset opens a later cycle.
+ _MAX_CYCLE_SPAN = "30 hours"
+@@ -175,13 +176,20 @@ def rekey_whoop_cycle_days(db: Session, *, dry_run: bool) -> int:
+     return moved
+ 
+ 
+-def main(dry_run: bool) -> None:
+-    with SessionLocal() as db:
+-        moved = rekey_whoop_cycle_days(db, dry_run=dry_run)
+-        if dry_run or not moved:
+-            return
++def _migrate(db: Session, dry_run: bool) -> bool:
++    moved = rekey_whoop_cycle_days(db, dry_run=dry_run)
++    if dry_run:
++        return False
++    if moved:
+         db.commit()
+         print("Done.")
++    # Contested rows are left for a manual look and never resolve on their own
++    return True
++
++
++def main(dry_run: bool) -> None:
++    with engine.connect() as connection, Session(bind=connection) as db:
++        data_migration_service.run(db, "rekey_whoop_cycle_days", lambda: _migrate(db, dry_run), dry_run=dry_run)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/backend/scripts/data_migrations/split_google_provider.py b/backend/scripts/data_migrations/split_google_provider.py
+index 3ed2315b3e..30816b38d6 100644
+--- a/backend/scripts/data_migrations/split_google_provider.py
++++ b/backend/scripts/data_migrations/split_google_provider.py
+@@ -34,8 +34,9 @@
+ from sqlalchemy.orm import Session
+ from sqlalchemy.sql.elements import TextClause
+ 
+-from app.database import SessionLocal
++from app.database import engine
+ from app.schemas.sync_status import SyncSource
++from app.services.data_migration_service import data_migration_service
+ 
+ LEGACY = "google"
+ API = "google_health"
+@@ -156,16 +157,21 @@ def split_google_provider(db: Session, *, dry_run: bool) -> dict[str, int]:
+     return result
+ 
+ 
++def _migrate(db: Session, dry_run: bool) -> bool:
++    result = split_google_provider(db, dry_run=dry_run)
++    if dry_run:
++        return False
++    if not any(result.values()):
++        print(f"Nothing to do — no '{LEGACY}' rows found.")
++        return True
++    db.commit()
++    print("Done.")
++    return True
++
++
+ def main(dry_run: bool) -> None:
+-    with SessionLocal() as db:
+-        result = split_google_provider(db, dry_run=dry_run)
+-        if dry_run:
+-            return
+-        if not any(result.values()):
+-            print(f"Nothing to do — no '{LEGACY}' rows found.")
+-            return
+-        db.commit()
+-        print("Done.")
++    with engine.connect() as connection, Session(bind=connection) as db:
++        data_migration_service.run(db, "split_google_provider", lambda: _migrate(db, dry_run), dry_run=dry_run)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/backend/tests/scripts/test_merge_duplicate_data_sources.py b/backend/tests/scripts/test_merge_duplicate_data_sources.py
+index 57ee71c4b4..9d940d3e50 100644
+--- a/backend/tests/scripts/test_merge_duplicate_data_sources.py
++++ b/backend/tests/scripts/test_merge_duplicate_data_sources.py
+@@ -41,10 +41,6 @@ def _event(ds: DataSource, start: datetime = START, category: str = "workout") -
+     )
+ 
+ 
+-def _phase_one_candidate() -> DataSource:
+-    return DataSourceFactory(provider=ProviderName.POLAR, device_model=None, source=None)
+-
+-
+ class TestMergeDuplicateDataSources:
+     def test_placeholder_model_merges_into_existing_source(self, db: Session) -> None:
+         user = UserFactory()
+@@ -84,7 +80,6 @@ def test_duplicate_event_keeps_specific_source_and_its_score(self, db: Session)
+         kept = _event(writer, category="sleep")
+         score = HealthScoreFactory(data_source=legacy, provider=ProviderName.APPLE, event_record_id=dropped.id)
+         dropped_id = dropped.id
+-        _phase_one_candidate()
+ 
+         result = merge_duplicate_data_sources(db, dry_run=False)
+         db.expire_all()
+@@ -100,7 +95,6 @@ def test_meals_sharing_an_interval_are_kept(self, db: Session) -> None:
+         for source, external_id in ((ds, "breakfast-eggs"), (ds, "breakfast-coffee"), (other, "lunch")):
+             meal = _event(source, category="meal")
+             meal.external_id = external_id
+-        _phase_one_candidate()
+         db.flush()
+ 
+         result = merge_duplicate_data_sources(db, dry_run=False)
+@@ -108,20 +102,6 @@ def test_meals_sharing_an_interval_are_kept(self, db: Session) -> None:
+         assert result["duplicate_events_removed"] == 0
+         assert db.query(EventRecord).filter(EventRecord.category == "meal").count() == 3
+ 
+-    def test_duplicates_are_left_alone_without_sources_to_fix(self, db: Session) -> None:
+-        user = UserFactory()
+-        legacy = DataSourceFactory(user=user, provider=ProviderName.APPLE, device_model="Watch6,2", source="apple")
+-        writer = DataSourceFactory(
+-            user=user, provider=ProviderName.APPLE, device_model="Watch6,2", source="Apple Watch"
+-        )
+-        _event(legacy, category="sleep")
+-        _event(writer, category="sleep")
+-
+-        result = merge_duplicate_data_sources(db, dry_run=False)
+-
+-        assert not any(result.values())
+-        assert db.query(EventRecord).filter(EventRecord.category == "sleep").count() == 2
+-
+     def test_samples_move_in_batches_dropping_copies_the_target_holds(
+         self, db: Session, monkeypatch: pytest.MonkeyPatch
+     ) -> None:
+@@ -153,7 +133,6 @@ def test_duplicate_events_are_removed_in_batches(self, db: Session, monkeypatch:
+         for day in range(5):
+             _event(legacy, START + timedelta(days=day), category="sleep")
+             _event(writer, START + timedelta(days=day), category="sleep")
+-        _phase_one_candidate()
+ 
+         result = merge_duplicate_data_sources(db, dry_run=False)
+ 
+@@ -172,7 +151,6 @@ def test_score_of_best_ranked_copy_moves_when_several_copies_have_one(self, db:
+         best_copy, worse_copy = _event(named, category="sleep"), _event(legacy, category="sleep")
+         best_score = HealthScoreFactory(data_source=named, provider=ProviderName.APPLE, event_record_id=best_copy.id)
+         HealthScoreFactory(data_source=legacy, provider=ProviderName.APPLE, event_record_id=worse_copy.id)
+-        _phase_one_candidate()
+ 
+         result = merge_duplicate_data_sources(db, dry_run=False)
+         db.expire_all()
+diff --git a/backend/tests/services/test_data_migration_service.py b/backend/tests/services/test_data_migration_service.py
+new file mode 100644
+index 0000000000..9a00ea184c
+--- /dev/null
++++ b/backend/tests/services/test_data_migration_service.py
+@@ -0,0 +1,62 @@
++"""Tests for running one-off data migrations at most once per instance."""
++
++from typing import Any
++from unittest.mock import MagicMock
++
++import pytest
++from sqlalchemy import text
++from sqlalchemy.orm import Session
++
++from app.models import DataMigration
++from app.services.data_migration_service import data_migration_service
++
++NAME = "test_migration"
++
++
++class TestDataMigrationService:
++    def test_clean_run_is_recorded_and_not_repeated(self, db: Session) -> None:
++        migrate = MagicMock(return_value=True)
++
++        data_migration_service.run(db, NAME, migrate)
++        data_migration_service.run(db, NAME, migrate)
++
++        migrate.assert_called_once()
++        assert db.get(DataMigration, NAME) is not None
++
++    def test_incomplete_run_is_retried(self, db: Session) -> None:
++        migrate = MagicMock(return_value=False)
++
++        data_migration_service.run(db, NAME, migrate)
++        data_migration_service.run(db, NAME, migrate)
++
++        assert migrate.call_count == 2
++        assert db.get(DataMigration, NAME) is None
++
++    def test_failed_run_is_not_recorded_and_releases_the_lock(self, db: Session) -> None:
++        with pytest.raises(RuntimeError):
++            data_migration_service.run(db, NAME, MagicMock(side_effect=RuntimeError("boom")))
++
++        assert db.get(DataMigration, NAME) is None
++        assert data_migration_service.repo.try_lock(db, NAME)
++        data_migration_service.repo.unlock(db, NAME)
++
++    def test_dry_run_is_never_recorded(self, db: Session) -> None:
++        migrate = MagicMock(return_value=True)
++
++        data_migration_service.run(db, NAME, migrate, dry_run=True)
++
++        migrate.assert_called_once()
++        assert db.get(DataMigration, NAME) is None
++
++    def test_run_held_by_another_instance_is_skipped(self, db: Session, engine: Any) -> None:
++        migrate = MagicMock(return_value=True)
++        key = {"key": f"data_migration:{NAME}"}
++        with engine.connect() as other:
++            other.execute(text("SELECT pg_advisory_lock(hashtextextended(:key, 0))"), key)
++            try:
++                data_migration_service.run(db, NAME, migrate)
++            finally:
++                other.execute(text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"), key)
++
++        migrate.assert_not_called()
++        assert db.get(DataMigration, NAME) is None
+diff --git a/docs/dev-guides/data-migrations.mdx b/docs/dev-guides/data-migrations.mdx
+index 4637a31267..849bd7863f 100644
+--- a/docs/dev-guides/data-migrations.mdx
++++ b/docs/dev-guides/data-migrations.mdx
+@@ -23,6 +23,18 @@ This automatic execution is **temporary**. Each entry in `app.sh` is gated by a
+ 
+ The practical consequence: if you upgrade Open Wearables long after a migration shipped, the corresponding script may already have been removed from `app.sh` and **will not run automatically**. In that case, run it manually (see below). Scripts that were never added to `app.sh` must always be run manually.
+ 
++### Run-once scripts
++
++Some scripts are expensive to run even when there is nothing left to fix, because checking means scanning a large table. These run **at most once per instance**: a clean run writes a row with the script's name to the `data_migration` table, and from then on the script prints `already completed, skipping` and exits, both on startup and when run manually. A run that fails or is interrupted writes nothing, so it is retried on the next startup. When several replicas start at once, only one runs the script; the others skip it.
++
++To run such a script again, delete its row first:
++
++```sql
++DELETE FROM data_migration WHERE name = '<script_name>';
++```
++
++`--dry-run` never writes the row.
++
+ ## Prerequisites
+ 
+ The scripts import from the `app` package and connect to the database via the environment variables in `backend/config/.env`. You need:

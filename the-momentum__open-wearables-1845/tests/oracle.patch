@@ -1,0 +1,337 @@
+diff --git a/backend/app/repositories/event_record_repository.py b/backend/app/repositories/event_record_repository.py
+index f7cd313265..7da4a554a4 100644
+--- a/backend/app/repositories/event_record_repository.py
++++ b/backend/app/repositories/event_record_repository.py
+@@ -16,7 +16,6 @@
+     desc,
+     func,
+     lateral,
+-    literal,
+     literal_column,
+     select,
+     text,
+@@ -30,8 +29,13 @@
+ from app.database import DbSession
+ from app.models import DataPointSeries, DataSource, EventRecord, SleepDetails, WorkoutDetails
+ from app.repositories.data_source_repository import DATA_SOURCE_FIELDS, DataSourceIdentity, DataSourceRepository
+-from app.repositories.repositories import CrudRepository, source_filter_conditions, utc_bucket_start
+-from app.schemas.enums import ProviderName, SeriesType, TimelineBucket, get_series_type_id
++from app.repositories.repositories import (
++    CrudRepository,
++    source_filter_conditions,
++    source_priority_order,
++    utc_bucket_start,
++)
++from app.schemas.enums import DeviceType, ProviderName, SeriesType, TimelineBucket, get_series_type_id
+ from app.schemas.model_crud.activities import (
+     EventRecordCreate,
+     EventRecordQueryParams,
+@@ -487,17 +491,6 @@ def winning_sleep_record_ids(
+             EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
+             Date,
+         )
+-        provider_rank = (
+-            case(*[(DataSource.provider == p, r) for p, r in provider_order.items()], else_=99)
+-            if provider_order
+-            else literal(99)
+-        )
+-        device_rank = (
+-            case(*[(DataSource.device_type == dt.value, r) for dt, r in device_type_order.items()], else_=99)
+-            if device_type_order
+-            else literal(99)
+-        )
+-
+         filters = [
+             DataSource.user_id == UUID(user_id),
+             EventRecord.category == "sleep",
+@@ -515,7 +508,7 @@ def winning_sleep_record_ids(
+                 func.dense_rank()
+                 .over(
+                     partition_by=local_sleep_date,
+-                    order_by=(provider_rank, device_rank, func.coalesce(DataSource.device_model, "")),
++                    order_by=source_priority_order(provider_order, device_type_order),
+                 )
+                 .label("source_rank"),
+             )
+@@ -692,8 +685,13 @@ def get_sleep_summaries(
+         end_date: datetime,
+         cursor: str | None,
+         limit: int,
++        provider_order: dict[ProviderName, int],
++        device_type_order: dict[DeviceType, int],
+     ) -> list[dict]:
+-        """Get daily sleep summaries aggregated by date, source, and device_model.
++        """Get daily sleep summaries: per date, the aggregate of its highest-priority source.
++
++        The source is picked before pagination, so a page holds `limit` dates however many
++        sources recorded each night.
+ 
+         Returns list of dicts with keys:
+         - sleep_date, min_start_time, max_end_time, total_duration_minutes
+@@ -747,6 +745,15 @@ def get_sleep_summaries(
+                 # so grouping by it as well cannot change the number of groups.
+                 DataSource.device_type,
+                 func.min(cast(EventRecord.id, String)).label("record_id_text"),
++                func.row_number()
++                .over(
++                    partition_by=local_sleep_date,
++                    order_by=(
++                        *source_priority_order(provider_order, device_type_order),
++                        func.min(cast(EventRecord.id, String)),
++                    ),
++                )
++                .label("source_rank"),
+                 # Sleep details aggregations - main sleep only (minutes stored, convert to seconds later)
+                 func.sum(case((is_main_sleep, SleepDetails.sleep_time_in_bed_minutes), else_=None)).label(
+                     "time_in_bed_minutes"
+@@ -859,6 +866,7 @@ def get_sleep_summaries(
+             physio_lateral.c.avg_resp,
+             physio_lateral.c.avg_spo2,
+         ).outerjoin(physio_lateral, true())
++        query = query.filter(subquery.c.source_rank == 1)
+ 
+         # Handle cursor pagination
+         if cursor:
+diff --git a/backend/app/repositories/repositories.py b/backend/app/repositories/repositories.py
+index f79e7586d1..0a41cf5627 100644
+--- a/backend/app/repositories/repositories.py
++++ b/backend/app/repositories/repositories.py
+@@ -1,15 +1,15 @@
+-from collections.abc import Collection, Sequence
++from collections.abc import Collection, Mapping, Sequence
+ from datetime import date, datetime
+ from uuid import UUID
+ 
+ from pydantic import BaseModel
+-from sqlalchemy import ColumnElement, Date, cast, exists, func, select
++from sqlalchemy import ColumnElement, Date, case, cast, exists, func, literal, select
+ from sqlalchemy.orm import InstrumentedAttribute, Query
+ 
+ from app.database import BaseDbModel, DbSession
+ from app.models import DataSource
+ from app.models.series_type_definition import SeriesTypeDefinition
+-from app.schemas.enums import TimelineBucket, TimelineGroupBy
++from app.schemas.enums import DeviceType, ProviderName, TimelineBucket, TimelineGroupBy
+ from app.schemas.model_crud.activities.source_filters import SourceFilterParams
+ from app.utils.duplicates import handle_duplicates
+ from app.utils.exceptions import handle_exceptions
+@@ -48,6 +48,28 @@ def source_filter_conditions(
+     return conditions
+ 
+ 
++# Rank of a provider or device type missing from the priority tables
++UNRANKED_PRIORITY = 99
++
++
++def source_priority_order(
++    provider_order: Mapping[ProviderName, int],
++    device_type_order: Mapping[DeviceType, int],
++) -> tuple[ColumnElement, ColumnElement, ColumnElement]:
++    """ORDER BY terms ranking sources best first: provider, device type, device model. Assumes ``DataSource``."""
++    provider_rank = (
++        case(*[(DataSource.provider == p, r) for p, r in provider_order.items()], else_=UNRANKED_PRIORITY)
++        if provider_order
++        else literal(UNRANKED_PRIORITY)
++    )
++    device_rank = (
++        case(*[(DataSource.device_type == t.value, r) for t, r in device_type_order.items()], else_=UNRANKED_PRIORITY)
++        if device_type_order
++        else literal(UNRANKED_PRIORITY)
++    )
++    return provider_rank, device_rank, func.coalesce(DataSource.device_model, "")
++
++
+ def timeline_key_column(group_by: TimelineGroupBy) -> InstrumentedAttribute[str]:
+     """Column a data point timeline series is keyed by.
+ 
+diff --git a/backend/app/services/summaries_service.py b/backend/app/services/summaries_service.py
+index 95bf722307..37b4302818 100644
+--- a/backend/app/services/summaries_service.py
++++ b/backend/app/services/summaries_service.py
+@@ -109,6 +109,13 @@ def __init__(self, log: Logger):
+         self.archive_repo = DataPointSeriesArchiveRepository()
+         self.health_score_repo = HealthScoreRepository(HealthScore)
+ 
++    @staticmethod
++    def _priority_orders(db_session: DbSession) -> tuple[dict[ProviderName, int], dict[DeviceType, int]]:
++        return (
++            ProviderPriorityRepository(ProviderPriority).get_priority_order(db_session),
++            DeviceTypePriorityRepository().get_priority_order(db_session),
++        )
++
+     def _filter_by_priority(
+         self,
+         db_session: DbSession,
+@@ -128,8 +135,7 @@ def _filter_by_priority(
+         if not results:
+             return results
+ 
+-        provider_order = ProviderPriorityRepository(ProviderPriority).get_priority_order(db_session)
+-        device_type_order = DeviceTypePriorityRepository().get_priority_order(db_session)
++        provider_order, device_type_order = self._priority_orders(db_session)
+ 
+         # Group results by date
+         by_date: dict[date, list[dict]] = defaultdict(list)
+@@ -266,11 +272,9 @@ def get_sleep_summaries(
+         """Get daily sleep summaries aggregated by date, provider, and device."""
+         self.logger.debug(f"Fetching sleep summaries for user {user_id} from {start_date} to {end_date}")
+ 
+-        # Get aggregated data from repository (now returns list of dicts)
+-        results = self.event_record_repo.get_sleep_summaries(db_session, user_id, start_date, end_date, cursor, limit)
+-
+-        # Filter by priority to get best source per date
+-        results = self._filter_by_priority(db_session, user_id, results, date_key="sleep_date")
++        results = self.event_record_repo.get_sleep_summaries(
++            db_session, user_id, start_date, end_date, cursor, limit, *self._priority_orders(db_session)
++        )
+ 
+         # Check if there's more data
+         has_more = len(results) > limit
+diff --git a/backend/tests/api/v1/test_summaries.py b/backend/tests/api/v1/test_summaries.py
+index 657d021832..6badcd0405 100644
+--- a/backend/tests/api/v1/test_summaries.py
++++ b/backend/tests/api/v1/test_summaries.py
+@@ -382,6 +382,41 @@ def test_get_sleep_summary_no_naps(self, client: TestClient, db: Session) -> Non
+         assert sleep_data["duration_minutes"] == 480  # 8 hours
+         assert sleep_data["efficiency_percent"] == 90.0
+ 
++    def test_get_sleep_summary_pages_nights_not_sources(self, client: TestClient, db: Session) -> None:
++        """Paging through nights two sources recorded returns what one big page does."""
++        user = UserFactory()
++        watch = DataSourceFactory(user=user, provider=ProviderName.GARMIN, device_type="watch")
++        ring = DataSourceFactory(user=user, provider=ProviderName.OURA, device_type="ring")
++        for day in range(1, 6):
++            sleep_start = datetime(2025, 12, day, 23, 0, 0, tzinfo=timezone.utc)
++            for data_source in (watch, ring):
++                EventRecordFactory(
++                    data_source=data_source,
++                    category="sleep",
++                    start_datetime=sleep_start,
++                    end_datetime=sleep_start + timedelta(hours=8),
++                    duration_seconds=8 * 3600,
++                )
++        headers = api_key_headers(ApiKeyFactory().plain_key)
++        url = f"/api/v1/users/{user.id}/summaries/sleep"
++        params = {"start_date": "2025-12-01T00:00:00Z", "end_date": "2025-12-31T00:00:00Z"}
++
++        everything = client.get(url, headers=headers, params={**params, "limit": 50}).json()["data"]
++        paged: list[dict] = []
++        page_params: dict[str, str | int] = {**params, "limit": 2}
++        while True:
++            page = client.get(url, headers=headers, params=page_params)
++            assert page.status_code == 200
++            paged += page.json()["data"]
++            if not page.json()["pagination"]["has_more"]:
++                break
++            page_params["cursor"] = page.json()["pagination"]["next_cursor"]
++
++        assert [(s["date"], s["source"]["provider"]) for s in everything] == [
++            (f"2025-12-0{day}", "garmin") for day in range(2, 7)
++        ]
++        assert paged == everything
++
+ 
+ class TestActivitySummaryEndpoint:
+     """Test suite for activity summaries endpoint."""
+diff --git a/backend/tests/services/test_summaries_service.py b/backend/tests/services/test_summaries_service.py
+index 9d54c330c0..a122abf3b0 100644
+--- a/backend/tests/services/test_summaries_service.py
++++ b/backend/tests/services/test_summaries_service.py
+@@ -1,13 +1,16 @@
+ """Tests for SummariesService."""
+ 
++import math
+ from datetime import date, datetime, timedelta, timezone
+ from logging import getLogger
+ from typing import Any
+-from uuid import uuid4
++from uuid import UUID, uuid4
+ 
+ import pytest
+ from sqlalchemy.orm import Session
+ 
++from app.models import ProviderPriority
++from app.repositories import ProviderPriorityRepository
+ from app.schemas.enums import ProviderName
+ from app.services.summaries_service import SummariesService
+ from tests.factories import (
+@@ -262,6 +265,79 @@ def test_has_more_flag_and_pagination(self, db: Session, service: SummariesServi
+         assert result.pagination.next_cursor is not None
+ 
+ 
++class TestSleepPagingPerDate:
++    """A page holds `limit` nights, however many sources recorded each one."""
++
++    NIGHTS = [date(2026, 1, day) for day in range(2, 7)]
++    START = _dt("2026-01-01T00:00:00+00:00")
++    END = _dt("2026-01-31T00:00:00+00:00")
++
++    def _two_sources_per_night(self, db: Session) -> Any:
++        """Garmin and Oura both record every night; Garmin wins each one.
++
++        The losing Oura record gets the lower id, so within a night it sorts first:
++        a page cut between the two rows would elect Oura.
++        """
++        priorities = ProviderPriorityRepository(ProviderPriority)
++        priorities.upsert(db, ProviderName.GARMIN, 1)
++        priorities.upsert(db, ProviderName.OURA, 2)
++        user = UserFactory()
++        garmin = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin", device_type="watch")
++        oura = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura", device_type="ring")
++        for n, night in enumerate(self.NIGHTS):
++            wake = datetime(night.year, night.month, night.day, 7, tzinfo=timezone.utc)
++            for ds, id_prefix in ((oura, "00000000"), (garmin, "ffffffff")):
++                EventRecordFactory(
++                    id=UUID(f"{id_prefix}-0000-0000-0000-{n:012d}"),
++                    data_source=ds,
++                    category="sleep",
++                    type="sleep",
++                    start_datetime=wake - timedelta(hours=8),
++                    end_datetime=wake,
++                    duration_seconds=8 * 3600,
++                    zone_offset="+00:00",
++                )
++        return user
++
++    @pytest.mark.parametrize("limit", [1, 2])
++    def test_pages_forward_through_every_night_once(self, db: Session, service: SummariesService, limit: int) -> None:
++        user = self._two_sources_per_night(db)
++
++        seen: list[tuple[date, str]] = []
++        has_more: list[bool] = []
++        cursor = None
++        while True:
++            page = service.get_sleep_summaries(db, user.id, self.START, self.END, cursor=cursor, limit=limit)
++            seen += [(summary.date, summary.source.provider) for summary in page.data]
++            has_more.append(page.pagination.has_more)
++            if not page.pagination.next_cursor:
++                break
++            cursor = page.pagination.next_cursor
++
++        assert seen == [(night, "garmin") for night in self.NIGHTS]
++        # Only the last page says there is nothing more
++        assert has_more == [True] * (math.ceil(len(self.NIGHTS) / limit) - 1) + [False]
++
++    def test_previous_cursor_returns_the_page_before(self, db: Session, service: SummariesService) -> None:
++        user = self._two_sources_per_night(db)
++        first = service.get_sleep_summaries(db, user.id, self.START, self.END, cursor=None, limit=2)
++        second = service.get_sleep_summaries(
++            db, user.id, self.START, self.END, cursor=first.pagination.next_cursor, limit=2
++        )
++        third = service.get_sleep_summaries(
++            db, user.id, self.START, self.END, cursor=second.pagination.next_cursor, limit=2
++        )
++
++        back = service.get_sleep_summaries(
++            db, user.id, self.START, self.END, cursor=third.pagination.previous_cursor, limit=2
++        )
++
++        assert sorted((s.date, s.source.provider) for s in back.data) == [
++            (night, "garmin") for night in self.NIGHTS[2:4]
++        ]
++        assert back.pagination.has_more is True
++
++
+ # ---------------------------------------------------------------------------
+ # get_recovery_summaries
+ # ---------------------------------------------------------------------------

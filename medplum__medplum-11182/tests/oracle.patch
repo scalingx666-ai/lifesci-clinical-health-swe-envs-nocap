@@ -1,0 +1,227 @@
+diff --git a/packages/docs/docs/access/smart-scopes.md b/packages/docs/docs/access/smart-scopes.md
+index 7fc6e523854..76c31281d64 100644
+--- a/packages/docs/docs/access/smart-scopes.md
++++ b/packages/docs/docs/access/smart-scopes.md
+@@ -46,6 +46,8 @@ Scopes grant read, write, search and update access to specific resources, here a
+ - `scope=[array of individual scopes]`
+ - `patient=123`: the user is allowed access to resources in the Patient/123 [compartment](http://hl7.org/fhir/R4B/compartmentdefinition.html).
+ 
++Wildcard scopes such as `user/*.rs` do not include the [project admin resource types](/docs/access/admin), such as `Project`, `ProjectMembership`, `User` and `AccessPolicy`. A project admin's token reaches those types only through scopes that name them, such as `user/ProjectMembership.rs`. Super admin logins cannot use `patient/`, `user/` or `system/` scopes or a SMART App Launch.
++
+ ## Authorization UI
+ 
+ During authorization, the user has an option to select/deselect scopes and will see a scope selection page like the below.
+diff --git a/packages/server/src/fhir/accesspolicy.test.ts b/packages/server/src/fhir/accesspolicy.test.ts
+index f645c4f705f..fa83e4e2db8 100644
+--- a/packages/server/src/fhir/accesspolicy.test.ts
++++ b/packages/server/src/fhir/accesspolicy.test.ts
+@@ -3530,6 +3530,66 @@ describe('AccessPolicy', () => {
+         await expect(patientRepo.readResource('Condition', otherCondition.id)).rejects.toThrow('Not found');
+       }));
+   });
++
++  describe('Logins with SMART scopes', () => {
++    const userConfig: UserConfiguration = { resourceType: 'UserConfiguration' };
++
++    test('Project admin resource types are only granted by scopes that name them', () =>
++      withTestContext(async () => {
++        const { project, membership, login } = await createTestProject({
++          withClient: true,
++          withAccessToken: true,
++          membership: { admin: true },
++        });
++        const getScopedRepo = (scope: string): Promise<Repository> =>
++          getRepoForLogin({ login: { ...login, scope }, project, membership, userConfig });
++
++        const namedRepo = await getScopedRepo('openid user/ProjectMembership.rs');
++        expect(namedRepo.isProjectAdmin()).toBe(true);
++        await expect(namedRepo.readResource('ProjectMembership', membership.id)).resolves.toBeDefined();
++        await expect(namedRepo.updateResource({ ...membership, externalId: randomUUID() })).rejects.toThrow(
++          'Forbidden'
++        );
++        await expect(namedRepo.readResource('Project', project.id)).rejects.toThrow('Forbidden');
++
++        const wildcardRepo = await getScopedRepo('openid user/*.cruds');
++        await expect(wildcardRepo.createResource<Patient>({ resourceType: 'Patient' })).resolves.toBeDefined();
++        await expect(wildcardRepo.readResource('Project', project.id)).rejects.toThrow('Forbidden');
++        await expect(wildcardRepo.readResource('ProjectMembership', membership.id)).rejects.toThrow('Forbidden');
++      }));
++
++    test('Scopes do not grant project admin resource types to non-admins', () =>
++      withTestContext(async () => {
++        const { project, membership, login } = await createTestProject({ withClient: true, withAccessToken: true });
++        const scopedRepo = await getRepoForLogin({
++          login: { ...login, scope: 'openid user/Project.cruds user/ProjectMembership.cruds' },
++          project,
++          membership,
++          userConfig,
++        });
++        await expect(scopedRepo.readResource('Project', project.id)).rejects.toThrow('Forbidden');
++        await expect(scopedRepo.readResource('ProjectMembership', membership.id)).rejects.toThrow('Forbidden');
++        await expect(scopedRepo.updateResource({ ...membership, admin: true })).rejects.toThrow('Forbidden');
++      }));
++
++    test('Super admin logins cannot use SMART scopes or launch context', () =>
++      withTestContext(async () => {
++        const { project, membership, login } = await createTestProject({
++          superAdmin: true,
++          withClient: true,
++          withAccessToken: true,
++        });
++        await expect(getRepoForLogin({ login, project, membership, userConfig })).resolves.toBeDefined();
++        for (const scopedLogin of [
++          { ...login, scope: 'openid user/*.rs' },
++          { ...login, launch: { reference: 'SmartAppLaunch/' + randomUUID() } },
++        ]) {
++          await expect(getRepoForLogin({ login: scopedLogin, project, membership, userConfig })).rejects.toThrow(
++            'SMART scopes are not supported for super admin logins'
++          );
++        }
++      }));
++  });
+ });
+ 
+ describe('reconcileDefaultAccessPolicy', () => {
+diff --git a/packages/server/src/fhir/accesspolicy.ts b/packages/server/src/fhir/accesspolicy.ts
+index a68a4733b3e..6aa45ebb0d7 100644
+--- a/packages/server/src/fhir/accesspolicy.ts
++++ b/packages/server/src/fhir/accesspolicy.ts
+@@ -32,7 +32,7 @@ import { membershipProfileTypes, readMembershipReference } from './projectmember
+ import type { SystemRepository } from './repo';
+ import { getGlobalSystemRepo, getProjectSystemRepo, Repository } from './repo';
+ import { PLACEHOLDER_SHARD_ID } from './sharding';
+-import { applySmartScopes } from './smart';
++import { applySmartScopes, parseSmartScopes } from './smart';
+ 
+ export type PopulatedAccessPolicy = AccessPolicy & { resource: AccessPolicyResource[] };
+ 
+@@ -164,6 +164,11 @@ export async function getAllowedProjects(
+  */
+ export async function getAccessPolicyForLogin(authState: AuthState): Promise<AccessPolicy | undefined> {
+   const { project, login } = authState;
++  if (project.superAdmin && (login.launch || parseSmartScopes(login.scope).length > 0)) {
++    // Super admin privileges are not limited by the access policy, so SMART scopes cannot narrow them
++    throw new OperationOutcomeError(badRequest('SMART scopes are not supported for super admin logins'));
++  }
++
+   // Heal any drift between the admin flag and the default access policy before building.
+   // If a member's admin flag was toggled without updating their (still-default) access policy,
+   // this substitutes the correct role default so an upgraded admin isn't left half-restricted.
+@@ -171,17 +176,18 @@ export async function getAccessPolicyForLogin(authState: AuthState): Promise<Acc
+ 
+   let accessPolicy = await buildAccessPolicy(membership);
+ 
+-  if (login.scope) {
+-    // If the login specifies SMART scopes,
+-    // then set the access policy to use those scopes
+-    accessPolicy = applySmartScopes(accessPolicy, authState);
+-  }
+-
+   // Apply project admin access policies
+   // This includes ensuring no admin rights for non-admins
+   // and restricted access for admins
+   accessPolicy = applyProjectAdminAccessPolicy(project, membership, accessPolicy);
+ 
++  if (login.scope) {
++    // If the login specifies SMART scopes,
++    // then set the access policy to use those scopes.
++    // Applied last so that the scopes also limit the project admin rules.
++    accessPolicy = applySmartScopes(accessPolicy, authState);
++  }
++
+   return accessPolicy;
+ }
+ 
+diff --git a/packages/server/src/fhir/smart.test.ts b/packages/server/src/fhir/smart.test.ts
+index ac91882da41..1d6bdbf5e8c 100644
+--- a/packages/server/src/fhir/smart.test.ts
++++ b/packages/server/src/fhir/smart.test.ts
+@@ -141,6 +141,28 @@ describe('SMART on FHIR', () => {
+       });
+     });
+ 
++    test('Project admin resource types are only covered by scopes that name them', () => {
++      const startAccessPolicy: PopulatedAccessPolicy = {
++        resourceType: 'AccessPolicy',
++        resource: [
++          { resourceType: '*' },
++          { resourceType: 'ProjectMembership', criteria: 'ProjectMembership?_project=' + project.id },
++        ],
++      };
++      const applyScope = (scope: string): PopulatedAccessPolicy['resource'] =>
++        applySmartScopes(startAccessPolicy, {
++          login: { ...login, scope },
++          membership,
++          project,
++          userConfig: { resourceType: 'UserConfiguration' },
++        }).resource;
++
++      expect(applyScope('user/*.rs').map((r) => r.resourceType)).toStrictEqual(['*']);
++      expect(applyScope('user/ProjectMembership.rs')).toMatchObject([
++        { resourceType: 'ProjectMembership', criteria: 'ProjectMembership?_project=' + project.id },
++      ]);
++    });
++
+     test('Generate access policy', () => {
+       const compartment = `Patient/${randomUUID()}`;
+       const authState: AuthState = {
+diff --git a/packages/server/src/fhir/smart.ts b/packages/server/src/fhir/smart.ts
+index 6895ff6b383..02bf8e3ea90 100644
+--- a/packages/server/src/fhir/smart.ts
++++ b/packages/server/src/fhir/smart.ts
+@@ -15,6 +15,7 @@ import {
+   OAuthSigningAlgorithm,
+   OAuthTokenAuthMethod,
+   OperationOutcomeError,
++  projectAdminResourceTypes,
+   readInteractions,
+   splitN,
+ } from '@medplum/core';
+@@ -267,6 +268,10 @@ function intersectSmartScopes(
+   for (const policy of accessPolicy.resource ?? EMPTY) {
+     if (policy.resourceType === '*') {
+       for (const scope of smartScope) {
++        if (projectAdminResourceTypes.includes(scope.resourceType)) {
++          // A wildcard policy does not cover project admin resource types
++          continue;
++        }
+         // Expand the wildcard policy before merging, so that any criteria added by the scope
+         // is prefixed with the resource type the policy will be applied to
+         const merged = mergeAccessPolicyWithScope({ ...policy, resourceType: scope.resourceType }, scope, context);
+@@ -332,5 +337,7 @@ function appendCriteria(policy: AccessPolicyResource, criteria: string): void {
+ }
+ 
+ function getScopesForResourceType(scopes: SmartScope[], resourceType: string): SmartScope[] {
+-  return scopes.filter((s) => s.resourceType === resourceType || s.resourceType === '*');
++  // Project admin resource types are only covered by scopes that name them
++  const wildcardMatches = !projectAdminResourceTypes.includes(resourceType);
++  return scopes.filter((s) => s.resourceType === resourceType || (wildcardMatches && s.resourceType === '*'));
+ }
+diff --git a/packages/server/src/oauth/token.test.ts b/packages/server/src/oauth/token.test.ts
+index f7b97f1af3b..6e2b16d2db7 100644
+--- a/packages/server/src/oauth/token.test.ts
++++ b/packages/server/src/oauth/token.test.ts
+@@ -312,6 +312,23 @@ describe('OAuth2 Token', () => {
+     }
+   );
+ 
++  test.each([
++    ['openid', 200],
++    ['openid system/*.rs', 400],
++  ] as const)('Token for super admin client credentials with scope %s', async (scope, status) => {
++    const superAdmin = await createTestProject({ superAdmin: true, withClient: true });
++    const res = await request(app).post('/oauth2/token').type('form').send({
++      grant_type: 'client_credentials',
++      client_id: superAdmin.client.id,
++      client_secret: superAdmin.client.secret,
++      scope,
++    });
++    expect(res).toHaveStatus(status);
++    if (status === 400) {
++      expect(res.body.error_description).toBe('SMART scopes are not supported for super admin logins');
++    }
++  });
++
+   test('Token for client credentials with missing client_id', async () => {
+     const res = await request(app).post('/oauth2/token').type('form').send({
+       grant_type: 'client_credentials',

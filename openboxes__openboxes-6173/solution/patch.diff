@@ -1,0 +1,250 @@
+diff --git a/grails-app/controllers/org/pih/warehouse/UrlMappings.groovy b/grails-app/controllers/org/pih/warehouse/UrlMappings.groovy
+index a4e0cfd8a50..787db320194 100644
+--- a/grails-app/controllers/org/pih/warehouse/UrlMappings.groovy
++++ b/grails-app/controllers/org/pih/warehouse/UrlMappings.groovy
+@@ -3,6 +3,7 @@ package org.pih.warehouse
+ import grails.validation.ValidationException
+ import org.apache.http.auth.AuthenticationException
+ import org.hibernate.ObjectNotFoundException
++import org.pih.warehouse.picking.StagingLocationMismatchException
+ import org.pih.warehouse.requisition.RequisitionSourceType
+ 
+ import java.sql.SQLIntegrityConstraintViolationException
+@@ -1297,6 +1298,10 @@ class UrlMappings {
+         "500"(controller: "errors", action: "handleException")
+         "500"(controller: "errors", action: "handleNotFound", exception: ObjectNotFoundException)
+         "500"(controller: "errors", action: "handleValidationErrors", exception: ValidationException)
++        // Must stay below the ValidationException mapping above: Grails dispatches on the
++        // reverse of file-declaration order and returns the first exception.isInstance() match,
++        // so a subclass mapping declared earlier in the file would never be reached.
++        "500"(controller: "errors", action: "handleStagingLocationMismatch", exception: StagingLocationMismatchException)
+         "500"(controller: "errors", action: "handleUnauthorized", exception: AuthenticationException)
+         "500"(controller: "errors", action: "handleConstraintViolation", exception: SQLIntegrityConstraintViolationException)
+         "/"(controller: "dashboard", action: "index")
+diff --git a/grails-app/controllers/org/pih/warehouse/api/picking/PickTaskApiController.groovy b/grails-app/controllers/org/pih/warehouse/api/picking/PickTaskApiController.groovy
+index f812a9bf5f1..b1442f4eeb4 100644
+--- a/grails-app/controllers/org/pih/warehouse/api/picking/PickTaskApiController.groovy
++++ b/grails-app/controllers/org/pih/warehouse/api/picking/PickTaskApiController.groovy
+@@ -130,14 +130,7 @@ class PickTaskApiController extends RestfulController<PickTask> {
+                     [errorCode: 404, errorMessage: "Outbound container ${outboundContainerId} not found"] as JSON)
+             return
+         }
+-        try {
+-            pickTaskService.drop(outboundContainer, jsonBody)
+-        } catch (Exception e) {
+-            response.status = 500
+-            render([errorCode: 500, errorMessage: e?.message ?: "Error occurred"] as JSON)
+-            return
+-        }
+-
++        pickTaskService.drop(outboundContainer, jsonBody)
+         render status: 200
+     }
+ 
+diff --git a/grails-app/controllers/org/pih/warehouse/core/ErrorsController.groovy b/grails-app/controllers/org/pih/warehouse/core/ErrorsController.groovy
+index bf01f0d5437..22a0f350bc1 100644
+--- a/grails-app/controllers/org/pih/warehouse/core/ErrorsController.groovy
++++ b/grails-app/controllers/org/pih/warehouse/core/ErrorsController.groovy
+@@ -116,6 +116,23 @@ class ErrorsController {
+         render(view: "/error")
+     }
+ 
++    // Handles org.pih.warehouse.picking.StagingLocationMismatchException (see UrlMappings).
++    // allowOverride tells the client this specific failure can be bypassed by resubmitting
++    // the request with an override flag, unlike any other validation/server error.
++    def handleStagingLocationMismatch() {
++        if (RequestUtil.isAjax(request)) {
++            response.status = 500
++            Throwable exception = request.getAttribute('exception')
++            def root = ExceptionUtils.getRootCause(exception)
++            render([errorCode    : 500,
++                    allowOverride: true,
++                    errorMessage : root.message
++            ] as JSON)
++            return
++        }
++        render(view: "/error")
++    }
++
+     def handleConstraintViolation() {
+         if (RequestUtil.isAjax(request)) {
+             if (request?.method == HttpMethod.DELETE.name()) {
+diff --git a/grails-app/i18n/messages.properties b/grails-app/i18n/messages.properties
+index 79180744b1f..f4274bf84e4 100644
+--- a/grails-app/i18n/messages.properties
++++ b/grails-app/i18n/messages.properties
+@@ -820,6 +820,7 @@ enum.ActivityCode.PUTAWAY_CART=Putaway Cart
+ enum.ActivityCode.OUTBOUND_CONTAINER=Outbound Container
+ enum.ActivityCode.STAGING_LOCATION=Staging Location
+ enum.ActivityCode.PREPICK_STOCK=Pre-pick Stock
++enum.ActivityCode.VALIDATE_STAGING_LOCATION_ZONE=Validate Staging Location Zone
+ enum.ActivityCode.DELIVERY_TYPE_LOCAL_DELIVERY=Local Delivery
+ enum.ActivityCode.DELIVERY_TYPE_PICKUP=Pickup
+ enum.ActivityCode.DELIVERY_TYPE_SERVICE=Service
+diff --git a/grails-app/services/org/pih/warehouse/picking/PickTaskService.groovy b/grails-app/services/org/pih/warehouse/picking/PickTaskService.groovy
+index 87635831f30..11c98105093 100644
+--- a/grails-app/services/org/pih/warehouse/picking/PickTaskService.groovy
++++ b/grails-app/services/org/pih/warehouse/picking/PickTaskService.groovy
+@@ -13,6 +13,7 @@ import org.pih.warehouse.core.ActivityCode
+ import org.pih.warehouse.core.history.EventLogCode
+ import org.pih.warehouse.core.DeliveryTypeCode
+ import org.pih.warehouse.core.Location
++import org.pih.warehouse.core.LocationService
+ import org.pih.warehouse.core.RequisitionEvent
+ import org.pih.warehouse.core.RoleType
+ import org.pih.warehouse.core.User
+@@ -48,6 +49,7 @@ class PickTaskService {
+     WebhookPublisherService webhookPublisherService
+     RequisitionService requisitionService
+     UserService userService
++    LocationService locationService
+ 
+     @Transactional(readOnly = true)
+     List<PickTask> search(SearchPickTaskCommand command, Map params = [:]) {
+@@ -420,7 +422,8 @@ class PickTaskService {
+         switch (data?.action) {
+ 
+             case 'drop':
+-                dropToStaging(outboundContainer, data.stagingLocationId as String, AuthService.currentUser?.id)
++                dropToStaging(outboundContainer, data.stagingLocationId as String, AuthService.currentUser?.id,
++                        data.overrideStagingLocationZone as Boolean ?: false)
+                 break
+ 
+             default:
+@@ -479,7 +482,8 @@ class PickTaskService {
+         task.status = to
+     }
+ 
+-    void dropToStaging(Location outboundContainer, String stagingLocationId, String stagedById) {
++    void dropToStaging(Location outboundContainer, String stagingLocationId, String stagedById,
++                        boolean overrideStagingLocationZone = false) {
+         Location stagingLocation = findInFacility(stagingLocationId, outboundContainer.parentLocation)
+         validateStagingLocation(stagingLocation)
+ 
+@@ -489,6 +493,13 @@ class PickTaskService {
+             throw new IllegalStateException("Outbound container with number ${outboundContainer.locationNumber} is empty")
+         }
+ 
++        // Validate the zone for every task up front so the drop fails atomically rather than
++        // partially transferring stock before hitting a mismatch on a later item.
++        List<PickTask> allTasks = itemsToMove.collectMany { item ->
++            PickTask.findAllByOutboundContainerAndInventoryItemAndStatus(outboundContainer, item.inventoryItem, PickTaskStatus.PICKED)
++        }.unique { it.id }
++        allTasks.each { task -> validateStagingLocationZone(stagingLocation, task, overrideStagingLocationZone) }
++
+         Person stagedBy = Person.get(stagedById)
+         itemsToMove.each { item ->
+             List<PickTask> tasks = PickTask.findAllByOutboundContainerAndInventoryItemAndStatus(
+@@ -795,4 +806,36 @@ class PickTaskService {
+             throw new IllegalArgumentException("Staging location ${stagingLocation.name} does not support ${ActivityCode.HOLD_STOCK} activity")
+         }
+     }
++
++    // Zone-level check, on top of validateStagingLocation's bin-capability check. Opt-in per
++    // facility via ActivityCode.VALIDATE_STAGING_LOCATION_ZONE so behaviour can be tuned per
++    // facility rather than hard-coded (OBLS-853). Fails closed on missing zone/config so an
++    // incomplete facility setup surfaces as a validation failure rather than silently no-op'ing.
++    // The mismatch is overridable: the caller (mobile app) can show the message carried on the
++    // thrown StagingLocationMismatchException and resubmit with overrideStagingLocationZone = true.
++    private void validateStagingLocationZone(Location stagingLocation, PickTask task, boolean overrideStagingLocationZone) {
++        ActivityCode deliveryTypeActivity = task.deliveryTypeCode?.activityCode
++        if (!deliveryTypeActivity) {
++            // Nothing to validate the zone against (e.g. DEFAULT delivery type)
++            return
++        }
++
++        if (!task.facility?.supports(ActivityCode.VALIDATE_STAGING_LOCATION_ZONE)) {
++            return
++        }
++
++        if (overrideStagingLocationZone) {
++            return
++        }
++
++        Location zone = stagingLocation.zone
++        if (!zone || !zone.supports(deliveryTypeActivity)) {
++            List<Location> expectedZones = locationService.getZones(task.facility).findAll { it.supports(deliveryTypeActivity) }
++            String zoneNames = expectedZones ? expectedZones*.name.join(', ') : 'none'
++            String message = "This order is ${task.deliveryTypeCode}. You scanned ${stagingLocation.name} " +
++                    "(zone: ${zone?.name ?: 'none'}), expected zone is ${zoneNames}."
++
++            throw new StagingLocationMismatchException(message)
++        }
++    }
+ }
+diff --git a/src/main/groovy/org/pih/warehouse/core/ActivityCode.groovy b/src/main/groovy/org/pih/warehouse/core/ActivityCode.groovy
+index a7706dca1e2..7fbd7919d9a 100644
+--- a/src/main/groovy/org/pih/warehouse/core/ActivityCode.groovy
++++ b/src/main/groovy/org/pih/warehouse/core/ActivityCode.groovy
+@@ -159,6 +159,9 @@ enum ActivityCode {
+     // Pre-pick location codes
+     PREPICK_STOCK('PREPICK_STOCK'),
+ 
++    // Enables zone-level validation of the staging location scanned during pick drop (facility-level toggle)
++    VALIDATE_STAGING_LOCATION_ZONE('VALIDATE_STAGING_LOCATION_ZONE'),
++
+     PICKING_SHORTAGE('PICKING_SHORTAGE'),
+ 
+     // Track internal locations
+@@ -254,6 +257,7 @@ enum ActivityCode {
+                 OUTBOUND_CONTAINER,
+                 STAGING_LOCATION,
+                 PREPICK_STOCK,
++                VALIDATE_STAGING_LOCATION_ZONE,
+ 
+                 // Allows classification of location by delivery type
+                 DELIVERY_TYPE_LOCAL_DELIVERY,
+diff --git a/src/main/groovy/org/pih/warehouse/picking/StagingLocationMismatchException.groovy b/src/main/groovy/org/pih/warehouse/picking/StagingLocationMismatchException.groovy
+new file mode 100644
+index 00000000000..bdea13108ea
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/picking/StagingLocationMismatchException.groovy
+@@ -0,0 +1,36 @@
++/**
++ * Copyright (c) 2012 Partners In Health.  All rights reserved.
++ * The use and distribution terms for this software are covered by the
++ * Eclipse Public License 1.0 (http://opensource.org/licenses/eclipse-1.0.php)
++ * which can be found in the file epl-v10.html at the root of this distribution.
++ * By using this software in any fashion, you are agreeing to be bound by
++ * the terms of this license.
++ * You must not remove this notice, or any other, from this software.
++ **/
++package org.pih.warehouse.picking
++
++import grails.validation.ValidationException
++import org.springframework.validation.BeanPropertyBindingResult
++
++// Thrown when the scanned/selected staging location's zone doesn't match the zone expected
++// for the requisition's delivery type (see PickTaskService.validateStagingLocationZone).
++// Handled globally by ErrorsController.handleStagingLocationMismatch (see UrlMappings, where
++// this must be registered *after* the plain ValidationException mapping to take precedence),
++// which marks the response overridable so the mobile app can offer to stage there anyway.
++//
++// getMessage() is overridden because grails.validation.ValidationException.getMessage() returns
++// a verbose, Spring-formatted dump of the Errors object rather than the raw message passed in.
++class StagingLocationMismatchException extends ValidationException {
++
++    private final String simpleMessage
++
++    StagingLocationMismatchException(String message) {
++        super(message, new BeanPropertyBindingResult(message, "stagingLocation"))
++        this.simpleMessage = message
++    }
++
++    @Override
++    String getMessage() {
++        return simpleMessage
++    }
++}
+diff --git a/src/test/groovy/org/pih/warehouse/regression/obaf/allocation/AllocationServiceSpec.groovy b/src/test/groovy/org/pih/warehouse/regression/obaf/allocation/AllocationServiceSpec.groovy
+index bee5844c059..3c5b68653ec 100644
+--- a/src/test/groovy/org/pih/warehouse/regression/obaf/allocation/AllocationServiceSpec.groovy
++++ b/src/test/groovy/org/pih/warehouse/regression/obaf/allocation/AllocationServiceSpec.groovy
+@@ -886,7 +886,6 @@ class AllocationServiceSpec extends Specification implements ServiceUnitTest<All
+         0 * requisitionService.logRequisitionEvent(*_)
+     }
+ 
+-    @PendingFeature(reason = 'AllocationService.groovy:287 completeAllocation gets results.any { it.suggestedItems }, ignoring prepickItems, so an order covered entirely by pre-picked stock stays CREATED and is re-allocated by the next job run')
+     void 'allocateRequisition moves an order covered entirely by pre-picked stock to PICKING'() {
+         given:
+         Location prepickBin = bin(facility, 'PREPICK', [ActivityCode.PREPICK_STOCK, ActivityCode.HOLD_STOCK])

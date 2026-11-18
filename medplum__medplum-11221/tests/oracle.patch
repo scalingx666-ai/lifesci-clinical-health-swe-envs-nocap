@@ -1,0 +1,202 @@
+diff --git a/packages/fhir-router/src/repo.ts b/packages/fhir-router/src/repo.ts
+index 98ac6a41f4c..03c8522bc80 100644
+--- a/packages/fhir-router/src/repo.ts
++++ b/packages/fhir-router/src/repo.ts
+@@ -88,10 +88,8 @@ export type RepositoryMode = (typeof RepositoryMode)[keyof typeof RepositoryMode
+ export abstract class FhirRepository {
+   /**
+    * Sets the repository mode.
+-   * In general, it is assumed that repositories will start in "reader" mode,
+-   * and that the mode will be changed to "writer" as needed.
+-   * It is recommended that the repository use "reader" opportunistically,
+-   * but after using "writer" once it should use "writer" exclusively.
++   * Repositories start in "writer" mode. Callers may opt in to "reader" for read-only work;
++   * any writer operation promotes the repository back to "writer" for the rest of its life.
+    * @param mode - The repository mode.
+    */
+   abstract setMode(mode: RepositoryMode): void;
+diff --git a/packages/server/src/fhir/repo.ts b/packages/server/src/fhir/repo.ts
+index abb84907ec0..85acfe79b6d 100644
+--- a/packages/server/src/fhir/repo.ts
++++ b/packages/server/src/fhir/repo.ts
+@@ -466,6 +466,20 @@ export class Repository extends FhirRepository implements Disposable {
+     await limiter?.consume(points);
+   }
+ 
++  /**
++   * Executes a read-only SQL query.
++   *
++   * The `READER` default permits the reader pool but does not select it: the query runs on the
++   * writer unless this repository was put in reader mode via `setMode(RepositoryMode.READER)`.
++   * See `RepositoryConnection.getDatabaseClient`.
++   * @param query - The query to execute.
++   * @param query.execute - Runs the query on the selected database client.
++   * @param resourceTypes - The resource types involved, used for shard routing and access tracking.
++   * @param options - Optional settings.
++   * @param options.mode - Lowest permitted database mode; defaults to `READER`.
++   * @param options.source - Short label identifying the call site.
++   * @returns The result rows.
++   */
+   async sqlRead<R extends QueryResultRow = any>(
+     query: { execute(conn: PgQueryable): Promise<R[]> },
+     resourceTypes: ResourceTypeInput,
+@@ -1106,7 +1120,7 @@ export class Repository extends FhirRepository implements Disposable {
+ 
+     await this.handleStorage(result, create);
+     await this.postCommit(async () => this.handleBinaryUpdate(existing, result));
+-    if (!this.context.skipBackgroundJobs) {
++    if (this.shouldAddBackgroundJobs(result)) {
+       await this.postCommit(async () => {
+         const project = await this.getProjectById(projectId);
+         await addBackgroundJobs(result, existing, { project, interaction });
+@@ -1117,6 +1131,11 @@ export class Repository extends FhirRepository implements Disposable {
+     return this.removeHiddenFields(output);
+   }
+ 
++  private shouldAddBackgroundJobs(resource: Resource): boolean {
++    // Cache-only resources have no history rows for the dispatch worker to read
++    return !this.context.skipBackgroundJobs && !this.isCacheOnly(resource);
++  }
++
+   /**
+    * Handles a Binary resource update.
+    * If the resource has embedded base-64 data, writes the data to the binary storage.
+@@ -1596,7 +1615,7 @@ export class Repository extends FhirRepository implements Disposable {
+         );
+       }
+ 
+-      if (!this.context.skipBackgroundJobs) {
++      if (this.shouldAddBackgroundJobs(resource)) {
+         await this.postCommit(async () => {
+           const project = await this.getProjectById(resource.meta?.project);
+           await addBackgroundJobs(resource, resource, { project, interaction: 'delete' });
+diff --git a/packages/server/src/fhir/repository/access-tracker.ts b/packages/server/src/fhir/repository/access-tracker.ts
+index 372b1e60d6a..7c1b352e2c0 100644
+--- a/packages/server/src/fhir/repository/access-tracker.ts
++++ b/packages/server/src/fhir/repository/access-tracker.ts
+@@ -28,6 +28,11 @@ export interface RepositoryAccessOptions {
+ 
+ export interface ExecuteSqlOptions extends RepositoryAccessOptions {
+   readonly operation: RepositoryAccessOperation;
++  /**
++   * The lowest database role this statement may run on. `READER` permits the reader pool but does
++   * not select it: the statement runs on the writer unless the repository was put in reader mode
++   * via `setMode(RepositoryMode.READER)`. See `RepositoryConnection.getDatabaseClient`.
++   */
+   readonly mode: DatabaseMode;
+ }
+ 
+diff --git a/packages/server/src/fhir/repository/method-guards.test.ts b/packages/server/src/fhir/repository/method-guards.test.ts
+index 539d5c940d6..bc1598564b2 100644
+--- a/packages/server/src/fhir/repository/method-guards.test.ts
++++ b/packages/server/src/fhir/repository/method-guards.test.ts
+@@ -105,6 +105,7 @@ const knownPrivateMembers = new Set<PropertyKey>([
+   'recordCacheAccess',
+   'assertUsable',
+   'authorizeBinarySecurityContext',
++  'shouldAddBackgroundJobs',
+ ]);
+ 
+ interface MethodInvocation {
+diff --git a/packages/server/src/workers/dicom.ts b/packages/server/src/workers/dicom.ts
+index cbbe8ce0b0c..4ba77ad697d 100644
+--- a/packages/server/src/workers/dicom.ts
++++ b/packages/server/src/workers/dicom.ts
+@@ -83,6 +83,10 @@ export function getDicomQueue(): Queue<DicomJobData> | undefined {
+  * @param previousVersion - The previous version of the resource, if available
+  */
+ export async function addDicomJobs(resource: WithId<DicomInstance>, previousVersion: DicomInstance): Promise<void> {
++  if (!resource.meta?.project) {
++    return;
++  }
++
+   if (resource.raw?.reference !== previousVersion?.raw?.reference) {
+     const ctx = tryGetRequestContext();
+     await addDicomJobData({
+diff --git a/packages/server/src/workers/dispatch.test.ts b/packages/server/src/workers/dispatch.test.ts
+index 61c3b9680dc..e3b12ab594b 100644
+--- a/packages/server/src/workers/dispatch.test.ts
++++ b/packages/server/src/workers/dispatch.test.ts
+@@ -1,15 +1,17 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+ import { DeleteFunctionCommand, LambdaClient, ResourceNotFoundException } from '@aws-sdk/client-lambda';
+-import type { Bot, Patient } from '@medplum/fhirtypes';
++import type { Bot, Patient, Subscription } from '@medplum/fhirtypes';
+ import type { AwsClientStub } from 'aws-sdk-client-mock';
+ import { mockClient } from 'aws-sdk-client-mock';
++import type { Mock } from 'vitest';
+ import { vi } from 'vitest';
+ import { initAppServices, shutdownApp } from '../app';
+ import { getConfig, loadTestConfig } from '../config/loader';
+ import type { Repository } from '../fhir/repo';
+ import { getLogger } from '../logger';
+ import { createTestProject, withTestContext } from '../test.setup';
++import { getDispatchQueue } from './dispatch';
+ import { findAndExecDispatchJob } from './test-utils';
+ 
+ describe('Dispatch Worker', () => {
+@@ -166,4 +168,20 @@ describe('Dispatch Worker', () => {
+ 
+     errorSpy.mockRestore();
+   });
++
++  test('does not enqueue dispatch jobs for cache-only resources', async () => {
++    const subscription = await withTestContext(() =>
++      botRepo.createResource<Subscription>({
++        resourceType: 'Subscription',
++        reason: 'test',
++        status: 'active',
++        criteria: 'Patient',
++        channel: { type: 'websocket' },
++      })
++    );
++    await withTestContext(() => botRepo.deleteResource('Subscription', subscription.id));
++
++    const enqueued = (getDispatchQueue().add as Mock).mock.calls.map(([, data]) => data);
++    expect(enqueued).not.toContainEqual(expect.objectContaining({ id: subscription.id }));
++  });
+ });
+diff --git a/packages/server/src/workers/dispatch.ts b/packages/server/src/workers/dispatch.ts
+index b886144cd19..372db560f00 100644
+--- a/packages/server/src/workers/dispatch.ts
++++ b/packages/server/src/workers/dispatch.ts
+@@ -108,12 +108,24 @@ async function addDispatchJobData(job: DispatchJobData): Promise<void> {
+   await getDispatchQueue().add(jobName, job);
+ }
+ 
++// For system resources, only these types have dispatch work: Bot Lambda and cron teardown.
++const SYSTEM_DISPATCH_TYPES: readonly ResourceType[] = ['Bot', 'Cron'];
++function hasDispatchWork(data: DispatchJobData): boolean {
++  // Subscriptions never fire for AuditEvents, and no other target applies to them
++  if (data.resourceType === 'AuditEvent') {
++    return false;
++  }
++
++  // skip system resources except SYSTEM_DISPATCH_TYPES
++  return !data.target.system || SYSTEM_DISPATCH_TYPES.includes(data.resourceType);
++}
++
+ /**
+  * Executes a dispatch job.
+  * @param job - The dispatch job details.
+  */
+ export async function execDispatchJob(job: Job<DispatchJobData>): Promise<void> {
+-  if (!getConfig().dispatchEnabled) {
++  if (!getConfig().dispatchEnabled || !hasDispatchWork(job.data)) {
+     return;
+   }
+ 
+diff --git a/packages/server/src/workers/subscription.test.ts b/packages/server/src/workers/subscription.test.ts
+index 39f05267a5e..117db95eeaf 100644
+--- a/packages/server/src/workers/subscription.test.ts
++++ b/packages/server/src/workers/subscription.test.ts
+@@ -2786,7 +2786,7 @@ describe('Subscription Worker', () => {
+           channel: { type: 'websocket' },
+         });
+ 
+-        await expect(findAndExecSubscriptionJob(resource, 'create')).rejects.toThrow('Not found');
++        await expect(findAndExecSubscriptionJob(resource, 'create')).rejects.toThrow('Job not found');
+ 
+         // No jobs were queued, but we still want to test that execSubscriptionJob handles this gracefully
+         // if the job had made its way to the queue previously under different logic

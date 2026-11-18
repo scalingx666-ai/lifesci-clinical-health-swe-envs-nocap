@@ -1,0 +1,738 @@
+diff --git a/api/src/main/java/org/openmrs/api/db/hibernate/HibernateLocationDAO.java b/api/src/main/java/org/openmrs/api/db/hibernate/HibernateLocationDAO.java
+index 94ddadb2b46c..5aed59f215de 100644
+--- a/api/src/main/java/org/openmrs/api/db/hibernate/HibernateLocationDAO.java
++++ b/api/src/main/java/org/openmrs/api/db/hibernate/HibernateLocationDAO.java
+@@ -18,16 +18,16 @@
+ import javax.persistence.criteria.Root;
+ import javax.persistence.criteria.Subquery;
+ import java.util.ArrayList;
+-import java.util.Collection;
+ import java.util.Collections;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+-import java.util.stream.Collectors;
+ 
+ import org.apache.commons.lang3.StringUtils;
+ import org.hibernate.Session;
+ import org.hibernate.SessionFactory;
++import org.hibernate.query.Query;
+ import org.openmrs.Location;
+ import org.openmrs.LocationAttribute;
+ import org.openmrs.LocationAttributeType;
+@@ -432,13 +432,16 @@ public List<Location> getLocationsHavingAllTags(List<LocationTag> tags) {
+ 	 *
+ 	 * @param tags A list of LocationTag objects from which to extract the location tag IDs.
+ 	 *             This list should not be null.
+-	 * @return A List of Integer representing the IDs of the provided LocationTag objects.
++	 * @return A List of Integer representing the IDs of the provided LocationTag objects, one per entry and in
++	 *         the same order, null where the entry or its id was null.
+ 	 *         Returns an empty list if the input list is empty.
+ 	 */
+ 	private List<Integer> getLocationTagIds(List<LocationTag> tags) {
+ 		List<Integer> locationTagIds = new ArrayList<>();
+ 		for (LocationTag tag : tags) {
+-			locationTagIds.add(tag.getLocationTagId());
++			// a null entry maps to a null id rather than being dropped, so that callers counting the ids back
++			// against the tags they asked for still see one entry per tag
++			locationTagIds.add(tag == null ? null : tag.getLocationTagId());
+ 		}
+ 		return locationTagIds;
+ 	}
+@@ -448,52 +451,208 @@ private List<Integer> getLocationTagIds(List<LocationTag> tags) {
+ 	 */
+ 	@Override
+ 	public List<Location> getLocations(LocationSearchCriteria criteria) {
+-		Collection<LocationTag> tags = criteria.getLocationTags();
++		Session session = sessionFactory.getCurrentSession();
++
++		// a non-null but empty id list means a descendant filter was asked for and matched nothing, which no
++		// other predicate can widen again
++		List<Integer> descendantIds = getDescendantIds(session, criteria);
++		if (descendantIds != null && descendantIds.isEmpty()) {
++			return Collections.emptyList();
++		}
++
++		CriteriaBuilder cb = session.getCriteriaBuilder();
++		CriteriaQuery<Location> cq = cb.createQuery(Location.class);
++		Root<Location> root = cq.from(Location.class);
++
++		List<Predicate> predicates = buildPredicates(cb, cq, root, criteria, descendantIds);
++
++		cq.where(cb.and(predicates.toArray(new Predicate[0])));
++		cq.orderBy(cb.asc(root.get("name")), cb.asc(root.get("locationId")));
+ 
+-		return getAllLocations(true).stream().filter(loc -> matchesCriteria(loc, criteria, tags))
+-		        .collect(Collectors.toList());
++		Query<Location> query = session.createQuery(cq);
++		applyPagination(query, criteria);
++
++		return query.getResultList();
+ 	}
+ 
+-	private boolean matchesCriteria(Location loc, LocationSearchCriteria criteria, Collection<LocationTag> tags) {
+-		if (!criteria.getIncludeRetired() && Boolean.TRUE.equals(loc.getRetired())) {
+-			return false;
++	/**
++	 * Resolves the ids of every location beneath {@code criteria.getDescendantOfLocation()} by walking the
++	 * hierarchy one level at a time. Each level issues a single query filtered to the current level's children,
++	 * so only the relevant subtree is touched rather than the whole location table. Avoiding a recursive CTE keeps
++	 * this compatible with databases that lack {@code WITH RECURSIVE} support (MySQL versions earlier than 8.0).
++	 * <p>
++	 * When retired locations are excluded, a retired location prunes its whole subtree; the ancestor is no
++	 * exception, so a retired ancestor yields no descendants at all.
++	 *
++	 * @return {@code null} when no descendant filter is requested; otherwise the descendant location ids, which is
++	 *         empty when the ancestor has no (matching) descendants
++	 */
++	private List<Integer> getDescendantIds(Session session, LocationSearchCriteria criteria) {
++		if (criteria.getDescendantOfLocation() == null) {
++			return null;
+ 		}
+ 
+-		if (criteria.getDescendantOfLocation() != null
+-		        && !isDescendantOf(loc, criteria.getDescendantOfLocation(), criteria.getIncludeRetired())) {
+-			return false;
++		Integer ancestorId = criteria.getDescendantOfLocation().getLocationId();
++		if (ancestorId == null) {
++			return Collections.emptyList();
+ 		}
+ 
+-		if (StringUtils.isNotBlank(criteria.getNameFragment())
+-		        && (loc.getName() == null
+-		                || !loc.getName().toLowerCase().startsWith(criteria.getNameFragment().toLowerCase()))) {
+-			return false;
++		// A retired location prunes its whole subtree, and that applies to the ancestor the walk starts from:
++		// the in-memory isDescendantOf() this replaced walked upwards from each candidate and rejected it as
++		// soon as any node on the path - the ancestor included - was retired. So if the ancestor is filtered
++		// out the walk never starts.
++		if (!ancestorPassesRetiredFilter(session, criteria, ancestorId)) {
++			return Collections.emptyList();
+ 		}
+ 
+-		if (tags != null && !tags.isEmpty()) {
+-			Set<LocationTag> locTags = loc.getTags();
+-			boolean tagMatch = criteria.getTagMatchMode() == LocationSearchCriteria.TagMatchMode.ALL
+-			        ? tags.stream().allMatch(locTags::contains)
+-			        : tags.stream().anyMatch(locTags::contains);
+-			if (!tagMatch) {
+-				return false;
++		// Track every id already queued so a pathological parent cycle can neither loop forever nor pull the
++		// starting location back in as its own descendant. Seeding the ancestor keeps it out of the results.
++		Set<Integer> seen = new LinkedHashSet<>();
++		seen.add(ancestorId);
++		List<Integer> descendantIds = new ArrayList<>();
++		List<Integer> currentLevel = Collections.singletonList(ancestorId);
++
++		while (!currentLevel.isEmpty()) {
++			List<Integer> nextLevel = new ArrayList<>();
++			for (Integer childId : getChildIds(session, criteria, currentLevel)) {
++				if (seen.add(childId)) {
++					descendantIds.add(childId);
++					nextLevel.add(childId);
++				}
+ 			}
++			currentLevel = nextLevel;
+ 		}
+ 
+-		return true;
++		return descendantIds;
+ 	}
+ 
+-	private boolean isDescendantOf(Location loc, Location ancestor, boolean includeRetired) {
+-		Location current = loc.getParentLocation();
+-		while (current != null) {
+-			if (!includeRetired && Boolean.TRUE.equals(current.getRetired())) {
+-				return false;
+-			}
+-			if (ancestor.equals(current)) {
+-				return true;
++	/**
++	 * Reports whether the ancestor a descendant search starts from survives the criteria's retired filter. The
++	 * flag is read back from the database rather than off {@code criteria.getDescendantOfLocation()}, so that the
++	 * ancestor's current state is used even when the caller handed in a stale instance, and so that changes still
++	 * pending in the session - a location retired earlier in the same transaction, say - are seen. No query is
++	 * issued when retired locations are included, since then nothing can be pruned.
++	 */
++	private boolean ancestorPassesRetiredFilter(Session session, LocationSearchCriteria criteria, Integer ancestorId) {
++		if (criteria.getIncludeRetired()) {
++			return true;
++		}
++
++		CriteriaBuilder cb = session.getCriteriaBuilder();
++		CriteriaQuery<Integer> cq = cb.createQuery(Integer.class);
++		Root<Location> root = cq.from(Location.class);
++		cq.select(root.get("locationId"));
++		cq.where(cb.and(cb.equal(root.get("locationId"), ancestorId), cb.isFalse(root.get("retired"))));
++
++		return !session.createQuery(cq).setMaxResults(1).getResultList().isEmpty();
++	}
++
++	/**
++	 * Fetches the ids of the direct children of {@code parentIds}, honouring the criteria's retired filter so
++	 * that a retired location is not descended into.
++	 */
++	private List<Integer> getChildIds(Session session, LocationSearchCriteria criteria, List<Integer> parentIds) {
++		CriteriaBuilder cb = session.getCriteriaBuilder();
++		CriteriaQuery<Integer> cq = cb.createQuery(Integer.class);
++		Root<Location> root = cq.from(Location.class);
++		cq.select(root.get("locationId"));
++
++		List<Predicate> predicates = new ArrayList<>();
++		predicates.add(root.get("parentLocation").get("locationId").in(parentIds));
++		if (!criteria.getIncludeRetired()) {
++			predicates.add(cb.isFalse(root.get("retired")));
++		}
++		cq.where(cb.and(predicates.toArray(new Predicate[0])));
++
++		return session.createQuery(cq).getResultList();
++	}
++
++	private List<Predicate> buildPredicates(CriteriaBuilder cb, CriteriaQuery<Location> cq, Root<Location> root,
++	        LocationSearchCriteria criteria, List<Integer> descendantIds) {
++		List<Predicate> predicates = new ArrayList<>();
++
++		if (!criteria.getIncludeRetired()) {
++			predicates.add(cb.isFalse(root.get("retired")));
++		}
++
++		if (descendantIds != null) {
++			predicates.add(root.get("locationId").in(descendantIds));
++		}
++
++		addNameFragmentPredicate(cb, root, criteria, predicates);
++		addTagPredicates(cb, cq, root, criteria, predicates);
++
++		return predicates;
++	}
++
++	private void addNameFragmentPredicate(CriteriaBuilder cb, Root<Location> root, LocationSearchCriteria criteria,
++	        List<Predicate> predicates) {
++		if (StringUtils.isNotBlank(criteria.getNameFragment())) {
++			// The fragment is a literal prefix, so escape LIKE wildcards ('%', '_') in it; the trailing '%' that
++			// MatchMode.START appends stays a wildcard and is applied against the already-escaped fragment.
++			String pattern = MatchMode.START.toLowerCasePattern(escapeLikeWildcards(criteria.getNameFragment()));
++			predicates.add(cb.like(cb.lower(root.get("name")), pattern, '\\'));
++		}
++	}
++
++	/**
++	 * Escapes the LIKE wildcards in a value bound as a query parameter, for use with an explicit
++	 * {@code ESCAPE '\'} clause. {@link HibernateUtil#escapeSqlWildcards(String, SessionFactory)} does not fit
++	 * here: it doubles quotes and escapes {@code '*'}, neither of which applies to a bound parameter, and it
++	 * leaves a backslash already present in the value unescaped.
++	 */
++	private String escapeLikeWildcards(String value) {
++		// the escape character has to go first, or the backslashes added below would be escaped in turn
++		return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
++	}
++
++	private void addTagPredicates(CriteriaBuilder cb, CriteriaQuery<Location> cq, Root<Location> root,
++	        LocationSearchCriteria criteria, List<Predicate> predicates) {
++		if (criteria.getLocationTags() == null || criteria.getLocationTags().isEmpty()) {
++			return;
++		}
++
++		List<Integer> requestedTagIds = getLocationTagIds(new ArrayList<>(criteria.getLocationTags()));
++		List<Integer> matchableTagIds = new ArrayList<>();
++		for (Integer tagId : requestedTagIds) {
++			if (tagId != null) {
++				matchableTagIds.add(tagId);
+ 			}
+-			current = current.getParentLocation();
+ 		}
+-		return false;
++
++		if (matchableTagIds.isEmpty()) {
++			// nothing is left to match against, and an empty IN list is not valid SQL
++			predicates.add(cb.disjunction());
++			return;
++		}
++
++		// The matching tags are counted in a correlated subquery rather than joined into the outer query. A join
++		// multiplies the location rows and needs a GROUP BY to collapse them again, which would leave
++		// setFirstResult/setMaxResults paging over grouped rows and, on MySQL, depend on how the dialect renders
++		// a GROUP BY over a whole entity under ONLY_FULL_GROUP_BY. This is the same shape as
++		// getLocationsHavingAllTags and keeps the outer query at one row per location.
++		Subquery<Long> matchedTagCount = cq.subquery(Long.class);
++		Root<Location> subRoot = matchedTagCount.from(Location.class);
++		Join<Location, LocationTag> tagsJoin = subRoot.join("tags");
++		matchedTagCount.select(cb.count(tagsJoin)).where(cb.and(tagsJoin.get("locationTagId").in(matchableTagIds),
++		    cb.equal(subRoot.get("locationId"), root.get("locationId"))));
++
++		if (criteria.getTagMatchMode() == LocationSearchCriteria.TagMatchMode.ALL) {
++			// location_tag_map holds each pairing once, so the count is the number of distinct tags matched
++			predicates.add(cb.equal(matchedTagCount, (long) requestedTagIds.size()));
++		} else {
++			predicates.add(cb.greaterThan(matchedTagCount, 0L));
++		}
++	}
++
++	private void applyPagination(Query<Location> query, LocationSearchCriteria criteria) {
++		// Mirror the bounds handling of getLocations(String, ...): a non-positive maxResults means "no limit"
++		// rather than an empty result, and a negative startIndex is ignored rather than passed to the driver.
++		if (criteria.getStartIndex() != null && criteria.getStartIndex() >= 0) {
++			query.setFirstResult(criteria.getStartIndex());
++		}
++		if (criteria.getMaxResults() != null && criteria.getMaxResults() > 0) {
++			query.setMaxResults(criteria.getMaxResults());
++		}
+ 	}
+ }
+diff --git a/api/src/main/java/org/openmrs/parameter/LocationSearchCriteria.java b/api/src/main/java/org/openmrs/parameter/LocationSearchCriteria.java
+index 816bbcd837a1..33062984617b 100644
+--- a/api/src/main/java/org/openmrs/parameter/LocationSearchCriteria.java
++++ b/api/src/main/java/org/openmrs/parameter/LocationSearchCriteria.java
+@@ -42,6 +42,10 @@ public enum TagMatchMode {
+ 
+ 	private boolean includeRetired = false;
+ 
++	private Integer startIndex;
++
++	private Integer maxResults;
++
+ 	/**
+ 	 * @param descendantOfLocation the ancestor location; only its descendants are returned (root excluded)
+ 	 */
+@@ -77,6 +81,22 @@ public void setIncludeRetired(boolean includeRetired) {
+ 		this.includeRetired = includeRetired;
+ 	}
+ 
++	/**
++	 * @param startIndex zero-based index of the first result to return; null means no offset
++	 * @since 2.8.10
++	 */
++	public void setStartIndex(Integer startIndex) {
++		this.startIndex = startIndex;
++	}
++
++	/**
++	 * @param maxResults maximum number of results to return; null means no limit
++	 * @since 2.8.10
++	 */
++	public void setMaxResults(Integer maxResults) {
++		this.maxResults = maxResults;
++	}
++
+ 	/**
+ 	 * @return the ancestor location; only descendants of that location are returned (root excluded)
+ 	 */
+@@ -111,4 +131,20 @@ public String getNameFragment() {
+ 	public boolean getIncludeRetired() {
+ 		return includeRetired;
+ 	}
++
++	/**
++	 * @return zero-based index of the first result to return, or null if not set
++	 * @since 2.8.10
++	 */
++	public Integer getStartIndex() {
++		return startIndex;
++	}
++
++	/**
++	 * @return maximum number of results to return, or null if not set
++	 * @since 2.8.10
++	 */
++	public Integer getMaxResults() {
++		return maxResults;
++	}
+ }
+diff --git a/api/src/test/java/org/openmrs/api/LocationServiceTest.java b/api/src/test/java/org/openmrs/api/LocationServiceTest.java
+index e5004b16777c..227d7205554b 100644
+--- a/api/src/test/java/org/openmrs/api/LocationServiceTest.java
++++ b/api/src/test/java/org/openmrs/api/LocationServiceTest.java
+@@ -1270,6 +1270,80 @@ public void getLocations_withDescendantOf_shouldExcludeRetiredSubtreesWhenInclud
+ 		assertFalse(withoutRetired.contains(grandchild));
+ 	}
+ 
++	/**
++	 * @see LocationService#getLocations(LocationSearchCriteria)
++	 */
++	@Test
++	public void getLocations_withDescendantOf_shouldReturnDescendantsOfARetiredAncestorWhenIncludeRetiredIsTrue() {
++		LocationService ls = Context.getLocationService();
++		List<Location> tree = saveTreeUnderRetiredAncestor(ls);
++		Location retiredRoot = tree.get(0);
++		Location child = tree.get(1);
++		Location grandchild = tree.get(2);
++
++		LocationSearchCriteria criteria = new LocationSearchCriteria();
++		criteria.setDescendantOfLocation(retiredRoot);
++		criteria.setIncludeRetired(true);
++		List<Location> result = ls.getLocations(criteria);
++
++		assertEquals(2, result.size());
++		assertTrue(result.contains(child));
++		assertTrue(result.contains(grandchild));
++		// the ancestor is the search root and is never part of its own descendants
++		assertFalse(result.contains(retiredRoot));
++	}
++
++	/**
++	 * A retired location prunes its whole subtree, and the ancestor the search starts from is no exception. This
++	 * held for the in-memory implementation, which walked parent pointers upwards and checked every node's
++	 * retired flag before matching the ancestor, so it has to keep holding now that the walk runs in the
++	 * database and starts from the top.
++	 *
++	 * @see LocationService#getLocations(LocationSearchCriteria)
++	 */
++	@Test
++	public void getLocations_withDescendantOf_shouldExcludeAllDescendantsWhenAncestorIsRetiredAndIncludeRetiredIsFalse() {
++		LocationService ls = Context.getLocationService();
++		List<Location> tree = saveTreeUnderRetiredAncestor(ls);
++		Location retiredRoot = tree.get(0);
++
++		// the descendants are not retired themselves, so an empty result can only come from pruning the ancestor
++		assertFalse(tree.get(1).getRetired());
++		assertFalse(tree.get(2).getRetired());
++
++		LocationSearchCriteria criteria = new LocationSearchCriteria();
++		criteria.setDescendantOfLocation(retiredRoot);
++		criteria.setIncludeRetired(false);
++
++		assertTrue(ls.getLocations(criteria).isEmpty());
++		// the convenience method builds the same criteria, so it has to agree
++		assertTrue(ls.getDescendantLocations(retiredRoot, false).isEmpty());
++	}
++
++	/**
++	 * Builds retiredRoot (retired) → child (active) → grandchild (active) and returns the three locations in that
++	 * order.
++	 */
++	private List<Location> saveTreeUnderRetiredAncestor(LocationService ls) {
++		Location retiredRoot = new Location();
++		retiredRoot.setName("Retired Ancestor");
++		ls.saveLocation(retiredRoot);
++
++		Location child = new Location();
++		child.setName("Child of Retired Ancestor");
++		child.setParentLocation(retiredRoot);
++		ls.saveLocation(child);
++
++		Location grandchild = new Location();
++		grandchild.setName("Grandchild of Retired Ancestor");
++		grandchild.setParentLocation(child);
++		ls.saveLocation(grandchild);
++
++		ls.retireLocation(retiredRoot, "test");
++
++		return Arrays.asList(retiredRoot, child, grandchild);
++	}
++
+ 	/**
+ 	 * @see LocationService#getLocations(LocationSearchCriteria)
+ 	 */
+@@ -1373,6 +1447,80 @@ public void getLocations_shouldFilterByAnyTag() {
+ 		assertTrue(result.contains(ls.getLocation(3)));
+ 	}
+ 
++	/**
++	 * The tag set is handed in by the caller, so it can contain a null. Matching used to ask the location's own
++	 * tag set whether it contained each requested tag, which is simply false for a null, so a null must go on
++	 * being an unmatchable tag rather than becoming an error.
++	 *
++	 * @see LocationService#getLocations(LocationSearchCriteria)
++	 */
++	@Test
++	public void getLocations_shouldTreatANullTagAsUnmatchableUnderAllMode() {
++		LocationService ls = Context.getLocationService();
++		// tag 3 alone matches locations 2 and 3, but the unmatchable null means ALL can never be satisfied
++		LocationSearchCriteria criteria = new LocationSearchCriteria();
++		criteria.setLocationTags(new HashSet<>(Arrays.asList(ls.getLocationTag(3), null)));
++		criteria.setTagMatchMode(LocationSearchCriteria.TagMatchMode.ALL);
++
++		assertTrue(ls.getLocations(criteria).isEmpty());
++	}
++
++	/**
++	 * @see LocationService#getLocations(LocationSearchCriteria)
++	 */
++	@Test
++	public void getLocations_shouldIgnoreANullTagUnderAnyMode() {
++		LocationService ls = Context.getLocationService();
++		// tag 3 is on locations 2 and 3; the null contributes nothing but must not suppress them either
++		LocationSearchCriteria criteria = new LocationSearchCriteria();
++		criteria.setLocationTags(new HashSet<>(Arrays.asList(ls.getLocationTag(3), null)));
++		criteria.setTagMatchMode(LocationSearchCriteria.TagMatchMode.ANY);
++		List<Location> result = ls.getLocations(criteria);
++
++		assertEquals(2, result.size());
++		assertTrue(result.contains(ls.getLocation(2)));
++		assertTrue(result.contains(ls.getLocation(3)));
++	}
++
++	/**
++	 * A tag set holding nothing matchable leaves no id to build an IN list from, which is where an empty result
++	 * and "no tag filter at all" are easiest to confuse.
++	 *
++	 * @see LocationService#getLocations(LocationSearchCriteria)
++	 */
++	@Test
++	public void getLocations_shouldReturnNoLocationsWhenEveryRequestedTagIsUnmatchable() {
++		LocationService ls = Context.getLocationService();
++
++		for (LocationSearchCriteria.TagMatchMode mode : LocationSearchCriteria.TagMatchMode.values()) {
++			LocationSearchCriteria nullTag = new LocationSearchCriteria();
++			nullTag.setLocationTags(new HashSet<>(Collections.singletonList(null)));
++			nullTag.setTagMatchMode(mode);
++			assertTrue(ls.getLocations(nullTag).isEmpty(), "a null tag should match nothing under " + mode);
++
++			// an unsaved tag has no id, so it cannot be on any location either
++			LocationSearchCriteria unsavedTag = new LocationSearchCriteria();
++			unsavedTag.setLocationTags(new HashSet<>(Collections.singletonList(new LocationTag("Unsaved", "no id"))));
++			unsavedTag.setTagMatchMode(mode);
++			assertTrue(ls.getLocations(unsavedTag).isEmpty(), "an unsaved tag should match nothing under " + mode);
++		}
++	}
++
++	/**
++	 * @see LocationService#getLocations(LocationSearchCriteria)
++	 */
++	@Test
++	public void getLocations_shouldReturnDistinctResultsWhenMatchingMultipleTagsInAnyMode() {
++		LocationService ls = Context.getLocationService();
++		// Tags 3 and 4 are both present on locations 2 and 3; matching ANY must not return those twice
++		LocationSearchCriteria criteria = new LocationSearchCriteria();
++		criteria.setLocationTags(new HashSet<>(Arrays.asList(ls.getLocationTag(3), ls.getLocationTag(4))));
++		criteria.setTagMatchMode(LocationSearchCriteria.TagMatchMode.ANY);
++		List<Location> result = ls.getLocations(criteria);
++		assertEquals(4, result.size());
++		assertEquals(4, new HashSet<>(result).size());
++	}
++
+ 	/**
+ 	 * @see LocationService#getLocations(LocationSearchCriteria)
+ 	 */
+@@ -1421,4 +1569,166 @@ public void getLocation_shouldLoadLocationParentLazily() throws Exception {
+ 		assertFalse(Hibernate.isInitialized(fetchedChild.getParentLocation()), "Parent Location should be loaded lazily");
+ 	}
+ 
++	/**
++	 * @see LocationService#getLocations(LocationSearchCriteria)
++	 */
++	@Test
++	public void getLocations_shouldApplyPaginationWhenProvided() {
++		LocationService ls = Context.getLocationService();
++
++		LocationSearchCriteria allCriteria = new LocationSearchCriteria();
++		allCriteria.setIncludeRetired(true);
++		List<Location> all = ls.getLocations(allCriteria);
++
++		LocationSearchCriteria pagedCriteria = new LocationSearchCriteria();
++		pagedCriteria.setIncludeRetired(true);
++		pagedCriteria.setStartIndex(1);
++		pagedCriteria.setMaxResults(2);
++		List<Location> paged = ls.getLocations(pagedCriteria);
++
++		assertEquals(2, paged.size());
++		assertEquals(all.get(1).getLocationId(), paged.get(0).getLocationId());
++		assertEquals(all.get(2).getLocationId(), paged.get(1).getLocationId());
++	}
++
++	/**
++	 * @see LocationService#getLocations(LocationSearchCriteria)
++	 */
++	@Test
++	public void getLocations_shouldApplyPaginationAfterOtherFilters() {
++		LocationService ls = Context.getLocationService();
++
++		LocationSearchCriteria filteredCriteria = new LocationSearchCriteria();
++		filteredCriteria.setNameFragment("Test Level A");
++		List<Location> filtered = ls.getLocations(filteredCriteria);
++
++		LocationSearchCriteria pagedCriteria = new LocationSearchCriteria();
++		pagedCriteria.setNameFragment("Test Level A");
++		pagedCriteria.setStartIndex(1);
++		pagedCriteria.setMaxResults(1);
++		List<Location> paged = ls.getLocations(pagedCriteria);
++
++		assertEquals(1, paged.size());
++		assertEquals(filtered.get(1).getLocationId(), paged.get(0).getLocationId());
++	}
++
++	/**
++	 * LocationValidator only rejects a name that an unretired location already holds, so retiring a location
++	 * frees its name for reuse and locations can end up sharing one. A sort on name alone is therefore not a
++	 * total order, and paging over it would leave tied rows wherever the database put them, serving a location
++	 * on two pages or on none. Walking the pages has to reconstruct the unpaged result exactly.
++	 *
++	 * @see LocationService#getLocations(LocationSearchCriteria)
++	 */
++	@Test
++	public void getLocations_shouldPageDeterministicallyOverLocationsSharingAName() {
++		LocationService ls = Context.getLocationService();
++
++		// each one is retired before the next takes the name again, which is what the validator allows
++		for (int i = 0; i < 5; i++) {
++			Location reusedName = new Location();
++			reusedName.setName("Reused Name");
++			ls.saveLocation(reusedName);
++			ls.retireLocation(reusedName, "test");
++		}
++		Location current = new Location();
++		current.setName("Reused Name");
++		ls.saveLocation(current);
++
++		LocationSearchCriteria allCriteria = new LocationSearchCriteria();
++		allCriteria.setNameFragment("Reused Name");
++		allCriteria.setIncludeRetired(true);
++		List<Location> all = ls.getLocations(allCriteria);
++		assertEquals(6, all.size());
++
++		List<Integer> walked = new ArrayList<>();
++		for (int page = 0; page < 3; page++) {
++			LocationSearchCriteria pageCriteria = new LocationSearchCriteria();
++			pageCriteria.setNameFragment("Reused Name");
++			pageCriteria.setIncludeRetired(true);
++			pageCriteria.setStartIndex(page * 2);
++			pageCriteria.setMaxResults(2);
++			for (Location location : ls.getLocations(pageCriteria)) {
++				walked.add(location.getLocationId());
++			}
++		}
++
++		List<Integer> expected = new ArrayList<>();
++		for (Location location : all) {
++			expected.add(location.getLocationId());
++		}
++
++		// no location skipped and none served twice
++		assertEquals(expected, walked);
++	}
++
++	/**
++	 * @see LocationService#getLocations(LocationSearchCriteria)
++	 */
++	@Test
++	public void getLocations_shouldTreatNameFragmentWildcardsLiterally() {
++		LocationService ls = Context.getLocationService();
++
++		Location underscore = new Location();
++		underscore.setName("Ward_1");
++		ls.saveLocation(underscore);
++
++		Location noUnderscore = new Location();
++		noUnderscore.setName("WardX1");
++		ls.saveLocation(noUnderscore);
++
++		LocationSearchCriteria criteria = new LocationSearchCriteria();
++		criteria.setNameFragment("Ward_");
++		List<Location> result = ls.getLocations(criteria);
++
++		// '_' must match itself, not any single character
++		assertEquals(1, result.size());
++		assertTrue(result.contains(underscore));
++		assertFalse(result.contains(noUnderscore));
++	}
++
++	/**
++	 * @see LocationService#getLocations(LocationSearchCriteria)
++	 */
++	@Test
++	public void getLocations_shouldIgnoreNonPositiveMaxResults() {
++		LocationService ls = Context.getLocationService();
++
++		LocationSearchCriteria all = new LocationSearchCriteria();
++		all.setIncludeRetired(true);
++		int total = ls.getLocations(all).size();
++
++		LocationSearchCriteria zero = new LocationSearchCriteria();
++		zero.setIncludeRetired(true);
++		zero.setMaxResults(0);
++		assertEquals(total, ls.getLocations(zero).size());
++
++		LocationSearchCriteria negative = new LocationSearchCriteria();
++		negative.setIncludeRetired(true);
++		negative.setMaxResults(-5);
++		assertEquals(total, ls.getLocations(negative).size());
++	}
++
++	/**
++	 * @see LocationService#getLocations(LocationSearchCriteria)
++	 */
++	@Test
++	public void getLocations_shouldIgnoreNegativeStartIndexAndReturnEmptyBeyondResults() {
++		LocationService ls = Context.getLocationService();
++
++		LocationSearchCriteria all = new LocationSearchCriteria();
++		all.setIncludeRetired(true);
++		int total = ls.getLocations(all).size();
++
++		LocationSearchCriteria negative = new LocationSearchCriteria();
++		negative.setIncludeRetired(true);
++		negative.setStartIndex(-1);
++		assertEquals(total, ls.getLocations(negative).size());
++
++		LocationSearchCriteria beyond = new LocationSearchCriteria();
++		beyond.setIncludeRetired(true);
++		beyond.setStartIndex(total + 10);
++		assertTrue(ls.getLocations(beyond).isEmpty());
++	}
++
+ }
+diff --git a/api/src/test/java/org/openmrs/api/db/hibernate/HibernateLocationDAOTest.java b/api/src/test/java/org/openmrs/api/db/hibernate/HibernateLocationDAOTest.java
+index cee87d435e9c..fcb433908eb6 100644
+--- a/api/src/test/java/org/openmrs/api/db/hibernate/HibernateLocationDAOTest.java
++++ b/api/src/test/java/org/openmrs/api/db/hibernate/HibernateLocationDAOTest.java
+@@ -10,14 +10,19 @@
+ package org.openmrs.api.db.hibernate;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
+ 
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
+ 
++import org.hibernate.SessionFactory;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
++import org.openmrs.Location;
+ import org.openmrs.LocationTag;
++import org.openmrs.api.context.Context;
++import org.openmrs.parameter.LocationSearchCriteria;
+ import org.openmrs.test.jupiter.BaseContextSensitiveTest;
+ import org.springframework.beans.factory.annotation.Autowired;
+ 
+@@ -73,5 +78,38 @@ public void getLocationsHavingAllTags_shouldIgnoreNullValuesInLocationTagList()
+ 		
+ 		assertEquals(1, dao.getLocationsHavingAllTags(list1).size());
+ 	}
+-	
++
++	@Test
++	public void getLocations_shouldNotLoadAllLocationsWhenFilteringBySelectiveNameFragment() {
++		for (int i = 0; i < 40; i++) {
++			Location noise = new Location();
++			noise.setName("Noise Location " + i);
++			dao.saveLocation(noise);
++		}
++
++		Location match1 = new Location();
++		match1.setName("Target Prefix One");
++		dao.saveLocation(match1);
++
++		Location match2 = new Location();
++		match2.setName("Target Prefix Two");
++		dao.saveLocation(match2);
++
++		Context.flushSession();
++		Context.clearSession();
++
++		SessionFactory sessionFactory = (SessionFactory) applicationContext.getBean("sessionFactory");
++		sessionFactory.getStatistics().clear();
++
++		LocationSearchCriteria criteria = new LocationSearchCriteria();
++		criteria.setIncludeRetired(true);
++		criteria.setNameFragment("Target Prefix");
++
++		List<Location> result = dao.getLocations(criteria);
++
++		assertEquals(2, result.size());
++		assertTrue(sessionFactory.getStatistics().getEntityLoadCount() <= 10,
++		    "Expected selective filtering to avoid loading the full location table");
++	}
++
+ }

@@ -1,0 +1,3897 @@
+diff --git a/docs/swift-openmedkit.md b/docs/swift-openmedkit.md
+index 85ec1e623..242bfbcf8 100644
+--- a/docs/swift-openmedkit.md
++++ b/docs/swift-openmedkit.md
+@@ -454,6 +454,116 @@ let openmed = try OpenMed(
+ )
+ ```
+ 
++## Lifecycle-managed runtime
++
++`OpenMedRuntime` is an actor that owns one on-device text model session and
++makes inference cancellable, background-aware and memory-pressure-safe. It
++loads the session lazily from local assets, leases it to in-flight requests,
++and releases it when idle, under memory pressure, on background expiration or
++at shutdown.
++
++```swift
++let runtime = OpenMedRuntime(
++    backend: .mlx(modelDirectoryURL: modelDirectory),
++    // iOS apps opt in to background time; the default never requests it.
++    backgroundExecution: OpenMedUIApplicationBackgroundExecution(application: .shared)
++)
++
++let task = Task { try await runtime.deidentify(note, policy: Policy.defaultName) }
++task.cancel()  // throws OpenMedRuntimeError.cancelled; no partial output
++
++do {
++    let entities = try await runtime.extractPII(note)
++} catch let error as OpenMedRuntimeError {
++    // error.reasonCode, error.retryGuidance — never text, spans or paths
++}
++await runtime.shutdown()
++```
++
++The runtime follows an explicit state machine:
++
++| State | Meaning | Leaves to |
++| --- | --- | --- |
++| `idle` | No session resident; admission loads one | `loading`, `released` |
++| `loading` | The loader is building a session from local assets | `ready`, `idle` (failure, pressure, expiration), `released` |
++| `ready` | Session resident, no lease held | `busy(1)`, `idle` (idle release, pressure, expiration), `released` |
++| `busy(n)` | `n` inferences hold leases | `busy(n±1)`, `ready`, `draining` |
++| `draining` | Admission closed while leases finish or cancel | `idle` (pressure, expiration), `released` (`drain()`, `shutdown()`) |
++| `released` | Terminal; no session, no signal observations | — |
++
++**Cancellation.** `analyzeText`, `extractPII` and the three `deidentify`
++overloads run tokenization, windowing, model prediction, merging and
++serialization behind cooperative checkpoints (`OpenMedInferenceStage`).
++Cancelling the calling task, a memory-pressure cancellation, background
++expiration or shutdown is observed at the next checkpoint, so the latency to a
++terminal state is bounded by one step between checkpoints: one tokenizer pass,
++one model window, or one merge or serialization pass. Model work that can
++suspend (for example async Core ML prediction) is also interrupted directly.
++The runtime always waits for the model call to return before ending its lease,
++so a session is never released while in use, and it drops any result produced
++after cancellation. `snapshot()` records the stage at which each cancellation
++was observed and its monotonic latency.
++
++**Memory pressure.** `OpenMedDispatchMemoryPressureSource` (the default,
++backed by `DispatchSource.makeMemoryPressureSource`) feeds warning, critical
++and normal levels. Warning and critical refuse new admissions immediately.
++By default a warning lets in-flight requests finish (cancelling stragglers
++after 2 s) and critical cancels them; both release the session once the last
++lease ends, and a session with no lease is released at once. A later request
++after `normal` reacquires a session through the loader. Configure this with
++`OpenMedRuntimeConfiguration.memoryWarningResponse` and
++`memoryCriticalResponse`, or call `handleMemoryPressure(_:)` from your own
++signal.
++
++**Background expiration.** `OpenMedUIApplicationBackgroundExecution` begins one
++`UIApplication` background task while the runtime is busy and ends it when the
++runtime is ready. When the system expires it, in-flight requests stop with
++`backgroundExpired`, their output is suppressed, the session is released, and
++admission stays closed until `UIApplication.willEnterForegroundNotification`
++(or `resumeAfterForeground()`); the next request loads a fresh session rather
++than reusing abandoned state. Pass the application explicitly so the library
++never touches `UIApplication.shared` from an app extension. macOS, watchOS and
++extensions use the default `OpenMedNoBackgroundExecution`, which never expires.
++Nothing is persisted to resume work in the background.
++
++**Idle release.** A resident session with no lease is released after
++`idleReleaseMilliseconds` (60 s by default; `nil` disables it) or on
++`releaseIdleResources()`. All timers use the injectable `OpenMedRuntimeClock`.
++
++**Errors.** Every lifecycle outcome is a value-free `OpenMedRuntimeError`:
++
++| Error | Reason code | Retry guidance |
++| --- | --- | --- |
++| `cancelled` | `cancelled` | `do_not_retry` |
++| `memoryPressure` | `memory_pressure` | `retry_after_memory_pressure_clears` |
++| `backgroundExpired` | `background_expired` | `retry_after_foreground` |
++| `draining` | `draining` | `retry_with_new_runtime` |
++| `released` | `released` | `retry_with_new_runtime` |
++| `capacityExceeded` | `capacity_exceeded` | `retry_later` |
++| `modelUnavailable` | `model_unavailable` | `check_model_artifact` |
++| `inferenceFailed` | `inference_failed` | `do_not_retry` |
++
++Loader and model errors are withheld; `snapshot()` keeps only their Swift type
++name. Errors, snapshots and descriptions never contain input text, spans,
++labels, model paths or underlying messages.
++
++**Local-only recovery.** `OpenMedRuntime(backend:)` loads with network access
++disabled on first use and on every reacquisition, so MLX artifacts must carry
++their tokenizer and Core ML bundles need `tokenizerFolderURL`. The runtime never
++selects a remote backend. Custom sessions conform to `OpenMedRuntimeModel` and
++are supplied through `OpenMedRuntime(loader:)`; the loader must verify its
++artifact and build fresh state on every call.
++
++**Synchronous calls.** The existing synchronous `OpenMed` methods keep their
++signatures and run the same staged pipeline and checkpoints, so they produce the
++same offsets, labels, actions and bytes. They observe only the calling task's
++cancellation (and throw `OpenMedRuntimeError.cancelled` when it is cancelled);
++they are not admitted, drained, or stopped by memory pressure or background
++expiration. Use `OpenMedRuntime` when you need those guarantees.
++
++Device and simulator memory evidence for these paths is not part of the package
++test suite; the unit tests drive every signal through deterministic fakes.
++
+ ## Public API
+ 
+ ### `OpenMedBackend`
+@@ -502,6 +612,36 @@ public final class OpenMed {
+ 
+ `extractPII(...)` now follows the Python PII path more closely by applying span repair plus semantic-unit merging for fragmented dates, SSNs, phone numbers, emails, and similar PII spans.
+ 
++### `OpenMedRuntime`
++
++```swift
++public actor OpenMedRuntime {
++    public init(
++        configuration: OpenMedRuntimeConfiguration = OpenMedRuntimeConfiguration(),
++        memoryPressure: any OpenMedMemoryPressureSource = OpenMedDispatchMemoryPressureSource(),
++        backgroundExecution: any OpenMedBackgroundExecutionProvider = OpenMedNoBackgroundExecution(),
++        clock: any OpenMedRuntimeClock = OpenMedSystemClock(),
++        loader: @escaping @Sendable () async throws -> any OpenMedRuntimeModel
++    )
++    public init(backend: OpenMedBackend, maxSeqLength: Int = 512, ...)  // iOS and macOS
++
++    public var state: OpenMedRuntimeState { get }
++    public func load() async throws
++    public func analyzeText(_ text: String, confidenceThreshold: Float = 0.5) async throws -> [EntityPrediction]
++    public func extractPII(_ text: String, confidenceThreshold: Float = 0.5, useSmartMerging: Bool = true) async throws -> [EntityPrediction]
++    public func deidentify(_ text: String, policy: String, ...) async throws -> PolicyDeidentificationResult
++    public func deidentify(_ text: String, policy: Policy, ...) async throws -> PolicyDeidentificationResult
++    public func deidentify(_ text: String, method: DeidentificationMethod = .mask, ...) async throws -> DeidentificationResult
++    public func releaseIdleResources() -> Bool
++    public func handleMemoryPressure(_ level: OpenMedMemoryPressureLevel)
++    public func handleBackgroundExpiration()
++    public func resumeAfterForeground()
++    public func drain() async
++    public func shutdown() async
++    public func snapshot() -> OpenMedRuntimeSnapshot
++}
++```
++
+ ### `OpenMedModelStore`
+ 
+ ```swift
+diff --git a/swift/OpenMedKit/Sources/OpenMedKit/OpenMedInferenceCore.swift b/swift/OpenMedKit/Sources/OpenMedKit/OpenMedInferenceCore.swift
+new file mode 100644
+index 000000000..0612bf4e2
+--- /dev/null
++++ b/swift/OpenMedKit/Sources/OpenMedKit/OpenMedInferenceCore.swift
+@@ -0,0 +1,445 @@
++import CryptoKit
++import Foundation
++
++// MARK: - Stages and checkpoints
++
++/// Cooperative-cancellation stages of a text inference.
++///
++/// Every stage boundary is a checkpoint. Cancellation requested while a stage
++/// runs is observed at the next checkpoint, so the latency to a terminal
++/// cancelled state is bounded by the longest single step between checkpoints:
++/// one tokenizer pass, one model window, or one merge or serialization pass.
++public enum OpenMedInferenceStage: String, Sendable, CaseIterable {
++    case tokenization
++    case windowing
++    case modelPrediction = "model_prediction"
++    case merging
++    case serialization
++}
++
++/// A cooperative cancellation checkpoint handed to each inference stage.
++///
++/// A checkpoint created with `init()` observes only the calling task's
++/// cancellation. Checkpoints issued by `OpenMedRuntime` additionally observe
++/// runtime cancellation caused by memory pressure, background expiration or
++/// shutdown.
++public struct OpenMedInferenceCheckpoint: Sendable {
++    let lease: OpenMedInferenceLease?
++
++    /// Create a checkpoint that observes only the calling task's cancellation.
++    public init() {
++        self.lease = nil
++    }
++
++    init(lease: OpenMedInferenceLease) {
++        self.lease = lease
++    }
++
++    /// Throw if the inference must stop before or during `stage`.
++    ///
++    /// - Throws: `OpenMedRuntimeError.cancelled` for task cancellation, or the
++    ///   runtime reason (`memoryPressure`, `backgroundExpired`, `released`).
++    public func check(_ stage: OpenMedInferenceStage) throws {
++        if let lease {
++            try lease.check(stage)
++        } else if Task.isCancelled {
++            throw OpenMedRuntimeError.cancelled
++        }
++    }
++}
++
++/// Lock-protected cancellation state for one admitted inference.
++///
++/// It holds only lifecycle facts: a reason code, a monotonic timestamp and a
++/// stage name. It never stores input text, spans or model paths.
++final class OpenMedInferenceLease: @unchecked Sendable {
++    struct Cancellation: Equatable {
++        let reason: OpenMedRuntimeError
++        let requestedAtMilliseconds: UInt64
++        let observedStage: OpenMedInferenceStage?
++    }
++
++    let id: UInt64
++    private let clock: any OpenMedRuntimeClock
++    private let probe: (@Sendable (OpenMedInferenceStage) -> Void)?
++    private let lock = NSLock()
++    private var reason: OpenMedRuntimeError?
++    private var requestedAt: UInt64 = 0
++    private var observedStage: OpenMedInferenceStage?
++    private var interrupt: (@Sendable () -> Void)?
++
++    init(
++        id: UInt64,
++        clock: any OpenMedRuntimeClock,
++        probe: (@Sendable (OpenMedInferenceStage) -> Void)?
++    ) {
++        self.id = id
++        self.clock = clock
++        self.probe = probe
++    }
++
++    /// Request cancellation. The first reason wins; later calls are ignored.
++    func cancel(_ reason: OpenMedRuntimeError) {
++        let now = clock.nowMilliseconds()
++        lock.lock()
++        guard self.reason == nil else {
++            lock.unlock()
++            return
++        }
++        self.reason = reason
++        requestedAt = now
++        let interrupt = self.interrupt
++        lock.unlock()
++        interrupt?()
++    }
++
++    /// Install the action that interrupts suspended model work.
++    func attachInterrupt(_ action: @escaping @Sendable () -> Void) {
++        lock.lock()
++        let alreadyCancelled = reason != nil
++        if !alreadyCancelled { interrupt = action }
++        lock.unlock()
++        if alreadyCancelled { action() }
++    }
++
++    var cancellation: Cancellation? {
++        lock.lock()
++        defer { lock.unlock() }
++        guard let reason else { return nil }
++        return Cancellation(
++            reason: reason,
++            requestedAtMilliseconds: requestedAt,
++            observedStage: observedStage
++        )
++    }
++
++    func check(_ stage: OpenMedInferenceStage) throws {
++        probe?(stage)
++        if Task.isCancelled { cancel(.cancelled) }
++        lock.lock()
++        defer { lock.unlock() }
++        guard let reason else { return }
++        if observedStage == nil { observedStage = stage }
++        throw reason
++    }
++}
++
++/// Lock-protected set of in-flight leases, so platform signal handlers can
++/// cancel work synchronously before the runtime actor processes the event.
++final class OpenMedLeaseRegistry: @unchecked Sendable {
++    private let lock = NSLock()
++    private var leases: [UInt64: OpenMedInferenceLease] = [:]
++
++    var count: Int {
++        lock.lock()
++        defer { lock.unlock() }
++        return leases.count
++    }
++
++    func insert(_ lease: OpenMedInferenceLease) {
++        lock.lock()
++        leases[lease.id] = lease
++        lock.unlock()
++    }
++
++    func remove(_ lease: OpenMedInferenceLease) {
++        lock.lock()
++        leases[lease.id] = nil
++        lock.unlock()
++    }
++
++    func cancelAll(_ reason: OpenMedRuntimeError) {
++        lock.lock()
++        let active = Array(leases.values)
++        lock.unlock()
++        for lease in active { lease.cancel(reason) }
++    }
++}
++
++// MARK: - Model seam
++
++/// How detected spans are merged into PII entities.
++public enum OpenMedPIIMergeProfile: String, Sendable, CaseIterable {
++    /// BIO token-classification models: semantic patterns may add or widen spans.
++    case tokenClassification = "token_classification"
++    /// Span-decoding models such as the Privacy Filter: keep model spans and
++    /// never add semantic-only matches or widen labels.
++    case modelSpansOnly = "model_spans_only"
++}
++
++/// A loaded, verified text model session owned by an `OpenMedRuntime`.
++///
++/// The runtime calls `predictEntities(in:checkpoint:)` only while it holds an
++/// active lease on the session, never after it has released the session, and
++/// by default never concurrently. Implementations should call
++/// `checkpoint.check(_:)` at least at the tokenization, windowing and
++/// model-prediction stages, and between model windows.
++public protocol OpenMedRuntimeModel: AnyObject, Sendable {
++    /// The merge behaviour applied to this model's detections.
++    var mergeProfile: OpenMedPIIMergeProfile { get }
++
++    /// Tokenize, window and run the model, returning raw entity predictions
++    /// before confidence filtering, with Unicode scalar offsets into `text`.
++    func predictEntities(
++        in text: String,
++        checkpoint: OpenMedInferenceCheckpoint
++    ) async throws -> [EntityPrediction]
++
++    /// Release process-wide caches after the runtime dropped its final
++    /// reference to a session of this type. The default does nothing.
++    static func releaseUnreferencedCaches()
++}
++
++extension OpenMedRuntimeModel {
++    /// Default: token-classification merging.
++    public var mergeProfile: OpenMedPIIMergeProfile { .tokenClassification }
++
++    /// Default: nothing to release.
++    public static func releaseUnreferencedCaches() {}
++}
++
++// MARK: - Shared staged core
++
++/// Post-model stages shared by the synchronous `OpenMed` APIs and the
++/// lifecycle-managed `OpenMedRuntime`, so both produce identical offsets,
++/// labels, actions and result bytes for the same model detections.
++enum OpenMedInferenceCore {
++    static func applyConfidenceThreshold(
++        _ entities: [EntityPrediction],
++        _ confidenceThreshold: Float
++    ) -> [EntityPrediction] {
++        entities.filter { $0.confidence >= confidenceThreshold }
++    }
++
++    static func mergePII(
++        _ entities: [EntityPrediction],
++        text: String,
++        useSmartMerging: Bool,
++        profile: OpenMedPIIMergeProfile,
++        checkpoint: OpenMedInferenceCheckpoint
++    ) throws -> [EntityPrediction] {
++        try checkpoint.check(.merging)
++        let repairedEntities = PostProcessing.repairEntitySpans(entities, text: text)
++        guard useSmartMerging else {
++            return repairedEntities
++        }
++        try checkpoint.check(.merging)
++        switch profile {
++        case .modelSpansOnly:
++            return PostProcessing.mergePIIEntities(
++                repairedEntities,
++                text: text,
++                useSemanticPatterns: true,
++                preferModelLabels: true,
++                allowSemanticOnlyMatches: false,
++                allowSemanticLabelExpansion: false
++            )
++        case .tokenClassification:
++            return PostProcessing.mergePIIEntities(
++                repairedEntities,
++                text: text,
++                useSemanticPatterns: true,
++                preferModelLabels: true
++            )
++        }
++    }
++
++    static func policyResult(
++        _ text: String,
++        entities: [EntityPrediction],
++        policy: Policy,
++        checkpoint: OpenMedInferenceCheckpoint
++    ) throws -> PolicyDeidentificationResult {
++        try checkpoint.check(.serialization)
++        let result = OpenMedRedaction.deidentify(text, entities: entities, policy: policy)
++        try checkpoint.check(.serialization)
++        return result
++    }
++
++    static func methodResult(
++        _ text: String,
++        entities: [EntityPrediction],
++        method: DeidentificationMethod,
++        checkpoint: OpenMedInferenceCheckpoint
++    ) throws -> DeidentificationResult {
++        try checkpoint.check(.serialization)
++        let deidentifiedText = OpenMedRedaction.deidentifiedText(
++            text,
++            entities: entities,
++            method: method
++        )
++        let result = DeidentificationResult(
++            originalText: text,
++            deidentifiedText: deidentifiedText,
++            entities: entities,
++            method: method.rawValue
++        )
++        try checkpoint.check(.serialization)
++        return result
++    }
++}
++
++// MARK: - Redaction
++
++/// Policy and method redaction shared by every OpenMedKit text surface.
++enum OpenMedRedaction {
++    static func deidentify(
++        _ text: String,
++        entities: [EntityPrediction],
++        policy: Policy
++    ) -> PolicyDeidentificationResult {
++        let candidates = deidentificationCandidates(entities, in: text)
++        var redactedText = text
++        var actionRecords: [DeidentifiedSpanAction] = []
++
++        for entity in candidates {
++            let canonicalLabel = Policy.canonicalLabel(for: entity.label)
++            let action = policy.action(for: entity.label)
++            let original = PostProcessing.scalarSubstring(text, start: entity.start, end: entity.end)
++            let replacement = replacementText(
++                for: action,
++                canonicalLabel: canonicalLabel,
++                original: original
++            )
++
++            actionRecords.append(
++                DeidentifiedSpanAction(
++                    label: entity.label,
++                    canonicalLabel: canonicalLabel,
++                    action: action,
++                    start: entity.start,
++                    end: entity.end,
++                    confidence: entity.confidence,
++                    replacement: replacement
++                )
++            )
++        }
++
++        for record in actionRecords.reversed() {
++            guard let replacement = record.replacement else {
++                continue
++            }
++            guard
++                let range = PostProcessing.scalarRange(
++                    in: redactedText,
++                    start: record.start,
++                    end: record.end
++                )
++            else {
++                continue
++            }
++            redactedText.replaceSubrange(range, with: replacement)
++        }
++
++        return PolicyDeidentificationResult(
++            redactedText: redactedText,
++            policyName: policy.name,
++            actions: actionRecords
++        )
++    }
++
++    static func deidentifiedText(
++        _ text: String,
++        entities: [EntityPrediction],
++        method: DeidentificationMethod
++    ) -> String {
++        var redacted = text
++        for entity in entities.sorted(by: { $0.start > $1.start }) {
++            guard
++                let range = PostProcessing.scalarRange(
++                    in: redacted,
++                    start: entity.start,
++                    end: entity.end
++                )
++            else {
++                continue
++            }
++            redacted.replaceSubrange(
++                range,
++                with: replacementText(for: entity, method: method)
++            )
++        }
++        return redacted
++    }
++
++    private static func deidentificationCandidates(
++        _ entities: [EntityPrediction],
++        in text: String
++    ) -> [EntityPrediction] {
++        let textLength = PostProcessing.unicodeScalarCount(in: text)
++        let sorted =
++            entities
++            .compactMap { $0.snappedToGraphemeBoundaries(in: text) }
++            .filter { $0.start >= 0 && $0.end > $0.start && $0.end <= textLength }
++            .sorted {
++                if $0.start == $1.start {
++                    let lhsLength = entityLength($0)
++                    let rhsLength = entityLength($1)
++                    if lhsLength == rhsLength {
++                        return $0.confidence > $1.confidence
++                    }
++                    return lhsLength > rhsLength
++                }
++                return $0.start < $1.start
++            }
++
++        var selected: [EntityPrediction] = []
++        for entity in sorted {
++            let overlapsSelected = selected.contains { existing in
++                entity.start < existing.end && entity.end > existing.start
++            }
++            if !overlapsSelected {
++                selected.append(entity)
++            }
++        }
++
++        return selected.sorted {
++            if $0.start == $1.start {
++                return $0.end < $1.end
++            }
++            return $0.start < $1.start
++        }
++    }
++
++    private static func replacementText(
++        for action: PolicyAction,
++        canonicalLabel: String,
++        original: String
++    ) -> String? {
++        switch action.redactionEquivalent {
++        case .keep:
++            return nil
++        case .mask:
++            return "[\(canonicalLabel)]"
++        case .replace:
++            return "[\(canonicalLabel)_REPLACED]"
++        case .remove:
++            return ""
++        case .hash:
++            return "\(canonicalLabel)_\(stableHash(original))"
++        case .redact:
++            return "[\(canonicalLabel)]"
++        }
++    }
++
++    private static func replacementText(
++        for entity: EntityPrediction,
++        method: DeidentificationMethod
++    ) -> String {
++        switch method {
++        case .mask:
++            return "[\(entity.entityType.uppercased())]"
++        case .remove:
++            return ""
++        }
++    }
++
++    private static func stableHash(_ text: String) -> String {
++        let digest = SHA256.hash(data: Data(text.utf8))
++        return digest.prefix(12).map { String(format: "%02x", $0) }.joined()
++    }
++
++    private static func entityLength(_ entity: EntityPrediction) -> Int {
++        max(0, entity.end - entity.start)
++    }
++}
+diff --git a/swift/OpenMedKit/Sources/OpenMedKit/OpenMedKit.swift b/swift/OpenMedKit/Sources/OpenMedKit/OpenMedKit.swift
+index fd23f5c05..2a3bec718 100644
+--- a/swift/OpenMedKit/Sources/OpenMedKit/OpenMedKit.swift
++++ b/swift/OpenMedKit/Sources/OpenMedKit/OpenMedKit.swift
+@@ -1,5 +1,4 @@
+ #if canImport(MLX) && canImport(Tokenizers) && !os(watchOS) && !os(visionOS)
+-    import CryptoKit
+     import Dispatch
+     import Foundation
+     import MLX
+@@ -121,38 +120,27 @@
+ 
+         /// Run NER on the given text and return detected entities.
+         ///
++        /// Synchronous calls share `OpenMedRuntime`'s staged pipeline and its
++        /// cooperative checkpoints, but observe only the calling task's
++        /// cancellation: they cannot be admitted, drained, or stopped by memory
++        /// pressure or background expiration. Use `OpenMedRuntime` for
++        /// lifecycle-managed inference.
++        ///
+         /// - Parameters:
+         ///   - text: Input clinical text.
+         ///   - confidenceThreshold: Minimum confidence to include an entity (default: 0.5).
+         /// - Returns: Array of detected entities above the confidence threshold.
++        /// - Throws: `OpenMedRuntimeError.cancelled` when the calling task is
++        ///   cancelled; output from cancelled work is never returned.
+         public func analyzeText(
+             _ text: String,
+             confidenceThreshold: Float = 0.5
+         ) throws -> [EntityPrediction] {
+-            let entities: [EntityPrediction]
+-            switch runtime {
+-            case .coreML(let pipeline):
+-                let (inputIDs, attentionMask, _, offsets) = try tokenize(text)
+-                entities = try pipeline.predict(
+-                    inputIds: inputIDs,
+-                    attentionMask: attentionMask,
+-                    offsets: offsets,
+-                    text: text
+-                )
+-            case .mlx(let pipeline):
+-                let (inputIDs, attentionMask, tokenTypeIDs, offsets) = try tokenize(text)
+-                entities = try pipeline.predict(
+-                    inputIDs: inputIDs,
+-                    attentionMask: attentionMask,
+-                    tokenTypeIDs: tokenTypeIDs,
+-                    offsets: offsets,
+-                    text: text
+-                )
+-            case .privacyFilter(let pipeline):
+-                entities = try pipeline.predict(text)
+-            }
+-
+-            return entities.filter { $0.confidence >= confidenceThreshold }
++            try analyzeText(
++                text,
++                confidenceThreshold: confidenceThreshold,
++                checkpoint: OpenMedInferenceCheckpoint()
++            )
+         }
+ 
+         /// Run PII detection on the given text with OpenMed's smart post-processing.
+@@ -165,31 +153,12 @@
+             confidenceThreshold: Float = 0.5,
+             useSmartMerging: Bool = true
+         ) throws -> [EntityPrediction] {
+-            let entities = try analyzeText(text, confidenceThreshold: confidenceThreshold)
+-            let repairedEntities = PostProcessing.repairEntitySpans(entities, text: text)
+-
+-            guard useSmartMerging else {
+-                return repairedEntities
+-            }
+-
+-            switch runtime {
+-            case .privacyFilter:
+-                return PostProcessing.mergePIIEntities(
+-                    repairedEntities,
+-                    text: text,
+-                    useSemanticPatterns: true,
+-                    preferModelLabels: true,
+-                    allowSemanticOnlyMatches: false,
+-                    allowSemanticLabelExpansion: false
+-                )
+-            case .coreML, .mlx:
+-                return PostProcessing.mergePIIEntities(
+-                    repairedEntities,
+-                    text: text,
+-                    useSemanticPatterns: true,
+-                    preferModelLabels: true
+-                )
+-            }
++            try extractPII(
++                text,
++                confidenceThreshold: confidenceThreshold,
++                useSmartMerging: useSmartMerging,
++                checkpoint: OpenMedInferenceCheckpoint()
++            )
+         }
+ 
+         /// De-identify text under a bundled policy profile.
+@@ -225,12 +194,19 @@
+             confidenceThreshold: Float = 0.5,
+             useSmartMerging: Bool = true
+         ) throws -> PolicyDeidentificationResult {
++            let checkpoint = OpenMedInferenceCheckpoint()
+             let entities = try extractPII(
+                 text,
+                 confidenceThreshold: confidenceThreshold,
+-                useSmartMerging: useSmartMerging
++                useSmartMerging: useSmartMerging,
++                checkpoint: checkpoint
++            )
++            return try OpenMedInferenceCore.policyResult(
++                text,
++                entities: entities,
++                policy: policy,
++                checkpoint: checkpoint
+             )
+-            return Self.deidentify(text, entities: entities, policy: policy)
+         }
+ 
+         /// Detect and de-identify PII, returning a Python-schema-compatible result.
+@@ -240,21 +216,18 @@
+             confidenceThreshold: Float = 0.5,
+             useSmartMerging: Bool = true
+         ) throws -> DeidentificationResult {
++            let checkpoint = OpenMedInferenceCheckpoint()
+             let entities = try extractPII(
+                 text,
+                 confidenceThreshold: confidenceThreshold,
+-                useSmartMerging: useSmartMerging
++                useSmartMerging: useSmartMerging,
++                checkpoint: checkpoint
+             )
+-            let deidentifiedText = Self.deidentifiedText(
++            return try OpenMedInferenceCore.methodResult(
+                 text,
+                 entities: entities,
+-                method: method
+-            )
+-            return DeidentificationResult(
+-                originalText: text,
+-                deidentifiedText: deidentifiedText,
+-                entities: entities,
+-                method: method.rawValue
++                method: method,
++                checkpoint: checkpoint
+             )
+         }
+ 
+@@ -270,6 +243,8 @@
+             tokenOverlap: Int = 32,
+             useSmartMerging: Bool = true
+         ) throws -> [EntityPrediction] {
++            let checkpoint = OpenMedInferenceCheckpoint()
++            try checkpoint.check(.tokenization)
+             let chunks = try makeTokenChunks(
+                 for: text,
+                 chunkTokenLimit: chunkTokenLimit,
+@@ -279,17 +254,20 @@
+                 return try extractPII(
+                     text,
+                     confidenceThreshold: confidenceThreshold,
+-                    useSmartMerging: useSmartMerging
++                    useSmartMerging: useSmartMerging,
++                    checkpoint: checkpoint
+                 )
+             }
+ 
+             var chunkEntities: [EntityPrediction] = []
+             for chunk in chunks {
++                try checkpoint.check(.windowing)
+                 let chunkText = Self.substring(text, start: chunk.start, end: chunk.end)
+                 let entities = try extractPII(
+                     chunkText,
+                     confidenceThreshold: confidenceThreshold,
+-                    useSmartMerging: useSmartMerging
++                    useSmartMerging: useSmartMerging,
++                    checkpoint: checkpoint
+                 )
+                 chunkEntities.append(
+                     contentsOf: entities.compactMap { entity in
+@@ -297,11 +275,96 @@
+                     })
+             }
+ 
+-            return mergeChunkedPIIEntities(
++            try checkpoint.check(.merging)
++            let merged = mergeChunkedPIIEntities(
+                 chunkEntities,
+                 text: text,
+                 useSmartMerging: useSmartMerging
+             )
++            try checkpoint.check(.serialization)
++            return merged
++        }
++
++        // MARK: - Staged core
++
++        /// Merge behaviour for this model's detections.
++        var mergeProfile: OpenMedPIIMergeProfile {
++            switch runtime {
++            case .privacyFilter: return .modelSpansOnly
++            case .coreML, .mlx: return .tokenClassification
++            }
++        }
++
++        /// Tokenize, window and run the model behind cooperative checkpoints,
++        /// returning raw detections before confidence filtering.
++        func predictEntities(
++            in text: String,
++            checkpoint: OpenMedInferenceCheckpoint
++        ) throws -> [EntityPrediction] {
++            switch runtime {
++            case .coreML(let pipeline):
++                try checkpoint.check(.tokenization)
++                let (inputIDs, attentionMask, _, offsets) = try tokenize(text)
++                try checkpoint.check(.windowing)
++                try checkpoint.check(.modelPrediction)
++                let entities = try pipeline.predict(
++                    inputIds: inputIDs,
++                    attentionMask: attentionMask,
++                    offsets: offsets,
++                    text: text
++                )
++                try checkpoint.check(.modelPrediction)
++                return entities
++            case .mlx(let pipeline):
++                try checkpoint.check(.tokenization)
++                let (inputIDs, attentionMask, tokenTypeIDs, offsets) = try tokenize(text)
++                try checkpoint.check(.windowing)
++                try checkpoint.check(.modelPrediction)
++                let entities = try pipeline.predict(
++                    inputIDs: inputIDs,
++                    attentionMask: attentionMask,
++                    tokenTypeIDs: tokenTypeIDs,
++                    offsets: offsets,
++                    text: text,
++                    checkpoint: checkpoint
++                )
++                try checkpoint.check(.modelPrediction)
++                return entities
++            case .privacyFilter(let pipeline):
++                try checkpoint.check(.tokenization)
++                let entities = try pipeline.predict(text, checkpoint: checkpoint)
++                try checkpoint.check(.modelPrediction)
++                return entities
++            }
++        }
++
++        func analyzeText(
++            _ text: String,
++            confidenceThreshold: Float,
++            checkpoint: OpenMedInferenceCheckpoint
++        ) throws -> [EntityPrediction] {
++            let entities = try predictEntities(in: text, checkpoint: checkpoint)
++            return OpenMedInferenceCore.applyConfidenceThreshold(entities, confidenceThreshold)
++        }
++
++        func extractPII(
++            _ text: String,
++            confidenceThreshold: Float,
++            useSmartMerging: Bool,
++            checkpoint: OpenMedInferenceCheckpoint
++        ) throws -> [EntityPrediction] {
++            let entities = try analyzeText(
++                text,
++                confidenceThreshold: confidenceThreshold,
++                checkpoint: checkpoint
++            )
++            return try OpenMedInferenceCore.mergePII(
++                entities,
++                text: text,
++                useSmartMerging: useSmartMerging,
++                profile: mergeProfile,
++                checkpoint: checkpoint
++            )
+         }
+ 
+         // MARK: - Private
+@@ -437,119 +500,7 @@
+             entities: [EntityPrediction],
+             policy: Policy
+         ) -> PolicyDeidentificationResult {
+-            let candidates = deidentificationCandidates(entities, in: text)
+-            var redactedText = text
+-            var actionRecords: [DeidentifiedSpanAction] = []
+-
+-            for entity in candidates {
+-                let canonicalLabel = Policy.canonicalLabel(for: entity.label)
+-                let action = policy.action(for: entity.label)
+-                let original = substring(text, start: entity.start, end: entity.end)
+-                let replacement = replacementText(
+-                    for: action,
+-                    canonicalLabel: canonicalLabel,
+-                    original: original
+-                )
+-
+-                actionRecords.append(
+-                    DeidentifiedSpanAction(
+-                        label: entity.label,
+-                        canonicalLabel: canonicalLabel,
+-                        action: action,
+-                        start: entity.start,
+-                        end: entity.end,
+-                        confidence: entity.confidence,
+-                        replacement: replacement
+-                    )
+-                )
+-            }
+-
+-            for record in actionRecords.reversed() {
+-                guard let replacement = record.replacement else {
+-                    continue
+-                }
+-                guard
+-                    let range = PostProcessing.scalarRange(
+-                        in: redactedText,
+-                        start: record.start,
+-                        end: record.end
+-                    )
+-                else {
+-                    continue
+-                }
+-                redactedText.replaceSubrange(range, with: replacement)
+-            }
+-
+-            return PolicyDeidentificationResult(
+-                redactedText: redactedText,
+-                policyName: policy.name,
+-                actions: actionRecords
+-            )
+-        }
+-
+-        private static func deidentificationCandidates(
+-            _ entities: [EntityPrediction],
+-            in text: String
+-        ) -> [EntityPrediction] {
+-            let textLength = PostProcessing.unicodeScalarCount(in: text)
+-            let sorted =
+-                entities
+-                .compactMap { $0.snappedToGraphemeBoundaries(in: text) }
+-                .filter { $0.start >= 0 && $0.end > $0.start && $0.end <= textLength }
+-                .sorted {
+-                    if $0.start == $1.start {
+-                        let lhsLength = entityLength($0)
+-                        let rhsLength = entityLength($1)
+-                        if lhsLength == rhsLength {
+-                            return $0.confidence > $1.confidence
+-                        }
+-                        return lhsLength > rhsLength
+-                    }
+-                    return $0.start < $1.start
+-                }
+-
+-            var selected: [EntityPrediction] = []
+-            for entity in sorted {
+-                let overlapsSelected = selected.contains { existing in
+-                    entity.start < existing.end && entity.end > existing.start
+-                }
+-                if !overlapsSelected {
+-                    selected.append(entity)
+-                }
+-            }
+-
+-            return selected.sorted {
+-                if $0.start == $1.start {
+-                    return $0.end < $1.end
+-                }
+-                return $0.start < $1.start
+-            }
+-        }
+-
+-        private static func replacementText(
+-            for action: PolicyAction,
+-            canonicalLabel: String,
+-            original: String
+-        ) -> String? {
+-            switch action.redactionEquivalent {
+-            case .keep:
+-                return nil
+-            case .mask:
+-                return "[\(canonicalLabel)]"
+-            case .replace:
+-                return "[\(canonicalLabel)_REPLACED]"
+-            case .remove:
+-                return ""
+-            case .hash:
+-                return "\(canonicalLabel)_\(stableHash(original))"
+-            case .redact:
+-                return "[\(canonicalLabel)]"
+-            }
+-        }
+-
+-        private static func stableHash(_ text: String) -> String {
+-            let digest = SHA256.hash(data: Data(text.utf8))
+-            return digest.prefix(12).map { String(format: "%02x", $0) }.joined()
++            OpenMedRedaction.deidentify(text, entities: entities, policy: policy)
+         }
+ 
+         static func deduplicateOverlappingEntities(
+@@ -674,44 +625,6 @@
+             PostProcessing.scalarSubstring(text, start: start, end: end)
+         }
+ 
+-        private static func deidentifiedText(
+-            _ text: String,
+-            entities: [EntityPrediction],
+-            method: DeidentificationMethod
+-        ) -> String {
+-            var redacted = text
+-            for entity in entities.sorted(by: { $0.start > $1.start }) {
+-                guard let range = characterRange(in: redacted, start: entity.start, end: entity.end) else {
+-                    continue
+-                }
+-                redacted.replaceSubrange(
+-                    range,
+-                    with: replacementText(for: entity, method: method)
+-                )
+-            }
+-            return redacted
+-        }
+-
+-        private static func replacementText(
+-            for entity: EntityPrediction,
+-            method: DeidentificationMethod
+-        ) -> String {
+-            switch method {
+-            case .mask:
+-                return "[\(entity.entityType.uppercased())]"
+-            case .remove:
+-                return ""
+-            }
+-        }
+-
+-        private static func characterRange(
+-            in text: String,
+-            start: Int,
+-            end: Int
+-        ) -> Range<String.Index>? {
+-            PostProcessing.scalarRange(in: text, start: start, end: end)
+-        }
+-
+         static func loadTokenizer(
+             tokenizerName: String,
+             tokenizerFolderURL: URL?,
+@@ -1185,4 +1098,92 @@
+             }
+         }
+     }
++
++    /// Adapts a loaded `OpenMed` session to the runtime's model seam. The
++    /// runtime serializes calls by default and is the session's only owner.
++    final class OpenMedTextModelSession: OpenMedRuntimeModel, @unchecked Sendable {
++        private static let loadQueue = DispatchQueue(
++            label: "OpenMedKit.runtime.load",
++            qos: .userInitiated
++        )
++        private let openMed: OpenMed
++
++        init(_ openMed: OpenMed) {
++            self.openMed = openMed
++        }
++
++        var mergeProfile: OpenMedPIIMergeProfile { openMed.mergeProfile }
++
++        func predictEntities(
++            in text: String,
++            checkpoint: OpenMedInferenceCheckpoint
++        ) async throws -> [EntityPrediction] {
++            try openMed.predictEntities(in: text, checkpoint: checkpoint)
++        }
++
++        static func releaseUnreferencedCaches() {
++            OpenMed.clearRuntimeMemoryCache()
++        }
++
++        /// Load on a dedicated queue: `OpenMed.init` blocks while it prepares
++        /// tokenizer assets and must not occupy a Swift concurrency thread.
++        static func load(
++            backend: OpenMedBackend,
++            maxSeqLength: Int
++        ) async throws -> OpenMedTextModelSession {
++            try await withCheckedThrowingContinuation { continuation in
++                loadQueue.async {
++                    continuation.resume(
++                        with: Result {
++                            OpenMedTextModelSession(
++                                try OpenMed(
++                                    backend: backend,
++                                    maxSeqLength: maxSeqLength,
++                                    allowNetworkAccess: false
++                                )
++                            )
++                        }
++                    )
++                }
++            }
++        }
++    }
++
++    extension OpenMedRuntime {
++        /// Create a lifecycle-managed runtime for an OpenMed text model.
++        ///
++        /// The model session is loaded lazily from local assets with network
++        /// access disabled, both on first use and on every reacquisition after
++        /// an idle, memory-pressure or background release. MLX artifacts carry
++        /// their tokenizer; Core ML bundles need `tokenizerFolderURL`.
++        ///
++        /// - Parameters:
++        ///   - backend: Core ML or MLX model location.
++        ///   - maxSeqLength: Maximum token sequence length.
++        ///   - configuration: Admission, idle-release and pressure policy.
++        ///   - memoryPressure: Memory-pressure signal source.
++        ///   - backgroundExecution: Background-time provider.
++        ///   - clock: Monotonic clock for timers and latency evidence.
++        public init(
++            backend: OpenMedBackend,
++            maxSeqLength: Int = 512,
++            configuration: OpenMedRuntimeConfiguration = OpenMedRuntimeConfiguration(),
++            memoryPressure: any OpenMedMemoryPressureSource = OpenMedDispatchMemoryPressureSource(),
++            backgroundExecution: any OpenMedBackgroundExecutionProvider = OpenMedNoBackgroundExecution(),
++            clock: any OpenMedRuntimeClock = OpenMedSystemClock()
++        ) {
++            self.init(
++                configuration: configuration,
++                memoryPressure: memoryPressure,
++                backgroundExecution: backgroundExecution,
++                clock: clock,
++                loader: {
++                    try await OpenMedTextModelSession.load(
++                        backend: backend,
++                        maxSeqLength: maxSeqLength
++                    )
++                }
++            )
++        }
++    }
+ #endif
+diff --git a/swift/OpenMedKit/Sources/OpenMedKit/OpenMedMLXPipeline.swift b/swift/OpenMedKit/Sources/OpenMedKit/OpenMedMLXPipeline.swift
+index 7e28e3f7d..e05e2893f 100644
+--- a/swift/OpenMedKit/Sources/OpenMedKit/OpenMedMLXPipeline.swift
++++ b/swift/OpenMedKit/Sources/OpenMedKit/OpenMedMLXPipeline.swift
+@@ -47,7 +47,8 @@
+             tokenTypeIDs: [Int],
+             offsets: [(Int, Int)],
+             text: String,
+-            strategy: PostProcessing.AggregationStrategy = .average
++            strategy: PostProcessing.AggregationStrategy = .average,
++            checkpoint: OpenMedInferenceCheckpoint = OpenMedInferenceCheckpoint()
+         ) throws -> [EntityPrediction] {
+             let sequenceLength = inputIDs.count
+ 
+@@ -64,6 +65,7 @@
+                 attentionMask: attentionArray
+             )
+             eval(logits)
++            try checkpoint.check(.modelPrediction)
+ 
+             let probabilities = softmax(logits[0], axis: -1)
+             let predictions = probabilities.argMax(axis: -1)
+diff --git a/swift/OpenMedKit/Sources/OpenMedKit/OpenMedPrivacyFilterPipeline.swift b/swift/OpenMedKit/Sources/OpenMedKit/OpenMedPrivacyFilterPipeline.swift
+index c3119a923..cf645ffce 100644
+--- a/swift/OpenMedKit/Sources/OpenMedKit/OpenMedPrivacyFilterPipeline.swift
++++ b/swift/OpenMedKit/Sources/OpenMedKit/OpenMedPrivacyFilterPipeline.swift
+@@ -669,9 +669,11 @@
+ 
+         func predict(
+             _ text: String,
+-            confidenceThreshold: Float = 0.0
++            confidenceThreshold: Float = 0.0,
++            checkpoint: OpenMedInferenceCheckpoint = OpenMedInferenceCheckpoint()
+         ) throws -> [EntityPrediction] {
+             let encoded = try tokenizer.encode(text, maxTokens: maxSeqLength)
++            try checkpoint.check(.windowing)
+             guard !encoded.tokenIDs.isEmpty else {
+                 return []
+             }
+@@ -683,6 +685,7 @@
+             let logProbabilities = (logits - logSumExp(logits, axis: -1, keepDims: true))[0]
+             let probabilities = exp(logProbabilities)
+             eval(logProbabilities, probabilities)
++            try checkpoint.check(.modelPrediction)
+ 
+             let flatLogProbabilities = logProbabilities.asArray(Float.self)
+             let flatProbabilities = probabilities.asArray(Float.self)
+@@ -697,6 +700,7 @@
+                 labelInfo: labelInfo,
+                 biases: artifact.configuration.viterbiBiases
+             )
++            try checkpoint.check(.modelPrediction)
+ 
+             let sourceText = encoded.decodedText == text ? text : encoded.decodedText
+             return decodeGroupedEntities(
+diff --git a/swift/OpenMedKit/Sources/OpenMedKit/OpenMedRuntime.swift b/swift/OpenMedKit/Sources/OpenMedKit/OpenMedRuntime.swift
+new file mode 100644
+index 000000000..02b945680
+--- /dev/null
++++ b/swift/OpenMedKit/Sources/OpenMedKit/OpenMedRuntime.swift
+@@ -0,0 +1,1178 @@
++import Foundation
++
++// MARK: - Lifecycle vocabulary
++
++/// Lifecycle state of an `OpenMedRuntime`.
++///
++/// The main path is `idle → loading → ready → busy(n) → draining → released`.
++/// A drain caused by memory pressure or background expiration ends in `idle`
++/// (the model session is released and reacquired on a later request); a drain
++/// started by `drain()` or `shutdown()` ends in the terminal `released` state.
++public enum OpenMedRuntimeState: Sendable, Equatable, CustomStringConvertible {
++    /// No model session is resident. Admission loads one lazily.
++    case idle
++    /// A model session is loading from its verified local artifact.
++    case loading
++    /// A model session is resident and no inference holds a lease on it.
++    case ready
++    /// `n` admitted inferences hold leases on the resident session.
++    case busy(Int)
++    /// Admission is closed while in-flight leases finish or cancel.
++    case draining
++    /// Terminal: the runtime is shut down and holds no model session.
++    case released
++
++    /// Stable, value-free reason code.
++    public var reasonCode: String {
++        switch self {
++        case .idle: return "idle"
++        case .loading: return "loading"
++        case .ready: return "ready"
++        case .busy: return "busy"
++        case .draining: return "draining"
++        case .released: return "released"
++        }
++    }
++
++    public var description: String {
++        if case .busy(let count) = self { return "busy(\(count))" }
++        return reasonCode
++    }
++}
++
++/// What a caller may do after an `OpenMedRuntimeError`.
++public enum OpenMedRuntimeRetryGuidance: String, Sendable, CaseIterable {
++    /// The caller cancelled; resubmit only if the result is still wanted.
++    case doNotRetry = "do_not_retry"
++    /// Transient capacity limit; retry after in-flight work settles.
++    case retryLater = "retry_later"
++    /// Retry after the platform reports normal memory pressure.
++    case retryAfterMemoryPressureClears = "retry_after_memory_pressure_clears"
++    /// Retry after the application returns to the foreground.
++    case retryAfterForeground = "retry_after_foreground"
++    /// This runtime is closing or closed; create a new runtime.
++    case retryWithNewRuntime = "retry_with_new_runtime"
++    /// The model session could not be loaded; check the local artifact.
++    case checkModelArtifact = "check_model_artifact"
++}
++
++/// Typed, value-free lifecycle outcome of an `OpenMedRuntime` operation.
++///
++/// Errors carry only a stable reason code and retry guidance. They never
++/// contain input text, spans, labels, model paths or underlying error
++/// messages, so they are safe to log.
++public enum OpenMedRuntimeError: Error, Sendable, Hashable, CaseIterable, LocalizedError,
++    CustomStringConvertible, CustomDebugStringConvertible
++{
++    /// The caller's task was cancelled; no output is delivered.
++    case cancelled
++    /// Refused or stopped because the platform reported memory pressure.
++    case memoryPressure
++    /// Stopped because background execution time expired.
++    case backgroundExpired
++    /// Refused because the runtime is draining for shutdown.
++    case draining
++    /// The runtime is shut down.
++    case released
++    /// Refused because the admission queue is full.
++    case capacityExceeded
++    /// The model session could not be loaded.
++    case modelUnavailable
++    /// The model failed while running; the underlying error is withheld.
++    case inferenceFailed
++
++    /// Stable, value-free reason code.
++    public var reasonCode: String {
++        switch self {
++        case .cancelled: return "cancelled"
++        case .memoryPressure: return "memory_pressure"
++        case .backgroundExpired: return "background_expired"
++        case .draining: return "draining"
++        case .released: return "released"
++        case .capacityExceeded: return "capacity_exceeded"
++        case .modelUnavailable: return "model_unavailable"
++        case .inferenceFailed: return "inference_failed"
++        }
++    }
++
++    /// What the caller may do next.
++    public var retryGuidance: OpenMedRuntimeRetryGuidance {
++        switch self {
++        case .cancelled, .inferenceFailed: return .doNotRetry
++        case .memoryPressure: return .retryAfterMemoryPressureClears
++        case .backgroundExpired: return .retryAfterForeground
++        case .draining, .released: return .retryWithNewRuntime
++        case .capacityExceeded: return .retryLater
++        case .modelUnavailable: return .checkModelArtifact
++        }
++    }
++
++    public var errorDescription: String? {
++        "OpenMed runtime stopped the request (\(reasonCode); \(retryGuidance.rawValue))."
++    }
++
++    public var description: String {
++        "OpenMedRuntimeError(reason=\(reasonCode), retry=\(retryGuidance.rawValue))"
++    }
++
++    public var debugDescription: String { description }
++}
++
++/// How the runtime treats in-flight inference when memory pressure arrives.
++public enum OpenMedPressureResponse: Sendable, Equatable {
++    /// Refuse new work and let in-flight inferences finish, cancelling any
++    /// still running after `timeoutMilliseconds` (never, when `nil`). The
++    /// model session is released once the last lease ends.
++    case drainInFlight(timeoutMilliseconds: UInt64?)
++    /// Refuse new work, cancel in-flight inferences at their next checkpoint
++    /// and release the model session once their leases end.
++    case cancelInFlight
++}
++
++/// Admission, release and pressure policy for an `OpenMedRuntime`.
++public struct OpenMedRuntimeConfiguration: Sendable {
++    /// Inferences that may hold a lease at once (1...64). The default of 1
++    /// serializes model execution, which every bundled model requires.
++    public var maxConcurrentInferences: Int
++    /// Requests that may wait for a lease or a model load (0...1024).
++    public var maxQueuedRequests: Int
++    /// Release a resident model after it has been idle this long; `nil`
++    /// keeps it resident until pressure, expiration or shutdown.
++    public var idleReleaseMilliseconds: UInt64?
++    /// Response to a memory-pressure warning.
++    public var memoryWarningResponse: OpenMedPressureResponse
++    /// Response to critical memory pressure.
++    public var memoryCriticalResponse: OpenMedPressureResponse
++
++    /// Test seam: invoked synchronously at every checkpoint, inside the
++    /// inference task, with the stage name only.
++    var stageProbe: (@Sendable (OpenMedInferenceStage) -> Void)?
++
++    /// Create a configuration. Out-of-range limits are clamped.
++    public init(
++        maxConcurrentInferences: Int = 1,
++        maxQueuedRequests: Int = 16,
++        idleReleaseMilliseconds: UInt64? = 60_000,
++        memoryWarningResponse: OpenMedPressureResponse = .drainInFlight(timeoutMilliseconds: 2_000),
++        memoryCriticalResponse: OpenMedPressureResponse = .cancelInFlight
++    ) {
++        self.maxConcurrentInferences = min(max(1, maxConcurrentInferences), 64)
++        self.maxQueuedRequests = min(max(0, maxQueuedRequests), 1_024)
++        self.idleReleaseMilliseconds = idleReleaseMilliseconds
++        self.memoryWarningResponse = memoryWarningResponse
++        self.memoryCriticalResponse = memoryCriticalResponse
++        self.stageProbe = nil
++    }
++
++    func response(for level: OpenMedMemoryPressureLevel) -> OpenMedPressureResponse? {
++        switch level {
++        case .normal: return nil
++        case .warning: return memoryWarningResponse
++        case .critical: return memoryCriticalResponse
++        }
++    }
++}
++
++/// Value-free lifecycle evidence: counts, reason codes, stage names and
++/// monotonic latencies only.
++public struct OpenMedRuntimeSnapshot: Sendable, Equatable, CustomStringConvertible {
++    public let state: OpenMedRuntimeState
++    /// Why admission is currently refused, if it is.
++    public let admissionHold: OpenMedRuntimeError?
++    public let memoryPressure: OpenMedMemoryPressureLevel
++    public let hasResidentModel: Bool
++    public let activeLeases: Int
++    public let pendingAdmissions: Int
++    public let loads: Int
++    public let loadFailures: Int
++    public let releases: Int
++    public let idleReleases: Int
++    public let admitted: Int
++    public let completed: Int
++    public let cancelled: Int
++    public let rejected: Int
++    public let failed: Int
++    public let memoryPressureEvents: Int
++    public let backgroundExpirations: Int
++    public let drainTimeouts: Int
++    public let transitions: Int
++    /// Reason code of the most recent settled or refused request.
++    public let lastOutcome: String?
++    /// Stage at which the most recent cancellation was observed.
++    public let lastCancellationStage: OpenMedInferenceStage?
++    /// Milliseconds from the most recent cancellation request to its terminal state.
++    public let lastCancellationLatencyMilliseconds: UInt64?
++    public let maxCancellationLatencyMilliseconds: UInt64?
++    /// Swift type name of the most recent withheld loader or model error.
++    public let lastFailureTypeName: String?
++
++    public var description: String {
++        var fields = [
++            "state=\(state)",
++            "hold=\(admissionHold?.reasonCode ?? "none")",
++            "pressure=\(memoryPressure.reasonCode)",
++            "resident=\(hasResidentModel)",
++            "active=\(activeLeases)",
++            "pending=\(pendingAdmissions)",
++            "loads=\(loads)",
++            "releases=\(releases)",
++            "admitted=\(admitted)",
++            "completed=\(completed)",
++            "cancelled=\(cancelled)",
++            "rejected=\(rejected)",
++            "failed=\(failed)",
++        ]
++        if let lastOutcome { fields.append("last=\(lastOutcome)") }
++        if let lastCancellationStage { fields.append("cancel_stage=\(lastCancellationStage.rawValue)") }
++        if let maxCancellationLatencyMilliseconds {
++            fields.append("max_cancel_ms=\(maxCancellationLatencyMilliseconds)")
++        }
++        return "OpenMedRuntimeSnapshot(\(fields.joined(separator: ", ")))"
++    }
++}
++
++// MARK: - Runtime
++
++/// Lifecycle-managed, cancellable owner of one on-device text model session.
++///
++/// `OpenMedRuntime` admits requests, loads the model session lazily through a
++/// local loader, leases it to in-flight inferences, and releases it when idle,
++/// under memory pressure, on background expiration or at shutdown. Each
++/// inference runs tokenization, windowing, model prediction, merging and
++/// serialization behind cooperative checkpoints; output from cancelled work
++/// is never delivered, and an active lease always outlives the session's use.
++///
++/// The runtime never performs network access itself and never selects a
++/// remote backend. Recovery after a release calls the same local loader, so it
++/// passes through the same artifact verification as the first load.
++public actor OpenMedRuntime {
++    private enum DrainIntent: Int, Comparable {
++        case memoryPressure
++        case backgroundExpired
++        case drain
++        case shutdown
++
++        static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
++
++        var isTerminal: Bool { self >= .drain }
++
++        var cancellationReason: OpenMedRuntimeError {
++            switch self {
++            case .memoryPressure: return .memoryPressure
++            case .backgroundExpired: return .backgroundExpired
++            case .drain: return .draining
++            case .shutdown: return .released
++            }
++        }
++    }
++
++    private struct Waiter {
++        let id: UInt64
++        let continuation: CheckedContinuation<Void, Never>
++    }
++
++    private struct Counters {
++        var loads = 0
++        var loadFailures = 0
++        var releases = 0
++        var idleReleases = 0
++        var admitted = 0
++        var completed = 0
++        var cancelled = 0
++        var rejected = 0
++        var failed = 0
++        var memoryPressureEvents = 0
++        var backgroundExpirations = 0
++        var drainTimeouts = 0
++        var transitions = 0
++        var lastOutcome: String?
++        var lastCancellationStage: OpenMedInferenceStage?
++        var lastCancellationLatency: UInt64?
++        var maxCancellationLatency: UInt64?
++        var lastFailureTypeName: String?
++    }
++
++    /// The admission, release and pressure policy.
++    public nonisolated let configuration: OpenMedRuntimeConfiguration
++
++    private let loader: @Sendable () async throws -> any OpenMedRuntimeModel
++    private let memoryPressureSource: any OpenMedMemoryPressureSource
++    private let backgroundExecution: any OpenMedBackgroundExecutionProvider
++    private let clock: any OpenMedRuntimeClock
++    private nonisolated let leases = OpenMedLeaseRegistry()
++    private nonisolated let signals = OpenMedSignalSequencer()
++
++    /// Current lifecycle state.
++    public private(set) var state: OpenMedRuntimeState = .idle
++
++    private var model: (any OpenMedRuntimeModel)?
++    private var loadTask: Task<Void, Never>?
++    private var loadGeneration: UInt64 = 0
++    private var failedLoadGeneration: UInt64?
++    private var drainIntent: DrainIntent?
++    private var pressureHold = false
++    private var backgroundHold = false
++    private var pressureLevel: OpenMedMemoryPressureLevel = .normal
++    private var activeLeaseCount = 0
++    private var pendingAdmissions = 0
++    private var nextLeaseID: UInt64 = 0
++    private var waiters: [Waiter] = []
++    private var nextWaiterID: UInt64 = 0
++    private var idleTimer: Task<Void, Never>?
++    private var idleGeneration: UInt64 = 0
++    private var drainTimer: Task<Void, Never>?
++    private var drainGeneration: UInt64 = 0
++    private var backgroundAssertion: (any OpenMedBackgroundExecutionAssertion)?
++    private var observations: [any OpenMedRuntimeObservation] = []
++    private var observingSignals = false
++    private var lastPressureSignal: UInt64 = 0
++    private var lastLifecycleSignal: UInt64 = 0
++    private var counters = Counters()
++
++    /// Create a runtime around a local model loader.
++    ///
++    /// - Parameters:
++    ///   - configuration: Admission, idle-release and pressure policy.
++    ///   - memoryPressure: Memory-pressure signal source.
++    ///   - backgroundExecution: Background-time provider. The default never
++    ///     requests background time; pass
++    ///     `OpenMedUIApplicationBackgroundExecution` from an iOS application.
++    ///   - clock: Monotonic clock for timers and latency evidence.
++    ///   - loader: Loads and verifies a fresh model session from local assets.
++    ///     It is called again after every release, so it must not reuse
++    ///     abandoned mutable state and must not reach the network.
++    public init(
++        configuration: OpenMedRuntimeConfiguration = OpenMedRuntimeConfiguration(),
++        memoryPressure: any OpenMedMemoryPressureSource = OpenMedDispatchMemoryPressureSource(),
++        backgroundExecution: any OpenMedBackgroundExecutionProvider = OpenMedNoBackgroundExecution(),
++        clock: any OpenMedRuntimeClock = OpenMedSystemClock(),
++        loader: @escaping @Sendable () async throws -> any OpenMedRuntimeModel
++    ) {
++        self.configuration = configuration
++        self.memoryPressureSource = memoryPressure
++        self.backgroundExecution = backgroundExecution
++        self.clock = clock
++        self.loader = loader
++    }
++
++    deinit {
++        loadTask?.cancel()
++        idleTimer?.cancel()
++        drainTimer?.cancel()
++        backgroundAssertion?.end()
++        for observation in observations { observation.cancel() }
++        leases.cancelAll(.released)
++    }
++
++    // MARK: Public operations
++
++    /// Load the model session now instead of on the first request.
++    ///
++    /// - Throws: `OpenMedRuntimeError` when admission is refused or loading fails.
++    public func load() async throws {
++        _ = try await acquire(lease: false)
++    }
++
++    /// Run named-entity recognition and return entities above the threshold.
++    ///
++    /// - Parameters:
++    ///   - text: Input clinical text.
++    ///   - confidenceThreshold: Minimum confidence to include an entity.
++    /// - Returns: Detected entities with Unicode scalar offsets into `text`.
++    /// - Throws: `OpenMedRuntimeError`; never partial output.
++    public func analyzeText(
++        _ text: String,
++        confidenceThreshold: Float = 0.5
++    ) async throws -> [EntityPrediction] {
++        try await perform { model, checkpoint in
++            let raw = try await model.predictEntities(in: text, checkpoint: checkpoint)
++            let entities = OpenMedInferenceCore.applyConfidenceThreshold(raw, confidenceThreshold)
++            try checkpoint.check(.serialization)
++            return entities
++        }
++    }
++
++    /// Detect PII with OpenMed's span repair and semantic merging.
++    ///
++    /// - Parameters:
++    ///   - text: Input clinical text.
++    ///   - confidenceThreshold: Minimum confidence to include an entity.
++    ///   - useSmartMerging: Apply semantic-unit merging after span repair.
++    /// - Returns: PII entities identical to `OpenMed.extractPII` for the same model.
++    /// - Throws: `OpenMedRuntimeError`; never partial output.
++    public func extractPII(
++        _ text: String,
++        confidenceThreshold: Float = 0.5,
++        useSmartMerging: Bool = true
++    ) async throws -> [EntityPrediction] {
++        try await perform { model, checkpoint in
++            let entities = try await Self.detectPII(
++                model: model,
++                text: text,
++                confidenceThreshold: confidenceThreshold,
++                useSmartMerging: useSmartMerging,
++                checkpoint: checkpoint
++            )
++            try checkpoint.check(.serialization)
++            return entities
++        }
++    }
++
++    /// De-identify text under a bundled policy profile.
++    ///
++    /// - Parameters:
++    ///   - text: Input clinical text.
++    ///   - policy: Bundled policy name or alias, resolved before admission.
++    ///   - confidenceThreshold: Minimum confidence to include an entity.
++    ///   - useSmartMerging: Apply semantic-unit merging after span repair.
++    /// - Returns: A complete policy result; cancelled work returns nothing.
++    /// - Throws: `PolicyError` for an unknown policy, else `OpenMedRuntimeError`.
++    public func deidentify(
++        _ text: String,
++        policy: String,
++        confidenceThreshold: Float = 0.5,
++        useSmartMerging: Bool = true
++    ) async throws -> PolicyDeidentificationResult {
++        let resolvedPolicy = try Policy(named: policy)
++        return try await deidentify(
++            text,
++            policy: resolvedPolicy,
++            confidenceThreshold: confidenceThreshold,
++            useSmartMerging: useSmartMerging
++        )
++    }
++
++    /// De-identify text under an already loaded policy profile.
++    ///
++    /// - Parameters:
++    ///   - text: Input clinical text.
++    ///   - policy: Loaded policy profile.
++    ///   - confidenceThreshold: Minimum confidence to include an entity.
++    ///   - useSmartMerging: Apply semantic-unit merging after span repair.
++    /// - Returns: A complete policy result; cancelled work returns nothing.
++    /// - Throws: `OpenMedRuntimeError`.
++    public func deidentify(
++        _ text: String,
++        policy: Policy,
++        confidenceThreshold: Float = 0.5,
++        useSmartMerging: Bool = true
++    ) async throws -> PolicyDeidentificationResult {
++        try await perform { model, checkpoint in
++            let entities = try await Self.detectPII(
++                model: model,
++                text: text,
++                confidenceThreshold: confidenceThreshold,
++                useSmartMerging: useSmartMerging,
++                checkpoint: checkpoint
++            )
++            return try OpenMedInferenceCore.policyResult(
++                text,
++                entities: entities,
++                policy: policy,
++                checkpoint: checkpoint
++            )
++        }
++    }
++
++    /// Detect and de-identify PII, returning a Python-schema-compatible result.
++    ///
++    /// - Parameters:
++    ///   - text: Input clinical text.
++    ///   - method: Mask or remove detected spans.
++    ///   - confidenceThreshold: Minimum confidence to include an entity.
++    ///   - useSmartMerging: Apply semantic-unit merging after span repair.
++    /// - Returns: A complete result; cancelled work returns nothing.
++    /// - Throws: `OpenMedRuntimeError`.
++    public func deidentify(
++        _ text: String,
++        method: DeidentificationMethod = .mask,
++        confidenceThreshold: Float = 0.5,
++        useSmartMerging: Bool = true
++    ) async throws -> DeidentificationResult {
++        try await perform { model, checkpoint in
++            let entities = try await Self.detectPII(
++                model: model,
++                text: text,
++                confidenceThreshold: confidenceThreshold,
++                useSmartMerging: useSmartMerging,
++                checkpoint: checkpoint
++            )
++            return try OpenMedInferenceCore.methodResult(
++                text,
++                entities: entities,
++                method: method,
++                checkpoint: checkpoint
++            )
++        }
++    }
++
++    /// Release the resident model session if no inference holds a lease.
++    ///
++    /// - Returns: `true` when a session was released.
++    @discardableResult
++    public func releaseIdleResources() -> Bool {
++        guard state == .ready else { return false }
++        cancelIdleTimer()
++        releaseModel()
++        transition(to: .idle)
++        return true
++    }
++
++    /// Apply a memory-pressure level, for applications that observe their own
++    /// signals (for example `UIApplication.didReceiveMemoryWarningNotification`).
++    ///
++    /// Warning and critical levels refuse new admissions, respond to in-flight
++    /// work per `configuration`, and release the model session once no lease
++    /// holds it. `normal` lifts the admission hold.
++    public func handleMemoryPressure(_ level: OpenMedMemoryPressureLevel) {
++        guard state != .released else { return }
++        pressureLevel = level
++        guard let response = configuration.response(for: level) else {
++            pressureHold = false
++            noteChange()
++            return
++        }
++        counters.memoryPressureEvents += 1
++        pressureHold = true
++        switch response {
++        case .cancelInFlight:
++            beginDrain(.memoryPressure, cancelInFlight: true, timeoutMilliseconds: nil)
++        case .drainInFlight(let timeoutMilliseconds):
++            beginDrain(
++                .memoryPressure,
++                cancelInFlight: false,
++                timeoutMilliseconds: timeoutMilliseconds
++            )
++        }
++    }
++
++    /// Apply background-time expiration: cancel in-flight work, suppress its
++    /// output, release the model session and refuse admission until
++    /// `resumeAfterForeground()`.
++    public func handleBackgroundExpiration() {
++        guard state != .released else { return }
++        counters.backgroundExpirations += 1
++        backgroundHold = true
++        endBackgroundAssertion()
++        beginDrain(.backgroundExpired, cancelInFlight: true, timeoutMilliseconds: nil)
++    }
++
++    /// Lift the background-expiration admission hold. A later request reloads
++    /// the model session through the loader; no abandoned state is reused.
++    public func resumeAfterForeground() {
++        guard backgroundHold else { return }
++        backgroundHold = false
++        noteChange()
++    }
++
++    /// Stop admission, let in-flight inferences finish, release the model
++    /// session and enter the terminal `released` state.
++    public func drain() async {
++        beginDrain(.drain, cancelInFlight: false, timeoutMilliseconds: nil)
++        await waitUntilReleased()
++    }
++
++    /// Stop admission, cancel in-flight inferences, release the model session
++    /// and enter the terminal `released` state.
++    public func shutdown() async {
++        beginDrain(.shutdown, cancelInFlight: true, timeoutMilliseconds: nil)
++        await waitUntilReleased()
++    }
++
++    /// Value-free lifecycle evidence.
++    public func snapshot() -> OpenMedRuntimeSnapshot {
++        OpenMedRuntimeSnapshot(
++            state: state,
++            admissionHold: admissionError(),
++            memoryPressure: pressureLevel,
++            hasResidentModel: model != nil,
++            activeLeases: activeLeaseCount,
++            pendingAdmissions: pendingAdmissions,
++            loads: counters.loads,
++            loadFailures: counters.loadFailures,
++            releases: counters.releases,
++            idleReleases: counters.idleReleases,
++            admitted: counters.admitted,
++            completed: counters.completed,
++            cancelled: counters.cancelled,
++            rejected: counters.rejected,
++            failed: counters.failed,
++            memoryPressureEvents: counters.memoryPressureEvents,
++            backgroundExpirations: counters.backgroundExpirations,
++            drainTimeouts: counters.drainTimeouts,
++            transitions: counters.transitions,
++            lastOutcome: counters.lastOutcome,
++            lastCancellationStage: counters.lastCancellationStage,
++            lastCancellationLatencyMilliseconds: counters.lastCancellationLatency,
++            maxCancellationLatencyMilliseconds: counters.maxCancellationLatency,
++            lastFailureTypeName: counters.lastFailureTypeName
++        )
++    }
++
++    /// Suspend until `predicate` holds for the current snapshot or the caller
++    /// is cancelled. Used by tests to observe transitions without sleeping.
++    func awaitSnapshot(
++        where predicate: @Sendable (OpenMedRuntimeSnapshot) -> Bool
++    ) async -> OpenMedRuntimeSnapshot {
++        while true {
++            let current = snapshot()
++            if predicate(current) || Task.isCancelled { return current }
++            await waitForChange()
++        }
++    }
++
++    static func isValidTransition(
++        from current: OpenMedRuntimeState,
++        to next: OpenMedRuntimeState
++    ) -> Bool {
++        switch (current, next) {
++        case (.released, _): return false
++        case (_, .released): return true
++        case (.idle, .loading): return true
++        case (.loading, .ready), (.loading, .idle): return true
++        case (.ready, .busy(1)), (.ready, .idle): return true
++        case (.busy(let lhs), .busy(let rhs)): return rhs == lhs + 1 || rhs == lhs - 1
++        case (.busy(1), .ready): return true
++        case (.busy, .draining): return true
++        case (.draining, .idle): return true
++        default: return false
++        }
++    }
++
++    // MARK: Execution
++
++    private static func detectPII(
++        model: any OpenMedRuntimeModel,
++        text: String,
++        confidenceThreshold: Float,
++        useSmartMerging: Bool,
++        checkpoint: OpenMedInferenceCheckpoint
++    ) async throws -> [EntityPrediction] {
++        let raw = try await model.predictEntities(in: text, checkpoint: checkpoint)
++        let analyzed = OpenMedInferenceCore.applyConfidenceThreshold(raw, confidenceThreshold)
++        return try OpenMedInferenceCore.mergePII(
++            analyzed,
++            text: text,
++            useSmartMerging: useSmartMerging,
++            profile: model.mergeProfile,
++            checkpoint: checkpoint
++        )
++    }
++
++    private func perform<Output: Sendable>(
++        _ body: @escaping @Sendable (any OpenMedRuntimeModel, OpenMedInferenceCheckpoint) async throws -> Output
++    ) async throws -> Output {
++        let lease: OpenMedInferenceLease
++        let result: Result<Output, Error>
++        do {
++            guard let admitted = try await acquire(lease: true) else {
++                throw OpenMedRuntimeError.released
++            }
++            lease = admitted.lease
++            let box = OpenMedModelBox(admitted.model)
++            result = await Self.execute(box: box, lease: lease, body: body)
++        }
++        return try settle(lease, result: result)
++    }
++
++    /// Run `body` in a child unstructured task that runtime cancellation can
++    /// interrupt, and wait for it to finish so the lease outlives every use of
++    /// the model session.
++    private nonisolated static func execute<Output: Sendable>(
++        box: OpenMedModelBox,
++        lease: OpenMedInferenceLease,
++        body: @escaping @Sendable (any OpenMedRuntimeModel, OpenMedInferenceCheckpoint) async throws -> Output
++    ) async -> Result<Output, Error> {
++        let checkpoint = OpenMedInferenceCheckpoint(lease: lease)
++        let work = Task<Output, Error> {
++            guard let model = box.take() else { throw OpenMedRuntimeError.released }
++            return try await body(model, checkpoint)
++        }
++        lease.attachInterrupt { work.cancel() }
++        return await withTaskCancellationHandler {
++            await work.result
++        } onCancel: {
++            lease.cancel(.cancelled)
++        }
++    }
++
++    private func settle<Output>(
++        _ lease: OpenMedInferenceLease,
++        result: Result<Output, Error>
++    ) throws -> Output {
++        leases.remove(lease)
++        activeLeaseCount -= 1
++        if Task.isCancelled { lease.cancel(.cancelled) }
++
++        let outcome: Result<Output, OpenMedRuntimeError>
++        if let cancellation = lease.cancellation {
++            recordCancellation(cancellation)
++            outcome = .failure(cancellation.reason)
++        } else {
++            switch result {
++            case .success(let value):
++                counters.completed += 1
++                outcome = .success(value)
++            case .failure(let error):
++                outcome = .failure(classify(error))
++            }
++        }
++        switch outcome {
++        case .success: counters.lastOutcome = "completed"
++        case .failure(let error): counters.lastOutcome = error.reasonCode
++        }
++        leaseEnded()
++        return try outcome.get()
++    }
++
++    private func classify(_ error: Error) -> OpenMedRuntimeError {
++        if let runtimeError = error as? OpenMedRuntimeError {
++            if runtimeError == .cancelled { counters.cancelled += 1 } else { counters.failed += 1 }
++            return runtimeError
++        }
++        if error is CancellationError {
++            counters.cancelled += 1
++            return .cancelled
++        }
++        counters.failed += 1
++        counters.lastFailureTypeName = String(describing: type(of: error))
++        return .inferenceFailed
++    }
++
++    private func recordCancellation(_ cancellation: OpenMedInferenceLease.Cancellation) {
++        counters.cancelled += 1
++        counters.lastCancellationStage = cancellation.observedStage
++        let now = clock.nowMilliseconds()
++        let latency =
++            now >= cancellation.requestedAtMilliseconds
++            ? now - cancellation.requestedAtMilliseconds : 0
++        counters.lastCancellationLatency = latency
++        counters.maxCancellationLatency = max(counters.maxCancellationLatency ?? 0, latency)
++    }
++
++    // MARK: Admission
++
++    /// Wait until a model session is resident and, when `lease` is true,
++    /// return a lease on it.
++    private func acquire(
++        lease wantsLease: Bool
++    ) async throws -> (lease: OpenMedInferenceLease, model: any OpenMedRuntimeModel)? {
++        activateSignals()
++        let capacity = configuration.maxConcurrentInferences + configuration.maxQueuedRequests
++        guard !wantsLease || pendingAdmissions + activeLeaseCount < capacity else {
++            throw reject(.capacityExceeded)
++        }
++        pendingAdmissions += 1
++        noteChange()
++        defer {
++            pendingAdmissions -= 1
++            noteChange()
++        }
++
++        var awaitedLoad: UInt64?
++        while true {
++            if Task.isCancelled { throw reject(.cancelled) }
++            if let error = admissionError() { throw reject(error) }
++            if let awaitedLoad, failedLoadGeneration == awaitedLoad {
++                throw reject(.modelUnavailable)
++            }
++            switch state {
++            case .idle:
++                startLoad()
++                awaitedLoad = loadGeneration
++            case .loading:
++                awaitedLoad = loadGeneration
++            case .ready, .busy:
++                guard let model else { break }
++                guard wantsLease else { return nil }
++                if activeLeaseCount < configuration.maxConcurrentInferences {
++                    return (makeLease(), model)
++                }
++            case .draining:
++                // A pressure drain whose hold already lifted: wait for the
++                // release to finish, then reload.
++                break
++            case .released:
++                throw reject(.released)
++            }
++            await waitForChange()
++        }
++    }
++
++    private func admissionError() -> OpenMedRuntimeError? {
++        if state == .released { return .released }
++        if let drainIntent, drainIntent.isTerminal { return .draining }
++        if backgroundHold { return .backgroundExpired }
++        if pressureHold { return .memoryPressure }
++        return nil
++    }
++
++    private func reject(_ error: OpenMedRuntimeError) -> OpenMedRuntimeError {
++        counters.rejected += 1
++        counters.lastOutcome = error.reasonCode
++        noteChange()
++        return error
++    }
++
++    private func makeLease() -> OpenMedInferenceLease {
++        cancelIdleTimer()
++        nextLeaseID &+= 1
++        let lease = OpenMedInferenceLease(
++            id: nextLeaseID,
++            clock: clock,
++            probe: configuration.stageProbe
++        )
++        leases.insert(lease)
++        activeLeaseCount += 1
++        counters.admitted += 1
++        beginBackgroundAssertionIfNeeded()
++        transition(to: .busy(activeLeaseCount))
++        return lease
++    }
++
++    private func leaseEnded() {
++        if activeLeaseCount == 0 { endBackgroundAssertion() }
++        if drainIntent != nil {
++            if activeLeaseCount == 0 { completeDrain() }
++        } else if activeLeaseCount > 0 {
++            transition(to: .busy(activeLeaseCount))
++        } else {
++            transition(to: .ready)
++            scheduleIdleRelease()
++        }
++        noteChange()
++    }
++
++    // MARK: Loading and release
++
++    private func startLoad() {
++        loadGeneration &+= 1
++        let generation = loadGeneration
++        counters.loads += 1
++        let loader = self.loader
++        loadTask = Task { [weak self] in
++            let box = OpenMedModelBox(nil)
++            var failureTypeName: String?
++            do {
++                box.store(try await loader())
++            } catch {
++                failureTypeName = String(describing: type(of: error))
++            }
++            guard let self else {
++                box.discard()
++                return
++            }
++            await self.finishLoad(
++                generation: generation,
++                box: box,
++                failureTypeName: failureTypeName
++            )
++        }
++        transition(to: .loading)
++    }
++
++    private func finishLoad(
++        generation: UInt64,
++        box: OpenMedModelBox,
++        failureTypeName: String?
++    ) {
++        guard generation == loadGeneration, state == .loading else {
++            box.discard()
++            noteChange()
++            return
++        }
++        loadTask = nil
++        if let loaded = box.take() {
++            model = loaded
++            transition(to: .ready)
++            scheduleIdleRelease()
++        } else {
++            failedLoadGeneration = generation
++            counters.loadFailures += 1
++            counters.lastFailureTypeName = failureTypeName
++            transition(to: .idle)
++        }
++    }
++
++    private func abandonLoad() {
++        guard let loadTask else { return }
++        loadGeneration &+= 1
++        loadTask.cancel()
++        self.loadTask = nil
++    }
++
++    private func releaseModel() {
++        guard let modelType = model.map({ type(of: $0) }) else { return }
++        model = nil
++        counters.releases += 1
++        modelType.releaseUnreferencedCaches()
++    }
++
++    private func scheduleIdleRelease() {
++        cancelIdleTimer()
++        guard let milliseconds = configuration.idleReleaseMilliseconds, state == .ready else {
++            return
++        }
++        let generation = idleGeneration
++        let clock = self.clock
++        idleTimer = Task { [weak self] in
++            do {
++                try await clock.sleep(milliseconds: milliseconds)
++            } catch {
++                return
++            }
++            await self?.idleReleaseFired(generation: generation)
++        }
++    }
++
++    private func cancelIdleTimer() {
++        idleGeneration &+= 1
++        idleTimer?.cancel()
++        idleTimer = nil
++    }
++
++    private func idleReleaseFired(generation: UInt64) {
++        guard generation == idleGeneration, state == .ready else { return }
++        idleTimer = nil
++        counters.idleReleases += 1
++        releaseModel()
++        transition(to: .idle)
++    }
++
++    // MARK: Draining
++
++    private func beginDrain(
++        _ intent: DrainIntent,
++        cancelInFlight: Bool,
++        timeoutMilliseconds: UInt64?
++    ) {
++        switch state {
++        case .released:
++            return
++        case .idle:
++            if intent.isTerminal { terminate() }
++        case .loading:
++            abandonLoad()
++            if intent.isTerminal { terminate() } else { transition(to: .idle) }
++        case .ready:
++            cancelIdleTimer()
++            releaseModel()
++            if intent.isTerminal { terminate() } else { transition(to: .idle) }
++        case .busy, .draining:
++            drainIntent = max(drainIntent ?? intent, intent)
++            cancelIdleTimer()
++            transition(to: .draining)
++            if cancelInFlight {
++                cancelDrainTimer()
++                leases.cancelAll(intent.cancellationReason)
++            } else if let timeoutMilliseconds {
++                scheduleDrainTimeout(timeoutMilliseconds, reason: intent.cancellationReason)
++            }
++        }
++        noteChange()
++    }
++
++    private func completeDrain() {
++        guard let intent = drainIntent else { return }
++        drainIntent = nil
++        cancelDrainTimer()
++        releaseModel()
++        if intent.isTerminal { terminate() } else { transition(to: .idle) }
++    }
++
++    private func scheduleDrainTimeout(_ milliseconds: UInt64, reason: OpenMedRuntimeError) {
++        guard drainTimer == nil else { return }
++        drainGeneration &+= 1
++        let generation = drainGeneration
++        let clock = self.clock
++        drainTimer = Task { [weak self] in
++            do {
++                try await clock.sleep(milliseconds: milliseconds)
++            } catch {
++                return
++            }
++            await self?.drainTimeoutFired(generation: generation, reason: reason)
++        }
++    }
++
++    private func cancelDrainTimer() {
++        drainGeneration &+= 1
++        drainTimer?.cancel()
++        drainTimer = nil
++    }
++
++    private func drainTimeoutFired(generation: UInt64, reason: OpenMedRuntimeError) {
++        guard generation == drainGeneration, state == .draining else { return }
++        drainTimer = nil
++        counters.drainTimeouts += 1
++        leases.cancelAll(reason)
++        noteChange()
++    }
++
++    private func terminate() {
++        guard state != .released else { return }
++        drainIntent = nil
++        abandonLoad()
++        cancelIdleTimer()
++        cancelDrainTimer()
++        releaseModel()
++        endBackgroundAssertion()
++        for observation in observations { observation.cancel() }
++        observations.removeAll()
++        transition(to: .released)
++    }
++
++    private func waitUntilReleased() async {
++        while state != .released, !Task.isCancelled {
++            await waitForChange()
++        }
++    }
++
++    // MARK: Signals
++
++    private func activateSignals() {
++        guard !observingSignals, state != .released else { return }
++        observingSignals = true
++        let leases = self.leases
++        let signals = self.signals
++        let configuration = self.configuration
++        observations.append(
++            memoryPressureSource.observe { [weak self] level in
++                let sequence = signals.next()
++                if configuration.response(for: level) == .cancelInFlight {
++                    leases.cancelAll(.memoryPressure)
++                }
++                Task { await self?.applyMemoryPressure(level, sequence: sequence) }
++            }
++        )
++        observations.append(
++            backgroundExecution.observeForeground { [weak self] in
++                let sequence = signals.next()
++                Task { await self?.applyForeground(sequence: sequence) }
++            }
++        )
++    }
++
++    private func applyMemoryPressure(_ level: OpenMedMemoryPressureLevel, sequence: UInt64) {
++        guard sequence > lastPressureSignal else { return }
++        lastPressureSignal = sequence
++        handleMemoryPressure(level)
++    }
++
++    private func applyBackgroundExpiration(sequence: UInt64) {
++        guard sequence > lastLifecycleSignal else { return }
++        lastLifecycleSignal = sequence
++        handleBackgroundExpiration()
++    }
++
++    private func applyForeground(sequence: UInt64) {
++        guard sequence > lastLifecycleSignal else { return }
++        lastLifecycleSignal = sequence
++        resumeAfterForeground()
++    }
++
++    private func beginBackgroundAssertionIfNeeded() {
++        guard backgroundAssertion == nil else { return }
++        let leases = self.leases
++        let signals = self.signals
++        backgroundAssertion = backgroundExecution.beginBackgroundExecution { [weak self] in
++            let sequence = signals.next()
++            leases.cancelAll(.backgroundExpired)
++            Task { await self?.applyBackgroundExpiration(sequence: sequence) }
++        }
++    }
++
++    private func endBackgroundAssertion() {
++        backgroundAssertion?.end()
++        backgroundAssertion = nil
++    }
++
++    // MARK: State and waiting
++
++    private func transition(to next: OpenMedRuntimeState) {
++        guard next != state else { return }
++        assert(
++            Self.isValidTransition(from: state, to: next),
++            "Invalid OpenMedRuntime lifecycle transition"
++        )
++        state = next
++        counters.transitions += 1
++        noteChange()
++    }
++
++    private func waitForChange() async {
++        let id = nextWaiterID
++        nextWaiterID &+= 1
++        await withTaskCancellationHandler {
++            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
++                if Task.isCancelled {
++                    continuation.resume()
++                } else {
++                    waiters.append(Waiter(id: id, continuation: continuation))
++                }
++            }
++        } onCancel: {
++            Task { await self.resumeWaiter(id) }
++        }
++    }
++
++    private func resumeWaiter(_ id: UInt64) {
++        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
++        waiters.remove(at: index).continuation.resume()
++    }
++
++    private func noteChange() {
++        guard !waiters.isEmpty else { return }
++        let current = waiters
++        waiters.removeAll()
++        for waiter in current { waiter.continuation.resume() }
++    }
++}
++
++// MARK: - Support
++
++/// Hands a model session to exactly one consumer so no stray reference keeps
++/// a released session alive.
++final class OpenMedModelBox: @unchecked Sendable {
++    private let lock = NSLock()
++    private var model: (any OpenMedRuntimeModel)?
++
++    init(_ model: (any OpenMedRuntimeModel)?) { self.model = model }
++
++    func store(_ model: any OpenMedRuntimeModel) {
++        lock.lock()
++        self.model = model
++        lock.unlock()
++    }
++
++    func take() -> (any OpenMedRuntimeModel)? {
++        lock.lock()
++        defer { lock.unlock() }
++        let taken = model
++        model = nil
++        return taken
++    }
++
++    /// Drop a session that will never be used and purge its type's caches.
++    func discard() {
++        let modelType: (any OpenMedRuntimeModel.Type)?
++        lock.lock()
++        modelType = model.map { type(of: $0) }
++        model = nil
++        lock.unlock()
++        modelType?.releaseUnreferencedCaches()
++    }
++}
++
++/// Orders asynchronously delivered platform signals.
++final class OpenMedSignalSequencer: @unchecked Sendable {
++    private let lock = NSLock()
++    private var value: UInt64 = 0
++
++    func next() -> UInt64 {
++        lock.lock()
++        defer { lock.unlock() }
++        value &+= 1
++        return value
++    }
++}
+diff --git a/swift/OpenMedKit/Sources/OpenMedKit/OpenMedRuntimeSignals.swift b/swift/OpenMedKit/Sources/OpenMedKit/OpenMedRuntimeSignals.swift
+new file mode 100644
+index 000000000..32b59db36
+--- /dev/null
++++ b/swift/OpenMedKit/Sources/OpenMedKit/OpenMedRuntimeSignals.swift
+@@ -0,0 +1,305 @@
++import Dispatch
++import Foundation
++
++#if canImport(UIKit) && !os(watchOS)
++    import UIKit
++#endif
++
++// MARK: - Observation
++
++/// A cancellable registration with a platform signal source.
++///
++/// `cancel()` must be idempotent and safe to call from any thread.
++public protocol OpenMedRuntimeObservation: Sendable {
++    /// Stop delivering events to the registered handler.
++    func cancel()
++}
++
++/// An observation that has nothing to cancel.
++public struct OpenMedInactiveObservation: OpenMedRuntimeObservation {
++    /// Create an inactive observation.
++    public init() {}
++
++    /// Does nothing.
++    public func cancel() {}
++}
++
++// MARK: - Clock
++
++/// Monotonic time used by `OpenMedRuntime` for idle release, drain timeouts and
++/// value-free cancellation-latency evidence.
++///
++/// Implementations must be monotonic and must never consult wall-clock time.
++public protocol OpenMedRuntimeClock: Sendable {
++    /// Milliseconds since an arbitrary, fixed, monotonic origin.
++    func nowMilliseconds() -> UInt64
++
++    /// Suspend for at least `milliseconds`.
++    ///
++    /// - Throws: `CancellationError` when the calling task is cancelled.
++    func sleep(milliseconds: UInt64) async throws
++}
++
++/// The system monotonic clock.
++public struct OpenMedSystemClock: OpenMedRuntimeClock {
++    /// Create the system clock.
++    public init() {}
++
++    /// Monotonic uptime in milliseconds.
++    public func nowMilliseconds() -> UInt64 {
++        DispatchTime.now().uptimeNanoseconds / 1_000_000
++    }
++
++    /// Suspend the calling task with `Task.sleep`.
++    public func sleep(milliseconds: UInt64) async throws {
++        let capped = min(milliseconds, UInt64.max / 1_000_000)
++        try await Task.sleep(nanoseconds: capped * 1_000_000)
++    }
++}
++
++// MARK: - Memory pressure
++
++/// Platform memory-pressure levels, ordered from least to most severe.
++public enum OpenMedMemoryPressureLevel: Int, Sendable, Comparable, CaseIterable {
++    case normal
++    case warning
++    case critical
++
++    /// Stable, value-free reason code.
++    public var reasonCode: String {
++        switch self {
++        case .normal: return "normal"
++        case .warning: return "warning"
++        case .critical: return "critical"
++        }
++    }
++
++    public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
++}
++
++/// A source of memory-pressure transitions.
++///
++/// Handlers may be invoked on any thread and must not block.
++public protocol OpenMedMemoryPressureSource: Sendable {
++    /// Start delivering memory-pressure levels to `handler`.
++    func observe(
++        _ handler: @escaping @Sendable (OpenMedMemoryPressureLevel) -> Void
++    ) -> any OpenMedRuntimeObservation
++}
++
++/// Memory-pressure source backed by `DispatchSource.makeMemoryPressureSource`.
++///
++/// Available on every Apple platform OpenMedKit supports. It reads only the
++/// pressure level, never process or device identifiers.
++public struct OpenMedDispatchMemoryPressureSource: OpenMedMemoryPressureSource {
++    /// Create a dispatch-backed memory-pressure source.
++    public init() {}
++
++    /// Begin observing normal, warning and critical transitions.
++    public func observe(
++        _ handler: @escaping @Sendable (OpenMedMemoryPressureLevel) -> Void
++    ) -> any OpenMedRuntimeObservation {
++        let source = DispatchSource.makeMemoryPressureSource(
++            eventMask: [.normal, .warning, .critical],
++            queue: DispatchQueue.global(qos: .utility)
++        )
++        source.setEventHandler { [weak source] in
++            guard let event = source?.data else { return }
++            if event.contains(.critical) {
++                handler(.critical)
++            } else if event.contains(.warning) {
++                handler(.warning)
++            } else {
++                handler(.normal)
++            }
++        }
++        source.activate()
++        return OpenMedDispatchSourceObservation(source)
++    }
++}
++
++private final class OpenMedDispatchSourceObservation: OpenMedRuntimeObservation, @unchecked Sendable {
++    private let lock = NSLock()
++    private var source: (any DispatchSourceProtocol)?
++
++    init(_ source: any DispatchSourceProtocol) { self.source = source }
++
++    func cancel() {
++        lock.lock()
++        let current = source
++        source = nil
++        lock.unlock()
++        current?.cancel()
++    }
++
++    deinit { cancel() }
++}
++
++// MARK: - Background execution
++
++/// One request for extra background execution time.
++public protocol OpenMedBackgroundExecutionAssertion: Sendable {
++    /// Release the background-time request. Must be idempotent and thread-safe.
++    func end()
++}
++
++/// Requests background execution time while inference is in flight.
++///
++/// The runtime begins one assertion when it becomes busy and ends it when the
++/// last in-flight inference settles. When the platform reports expiration, the
++/// runtime cancels in-flight work, suppresses its output, releases the model
++/// session and refuses admission until the application returns to the
++/// foreground.
++public protocol OpenMedBackgroundExecutionProvider: Sendable {
++    /// Begin a background-time request.
++    ///
++    /// - Parameter onExpiration: Called at most once, on any thread, when the
++    ///   platform is about to suspend the application. It must return quickly.
++    func beginBackgroundExecution(
++        onExpiration: @escaping @Sendable () -> Void
++    ) -> any OpenMedBackgroundExecutionAssertion
++
++    /// Observe the application returning to the foreground.
++    func observeForeground(
++        _ handler: @escaping @Sendable () -> Void
++    ) -> any OpenMedRuntimeObservation
++}
++
++extension OpenMedBackgroundExecutionProvider {
++    /// Default: no foreground notifications. Call
++    /// `OpenMedRuntime.resumeAfterForeground()` from the application instead.
++    public func observeForeground(
++        _ handler: @escaping @Sendable () -> Void
++    ) -> any OpenMedRuntimeObservation {
++        OpenMedInactiveObservation()
++    }
++}
++
++/// A provider that never requests background time and never expires.
++///
++/// This is the default on every platform, including macOS and watchOS, and in
++/// application extensions where `UIApplication` is unavailable.
++public struct OpenMedNoBackgroundExecution: OpenMedBackgroundExecutionProvider {
++    /// Create the no-op provider.
++    public init() {}
++
++    /// Return an assertion that does nothing.
++    public func beginBackgroundExecution(
++        onExpiration: @escaping @Sendable () -> Void
++    ) -> any OpenMedBackgroundExecutionAssertion {
++        OpenMedInactiveBackgroundAssertion()
++    }
++}
++
++private struct OpenMedInactiveBackgroundAssertion: OpenMedBackgroundExecutionAssertion {
++    func end() {}
++}
++
++#if canImport(UIKit) && !os(watchOS)
++    /// Background execution backed by `UIApplication` background tasks.
++    ///
++    /// Pass the host application explicitly, for example
++    /// `OpenMedUIApplicationBackgroundExecution(application: .shared)`, so that
++    /// OpenMedKit never touches `UIApplication.shared` from an app extension.
++    /// The task name is a fixed, value-free constant.
++    public struct OpenMedUIApplicationBackgroundExecution: OpenMedBackgroundExecutionProvider {
++        private let application: UIApplication
++
++        /// Create a provider for the given application.
++        public init(application: UIApplication) {
++            self.application = application
++        }
++
++        /// Begin a `UIApplication` background task on the main queue.
++        public func beginBackgroundExecution(
++            onExpiration: @escaping @Sendable () -> Void
++        ) -> any OpenMedBackgroundExecutionAssertion {
++            let assertion = OpenMedUIApplicationBackgroundAssertion(application: application)
++            assertion.begin(onExpiration: onExpiration)
++            return assertion
++        }
++
++        /// Observe `UIApplication.willEnterForegroundNotification`.
++        public func observeForeground(
++            _ handler: @escaping @Sendable () -> Void
++        ) -> any OpenMedRuntimeObservation {
++            let token = NotificationCenter.default.addObserver(
++                forName: UIApplication.willEnterForegroundNotification,
++                object: nil,
++                queue: nil
++            ) { _ in handler() }
++            return OpenMedNotificationObservation(token)
++        }
++    }
++
++    private final class OpenMedUIApplicationBackgroundAssertion: OpenMedBackgroundExecutionAssertion, @unchecked Sendable {
++        private static let taskName = "OpenMedKit.inference"
++        private let application: UIApplication
++        private let lock = NSLock()
++        private var identifier: UIBackgroundTaskIdentifier = .invalid
++        private var ended = false
++
++        init(application: UIApplication) {
++            self.application = application
++        }
++
++        func begin(onExpiration: @escaping @Sendable () -> Void) {
++            DispatchQueue.main.async {
++                MainActor.assumeIsolated { self.beginOnMain(onExpiration: onExpiration) }
++            }
++        }
++
++        func end() {
++            lock.lock()
++            ended = true
++            lock.unlock()
++            DispatchQueue.main.async {
++                MainActor.assumeIsolated { self.finishOnMain() }
++            }
++        }
++
++        @MainActor
++        private func beginOnMain(onExpiration: @escaping @Sendable () -> Void) {
++            lock.lock()
++            let alreadyEnded = ended
++            lock.unlock()
++            guard !alreadyEnded else { return }
++            let identifier = application.beginBackgroundTask(withName: Self.taskName) {
++                onExpiration()
++                MainActor.assumeIsolated { self.finishOnMain() }
++            }
++            lock.lock()
++            self.identifier = identifier
++            lock.unlock()
++        }
++
++        @MainActor
++        private func finishOnMain() {
++            lock.lock()
++            let current = identifier
++            identifier = .invalid
++            ended = true
++            lock.unlock()
++            if current != .invalid {
++                application.endBackgroundTask(current)
++            }
++        }
++    }
++
++    private final class OpenMedNotificationObservation: OpenMedRuntimeObservation, @unchecked Sendable {
++        private let lock = NSLock()
++        private var token: NSObjectProtocol?
++
++        init(_ token: NSObjectProtocol) { self.token = token }
++
++        func cancel() {
++            lock.lock()
++            let current = token
++            token = nil
++            lock.unlock()
++            if let current { NotificationCenter.default.removeObserver(current) }
++        }
++
++        deinit { cancel() }
++    }
++#endif
+diff --git a/swift/OpenMedKit/Tests/OpenMedKitTests/OpenMedRuntimeTests.swift b/swift/OpenMedKit/Tests/OpenMedKitTests/OpenMedRuntimeTests.swift
+new file mode 100644
+index 000000000..9c8777b7f
+--- /dev/null
++++ b/swift/OpenMedKit/Tests/OpenMedKitTests/OpenMedRuntimeTests.swift
+@@ -0,0 +1,1193 @@
++import Foundation
++import XCTest
++
++@testable import OpenMedKit
++
++// Synthetic, offline fixtures only. Sentinels mark values that must never reach
++// lifecycle errors, evidence or descriptions.
++private let phiSentinel = "OMSENTINEL-PHI-7Q3"
++private let pathSentinel = "/private/var/OMSENTINEL-PATH/model.mlx"
++private let syntheticNote = "Patient Jane Roe 🧑‍⚕️ called 555-0100 on 2024-01-02 (\(phiSentinel))."
++
++private func withLock<T>(_ lock: NSLock, _ body: () -> T) -> T {
++    lock.lock()
++    defer { lock.unlock() }
++    return body()
++}
++
++// MARK: - Fakes
++
++/// Manual monotonic clock: sleepers resume only when the test advances time.
++private final class ManualRuntimeClock: OpenMedRuntimeClock, @unchecked Sendable {
++    private struct Sleeper {
++        let id: Int
++        let deadline: UInt64
++        let continuation: CheckedContinuation<Void, Error>
++    }
++
++    private let lock = NSLock()
++    private var now: UInt64 = 10_000
++    private var nextID = 0
++    private var sleepers: [Sleeper] = []
++    private var cancelledIDs: Set<Int> = []
++    private var sleeperWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
++
++    func nowMilliseconds() -> UInt64 { withLock(lock) { now } }
++
++    var pendingSleepers: Int { withLock(lock) { sleepers.count } }
++
++    func sleep(milliseconds: UInt64) async throws {
++        let id = withLock(lock) { () -> Int in
++            nextID += 1
++            return nextID
++        }
++        try await withTaskCancellationHandler {
++            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
++                lock.lock()
++                if cancelledIDs.remove(id) != nil {
++                    lock.unlock()
++                    continuation.resume(throwing: CancellationError())
++                    return
++                }
++                let deadline = now + milliseconds
++                if deadline <= now {
++                    lock.unlock()
++                    continuation.resume()
++                    return
++                }
++                sleepers.append(Sleeper(id: id, deadline: deadline, continuation: continuation))
++                let count = sleepers.count
++                let ready = sleeperWaiters.filter { $0.count <= count }
++                sleeperWaiters.removeAll { $0.count <= count }
++                lock.unlock()
++                for waiter in ready { waiter.continuation.resume() }
++            }
++        } onCancel: {
++            lock.lock()
++            let index = sleepers.firstIndex { $0.id == id }
++            let sleeper = index.map { sleepers.remove(at: $0) }
++            if sleeper == nil { cancelledIDs.insert(id) }
++            lock.unlock()
++            sleeper?.continuation.resume(throwing: CancellationError())
++        }
++    }
++
++    func advance(by milliseconds: UInt64) {
++        lock.lock()
++        now += milliseconds
++        let due = sleepers.filter { $0.deadline <= now }
++        sleepers.removeAll { $0.deadline <= now }
++        lock.unlock()
++        for sleeper in due { sleeper.continuation.resume() }
++    }
++
++    func waitForSleepers(_ count: Int) async {
++        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
++            lock.lock()
++            if sleepers.count >= count {
++                lock.unlock()
++                continuation.resume()
++            } else {
++                sleeperWaiters.append((count, continuation))
++                lock.unlock()
++            }
++        }
++    }
++}
++
++private final class FakeObservation: OpenMedRuntimeObservation, @unchecked Sendable {
++    private let action: @Sendable () -> Void
++    init(_ action: @escaping @Sendable () -> Void) { self.action = action }
++    func cancel() { action() }
++}
++
++private final class FakeMemoryPressure: OpenMedMemoryPressureSource, @unchecked Sendable {
++    private let lock = NSLock()
++    private var handlers: [Int: @Sendable (OpenMedMemoryPressureLevel) -> Void] = [:]
++    private var nextID = 0
++
++    var observerCount: Int { withLock(lock) { handlers.count } }
++
++    func observe(
++        _ handler: @escaping @Sendable (OpenMedMemoryPressureLevel) -> Void
++    ) -> any OpenMedRuntimeObservation {
++        let id = withLock(lock) { () -> Int in
++            nextID += 1
++            handlers[nextID] = handler
++            return nextID
++        }
++        return FakeObservation { [weak self] in
++            guard let self else { return }
++            withLock(self.lock) { self.handlers[id] = nil }
++        }
++    }
++
++    func emit(_ level: OpenMedMemoryPressureLevel) {
++        let current = withLock(lock) { Array(handlers.values) }
++        for handler in current { handler(level) }
++    }
++}
++
++private final class FakeBackgroundExecution: OpenMedBackgroundExecutionProvider, @unchecked Sendable {
++    private let lock = NSLock()
++    private var active: [Int: @Sendable () -> Void] = [:]
++    private var foregroundHandlers: [Int: @Sendable () -> Void] = [:]
++    private var nextID = 0
++    private(set) var begun = 0
++    private(set) var ended = 0
++
++    var activeAssertions: Int { withLock(lock) { active.count } }
++    var beginCount: Int { withLock(lock) { begun } }
++
++    func beginBackgroundExecution(
++        onExpiration: @escaping @Sendable () -> Void
++    ) -> any OpenMedBackgroundExecutionAssertion {
++        let id = withLock(lock) { () -> Int in
++            nextID += 1
++            begun += 1
++            active[nextID] = onExpiration
++            return nextID
++        }
++        return FakeAssertion { [weak self] in self?.end(id) }
++    }
++
++    func observeForeground(
++        _ handler: @escaping @Sendable () -> Void
++    ) -> any OpenMedRuntimeObservation {
++        let id = withLock(lock) { () -> Int in
++            nextID += 1
++            foregroundHandlers[nextID] = handler
++            return nextID
++        }
++        return FakeObservation { [weak self] in
++            guard let self else { return }
++            withLock(self.lock) { self.foregroundHandlers[id] = nil }
++        }
++    }
++
++    private func end(_ id: Int) {
++        withLock(lock) {
++            if active.removeValue(forKey: id) != nil { ended += 1 }
++        }
++    }
++
++    /// Simulate the platform expiring every outstanding background request.
++    func expire() {
++        let handlers = withLock(lock) { () -> [@Sendable () -> Void] in
++            let current = Array(active.values)
++            ended += active.count
++            active.removeAll()
++            return current
++        }
++        for handler in handlers { handler() }
++    }
++
++    func enterForeground() {
++        let handlers = withLock(lock) { Array(foregroundHandlers.values) }
++        for handler in handlers { handler() }
++    }
++}
++
++private struct FakeAssertion: OpenMedBackgroundExecutionAssertion {
++    let action: @Sendable () -> Void
++    func end() { action() }
++}
++
++/// A single-use pause point. Interruptible gates throw when the waiting task
++/// is cancelled, like async Core ML prediction; non-interruptible gates model
++/// synchronous work that only notices cancellation at its next checkpoint.
++private final class TestGate: @unchecked Sendable {
++    private let lock = NSLock()
++    private var armed = false
++    private var interruptible = true
++    private var arrived = false
++    private var released = false
++    private var held: CheckedContinuation<Void, Error>?
++    private var arrivalWaiters: [CheckedContinuation<Void, Never>] = []
++
++    func arm(interruptible: Bool = true) {
++        withLock(lock) {
++            armed = true
++            self.interruptible = interruptible
++            arrived = false
++            released = false
++        }
++    }
++
++    func pass() async throws {
++        let shouldPause = withLock(lock) { () -> (Bool, Bool, [CheckedContinuation<Void, Never>]) in
++            guard armed, !arrived else { return (false, false, []) }
++            arrived = true
++            armed = false
++            let waiters = arrivalWaiters
++            arrivalWaiters.removeAll()
++            return (true, interruptible, waiters)
++        }
++        for waiter in shouldPause.2 { waiter.resume() }
++        guard shouldPause.0 else { return }
++        if shouldPause.1 {
++            try await withTaskCancellationHandler {
++                try await suspend(throwOnCancel: true)
++            } onCancel: {
++                let continuation = withLock(lock) { () -> CheckedContinuation<Void, Error>? in
++                    let current = held
++                    held = nil
++                    return current
++                }
++                continuation?.resume(throwing: CancellationError())
++            }
++        } else {
++            try await suspend(throwOnCancel: false)
++        }
++    }
++
++    private func suspend(throwOnCancel: Bool) async throws {
++        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
++            lock.lock()
++            if released {
++                lock.unlock()
++                continuation.resume()
++            } else if throwOnCancel && Task.isCancelled {
++                lock.unlock()
++                continuation.resume(throwing: CancellationError())
++            } else {
++                held = continuation
++                lock.unlock()
++            }
++        }
++    }
++
++    func waitUntilArrived() async {
++        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
++            lock.lock()
++            if arrived {
++                lock.unlock()
++                continuation.resume()
++            } else {
++                arrivalWaiters.append(continuation)
++                lock.unlock()
++            }
++        }
++    }
++
++    func release() {
++        let continuation = withLock(lock) { () -> CheckedContinuation<Void, Error>? in
++            released = true
++            let current = held
++            held = nil
++            return current
++        }
++        continuation?.resume()
++    }
++}
++
++private struct SentinelFailure: Error, CustomStringConvertible {
++    var description: String { "failed reading \(pathSentinel) for \(phiSentinel)" }
++}
++
++/// Per-test model controls and leak ledger.
++private final class FakeModelControls: @unchecked Sendable {
++    private let lock = NSLock()
++    let stageGate = TestGate()
++    let loadGate = TestGate()
++    private var pauseStage: OpenMedInferenceStage?
++    private var predictionCalls = 0
++    private var loaderCalls = 0
++    private var liveModels = 0
++    private var peakLiveModels = 0
++    private var liveScratch = 0
++    private var modelsCreated = 0
++    private var nextLoadFailure: Error?
++    private var nextPredictionFailure: Error?
++
++    var calls: Int { withLock(lock) { predictionCalls } }
++    var loads: Int { withLock(lock) { loaderCalls } }
++    var live: Int { withLock(lock) { liveModels } }
++    var peakLive: Int { withLock(lock) { peakLiveModels } }
++    var scratch: Int { withLock(lock) { liveScratch } }
++    var created: Int { withLock(lock) { modelsCreated } }
++
++    func pause(at stage: OpenMedInferenceStage, interruptible: Bool = true) {
++        withLock(lock) { pauseStage = stage }
++        stageGate.arm(interruptible: interruptible)
++    }
++
++    func failNextLoad(_ error: Error) { withLock(lock) { nextLoadFailure = error } }
++    func failNextPrediction(_ error: Error) { withLock(lock) { nextPredictionFailure = error } }
++
++    func pass(_ stage: OpenMedInferenceStage) async throws {
++        let matches = withLock(lock) { pauseStage == stage }
++        if matches { try await stageGate.pass() }
++    }
++
++    func recordPrediction() throws {
++        let failure = withLock(lock) { () -> Error? in
++            predictionCalls += 1
++            let failure = nextPredictionFailure
++            nextPredictionFailure = nil
++            return failure
++        }
++        if let failure { throw failure }
++    }
++
++    func recordLoad() throws {
++        let failure = withLock(lock) { () -> Error? in
++            loaderCalls += 1
++            let failure = nextLoadFailure
++            nextLoadFailure = nil
++            return failure
++        }
++        if let failure { throw failure }
++    }
++
++    func modelCreated() -> Int {
++        withLock(lock) {
++            liveModels += 1
++            modelsCreated += 1
++            peakLiveModels = max(peakLiveModels, liveModels)
++            return modelsCreated
++        }
++    }
++
++    func modelDestroyed() { withLock(lock) { liveModels -= 1 } }
++    func scratchAllocated() { withLock(lock) { liveScratch += 1 } }
++    func scratchFreed() { withLock(lock) { liveScratch -= 1 } }
++}
++
++/// Records how many fake sessions were still alive when the runtime purged caches.
++private enum CachePurgeLedger {
++    private static let lock = NSLock()
++    nonisolated(unsafe) private static var controls: FakeModelControls?
++    nonisolated(unsafe) private static var liveCountsAtPurge: [Int] = []
++
++    static func reset(_ current: FakeModelControls) {
++        withLock(lock) {
++            controls = current
++            liveCountsAtPurge = []
++        }
++    }
++
++    static func recordPurge() {
++        withLock(lock) { liveCountsAtPurge.append(controls?.live ?? -1) }
++    }
++
++    static var purges: [Int] { withLock(lock) { liveCountsAtPurge } }
++}
++
++private final class ScratchBuffer {
++    private let controls: FakeModelControls
++    private var storage = [UInt8](repeating: 0, count: 4_096)
++    init(_ controls: FakeModelControls) {
++        self.controls = controls
++        controls.scratchAllocated()
++    }
++    func touch() { storage[0] &+= 1 }
++    deinit { controls.scratchFreed() }
++}
++
++private final class FakeTextModel: OpenMedRuntimeModel, @unchecked Sendable {
++    let generation: Int
++    private let controls: FakeModelControls
++
++    init(controls: FakeModelControls) {
++        self.controls = controls
++        self.generation = controls.modelCreated()
++    }
++
++    deinit { controls.modelDestroyed() }
++
++    func predictEntities(
++        in text: String,
++        checkpoint: OpenMedInferenceCheckpoint
++    ) async throws -> [EntityPrediction] {
++        try controls.recordPrediction()
++        let scratch = ScratchBuffer(controls)
++        try checkpoint.check(.tokenization)
++        try await controls.pass(.tokenization)
++        scratch.touch()
++        try checkpoint.check(.tokenization)
++        try checkpoint.check(.windowing)
++        try await controls.pass(.windowing)
++        for _ in 0..<2 {
++            try checkpoint.check(.modelPrediction)
++            try await controls.pass(.modelPrediction)
++            scratch.touch()
++        }
++        try checkpoint.check(.modelPrediction)
++        return Self.entities(for: text)
++    }
++
++    static func releaseUnreferencedCaches() {
++        CachePurgeLedger.recordPurge()
++    }
++
++    /// Deterministic detections with Unicode scalar offsets.
++    static func entities(for text: String) -> [EntityPrediction] {
++        let spans: [(String, String, Float)] = [
++            ("Jane", "first_name", 0.97),
++            ("Roe", "last_name", 0.95),
++            ("555-0100", "phone_number", 0.91),
++            ("2024-01-02", "date", 0.88),
++            ("called", "occupation", 0.20),
++        ]
++        return spans.compactMap { needle, label, confidence in
++            guard let range = text.range(of: needle) else { return nil }
++            let start = PostProcessing.scalarOffset(in: text, at: range.lowerBound)
++            let end = PostProcessing.scalarOffset(in: text, at: range.upperBound)
++            return EntityPrediction(
++                label: label,
++                text: needle,
++                confidence: confidence,
++                start: start,
++                end: end
++            )
++        }
++    }
++}
++
++/// Selects the stage at which the in-band probe acts.
++private final class ProbeTarget: @unchecked Sendable {
++    enum Action { case cancelTask, criticalPressure, expireBackground }
++    private let lock = NSLock()
++    private var stage: OpenMedInferenceStage?
++    private var action: Action = .cancelTask
++
++    func set(_ stage: OpenMedInferenceStage?, _ action: Action = .cancelTask) {
++        withLock(lock) {
++            self.stage = stage
++            self.action = action
++        }
++    }
++
++    /// Fire once at the first checkpoint of the selected stage.
++    func take(_ stage: OpenMedInferenceStage) -> Action? {
++        withLock(lock) {
++            guard self.stage == stage else { return nil }
++            self.stage = nil
++            return action
++        }
++    }
++}
++
++private struct HangGuardTimeout: Error {}
++
++// MARK: - Tests
++
++final class OpenMedRuntimeTests: XCTestCase {
++    private var controls: FakeModelControls!
++    private var clock: ManualRuntimeClock!
++    private var pressure: FakeMemoryPressure!
++    private var background: FakeBackgroundExecution!
++    private var probe: ProbeTarget!
++
++    override func setUp() {
++        super.setUp()
++        controls = FakeModelControls()
++        clock = ManualRuntimeClock()
++        pressure = FakeMemoryPressure()
++        background = FakeBackgroundExecution()
++        probe = ProbeTarget()
++        CachePurgeLedger.reset(controls)
++    }
++
++    private func makeRuntime(
++        maxConcurrentInferences: Int = 1,
++        maxQueuedRequests: Int = 8,
++        idleReleaseMilliseconds: UInt64? = nil,
++        memoryWarningResponse: OpenMedPressureResponse = .drainInFlight(timeoutMilliseconds: nil),
++        memoryCriticalResponse: OpenMedPressureResponse = .cancelInFlight
++    ) -> OpenMedRuntime {
++        var configuration = OpenMedRuntimeConfiguration(
++            maxConcurrentInferences: maxConcurrentInferences,
++            maxQueuedRequests: maxQueuedRequests,
++            idleReleaseMilliseconds: idleReleaseMilliseconds,
++            memoryWarningResponse: memoryWarningResponse,
++            memoryCriticalResponse: memoryCriticalResponse
++        )
++        let probe = self.probe!
++        let pressure = self.pressure!
++        let background = self.background!
++        configuration.stageProbe = { stage in
++            switch probe.take(stage) {
++            case .cancelTask?: withUnsafeCurrentTask { $0?.cancel() }
++            case .criticalPressure?: pressure.emit(.critical)
++            case .expireBackground?: background.expire()
++            case nil: break
++            }
++        }
++        let controls = self.controls!
++        return OpenMedRuntime(
++            configuration: configuration,
++            memoryPressure: pressure,
++            backgroundExecution: background,
++            clock: clock,
++            loader: {
++                try controls.recordLoad()
++                try await controls.loadGate.pass()
++                return FakeTextModel(controls: controls)
++            }
++        )
++    }
++
++    // MARK: Helpers
++
++    private func guarded<T: Sendable>(
++        _ operation: @escaping @Sendable () async throws -> T
++    ) async throws -> T {
++        try await withThrowingTaskGroup(of: T?.self) { group in
++            group.addTask { try await operation() }
++            group.addTask {
++                try await Task.sleep(nanoseconds: 30_000_000_000)
++                return nil
++            }
++            defer { group.cancelAll() }
++            guard let first = try await group.next(), let value = first else {
++                throw HangGuardTimeout()
++            }
++            return value
++        }
++    }
++
++    @discardableResult
++    private func waitFor(
++        _ runtime: OpenMedRuntime,
++        file: StaticString = #filePath,
++        line: UInt = #line,
++        _ predicate: @escaping @Sendable (OpenMedRuntimeSnapshot) -> Bool
++    ) async throws -> OpenMedRuntimeSnapshot {
++        let snapshot = try await guarded { await runtime.awaitSnapshot(where: predicate) }
++        XCTAssertTrue(predicate(snapshot), "runtime did not reach the expected snapshot", file: file, line: line)
++        return snapshot
++    }
++
++    private func arrival(_ gate: TestGate) async throws {
++        try await guarded { await gate.waitUntilArrived() }
++    }
++
++    private func waitForSleepers(_ count: Int) async throws {
++        let clock = self.clock!
++        try await guarded { await clock.waitForSleepers(count) }
++    }
++
++    private func expectError<T: Sendable>(
++        _ expected: OpenMedRuntimeError,
++        file: StaticString = #filePath,
++        line: UInt = #line,
++        _ operation: @escaping @Sendable () async throws -> T
++    ) async {
++        do {
++            _ = try await guarded(operation)
++            XCTFail("expected \(expected.reasonCode)", file: file, line: line)
++        } catch let error as OpenMedRuntimeError {
++            XCTAssertEqual(error, expected, file: file, line: line)
++        } catch {
++            XCTFail("unexpected error type \(type(of: error))", file: file, line: line)
++        }
++    }
++
++    private func expectedPII(_ text: String = syntheticNote) throws -> [EntityPrediction] {
++        let analyzed = OpenMedInferenceCore.applyConfidenceThreshold(
++            FakeTextModel.entities(for: text),
++            0.5
++        )
++        return try OpenMedInferenceCore.mergePII(
++            analyzed,
++            text: text,
++            useSmartMerging: true,
++            profile: .tokenClassification,
++            checkpoint: OpenMedInferenceCheckpoint()
++        )
++    }
++
++    private func bytes(_ entities: [EntityPrediction]) throws -> Data {
++        let encoder = JSONEncoder()
++        encoder.outputFormatting = [.sortedKeys]
++        return try encoder.encode(entities)
++    }
++
++    private func assertNoLeaks(
++        _ runtime: OpenMedRuntime,
++        file: StaticString = #filePath,
++        line: UInt = #line
++    ) async {
++        let snapshot = await runtime.snapshot()
++        XCTAssertEqual(snapshot.activeLeases, 0, file: file, line: line)
++        XCTAssertEqual(snapshot.pendingAdmissions, 0, file: file, line: line)
++        XCTAssertEqual(controls.scratch, 0, "inference buffers retained", file: file, line: line)
++        XCTAssertEqual(background.activeAssertions, 0, "background assertion leaked", file: file, line: line)
++    }
++
++    // MARK: State machine
++
++    func testTransitionTableMatchesDocumentedLifecycle() {
++        let valid: [(OpenMedRuntimeState, OpenMedRuntimeState)] = [
++            (.idle, .loading), (.loading, .ready), (.loading, .idle), (.ready, .busy(1)),
++            (.busy(1), .busy(2)), (.busy(2), .busy(1)), (.busy(1), .ready), (.busy(3), .draining),
++            (.draining, .idle), (.draining, .released), (.ready, .idle), (.idle, .released),
++            (.loading, .released), (.ready, .released),
++        ]
++        for (from, to) in valid {
++            XCTAssertTrue(OpenMedRuntime.isValidTransition(from: from, to: to), "\(from) -> \(to)")
++        }
++        let invalid: [(OpenMedRuntimeState, OpenMedRuntimeState)] = [
++            (.idle, .ready), (.idle, .busy(1)), (.ready, .busy(2)), (.busy(2), .ready),
++            (.busy(1), .busy(3)), (.draining, .busy(1)), (.draining, .ready), (.released, .idle),
++            (.released, .loading), (.loading, .busy(1)), (.ready, .draining),
++        ]
++        for (from, to) in invalid {
++            XCTAssertFalse(OpenMedRuntime.isValidTransition(from: from, to: to), "\(from) -> \(to)")
++        }
++    }
++
++    func testConcurrentCallersShareOneLoadAndMatchSynchronousCore() async throws {
++        let runtime = makeRuntime(maxConcurrentInferences: 2)
++        controls.loadGate.arm()
++        let first = Task { try await runtime.extractPII(syntheticNote) }
++        let second = Task { try await runtime.extractPII(syntheticNote) }
++        let third = Task { try await runtime.extractPII(syntheticNote) }
++        try await arrival(controls.loadGate)
++        try await waitFor(runtime) { $0.state == .loading && $0.pendingAdmissions == 3 }
++        controls.loadGate.release()
++
++        let results = try await guarded {
++            [try await first.value, try await second.value, try await third.value]
++        }
++        let expected = try bytes(try expectedPII())
++        for result in results { XCTAssertEqual(try bytes(result), expected) }
++        XCTAssertEqual(controls.loads, 1)
++        XCTAssertEqual(controls.created, 1)
++
++        let snapshot = await runtime.snapshot()
++        XCTAssertEqual(snapshot.state, .ready)
++        XCTAssertEqual(snapshot.admitted, 3)
++        XCTAssertEqual(snapshot.completed, 3)
++        XCTAssertEqual(snapshot.loads, 1)
++        await assertNoLeaks(runtime)
++        await runtime.shutdown()
++    }
++
++    func testAsyncDeidentifyMatchesSynchronousCoreBytes() async throws {
++        let runtime = makeRuntime()
++        let policy = try Policy(named: Policy.defaultName)
++        let entities = try expectedPII()
++        let expectedPolicy = try OpenMedInferenceCore.policyResult(
++            syntheticNote,
++            entities: entities,
++            policy: policy,
++            checkpoint: OpenMedInferenceCheckpoint()
++        )
++        let expectedMethod = try OpenMedInferenceCore.methodResult(
++            syntheticNote,
++            entities: entities,
++            method: .mask,
++            checkpoint: OpenMedInferenceCheckpoint()
++        )
++
++        let byPolicy = try await runtime.deidentify(syntheticNote, policy: policy)
++        let byName = try await runtime.deidentify(syntheticNote, policy: Policy.defaultName)
++        let byMethod = try await runtime.deidentify(syntheticNote, method: .mask)
++        let analyzed = try await runtime.analyzeText(syntheticNote)
++
++        XCTAssertEqual(byPolicy, expectedPolicy)
++        XCTAssertEqual(byName, expectedPolicy)
++        XCTAssertEqual(Data(byPolicy.redactedText.utf8), Data(expectedPolicy.redactedText.utf8))
++        XCTAssertFalse(byPolicy.redactedText.contains("Jane"))
++        XCTAssertEqual(byMethod.deidentifiedText, expectedMethod.deidentifiedText)
++        XCTAssertEqual(byMethod.piiEntities, expectedMethod.piiEntities)
++        XCTAssertEqual(analyzed.count, 4, "the 0.20 detection is below the threshold")
++        await runtime.shutdown()
++    }
++
++    // MARK: Cancellation
++
++    func testCancellationAtEveryStageReachesTerminalStateWithoutLeaks() async throws {
++        let runtime = makeRuntime()
++        let baseline = try bytes(try await runtime.extractPII(syntheticNote))
++        let policy = try Policy(named: Policy.defaultName)
++
++        for stage in OpenMedInferenceStage.allCases {
++            for operation in 0..<2 {
++                probe.set(stage)
++                await expectError(.cancelled) {
++                    if operation == 0 {
++                        return try await runtime.extractPII(syntheticNote).count
++                    }
++                    return try await runtime.deidentify(syntheticNote, policy: policy).actions.count
++                }
++                let snapshot = await runtime.snapshot()
++                XCTAssertEqual(snapshot.lastCancellationStage, stage, "operation \(operation)")
++                XCTAssertEqual(snapshot.state, .ready)
++                XCTAssertEqual(snapshot.lastOutcome, "cancelled")
++                XCTAssertNotNil(snapshot.lastCancellationLatencyMilliseconds)
++                await assertNoLeaks(runtime)
++            }
++        }
++
++        let recovered = try bytes(try await runtime.extractPII(syntheticNote))
++        XCTAssertEqual(recovered, baseline)
++        let snapshot = await runtime.snapshot()
++        XCTAssertEqual(snapshot.cancelled, OpenMedInferenceStage.allCases.count * 2)
++        XCTAssertEqual(snapshot.loads, 1, "cancellation must not release or reload the model")
++        await runtime.shutdown()
++    }
++
++    func testCallerCancellationInterruptsSuspendedModelWork() async throws {
++        let runtime = makeRuntime()
++        controls.pause(at: .modelPrediction, interruptible: true)
++        let task = Task { try await runtime.extractPII(syntheticNote) }
++        try await arrival(controls.stageGate)
++        task.cancel()
++        await expectError(.cancelled) { try await task.value }
++
++        let snapshot = await runtime.snapshot()
++        XCTAssertEqual(snapshot.cancelled, 1)
++        XCTAssertEqual(snapshot.completed, 0)
++        XCTAssertEqual(snapshot.state, .ready)
++        await assertNoLeaks(runtime)
++        await runtime.shutdown()
++    }
++
++    func testCancellationLatencyIsBoundedByTheNextCheckpoint() async throws {
++        let runtime = makeRuntime()
++        controls.pause(at: .windowing, interruptible: false)
++        let task = Task { try await runtime.extractPII(syntheticNote) }
++        try await arrival(controls.stageGate)
++        task.cancel()
++        clock.advance(by: 40)
++        controls.stageGate.release()
++        await expectError(.cancelled) { try await task.value }
++
++        let snapshot = await runtime.snapshot()
++        XCTAssertEqual(snapshot.lastCancellationStage, .modelPrediction)
++        XCTAssertEqual(snapshot.lastCancellationLatencyMilliseconds, 40)
++        XCTAssertEqual(snapshot.maxCancellationLatencyMilliseconds, 40)
++        await assertNoLeaks(runtime)
++        await runtime.shutdown()
++    }
++
++    func testCancellingAQueuedRequestNeverRunsTheModel() async throws {
++        let runtime = makeRuntime(maxConcurrentInferences: 1, maxQueuedRequests: 2)
++        _ = try await runtime.extractPII(syntheticNote)
++        let callsBefore = controls.calls
++        controls.pause(at: .tokenization)
++        let running = Task { try await runtime.extractPII(syntheticNote) }
++        try await arrival(controls.stageGate)
++        let queuedA = Task { try await runtime.extractPII(syntheticNote) }
++        let queuedB = Task { try await runtime.extractPII(syntheticNote) }
++        try await waitFor(runtime) { $0.pendingAdmissions == 2 }
++
++        await expectError(.capacityExceeded) { try await runtime.extractPII(syntheticNote) }
++        queuedA.cancel()
++        await expectError(.cancelled) { try await queuedA.value }
++        controls.stageGate.release()
++
++        let expected = try bytes(try expectedPII())
++        let completed = try await guarded { [try await running.value, try await queuedB.value] }
++        for result in completed { XCTAssertEqual(try bytes(result), expected) }
++        XCTAssertEqual(controls.calls - callsBefore, 2, "the cancelled queued request never ran")
++        await assertNoLeaks(runtime)
++        await runtime.shutdown()
++    }
++
++    func testSynchronousCheckpointObservesOnlyTaskCancellation() async throws {
++        XCTAssertNoThrow(try OpenMedInferenceCheckpoint().check(.tokenization))
++        let task = Task { () -> OpenMedRuntimeError? in
++            withUnsafeCurrentTask { $0?.cancel() }
++            do {
++                try OpenMedInferenceCheckpoint().check(.merging)
++                return nil
++            } catch let error as OpenMedRuntimeError {
++                return error
++            } catch {
++                return nil
++            }
++        }
++        let error = await task.value
++        XCTAssertEqual(error, .cancelled)
++    }
++
++    // MARK: Memory pressure
++
++    func testMemoryWarningDrainsInFlightRejectsNewWorkAndReleasesOnlyWhenIdle() async throws {
++        let runtime = makeRuntime(memoryWarningResponse: .drainInFlight(timeoutMilliseconds: nil))
++        let baseline = try bytes(try await runtime.extractPII(syntheticNote))
++        controls.pause(at: .modelPrediction)
++        let inFlight = Task { try await runtime.extractPII(syntheticNote) }
++        try await arrival(controls.stageGate)
++
++        pressure.emit(.warning)
++        let draining = try await waitFor(runtime) { $0.state == .draining }
++        XCTAssertTrue(draining.hasResidentModel, "an active lease keeps the session resident")
++        XCTAssertEqual(draining.releases, 0)
++        XCTAssertEqual(draining.admissionHold, .memoryPressure)
++        await expectError(.memoryPressure) { try await runtime.extractPII(syntheticNote) }
++
++        controls.stageGate.release()
++        let finished = try await guarded { try await inFlight.value }
++        XCTAssertEqual(try bytes(finished), baseline, "a drained request completes whole")
++
++        let idle = try await waitFor(runtime) { $0.state == .idle }
++        XCTAssertFalse(idle.hasResidentModel)
++        XCTAssertEqual(idle.releases, 1)
++        XCTAssertEqual(CachePurgeLedger.purges, [0], "caches purged after the last reference")
++        XCTAssertEqual(controls.live, 0)
++        await expectError(.memoryPressure) { try await runtime.extractPII(syntheticNote) }
++
++        pressure.emit(.normal)
++        try await waitFor(runtime) { $0.admissionHold == nil }
++        let recovered = try bytes(try await runtime.extractPII(syntheticNote))
++        XCTAssertEqual(recovered, baseline)
++        XCTAssertEqual(controls.loads, 2, "a later request reacquires through the loader")
++        XCTAssertEqual(controls.created, 2)
++        await assertNoLeaks(runtime)
++        await runtime.shutdown()
++    }
++
++    func testCriticalPressureCancelsInFlightAndRecoversAfterNormal() async throws {
++        let runtime = makeRuntime()
++        let baseline = try bytes(try await runtime.extractPII(syntheticNote))
++        controls.pause(at: .modelPrediction, interruptible: false)
++        let inFlight = Task { try await runtime.extractPII(syntheticNote) }
++        try await arrival(controls.stageGate)
++
++        pressure.emit(.critical)
++        try await waitFor(runtime) { $0.state == .draining }
++        await expectError(.memoryPressure) { try await runtime.extractPII(syntheticNote) }
++        XCTAssertEqual(controls.live, 1, "the leased session survives until its lease ends")
++        controls.stageGate.release()
++        await expectError(.memoryPressure) { try await inFlight.value }
++
++        let idle = try await waitFor(runtime) { $0.state == .idle }
++        XCTAssertEqual(idle.lastCancellationStage, .modelPrediction)
++        XCTAssertEqual(controls.live, 0)
++        pressure.emit(.normal)
++        try await waitFor(runtime) { $0.admissionHold == nil }
++        let recovered = try bytes(try await runtime.extractPII(syntheticNote))
++        XCTAssertEqual(recovered, baseline)
++        await assertNoLeaks(runtime)
++        await runtime.shutdown()
++    }
++
++    func testPressureObservedInsideMergingCancelsAtThatCheckpoint() async throws {
++        let runtime = makeRuntime()
++        try await runtime.load()
++        probe.set(.merging, .criticalPressure)
++        await expectError(.memoryPressure) { try await runtime.extractPII(syntheticNote) }
++        let snapshot = try await waitFor(runtime) { $0.state == .idle }
++        XCTAssertEqual(snapshot.lastCancellationStage, .merging)
++        await assertNoLeaks(runtime)
++        await runtime.shutdown()
++    }
++
++    func testWarningDrainTimeoutCancelsStragglersOnTheInjectedClock() async throws {
++        let runtime = makeRuntime(memoryWarningResponse: .drainInFlight(timeoutMilliseconds: 500))
++        try await runtime.load()
++        controls.pause(at: .modelPrediction)
++        let inFlight = Task { try await runtime.extractPII(syntheticNote) }
++        try await arrival(controls.stageGate)
++        pressure.emit(.warning)
++        try await waitFor(runtime) { $0.state == .draining }
++        try await waitForSleepers(1)
++        clock.advance(by: 499)
++        XCTAssertEqual(clock.pendingSleepers, 1)
++        clock.advance(by: 1)
++        await expectError(.memoryPressure) { try await inFlight.value }
++        let snapshot = try await waitFor(runtime) { $0.state == .idle }
++        XCTAssertEqual(snapshot.drainTimeouts, 1)
++        XCTAssertEqual(snapshot.lastCancellationLatencyMilliseconds, 0)
++        await assertNoLeaks(runtime)
++        await runtime.shutdown()
++    }
++
++    func testPressureWhileReadyReleasesTheIdleSessionImmediately() async throws {
++        let runtime = makeRuntime()
++        try await runtime.load()
++        XCTAssertEqual(controls.live, 1)
++        pressure.emit(.warning)
++        let snapshot = try await waitFor(runtime) { $0.state == .idle }
++        XCTAssertEqual(snapshot.releases, 1)
++        XCTAssertEqual(controls.live, 0)
++        await runtime.shutdown()
++    }
++
++    func testPressureDuringLoadDiscardsTheLoadedSession() async throws {
++        let runtime = makeRuntime()
++        controls.loadGate.arm(interruptible: false)
++        let waiting = Task { try await runtime.extractPII(syntheticNote) }
++        try await arrival(controls.loadGate)
++        pressure.emit(.critical)
++        await expectError(.memoryPressure) { try await waiting.value }
++        try await waitFor(runtime) { $0.state == .idle }
++
++        controls.loadGate.release()
++        try await waitFor(runtime) { _ in !CachePurgeLedger.purges.isEmpty }
++        XCTAssertEqual(CachePurgeLedger.purges, [0], "the abandoned session was dropped, then purged")
++        XCTAssertEqual(controls.live, 0)
++        let snapshot = await runtime.snapshot()
++        XCTAssertFalse(snapshot.hasResidentModel)
++
++        pressure.emit(.normal)
++        try await waitFor(runtime) { $0.admissionHold == nil }
++        _ = try await runtime.extractPII(syntheticNote)
++        XCTAssertEqual(controls.loads, 2)
++        await runtime.shutdown()
++    }
++
++    // MARK: Background expiration
++
++    func testBackgroundExpirationSuppressesOutputAndRequiresForeground() async throws {
++        let runtime = makeRuntime()
++        let baseline = try bytes(try await runtime.extractPII(syntheticNote))
++        XCTAssertEqual(background.beginCount, 1)
++        XCTAssertEqual(background.activeAssertions, 0, "assertion ends when the runtime is ready")
++
++        controls.pause(at: .modelPrediction, interruptible: false)
++        let inFlight = Task { try await runtime.extractPII(syntheticNote) }
++        try await arrival(controls.stageGate)
++        XCTAssertEqual(background.activeAssertions, 1)
++        background.expire()
++        controls.stageGate.release()
++        await expectError(.backgroundExpired) { try await inFlight.value }
++
++        let idle = try await waitFor(runtime) { $0.state == .idle }
++        XCTAssertEqual(idle.admissionHold, .backgroundExpired)
++        XCTAssertEqual(idle.backgroundExpirations, 1)
++        XCTAssertEqual(controls.live, 0, "abandoned session state is not kept")
++        await expectError(.backgroundExpired) { try await runtime.extractPII(syntheticNote) }
++
++        background.enterForeground()
++        try await waitFor(runtime) { $0.admissionHold == nil }
++        let recovered = try bytes(try await runtime.extractPII(syntheticNote))
++        XCTAssertEqual(recovered, baseline)
++        XCTAssertEqual(controls.created, 2, "foreground work starts from a freshly loaded session")
++        await assertNoLeaks(runtime)
++        await runtime.shutdown()
++    }
++
++    func testBackgroundExpirationDuringSerializationIsSuppressed() async throws {
++        let runtime = makeRuntime()
++        try await runtime.load()
++        probe.set(.serialization, .expireBackground)
++        await expectError(.backgroundExpired) {
++            try await runtime.deidentify(syntheticNote, method: .mask).deidentifiedText
++        }
++        let snapshot = try await waitFor(runtime) { $0.state == .idle }
++        XCTAssertEqual(snapshot.lastCancellationStage, .serialization)
++        await runtime.resumeAfterForeground()
++        _ = try await runtime.deidentify(syntheticNote, method: .mask)
++        await assertNoLeaks(runtime)
++        await runtime.shutdown()
++    }
++
++    // MARK: Idle release, drain and shutdown
++
++    func testIdleReleaseUsesTheInjectedClock() async throws {
++        let runtime = makeRuntime(idleReleaseMilliseconds: 1_000)
++        _ = try await runtime.extractPII(syntheticNote)
++        try await waitForSleepers(1)
++        clock.advance(by: 999)
++        let ready = await runtime.snapshot()
++        XCTAssertEqual(ready.state, .ready)
++        clock.advance(by: 1)
++        let idle = try await waitFor(runtime) { $0.state == .idle }
++        XCTAssertEqual(idle.idleReleases, 1)
++        XCTAssertEqual(controls.live, 0)
++
++        _ = try await runtime.extractPII(syntheticNote)
++        XCTAssertEqual(controls.loads, 2)
++        await runtime.shutdown()
++        XCTAssertEqual(clock.pendingSleepers, 0, "shutdown cancels the idle timer")
++    }
++
++    func testAdmissionCancelsAPendingIdleRelease() async throws {
++        let runtime = makeRuntime(idleReleaseMilliseconds: 1_000)
++        _ = try await runtime.extractPII(syntheticNote)
++        try await waitForSleepers(1)
++        controls.pause(at: .tokenization)
++        let task = Task { try await runtime.extractPII(syntheticNote) }
++        try await arrival(controls.stageGate)
++        clock.advance(by: 5_000)
++        let busy = await runtime.snapshot()
++        XCTAssertEqual(busy.state, .busy(1))
++        XCTAssertEqual(busy.idleReleases, 0)
++        controls.stageGate.release()
++        _ = try await guarded { try await task.value }
++        await runtime.shutdown()
++    }
++
++    func testDrainFinishesInFlightThenReleasesTerminally() async throws {
++        let runtime = makeRuntime()
++        let baseline = try bytes(try await runtime.extractPII(syntheticNote))
++        controls.pause(at: .modelPrediction)
++        let inFlight = Task { try await runtime.extractPII(syntheticNote) }
++        try await arrival(controls.stageGate)
++        let drain = Task { await runtime.drain() }
++        try await waitFor(runtime) { $0.state == .draining }
++        await expectError(.draining) { try await runtime.extractPII(syntheticNote) }
++
++        controls.stageGate.release()
++        let drained = try await guarded { try await inFlight.value }
++        XCTAssertEqual(try bytes(drained), baseline)
++        try await guarded { await drain.value }
++        let snapshot = await runtime.snapshot()
++        XCTAssertEqual(snapshot.state, .released)
++        XCTAssertEqual(controls.live, 0)
++        XCTAssertEqual(pressure.observerCount, 0, "signal observations end at release")
++        await expectError(.released) { try await runtime.extractPII(syntheticNote) }
++        await assertNoLeaks(runtime)
++    }
++
++    func testShutdownCancelsInFlightAndClosesTheRuntime() async throws {
++        let runtime = makeRuntime()
++        controls.pause(at: .tokenization)
++        let inFlight = Task { try await runtime.extractPII(syntheticNote) }
++        try await arrival(controls.stageGate)
++        try await guarded { await runtime.shutdown() }
++        await expectError(.released) { try await inFlight.value }
++        await expectError(.released) { try await runtime.load() }
++        XCTAssertEqual(controls.live, 0)
++        await assertNoLeaks(runtime)
++    }
++
++    // MARK: Failures and value-free evidence
++
++    func testLoaderAndModelFailuresAreWithheldBehindValueFreeErrors() async throws {
++        let runtime = makeRuntime()
++        controls.failNextLoad(SentinelFailure())
++        await expectError(.modelUnavailable) { try await runtime.extractPII(syntheticNote) }
++        var snapshot = await runtime.snapshot()
++        XCTAssertEqual(snapshot.state, .idle)
++        XCTAssertEqual(snapshot.loadFailures, 1)
++        XCTAssertEqual(snapshot.lastFailureTypeName, "SentinelFailure")
++
++        controls.failNextPrediction(SentinelFailure())
++        await expectError(.inferenceFailed) { try await runtime.extractPII(syntheticNote) }
++        snapshot = await runtime.snapshot()
++        XCTAssertEqual(snapshot.failed, 1)
++        XCTAssertEqual(snapshot.state, .ready)
++
++        _ = try await runtime.extractPII(syntheticNote)
++        await assertNoLeaks(runtime)
++        await runtime.shutdown()
++        snapshot = await runtime.snapshot()
++        assertValueFree(String(describing: snapshot))
++        assertValueFree(String(reflecting: snapshot))
++    }
++
++    func testLifecycleErrorsAndEvidencePassSentinelScans() async throws {
++        for error in OpenMedRuntimeError.allCases {
++            let rendered = [
++                error.reasonCode,
++                error.retryGuidance.rawValue,
++                String(describing: error),
++                String(reflecting: error),
++                error.localizedDescription,
++                (error as NSError).localizedDescription,
++                error.errorDescription ?? "",
++            ]
++            for value in rendered { assertValueFree(value) }
++            XCTAssertTrue(error.reasonCode.allSatisfy { $0.isLowercase || $0 == "_" })
++        }
++        for state in [OpenMedRuntimeState.idle, .loading, .ready, .busy(3), .draining, .released] {
++            assertValueFree(String(describing: state))
++        }
++
++        let runtime = makeRuntime()
++        _ = try await runtime.extractPII(syntheticNote)
++        probe.set(.merging)
++        await expectError(.cancelled) { try await runtime.extractPII(syntheticNote) }
++        pressure.emit(.critical)
++        let snapshot = try await waitFor(runtime) { $0.state == .idle }
++        assertValueFree(String(describing: snapshot))
++        assertValueFree(String(reflecting: snapshot))
++        await runtime.shutdown()
++    }
++
++    private func assertValueFree(
++        _ rendered: String,
++        file: StaticString = #filePath,
++        line: UInt = #line
++    ) {
++        for forbidden in [phiSentinel, pathSentinel, "OMSENTINEL", "Jane", "Roe", "555-0100", "2024-01-02", "/private/"] {
++            XCTAssertFalse(rendered.contains(forbidden), "leaked a protected value", file: file, line: line)
++        }
++    }
++
++    // MARK: Cycles
++
++    func testRepeatedLifecycleCyclesKeepResultsStableAndBounded() async throws {
++        let runtime = makeRuntime(memoryWarningResponse: .drainInFlight(timeoutMilliseconds: nil))
++        let policy = try Policy(named: Policy.defaultName)
++        let baseline = try bytes(try await runtime.extractPII(syntheticNote))
++        let baselinePolicy = try await runtime.deidentify(syntheticNote, policy: policy)
++
++        for cycle in 0..<4 {
++            probe.set(.modelPrediction)
++            await expectError(.cancelled) { try await runtime.extractPII(syntheticNote) }
++
++            controls.pause(at: .windowing)
++            let backgrounded = Task { try await runtime.deidentify(syntheticNote, policy: policy) }
++            try await arrival(controls.stageGate)
++            background.expire()
++            await expectError(.backgroundExpired) { try await backgrounded.value }
++            try await waitFor(runtime) { $0.state == .idle }
++            background.enterForeground()
++            try await waitFor(runtime) { $0.admissionHold == nil }
++
++            let recovered = try bytes(try await runtime.extractPII(syntheticNote))
++            XCTAssertEqual(recovered, baseline, "cycle \(cycle)")
++            pressure.emit(.warning)
++            try await waitFor(runtime) { $0.state == .idle }
++            pressure.emit(.normal)
++            try await waitFor(runtime) { $0.admissionHold == nil }
++            let policyResult = try await runtime.deidentify(syntheticNote, policy: policy)
++            XCTAssertEqual(policyResult, baselinePolicy, "cycle \(cycle)")
++            XCTAssertLessThanOrEqual(controls.live, 1)
++            await assertNoLeaks(runtime)
++        }
++
++        XCTAssertEqual(controls.peakLive, 1, "never more than one resident session")
++        await runtime.shutdown()
++        XCTAssertEqual(controls.live, 0)
++        XCTAssertTrue(CachePurgeLedger.purges.allSatisfy { $0 == 0 })
++        await assertNoLeaks(runtime)
++    }
++
++    // MARK: Platform seams
++
++    func testSystemSeamsAreInertWithoutSignals() async throws {
++        let observation = OpenMedDispatchMemoryPressureSource().observe { _ in }
++        observation.cancel()
++        observation.cancel()
++        let assertion = OpenMedNoBackgroundExecution().beginBackgroundExecution {}
++        assertion.end()
++        OpenMedNoBackgroundExecution().observeForeground {}.cancel()
++
++        let systemClock = OpenMedSystemClock()
++        let before = systemClock.nowMilliseconds()
++        try await systemClock.sleep(milliseconds: 0)
++        XCTAssertGreaterThanOrEqual(systemClock.nowMilliseconds(), before)
++        XCTAssertEqual(OpenMedRuntimeConfiguration(maxConcurrentInferences: 0).maxConcurrentInferences, 1)
++        XCTAssertEqual(OpenMedRuntimeConfiguration(maxQueuedRequests: -3).maxQueuedRequests, 0)
++    }
++
++    #if canImport(MLX) && canImport(Tokenizers) && !os(watchOS) && !os(visionOS)
++        func testBackendRuntimeLoadsOfflineAndWithholdsArtifactErrors() async throws {
++            let missing = FileManager.default.temporaryDirectory
++                .appending(path: "OMSENTINEL-PATH-\(UUID().uuidString)", directoryHint: .isDirectory)
++            let runtime = OpenMedRuntime(
++                backend: .mlx(modelDirectoryURL: missing),
++                memoryPressure: pressure,
++                backgroundExecution: background,
++                clock: clock
++            )
++            await expectError(.modelUnavailable) { try await runtime.load() }
++            let snapshot = await runtime.snapshot()
++            XCTAssertEqual(snapshot.loadFailures, 1)
++            XCTAssertNotNil(snapshot.lastFailureTypeName)
++            assertValueFree(String(describing: snapshot))
++            XCTAssertFalse(String(describing: snapshot).contains(missing.path))
++            await runtime.shutdown()
++        }
++    #endif
++}

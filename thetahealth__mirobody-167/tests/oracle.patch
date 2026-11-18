@@ -1,0 +1,179 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 25add7f1..01bb26e9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,6 +13,13 @@
+ 
+ ### Fixed
+ 
++- **A total over many readings had no direct answer.** `view=stats` gave count, min, max and
++  average but no sum, so a total over more rows than the raw view returns (a year of exercise
++  logs) had to be rebuilt as average times count. Stats now carry `sum` over the same values
++  and unit as the average.
++- **A result cut at 40,000 characters read as complete.** The cut was said only after the
++  rows and the meta line did not mark it. A cut result now says so before its rows and the
++  meta line reads `truncated`.
+ - **A redacted genotype answer could break the next request.** After a
+   turn that read genotype data, the guard removed a later answer's tool calls
+   but kept their results, so the history held `tool` messages with no call;
+diff --git a/docs/answers.md b/docs/answers.md
+index d1074b65..82dbe3ab 100644
+--- a/docs/answers.md
++++ b/docs/answers.md
+@@ -125,7 +125,7 @@ And `view` is a dispatch TABLE, not a chain of `if`s (`query.DISPATCH`):
+ | `raw` | readings, newest first, at most 50 per indicator (`query.ROW_CAP`) |
+ | `minute` / `hour` | one point per bucket, the newest 92 per indicator (`query.BUCKET_CAP`) |
+ | `day` / `week` / `month` | the same, from the day authority: each day counts once |
+-| `stats` | count/min/max/avg/first/last/change over the window |
++| `stats` | count/min/max/avg/sum/first/last/change over the window |
+ | `latest` | the most recent value per indicator |
+ | any, with no `keywords` or `indicators` | the catalogue, and a note that the view waits for names |
+ 
+diff --git a/mirobody/agent/tools/_render.py b/mirobody/agent/tools/_render.py
+index 2a3bdf09..e659f42d 100644
+--- a/mirobody/agent/tools/_render.py
++++ b/mirobody/agent/tools/_render.py
+@@ -44,7 +44,7 @@
+     "catalog": ("indicator", "system", "code", "count", "first_date", "last_date", "reason"),
+     "readings": ("indicator", "name", "time", "value", "unit", "ref", "flag", "system", "code", "file"),
+     "buckets": ("indicator", "period", "avg", "min", "max", "n", "unit", "system", "code"),
+-    "stats": ("indicator", "count", "min", "max", "avg", "first", "first_date", "last", "last_date",
++    "stats": ("indicator", "count", "min", "max", "avg", "sum", "first", "first_date", "last", "last_date",
+               "change", "unit", "mixed_units", "system", "code"),
+     "latest": ("indicator", "name", "date", "time", "value", "unit", "ref", "flag", "system", "code", "file"),
+ }
+@@ -122,12 +122,18 @@ def render_compact(envelope: tools.Envelope, columns: Sequence[str] | None = Non
+     else:
+         table = _readings_table(rows)
+     body = table or "(no rows)"
++    cut = [envelope.meta.cut] if envelope.meta.cut else []
+     if len(body) > MAX_RENDER_CHARS:
++        # Said only after the rows, this cut was invisible: the meta line still
++        # read as complete and a model summed the rows it could see.
++        shown = body[:MAX_RENDER_CHARS].count("\n")
++        cut.append(f"cut: only the first {shown} lines of the table fit in {MAX_RENDER_CHARS} characters; "
++                   "narrow the dates or ask view=stats for totals and averages")
+         body = body[:MAX_RENDER_CHARS] + f"\n… cut at {MAX_RENDER_CHARS} characters"
+     # A cut answer says so before its rows: said after them, among the notes,
+     # it was missed (`tools.Meta.cut`).
+-    lines = [envelope.meta.cut, "", body] if envelope.meta.cut else [body]
+-    lines += ["", _meta_line(envelope.meta)]
++    lines = [*cut, "", body] if cut else [body]
++    lines += ["", _meta_line(envelope.meta, cut_chars=len(cut) > bool(envelope.meta.cut))]
+     if envelope.assumptions:
+         lines.append("notes: " + "; ".join(envelope.assumptions))
+     if envelope.next_steps:
+@@ -163,7 +169,7 @@ def _render_error(envelope: tools.Envelope) -> str:
+     return f"error ({envelope.error_kind}): {reason}. {hint}"
+ 
+ 
+-def _meta_line(meta: tools.Meta) -> str:
++def _meta_line(meta: tools.Meta, *, cut_chars: bool = False) -> str:
+     # A tool whose data has no time axis (genetics) reports no zone, and gets
+     # no window line: "window=all recorded data, tz=, dates=tz_exact" on a
+     # genotype answer is three tokens of noise and one false claim: a
+@@ -177,7 +183,7 @@ def _meta_line(meta: tools.Meta) -> str:
+     bits.append(f"rows={meta.row_count}")
+     if meta.catalog_total:
+         bits.append(f"of {meta.catalog_total}")
+-    if meta.truncated:
++    if meta.truncated or cut_chars:
+         bits.append("truncated")
+     return "(" + ", ".join(bits) + ")"
+ 
+diff --git a/mirobody/collect/query.py b/mirobody/collect/query.py
+index e0ee4002..f4a94888 100644
+--- a/mirobody/collect/query.py
++++ b/mirobody/collect/query.py
+@@ -494,10 +494,14 @@ async def buckets(
+         return [_bucket_row(r) for r in rows]
+ 
+     async def stats(self, subject_id: str, sel: query.Selection, window: query.Window) -> list[dict]:
+-        """count/min/max/avg/first/last/change per series over the WHOLE
++        """count/min/max/avg/sum/first/last/change per series over the WHOLE
+         window, in SQL, over `_STATS_CTE`: a day with an elected authority
+         counts once, as that value; any other day counts every reading.
+ 
++        `sum` is over the same values as `avg`, in the same unit. Without it a
++        total over more than `query.ROW_CAP` readings (a year of exercise logs)
++        could only be rebuilt as avg x count, which a model rarely did.
++
+         `first_date`/`last_date` are the readings' stored local days, as the
+         catalogue's are. They were the UTC date of the instant, so a report
+         filed at local midnight in Asia/Shanghai showed the day before: a
+@@ -527,6 +531,7 @@ async def stats(self, subject_id: str, sel: query.Selection, window: query.Windo
+                    {_STAT_VALUE.format(agg="MIN")} AS min,
+                    {_STAT_VALUE.format(agg="MAX")} AS max,
+                    {_STAT_AVG} AS avg,
++                   {_STAT_VALUE.format(agg="SUM")} AS sum,
+                    (ARRAY_AGG(value_text ORDER BY at ASC))[1] AS first,
+                    to_char((ARRAY_AGG(local_date ORDER BY at ASC))[1], 'YYYY-MM-DD') AS first_date,
+                    (ARRAY_AGG(value_text ORDER BY at DESC))[1] AS last,
+@@ -904,6 +909,7 @@ def _stats_row(r: dict) -> dict:
+         "min": _number(r.get("min")),
+         "max": _number(r.get("max")),
+         "avg": _number(r.get("avg")),
++        "sum": _number(r.get("sum")),
+         "first": _shown(r.get("first"), r.get("unit")),
+         "first_date": r.get("first_date") or "",
+         "last": _shown(r.get("last"), r.get("unit")),
+diff --git a/mirobody/kernel/query.py b/mirobody/kernel/query.py
+index 47226ecd..b10e2c8e 100644
+--- a/mirobody/kernel/query.py
++++ b/mirobody/kernel/query.py
+@@ -402,7 +402,7 @@ def compact(
+             "type": "string",
+             "enum": list(VIEWS),
+             "default": "raw",
+-            "description": "raw: the readings, newest first, each with the file it came from. minute/hour/day/week/month: one point per period, for a trend or a chart. stats: count/min/max/avg/first/last/change over the window, for 'how did it change' and a baseline. latest: the most recent value per indicator.",
++            "description": "raw: the readings, newest first, each with the file it came from. minute/hour/day/week/month: one point per period, for a trend or a chart. stats: count/min/max/avg/sum/first/last/change over the window, for totals, 'how did it change' and a baseline. latest: the most recent value per indicator.",
+         },
+     },
+ }
+diff --git a/mirobody/tests/test_collect_regressions.py b/mirobody/tests/test_collect_regressions.py
+index 436f178e..6355e88b 100644
+--- a/mirobody/tests/test_collect_regressions.py
++++ b/mirobody/tests/test_collect_regressions.py
+@@ -219,3 +219,16 @@ async def test_malformed_genotype_citation_does_not_query(citation_store, monkey
+     monkeypatch.setattr(citation_store, "execute_query", execute)
+     assert await citation_store._genotypes("synthetic-subject", [key]) == {}
+     execute.assert_not_awaited()
++
++
++def test_a_rendering_cut_by_characters_says_so_before_its_rows():
++    from mirobody.agent.tools import _render
++    from mirobody.kernel import tools
++
++    rows = [{"indicator": "Heart rate", "name": "HR", "time": f"2026-01-01 00:{i // 60:02d}:{i % 60:02d}",
++             "value": str(60 + i % 40), "unit": "/min", "system": "http://loinc.org", "code": "8867-4",
++             "file": f"synthetic-{i}.json", "total": 5000} for i in range(3000)]
++    text = _render.render_compact(tools.Envelope(status="ok", data=rows, meta=tools.Meta(row_count=len(rows))))
++    # The cut used to be said only after the rows, with a meta line that read complete.
++    assert text.splitlines()[0].startswith("cut: only the first")
++    assert "truncated" in text.splitlines()[-1]
+diff --git a/mirobody/tests/test_postgres_regressions.py b/mirobody/tests/test_postgres_regressions.py
+index 79146987..0917114f 100644
+--- a/mirobody/tests/test_postgres_regressions.py
++++ b/mirobody/tests/test_postgres_regressions.py
+@@ -431,3 +431,21 @@ async def test_evidence_survives_actual_writes_windows_and_elected_answers(datab
+                                  start=window.start if case == "window" else "", end=window.end if case == "window" else "")
+     envelope = _envelope_for(method, request, window, rows)
+     assert any("check the file" in note for note in envelope.assumptions) is expected
++
++
++async def test_stats_sum_is_the_total_over_every_reading_of_an_unelected_day(database):
++    from mirobody.collect import observations
++    from mirobody.collect.query import PostgresHealthQuery
++    from mirobody.kernel import query
++
++    drafts = [observations.Draft(name_text="activeDuration", value_text=str(ms), unit_text="ms",
++                                 observed_start=datetime(2026, 1, 1, hour, tzinfo=UTC))
++              for ms, hour in ((600000, 8), (1200000, 12), (900000, 18))]
++    await observations.ingest("1", drafts, observations.Provenance("device-sensed", "device", "synthetic-sum",
++                                                                   vendor="synthetic-research"), user_tz="UTC")
++    [stats] = await PostgresHealthQuery().stats("1", query.Selection(indicators=("activeDuration",)), query.Window(0, 0, "UTC"))
++    # Three logs on one day, none elected. A total over more rows than the raw
++    # view returns could only be rebuilt as avg x count before `sum` existed.
++    assert (stats["count"], stats["unit"]) == (3, "ms")
++    assert stats["sum"] == pytest.approx(2_700_000)
++    assert stats["avg"] == pytest.approx(900_000)

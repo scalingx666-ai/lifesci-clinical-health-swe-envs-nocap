@@ -1,0 +1,718 @@
+diff --git a/backend/app/schemas/providers/mobile_sdk/sync_request.py b/backend/app/schemas/providers/mobile_sdk/sync_request.py
+index 98db7d92fa..6b2ab7cef3 100644
+--- a/backend/app/schemas/providers/mobile_sdk/sync_request.py
++++ b/backend/app/schemas/providers/mobile_sdk/sync_request.py
+@@ -105,6 +105,30 @@ class WorkoutStatistic(BaseModel):
+     value: float | int
+ 
+ 
++class WorkoutLap(BaseModel):
++    """HealthKit workout event (lap, segment or marker) or Health Connect lap (no `type`)."""
++
++    type: str | None = None
++    startDate: datetime
++    endDate: datetime
++    duration: float | None = None
++    distanceM: float | None = None
++    strokeStyle: str | None = None  # freestyle | backstroke | breaststroke | butterfly | kickboard | mixed | unknown
++    strokeCount: float | None = None
++    swolf: float | None = None
++    metadata: dict[str, Any] | None = None
++
++
++class WorkoutSegment(BaseModel):
++    """Exercise segment of a workout (Health Connect `ExerciseSegment`)."""
++
++    type: str | None = None
++    startDate: datetime
++    endDate: datetime
++    repetitions: int | None = None
++    metadata: dict[str, Any] | None = None
++
++
+ class WorkoutRoutePoint(BaseModel):
+     """One GPS location of a workout route. Other keys (accuracy, speed, course) are ignored."""
+ 
+@@ -128,6 +152,14 @@ class WorkoutSample(BaseModel):
+     unit: str | None = None
+ 
+ 
++_WORKOUT_ITEM_MODELS: dict[str | None, type[BaseModel]] = {
++    "route": WorkoutRoutePoint,
++    "samples": WorkoutSample,
++    "segments": WorkoutSegment,
++    "laps": WorkoutLap,
++}
++
++
+ class Workout(BaseModel):
+     """Schema for workout/exercise session from HealthKit."""
+ 
+@@ -143,14 +175,16 @@ class Workout(BaseModel):
+     values: list[WorkoutStatistic] | None = None
+     route: list[WorkoutRoutePoint] | None = None
+     samples: list[WorkoutSample] | None = None
++    segments: list[WorkoutSegment] | None = None
++    laps: list[WorkoutLap] | None = None
+ 
+-    @field_validator("route", "samples", mode="before")
++    @field_validator("route", "samples", "segments", "laps", mode="before")
+     @classmethod
+     def _drop_invalid_items(cls, items: Any, info: ValidationInfo) -> Any:
+-        """A malformed route point or sample is dropped on its own instead of failing the workout."""
++        """A malformed item is dropped on its own instead of failing the workout."""
+         if not isinstance(items, list):
+             return items
+-        model = WorkoutRoutePoint if info.field_name == "route" else WorkoutSample
++        model = _WORKOUT_ITEM_MODELS[info.field_name]
+         valid = []
+         for item in items:
+             try:
+@@ -160,8 +194,6 @@ def _drop_invalid_items(cls, items: Any, info: ValidationInfo) -> Any:
+         return valid
+ 
+     # everything below is unused for now
+-    segments: list[dict[str, Any]] | None = None
+-    laps: list[dict[str, Any]] | None = None
+     metadata: list[dict[str, Any]] | dict[str, Any] | None = None
+ 
+ 
+diff --git a/backend/app/services/providers/apple/coverage.py b/backend/app/services/providers/apple/coverage.py
+index 8eb4d801ca..4f45ab2469 100644
+--- a/backend/app/services/providers/apple/coverage.py
++++ b/backend/app/services/providers/apple/coverage.py
+@@ -30,6 +30,7 @@
+         "elev_high",
+         "elev_low",
+         "entry_source",
++        "segments",
+     }
+ )
+ 
+diff --git a/backend/app/services/sdk/import_service.py b/backend/app/services/sdk/import_service.py
+index ac29b5cf67..d8dd614213 100644
+--- a/backend/app/services/sdk/import_service.py
++++ b/backend/app/services/sdk/import_service.py
+@@ -58,6 +58,7 @@
+ 
+ from .device_resolution import extract_device_ids, extract_device_info, extract_device_type
+ from .sleep_service import save_sleep
++from .workout_segments import build_workout_segments
+ 
+ logger = get_logger(__name__)
+ 
+@@ -272,6 +273,7 @@ def _build_workout_bundles(
+ 
+             detail = EventRecordDetailCreate(
+                 record_id=workout_id,
++                segments=build_workout_segments(wjson),
+                 **metrics,
+             )
+ 
+diff --git a/backend/app/services/sdk/workout_segments.py b/backend/app/services/sdk/workout_segments.py
+new file mode 100644
+index 0000000000..30a40b8996
+--- /dev/null
++++ b/backend/app/services/sdk/workout_segments.py
+@@ -0,0 +1,128 @@
++import re
++from datetime import datetime, timezone
++from typing import Any
++
++from app.schemas.providers.mobile_sdk.sync_request import Workout, WorkoutLap, WorkoutSegment
++
++# HealthKit metadata keys, as old iOS SDK builds send them (values stringified).
++_HK_STROKE_STYLE_KEY = "HKSwimmingStrokeStyle"
++_HK_SWOLF_KEY = "HKSWOLFScore"
++
++# HKSwimmingStrokeStyle raw values. Kickboard maps to the FIT `drill` stroke Garmin ingestion uses.
++_HK_STROKE_STYLES: dict[int, str | None] = {
++    0: None,  # unknown
++    1: "mixed",
++    2: "freestyle",
++    3: "backstroke",
++    4: "breaststroke",
++    5: "butterfly",
++    6: "drill",  # kickboard
++}
++
++_STROKE_NAMES: dict[str, str | None] = {
++    "freestyle": "freestyle",
++    "backstroke": "backstroke",
++    "breaststroke": "breaststroke",
++    "butterfly": "butterfly",
++    "mixed": "mixed",
++    "kickboard": "drill",
++    "drill": "drill",
++    "unknown": None,
++}
++
++_LEADING_NUMBER = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")
++
++
++def build_workout_segments(workout: Workout) -> list[dict[str, Any]] | None:
++    """Laps and segments in the shape the FIT parser stores for Garmin; HealthKit markers are dropped."""
++    items: list[tuple[str, WorkoutLap | WorkoutSegment]] = []
++    for lap in workout.laps or []:
++        kind = _lap_kind(lap)
++        if kind is not None:
++            items.append((kind, lap))
++    items.extend(("split", segment) for segment in workout.segments or [])
++    items.sort(key=lambda item: _as_utc(item[1].startDate))
++
++    counters: dict[str, int] = {}
++    segments: list[dict[str, Any]] = []
++    for kind, item in items:
++        index = counters.get(kind, 0)
++        counters[kind] = index + 1
++        segments.append(_build_segment(kind, index, item))
++    return segments or None
++
++
++def _lap_kind(lap: WorkoutLap) -> str | None:
++    if lap.type == "segment":
++        return "split"
++    if lap.type not in (None, "lap"):
++        return None
++    if _stroke_style(lap) is not None or _swolf(lap) is not None:
++        return "length"
++    return "lap"
++
++
++def _build_segment(kind: str, index: int, item: WorkoutLap | WorkoutSegment) -> dict[str, Any]:
++    elapsed = (_as_utc(item.endDate) - _as_utc(item.startDate)).total_seconds()
++    seg: dict[str, Any] = {
++        "kind": kind,
++        "index": index,
++        "start_time": _iso(item.startDate),
++        "elapsed_seconds": _r2(elapsed),
++    }
++
++    if isinstance(item, WorkoutSegment):
++        seg["split_type"] = item.type
++        seg["repetitions"] = item.repetitions
++    else:
++        distance = item.distanceM
++        speed = _r2(distance / elapsed) if distance is not None and elapsed > 0 else None
++        if kind == "length":
++            seg["swim_stroke"] = _stroke_style(item)
++            seg["total_strokes"] = _r2(item.strokeCount)
++            seg["swolf"] = _r2(_swolf(item))
++            seg["avg_speed"] = speed
++            seg["length_type"] = "active"
++        else:
++            seg["distance_meters"] = _r2(distance)
++            seg["avg_speed"] = speed
++            if kind == "split":
++                seg["split_type"] = "segment"
++
++    return {k: v for k, v in seg.items() if v is not None}
++
++
++def _stroke_style(lap: WorkoutLap) -> str | None:
++    if lap.strokeStyle is not None:
++        return _STROKE_NAMES.get(lap.strokeStyle.lower())
++    raw = _metadata_number(lap, _HK_STROKE_STYLE_KEY)
++    return _HK_STROKE_STYLES.get(int(raw)) if raw is not None else None
++
++
++def _swolf(lap: WorkoutLap) -> float | None:
++    if lap.swolf is not None:
++        return lap.swolf
++    return _metadata_number(lap, _HK_SWOLF_KEY)
++
++
++def _metadata_number(lap: WorkoutLap, key: str) -> float | None:
++    """Read a number from metadata, tolerating the `"23 count"` form an `HKQuantity` stringifies to."""
++    value = (lap.metadata or {}).get(key)
++    if isinstance(value, int | float):
++        return float(value)
++    if isinstance(value, str) and (match := _LEADING_NUMBER.match(value)):
++        return float(match.group(1))
++    return None
++
++
++def _r2(v: float | None) -> float | None:
++    return None if v is None else round(v, 2)
++
++
++def _as_utc(v: datetime) -> datetime:
++    """Treat a naive SDK timestamp as UTC, so naive and offset-aware ones compare."""
++    return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
++
++
++def _iso(v: datetime) -> str:
++    return _as_utc(v).isoformat()
+diff --git a/backend/tests/integrations/test_sdk_import.py b/backend/tests/integrations/test_sdk_import.py
+index b0ae66e705..cd4b159ce2 100644
+--- a/backend/tests/integrations/test_sdk_import.py
++++ b/backend/tests/integrations/test_sdk_import.py
+@@ -719,6 +719,75 @@ def test_import_workout_null_statistics(
+         assert details.distance is None
+         assert details.energy_burned is None
+ 
++    def test_import_pool_swim_laps_as_segments(
++        self,
++        db: Session,
++        import_service: ImportService,
++    ) -> None:
++        """HealthKit lap events of a pool swim are stored as `length` segments in the FIT shape."""
++        user = UserFactory()
++        payload = {
++            **SDK_ENVELOPE,
++            "data": {
++                "workouts": [
++                    {
++                        "id": "CCCC1111-2222-3333-4444-555566667777",
++                        "type": "swimming",
++                        "startDate": "2026-09-01T06:00:00Z",
++                        "endDate": "2026-09-01T06:05:00Z",
++                        "values": [{"type": "distance", "unit": "m", "value": 100}],
++                        "laps": [
++                            {
++                                "type": "lap",
++                                "startDate": "2026-09-01T06:00:00Z",
++                                "endDate": "2026-09-01T06:01:00Z",
++                                "distanceM": 50,
++                                "strokeStyle": "freestyle",
++                                "strokeCount": 22,
++                                "swolf": 82,
++                            },
++                            {
++                                "type": "lap",
++                                "startDate": "2026-09-01T06:02:00Z",
++                                "endDate": "2026-09-01T06:03:15Z",
++                                "distanceM": 50,
++                                "metadata": {"HKSwimmingStrokeStyle": "4", "HKSWOLFScore": "93"},
++                            },
++                        ],
++                    }
++                ],
++            },
++        }
++
++        result = import_service.load_data(db, payload, str(user.id))
++
++        assert result["workouts_saved"] == 1
++        workout = db.query(EventRecord).filter(EventRecord.category == "workout").one()
++        details = db.query(WorkoutDetails).filter(WorkoutDetails.record_id == workout.id).one()
++        assert details.segments == [
++            {
++                "kind": "length",
++                "index": 0,
++                "start_time": "2026-09-01T06:00:00+00:00",
++                "elapsed_seconds": 60.0,
++                "swim_stroke": "freestyle",
++                "total_strokes": 22.0,
++                "swolf": 82.0,
++                "avg_speed": 0.83,
++                "length_type": "active",
++            },
++            {
++                "kind": "length",
++                "index": 1,
++                "start_time": "2026-09-01T06:02:00+00:00",
++                "elapsed_seconds": 75.0,
++                "swim_stroke": "breaststroke",
++                "swolf": 93.0,
++                "avg_speed": 0.67,
++                "length_type": "active",
++            },
++        ]
++
+     def test_import_workout_without_energy_statistic_leaves_calories_unset(
+         self,
+         db: Session,
+diff --git a/backend/tests/providers/test_provider_coverage.py b/backend/tests/providers/test_provider_coverage.py
+index 977a7c7185..9417bc01b7 100644
+--- a/backend/tests/providers/test_provider_coverage.py
++++ b/backend/tests/providers/test_provider_coverage.py
+@@ -51,8 +51,8 @@
+ EXTRA_IMPL_FILES = {"apple": (Path("app/services/providers/apple/apple_xml/xml_service.py"),)}
+ 
+ # Fields the shared SDK pipeline sets, but only from inputs this provider never sends:
+-# Samsung has no `stepCount`/`recordingMethod`.
+-SDK_UNREACHABLE_DETAIL_FIELDS = {"samsung": {"steps_count", "entry_source"}}
++# Samsung has no `stepCount`/`recordingMethod` or laps/segments.
++SDK_UNREACHABLE_DETAIL_FIELDS = {"samsung": {"steps_count", "entry_source", "segments"}}
+ 
+ # EventRecordDetail fields that are NOT part of the coverage matrix. provider_state is the sleep state as the provider
+ # sent it, kept for is_final and never returned as data.
+diff --git a/backend/tests/services/test_sdk_workout_segments.py b/backend/tests/services/test_sdk_workout_segments.py
+new file mode 100644
+index 0000000000..1b2813ab05
+--- /dev/null
++++ b/backend/tests/services/test_sdk_workout_segments.py
+@@ -0,0 +1,182 @@
++"""Tests for normalising mobile-SDK workout laps and segments into `workout_details.segments`."""
++
++from typing import Any
++
++from app.schemas.providers.mobile_sdk.sync_request import Workout
++from app.services.sdk.workout_segments import build_workout_segments
++
++
++def _workout(**fields: Any) -> Workout:
++    return Workout.model_validate(
++        {"type": "swimming", "startDate": "2026-09-01T06:00:00Z", "endDate": "2026-09-01T07:00:00Z", **fields}
++    )
++
++
++def _at(start: str, end: str, **fields: Any) -> dict[str, Any]:
++    return {"startDate": f"2026-09-01T{start}Z", "endDate": f"2026-09-01T{end}Z", **fields}
++
++
++class TestPoolSwimLengths:
++    def test_typed_lap_fields_become_a_length(self) -> None:
++        workout = _workout(
++            laps=[
++                {
++                    "type": "lap",
++                    "startDate": "2026-09-01T06:01:00Z",
++                    "endDate": "2026-09-01T06:01:58.8Z",
++                    "distanceM": 50,
++                    "strokeStyle": "freestyle",
++                    "strokeCount": 23,
++                    "swolf": 82,
++                }
++            ]
++        )
++
++        assert build_workout_segments(workout) == [
++            {
++                "kind": "length",
++                "index": 0,
++                "start_time": "2026-09-01T06:01:00+00:00",
++                "elapsed_seconds": 58.8,
++                "swim_stroke": "freestyle",
++                "total_strokes": 23,
++                "swolf": 82,
++                "avg_speed": 0.85,
++                "length_type": "active",
++            }
++        ]
++
++    def test_stringified_healthkit_metadata_is_read_from_older_sdks(self) -> None:
++        workout = _workout(
++            laps=[
++                {
++                    "type": "lap",
++                    "startDate": "2026-09-01T06:01:00Z",
++                    "endDate": "2026-09-01T06:02:00Z",
++                    "duration": 60,
++                    "distanceM": 50,
++                    "metadata": {"HKSwimmingStrokeStyle": "4", "HKSWOLFScore": "88 count", "HKLapLength": "50 m"},
++                }
++            ]
++        )
++
++        [length] = build_workout_segments(workout) or []
++
++        assert length["kind"] == "length"
++        assert length["swim_stroke"] == "breaststroke"
++        assert length["swolf"] == 88
++        assert "total_strokes" not in length
++
++    def test_kickboard_maps_to_drill(self) -> None:
++        workout = _workout(
++            laps=[
++                {"startDate": "2026-09-01T06:01:00Z", "endDate": "2026-09-01T06:02:00Z", "strokeStyle": "kickboard"},
++                {
++                    "startDate": "2026-09-01T06:03:00Z",
++                    "endDate": "2026-09-01T06:04:00Z",
++                    "metadata": {"HKSwimmingStrokeStyle": "6"},
++                },
++            ]
++        )
++
++        assert [s["swim_stroke"] for s in build_workout_segments(workout) or []] == ["drill", "drill"]
++
++    def test_unknown_stroke_without_swolf_is_a_plain_lap(self) -> None:
++        workout = _workout(
++            laps=[
++                {
++                    "startDate": "2026-09-01T06:01:00Z",
++                    "endDate": "2026-09-01T06:02:00Z",
++                    "metadata": {"HKSwimmingStrokeStyle": "0"},
++                }
++            ]
++        )
++
++        [lap] = build_workout_segments(workout) or []
++
++        assert lap["kind"] == "lap"
++        assert "swim_stroke" not in lap
++
++
++class TestLapsAndSplits:
++    def test_running_laps_and_segment_events(self) -> None:
++        workout = _workout(
++            type="running",
++            laps=[
++                _at("06:05:00", "06:10:00", type="lap", distanceM=1000),
++                _at("06:07:00", "06:07:00", type="marker"),
++                _at("06:00:00", "06:10:00", type="segment"),
++                _at("06:00:00", "06:05:00", type="lap", distanceM=1000),
++            ],
++        )
++
++        segments = build_workout_segments(workout) or []
++
++        assert [(s["kind"], s["index"]) for s in segments] == [("split", 0), ("lap", 0), ("lap", 1)]
++        assert segments[1] == {
++            "kind": "lap",
++            "index": 0,
++            "start_time": "2026-09-01T06:00:00+00:00",
++            "elapsed_seconds": 300,
++            "distance_meters": 1000,
++            "avg_speed": 3.33,
++        }
++        assert segments[0]["split_type"] == "segment"
++
++    def test_health_connect_exercise_segments_become_splits(self) -> None:
++        workout = _workout(
++            type="STRENGTH_TRAINING",
++            segments=[
++                _at("06:00:00", "06:01:00", type="squat", repetitions=12),
++                _at("06:01:00", "06:03:00", type="rest"),
++            ],
++        )
++
++        assert build_workout_segments(workout) == [
++            {
++                "kind": "split",
++                "index": 0,
++                "start_time": "2026-09-01T06:00:00+00:00",
++                "elapsed_seconds": 60,
++                "split_type": "squat",
++                "repetitions": 12,
++            },
++            {
++                "kind": "split",
++                "index": 1,
++                "start_time": "2026-09-01T06:01:00+00:00",
++                "elapsed_seconds": 120,
++                "split_type": "rest",
++            },
++        ]
++
++    def test_no_laps_or_segments_returns_none(self) -> None:
++        assert build_workout_segments(_workout(laps=None, segments=None)) is None
++        assert build_workout_segments(_workout(laps=[_at("06:00:00", "06:00:00", type="marker")])) is None
++
++
++class TestTolerance:
++    def test_malformed_lap_is_skipped_and_the_workout_kept(self) -> None:
++        workout = _workout(laps=[{"type": "lap", "startDate": "not-a-date"}, _at("06:00:00", "06:01:00", type="lap")])
++
++        assert [s["kind"] for s in build_workout_segments(workout) or []] == ["lap"]
++
++    def test_naive_and_offset_aware_timestamps_sort_together(self) -> None:
++        workout = _workout(
++            laps=[{"type": "lap", "startDate": "2026-09-01T06:05:00", "endDate": "2026-09-01T06:06:00"}],
++            segments=[_at("06:00:00", "06:05:00", type="running")],
++        )
++
++        segments = build_workout_segments(workout) or []
++
++        assert [s["kind"] for s in segments] == ["split", "lap"]
++        assert segments[1]["start_time"] == "2026-09-01T06:05:00+00:00"
++
++    def test_lap_with_one_naive_date_keeps_its_elapsed_time(self) -> None:
++        workout = _workout(
++            laps=[{"type": "lap", "startDate": "2026-09-01T06:00:00", "endDate": "2026-09-01T06:01:00Z"}]
++        )
++
++        [lap] = build_workout_segments(workout) or []
++
++        assert lap["elapsed_seconds"] == 60
+diff --git a/docs/openapi.json b/docs/openapi.json
+index 158aace74d..b17916f6b3 100644
+--- a/docs/openapi.json
++++ b/docs/openapi.json
+@@ -9282,7 +9282,58 @@
+                               "anyOf": [
+                                 {
+                                   "items": {
+-                                    "additionalProperties": true,
++                                    "description": "Exercise segment of a workout (Health Connect `ExerciseSegment`).",
++                                    "properties": {
++                                      "type": {
++                                        "anyOf": [
++                                          {
++                                            "type": "string"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Type"
++                                      },
++                                      "startDate": {
++                                        "format": "date-time",
++                                        "title": "Startdate",
++                                        "type": "string"
++                                      },
++                                      "endDate": {
++                                        "format": "date-time",
++                                        "title": "Enddate",
++                                        "type": "string"
++                                      },
++                                      "repetitions": {
++                                        "anyOf": [
++                                          {
++                                            "type": "integer"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Repetitions"
++                                      },
++                                      "metadata": {
++                                        "anyOf": [
++                                          {
++                                            "additionalProperties": true,
++                                            "type": "object"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Metadata"
++                                      }
++                                    },
++                                    "required": [
++                                      "startDate",
++                                      "endDate"
++                                    ],
++                                    "title": "WorkoutSegment",
+                                     "type": "object"
+                                   },
+                                   "type": "array"
+@@ -9297,7 +9348,102 @@
+                               "anyOf": [
+                                 {
+                                   "items": {
+-                                    "additionalProperties": true,
++                                    "description": "HealthKit workout event (lap, segment or marker) or Health Connect lap (no `type`).",
++                                    "properties": {
++                                      "type": {
++                                        "anyOf": [
++                                          {
++                                            "type": "string"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Type"
++                                      },
++                                      "startDate": {
++                                        "format": "date-time",
++                                        "title": "Startdate",
++                                        "type": "string"
++                                      },
++                                      "endDate": {
++                                        "format": "date-time",
++                                        "title": "Enddate",
++                                        "type": "string"
++                                      },
++                                      "duration": {
++                                        "anyOf": [
++                                          {
++                                            "type": "number"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Duration"
++                                      },
++                                      "distanceM": {
++                                        "anyOf": [
++                                          {
++                                            "type": "number"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Distancem"
++                                      },
++                                      "strokeStyle": {
++                                        "anyOf": [
++                                          {
++                                            "type": "string"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Strokestyle"
++                                      },
++                                      "strokeCount": {
++                                        "anyOf": [
++                                          {
++                                            "type": "number"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Strokecount"
++                                      },
++                                      "swolf": {
++                                        "anyOf": [
++                                          {
++                                            "type": "number"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Swolf"
++                                      },
++                                      "metadata": {
++                                        "anyOf": [
++                                          {
++                                            "additionalProperties": true,
++                                            "type": "object"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Metadata"
++                                      }
++                                    },
++                                    "required": [
++                                      "startDate",
++                                      "endDate"
++                                    ],
++                                    "title": "WorkoutLap",
+                                     "type": "object"
+                                   },
+                                   "type": "array"
+diff --git a/docs/providers/coverage.mdx b/docs/providers/coverage.mdx
+index d608273c49..d4285322a0 100644
+--- a/docs/providers/coverage.mdx
++++ b/docs/providers/coverage.mdx
+@@ -314,7 +314,7 @@ Legend:
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>max_<wbr />watts</code></th><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>moving_<wbr />time_<wbr />seconds</code></th><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>power_<wbr />zones</code></th><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+-<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>segments</code></th><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
++<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>segments</code></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>steps_<wbr />count</code></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>total_<wbr />elevation_<wbr />gain</code></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ </tbody>
+@@ -700,7 +700,7 @@ Legend: ✅ supported, ❌ not available.
+ | `max_watts` | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+ | `moving_time_seconds` | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ |
+ | `power_zones` | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+-| `segments` | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
++| `segments` | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `steps_count` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ |
+ | `total_elevation_gain` | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | ❌ |
+ 

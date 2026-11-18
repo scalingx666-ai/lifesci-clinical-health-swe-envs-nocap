@@ -1,0 +1,713 @@
+diff --git a/api/src/main/java/org/openmrs/aop/AuthorizationAdvice.java b/api/src/main/java/org/openmrs/aop/AuthorizationAdvice.java
+index d5a40fa4b4b4..ff48d20e66b3 100644
+--- a/api/src/main/java/org/openmrs/aop/AuthorizationAdvice.java
++++ b/api/src/main/java/org/openmrs/aop/AuthorizationAdvice.java
+@@ -10,12 +10,19 @@
+ package org.openmrs.aop;
+ 
+ import java.lang.reflect.Method;
++import java.lang.reflect.Modifier;
++import java.util.Arrays;
+ import java.util.Collection;
++import java.util.Collections;
++import java.util.LinkedHashSet;
+ import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
+ 
+ import org.apache.commons.lang3.StringUtils;
+ import org.openmrs.User;
+-import org.openmrs.annotation.AuthorizedAnnotationAttributes;
++import org.openmrs.annotation.Authorized;
+ import org.openmrs.api.APIAuthenticationException;
+ import org.openmrs.api.context.Context;
+ import org.openmrs.api.context.Daemon;
+@@ -23,6 +30,7 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.aop.MethodBeforeAdvice;
++import org.springframework.core.annotation.AnnotationUtils;
+ import org.springframework.stereotype.Component;
+ 
+ /**
+@@ -39,6 +47,13 @@ public class AuthorizationAdvice implements MethodBeforeAdvice {
+ 
+ 	private static final String USER_IS_NOT_AUTHORIZED_TO_ACCESS = "User {} is not authorized to access {}";
+ 
++	/**
++	 * Resolved {@link Authorized} metadata per advised method. Which privileges a method requires never
++	 * changes, but working it out means walking every supertype of the declaring class, and this advice
++	 * runs ahead of every service call.
++	 */
++	private final Map<Method, AuthorizationMetadata> metadataCache = new ConcurrentHashMap<>();
++
+ 	/**
+ 	 * Allows us to check whether a user is authorized to access a particular method.
+ 	 * <p>
+@@ -53,6 +68,22 @@ public class AuthorizationAdvice implements MethodBeforeAdvice {
+ 	public void before(Method method, Object[] args, Object target) throws Throwable {
+ 		log.debug("Calling authorization advice before {}", method.getName());
+ 
++		if (Daemon.isDaemonThread()) {
++			return;
++		}
++
++		// computeIfAbsent will always obtain a lock while get will not, hence this construction
++		// we can't rely on the key not existing because multiple threads could hit this at once
++		// and we don't synchronize
++		AuthorizationMetadata metadata = metadataCache.get(method);
++		if (metadata == null) {
++			metadata = metadataCache.computeIfAbsent(method, AuthorizationAdvice::resolveMetadata);
++		}
++
++		if (!metadata.annotated()) {
++			return;
++		}
++
+ 		if (log.isDebugEnabled()) {
+ 			User user = Context.getAuthenticatedUser();
+ 			log.debug("User {}", user);
+@@ -61,13 +92,8 @@ public void before(Method method, Object[] args, Object target) throws Throwable
+ 			}
+ 		}
+ 
+-		if (Daemon.isDaemonThread()) {
+-			return;
+-		}
+-
+-		AuthorizedAnnotationAttributes attributes = new AuthorizedAnnotationAttributes();
+-		Collection<String> privileges = attributes.getAttributes(method);
+-		boolean requireAll = attributes.getRequireAll(method);
++		Collection<String> privileges = metadata.privileges();
++		boolean requireAll = metadata.requireAll();
+ 
+ 		// Only execute if the "secure" method has authorization attributes
+ 		// Iterate through required privileges and return only if the user has
+@@ -108,12 +134,56 @@ public void before(Method method, Object[] args, Object target) throws Throwable
+ 				throwUnauthorized(Context.getAuthenticatedUser(), method, privileges);
+ 			}
+ 
+-		} else if (attributes.hasAuthorizedAnnotation(method)
+-		        && !(Context.isAuthenticated() || Context.hasProxyPrivileges())) {
++		} else if (!(Context.isAuthenticated() || Context.hasProxyPrivileges())) {
++			// an @Authorized that names no privilege only asks that the caller be authenticated
+ 			throwUnauthorized(Context.getAuthenticatedUser(), method);
+ 		}
+ 	}
+ 
++	/**
++	 * Works out which {@link Authorized} annotation, if any, governs a method.
++	 * <p>
++	 * Java does not inherit method annotations, so reading the method's own would let a subtype that
++	 * redeclares an annotated method — usually only to narrow the return type — silently drop its
++	 * privilege requirement. {@link AnnotationUtils#findAnnotation(Method, Class)} instead searches the
++	 * supertypes of the declaring class and follows synthetic bridge methods, preferring an annotation
++	 * on the method's own declaration over an inherited one. Which of two annotated supertype branches
++	 * wins is not documented, so a service hierarchy should not depend on it.
++	 * <p>
++	 * Runs inside {@link Map#computeIfAbsent}, so it must not call back into a service: the advice on
++	 * that call would re-enter this map, which {@link ConcurrentHashMap} forbids. Reflection and
++	 * logging only.
++	 */
++	private static AuthorizationMetadata resolveMetadata(Method method) {
++		Authorized authorized = AnnotationUtils.findAnnotation(method, Authorized.class);
++		if (authorized == null) {
++			warnMethodIsUnguarded(method);
++			return AuthorizationMetadata.UNGUARDED;
++		}
++
++		return AuthorizationMetadata.of(authorized);
++	}
++
++	/**
++	 * Reports, once per method thanks to the cache, that nothing guards a proxied method. Plenty of
++	 * service methods are unannotated by design, so this flags something to look at rather than
++	 * something necessarily wrong.
++	 * <p>
++	 * Bridge and synthetic methods are skipped because a bridge duplicates a declaration reported in
++	 * its own right; non-public methods and {@link Object}'s are not part of the service API a caller
++	 * reaches through the proxy.
++	 */
++	private static void warnMethodIsUnguarded(Method method) {
++		if (method.isBridge() || method.isSynthetic() || !Modifier.isPublic(method.getModifiers())
++		        || method.getDeclaringClass() == Object.class) {
++			return;
++		}
++
++		log.warn("No @Authorized annotation applies to {}.{}(), directly or through any method it overrides, "
++		        + "so calls to it are not privilege checked",
++		    method.getDeclaringClass().getName(), method.getName());
++	}
++
+ 	/**
+ 	 * Throws an APIAuthorization exception stating why the user failed
+ 	 *
+@@ -150,4 +220,25 @@ private void throwUnauthorized(User user, Method method) {
+ 		log.debug(USER_IS_NOT_AUTHORIZED_TO_ACCESS, user, method.getName());
+ 		throw new APIAuthenticationException(Context.getMessageSourceService().getMessage("error.aunthenticationRequired"));
+ 	}
++
++	/**
++	 * The {@link Authorized} configuration governing a single method. Privileges and
++	 * {@code requireAll} always come from one annotation, so a redeclaration replaces the inherited
++	 * configuration outright rather than merging with it.
++	 * <p>
++	 * {@code annotated} records whether an annotation was found at all, which
++	 * {@code privileges.isEmpty()} cannot tell apart from an {@code @Authorized} naming no privilege.
++	 * It is carried in band because {@link ConcurrentHashMap} will not store a null value.
++	 */
++	private record AuthorizationMetadata(boolean annotated, Collection<String> privileges, boolean requireAll) {
++
++		private static final AuthorizationMetadata UNGUARDED = new AuthorizationMetadata(false, Collections.emptyList(),
++		        false);
++
++		private static AuthorizationMetadata of(Authorized authorized) {
++			// drop duplicate privileges
++			Set<String> privileges = new LinkedHashSet<>(Arrays.asList(authorized.value()));
++			return new AuthorizationMetadata(true, Collections.unmodifiableSet(privileges), authorized.requireAll());
++		}
++	}
+ }
+diff --git a/api/src/test/java/org/openmrs/aop/AuthorizationAdviceHierarchyTest.java b/api/src/test/java/org/openmrs/aop/AuthorizationAdviceHierarchyTest.java
+new file mode 100644
+index 000000000000..63e98c5daf6b
+--- /dev/null
++++ b/api/src/test/java/org/openmrs/aop/AuthorizationAdviceHierarchyTest.java
+@@ -0,0 +1,521 @@
++/**
++ * This Source Code Form is subject to the terms of the Mozilla Public License,
++ * v. 2.0. If a copy of the MPL was not distributed with this file, You can
++ * obtain one at http://mozilla.org/MPL/2.0/. OpenMRS is also distributed under
++ * the terms of the Healthcare Disclaimer located at http://openmrs.org/license.
++ *
++ * Copyright (C) OpenMRS Inc. OpenMRS is a registered trademark and the OpenMRS
++ * graphic logo is a trademark of OpenMRS Inc.
++ */
++package org.openmrs.aop;
++
++import java.lang.reflect.Method;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.Locale;
++import java.util.Set;
++
++import org.apache.logging.log4j.Level;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.core.Logger;
++import org.apache.logging.log4j.core.layout.PatternLayout;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.TestInfo;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.openmrs.annotation.Authorized;
++import org.openmrs.api.APIAuthenticationException;
++import org.openmrs.api.context.Daemon;
++import org.openmrs.logging.MemoryAppender;
++import org.openmrs.messagesource.MessageSourceService;
++import org.openmrs.test.jupiter.BaseContextMockTest;
++import org.openmrs.util.PrivilegeConstants;
++
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.contains;
++import static org.hamcrest.Matchers.containsString;
++import static org.hamcrest.Matchers.empty;
++import static org.hamcrest.Matchers.hasItem;
++import static org.hamcrest.Matchers.is;
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.lenient;
++import static org.mockito.Mockito.mockStatic;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * Tests how {@link AuthorizationAdvice} resolves {@link Authorized} for the method it is advising.
++ * <p>
++ * Java does not inherit method annotations, so a subtype that redeclares an annotated method — most
++ * often only to narrow the return type — carries no annotation of its own, and read naively
++ * requires no privilege at all. These tests hold the advice to resolving the annotation through the
++ * method hierarchy, to letting a redeclaration that does carry one override what it inherits, and
++ * to reporting a method that really is guarded by nothing.
++ * <p>
++ * The advice is driven directly rather than through a proxy, so the {@link Method} each test passes
++ * stands in for the one Spring AOP would hand it — including, deliberately, the synthetic bridge
++ * method a caller holding a supertype reference actually invokes. Since the advice reads neither
++ * the arguments nor the target, every call passes {@link #NO_ARGS} and a null target.
++ */
++public class AuthorizationAdviceHierarchyTest extends BaseContextMockTest {
++
++	private static final Object[] NO_ARGS = new Object[0];
++
++	/**
++	 * Stands in for a module's base service interface: every {@link Authorized} in this hierarchy is
++	 * declared here and nowhere else.
++	 */
++	public interface BaseTestService {
++
++		@Authorized(PrivilegeConstants.GET_CONCEPTS)
++		Object getGuardedThing();
++
++		@Authorized({ PrivilegeConstants.GET_CONCEPTS, PrivilegeConstants.GET_OBS })
++		Object getThingRequiringAnyPrivilege();
++
++		@Authorized(value = { PrivilegeConstants.GET_CONCEPTS, PrivilegeConstants.GET_OBS }, requireAll = true)
++		Object getThingRequiringAllPrivileges();
++
++		/**
++		 * An {@link Authorized} naming no privilege, which asks only that the caller be authenticated.
++		 */
++		@Authorized
++		Object getThingRequiringAuthenticationOnly();
++
++		/**
++		 * Overloads share a {@link Method#hashCode()}, so this pair is what tells a cache keyed on the
++		 * method apart from one keyed on its name.
++		 */
++		@Authorized(PrivilegeConstants.GET_CONCEPTS)
++		Object getOverloadedThing();
++
++		@Authorized(PrivilegeConstants.GET_ENCOUNTERS)
++		Object getOverloadedThing(String argument);
++
++		Object getUnguardedThing();
++	}
++
++	/**
++	 * The sub-interface at the heart of the ticket: it redeclares the inherited methods without
++	 * repeating their annotations. Narrowing the return type is the usual reason to do that, and it
++	 * also makes the compiler emit a synthetic bridge method for each.
++	 */
++	public interface NarrowedTestService extends BaseTestService {
++
++		@Override
++		String getGuardedThing();
++
++		@Override
++		String getThingRequiringAnyPrivilege();
++
++		@Override
++		String getThingRequiringAllPrivileges();
++
++		@Override
++		String getThingRequiringAuthenticationOnly();
++
++		@Override
++		String getOverloadedThing();
++
++		@Override
++		String getOverloadedThing(String argument);
++
++		@Override
++		String getUnguardedThing();
++	}
++
++	/**
++	 * A sub-interface that redeclares an inherited method with an {@link Authorized} of its own, which
++	 * is how a subtype changes the privileges a method requires.
++	 */
++	public interface RedeclaringTestService extends BaseTestService {
++
++		@Override
++		@Authorized(PrivilegeConstants.GET_ENCOUNTERS)
++		String getGuardedThing();
++	}
++
++	public static class NarrowedTestServiceImpl implements NarrowedTestService {
++
++		@Override
++		public String getGuardedThing() {
++			return null;
++		}
++
++		@Override
++		public String getThingRequiringAnyPrivilege() {
++			return null;
++		}
++
++		@Override
++		public String getThingRequiringAllPrivileges() {
++			return null;
++		}
++
++		@Override
++		public String getThingRequiringAuthenticationOnly() {
++			return null;
++		}
++
++		@Override
++		public String getOverloadedThing() {
++			return null;
++		}
++
++		@Override
++		public String getOverloadedThing(String argument) {
++			return null;
++		}
++
++		@Override
++		public String getUnguardedThing() {
++			return null;
++		}
++	}
++
++	public static class RedeclaringTestServiceImpl implements RedeclaringTestService {
++
++		@Override
++		public String getGuardedThing() {
++			return null;
++		}
++
++		@Override
++		public Object getThingRequiringAnyPrivilege() {
++			return null;
++		}
++
++		@Override
++		public Object getThingRequiringAllPrivileges() {
++			return null;
++		}
++
++		@Override
++		public Object getThingRequiringAuthenticationOnly() {
++			return null;
++		}
++
++		@Override
++		public Object getOverloadedThing() {
++			return null;
++		}
++
++		@Override
++		public Object getOverloadedThing(String argument) {
++			return null;
++		}
++
++		@Override
++		public Object getUnguardedThing() {
++			return null;
++		}
++	}
++
++	/**
++	 * Only needed so that the advice can build the message of the exception it throws.
++	 */
++	@Mock
++	private MessageSourceService messageSourceService;
++
++	private MemoryAppender memoryAppender;
++
++	private Logger logger;
++
++	private Level originalLevel;
++
++	private boolean originalAdditive;
++
++	private AuthorizationAdvice advice;
++
++	@BeforeEach
++	public void setUp(TestInfo testInfo) {
++		// MemoryAppender keys its backing buffer on the appender name in a static map, so each test needs
++		// its own name or it sees the log lines every other test produced
++		memoryAppender = MemoryAppender.newBuilder().setName("AuthorizationAdviceHierarchyTest-" + testInfo.getDisplayName())
++		        .setLayout(PatternLayout.newBuilder().withPattern("%m").build()).build();
++		memoryAppender.start();
++
++		logger = (Logger) LogManager.getLogger(AuthorizationAdvice.class);
++		originalLevel = logger.getLevel();
++		originalAdditive = logger.isAdditive();
++		// NB This needs to come before the setLevel() call
++		logger.setAdditive(false);
++		logger.setLevel(Level.WARN);
++		logger.addAppender(memoryAppender);
++
++		// echo the code and arguments back so that the tests can see which privileges a failure named
++		lenient().when(messageSourceService.getMessage(anyString(), any(Object[].class), any(Locale.class)))
++		        .thenAnswer(invocation -> invocation.getArgument(0, String.class)
++		                + Arrays.toString(invocation.getArgument(1, Object[].class)));
++		lenient().when(messageSourceService.getMessage(anyString()))
++		        .thenAnswer(invocation -> invocation.getArgument(0, String.class));
++
++		// a fresh advice per test so that one test's metadata cache cannot answer another test's lookups
++		advice = new AuthorizationAdvice();
++	}
++
++	@AfterEach
++	public void tearDown() {
++		logger.removeAppender(memoryAppender);
++		logger.setLevel(originalLevel);
++		logger.setAdditive(originalAdditive);
++		((Logger) LogManager.getRootLogger()).getContext().updateLoggers();
++		memoryAppender.stop();
++
++		memoryAppender = null;
++		logger = null;
++		advice = null;
++	}
++
++	/**
++	 * Makes {@link org.openmrs.api.context.Context#hasPrivilege(String)} answer true for exactly the
++	 * given privileges and false for everything else.
++	 */
++	private void userHolds(String... privileges) {
++		Set<String> held = new HashSet<>(Arrays.asList(privileges));
++		lenient().when(userContext.hasPrivilege(anyString()))
++		        .thenAnswer(invocation -> held.contains(invocation.getArgument(0, String.class)));
++	}
++
++	/**
++	 * @return the method the compiler generated from the source declaration, as opposed to the bridge
++	 *         method a covariant return type also produces
++	 */
++	private static Method declaredMethod(Class<?> type, String name, Class<?>... parameterTypes) {
++		return Arrays.stream(type.getDeclaredMethods()).filter(method -> method.getName().equals(name))
++		        .filter(method -> !method.isBridge())
++		        .filter(method -> Arrays.equals(method.getParameterTypes(), parameterTypes)).findFirst()
++		        .orElseThrow(() -> new AssertionError("no declared method " + name + " on " + type.getName()));
++	}
++
++	/**
++	 * @return the synthetic bridge method a covariant return type produces, which is what a caller
++	 *         holding a reference to the supertype actually invokes
++	 */
++	private static Method bridgeMethod(Class<?> type, String name) {
++		return Arrays.stream(type.getDeclaredMethods()).filter(method -> method.getName().equals(name))
++		        .filter(method -> method.getParameterCount() == 0).filter(Method::isBridge).findFirst()
++		        .orElseThrow(() -> new AssertionError("no bridge method " + name + " on " + type.getName()));
++	}
++
++	@Test
++	public void before_shouldEnforceThePrivilegeInheritedThroughACovariantRedeclaration() {
++		userHolds();
++
++		assertThrows(APIAuthenticationException.class,
++		    () -> advice.before(declaredMethod(NarrowedTestServiceImpl.class, "getGuardedThing"), NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldPassWhenThePrivilegeInheritedThroughACovariantRedeclarationIsHeld() {
++		userHolds(PrivilegeConstants.GET_CONCEPTS);
++
++		assertDoesNotThrow(
++		    () -> advice.before(declaredMethod(NarrowedTestServiceImpl.class, "getGuardedThing"), NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldEnforceTheInheritedPrivilegeThroughTheGeneratedBridgeMethod() {
++		userHolds();
++
++		assertThrows(APIAuthenticationException.class,
++		    () -> advice.before(bridgeMethod(NarrowedTestServiceImpl.class, "getGuardedThing"), NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldPassOnTheGeneratedBridgeMethodWhenTheInheritedPrivilegeIsHeld() {
++		userHolds(PrivilegeConstants.GET_CONCEPTS);
++
++		assertDoesNotThrow(
++		    () -> advice.before(bridgeMethod(NarrowedTestServiceImpl.class, "getGuardedThing"), NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldPreferTheAnnotationOnTheRedeclarationOverTheInheritedOne() {
++		// the privilege the parent declared no longer opens the method
++		userHolds(PrivilegeConstants.GET_CONCEPTS);
++
++		assertThrows(APIAuthenticationException.class,
++		    () -> advice.before(declaredMethod(RedeclaringTestServiceImpl.class, "getGuardedThing"), NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldRequireThePrivilegeNamedByTheRedeclaration() {
++		userHolds(PrivilegeConstants.GET_ENCOUNTERS);
++
++		assertDoesNotThrow(
++		    () -> advice.before(declaredMethod(RedeclaringTestServiceImpl.class, "getGuardedThing"), NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldInheritRequireAllThroughARedeclaration() {
++		// holding one of the two is not enough, because the annotation that supplies the privileges also
++		// supplies requireAll = true
++		userHolds(PrivilegeConstants.GET_CONCEPTS);
++
++		assertThrows(APIAuthenticationException.class, () -> advice
++		        .before(declaredMethod(NarrowedTestServiceImpl.class, "getThingRequiringAllPrivileges"), NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldPassWhenEveryInheritedRequiredPrivilegeIsHeld() {
++		userHolds(PrivilegeConstants.GET_CONCEPTS, PrivilegeConstants.GET_OBS);
++
++		assertDoesNotThrow(() -> advice
++		        .before(declaredMethod(NarrowedTestServiceImpl.class, "getThingRequiringAllPrivileges"), NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldInheritRequireAllBeingUnsetThroughARedeclaration() {
++		// the same two privileges, but declared without requireAll, so either one opens the method
++		userHolds(PrivilegeConstants.GET_OBS);
++
++		assertDoesNotThrow(() -> advice
++		        .before(declaredMethod(NarrowedTestServiceImpl.class, "getThingRequiringAnyPrivilege"), NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldRequireOnlyAuthenticationWhenTheInheritedAnnotationNamesNoPrivilege() {
++		// the mocked UserContext reports an authenticated user, and no privilege is named, so there is
++		// nothing left to check
++		userHolds();
++
++		assertDoesNotThrow(() -> advice.before(
++		    declaredMethod(NarrowedTestServiceImpl.class, "getThingRequiringAuthenticationOnly"), NO_ARGS, null));
++		verify(userContext, never()).hasPrivilege(anyString());
++	}
++
++	@Test
++	public void before_shouldRejectAnUnauthenticatedCallerWhenTheInheritedAnnotationNamesNoPrivilege() {
++		when(userContext.getAuthenticatedUser()).thenReturn(null);
++
++		assertThrows(APIAuthenticationException.class,
++		    () -> advice.before(declaredMethod(NarrowedTestServiceImpl.class, "getThingRequiringAuthenticationOnly"),
++		        NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldAcceptProxyPrivilegesInPlaceOfAuthenticationWhenNoPrivilegeIsNamed() {
++		// initialisation code runs unauthenticated but with proxy privileges, and has to get through
++		when(userContext.getAuthenticatedUser()).thenReturn(null);
++		when(userContext.hasProxyPrivileges()).thenReturn(true);
++
++		assertDoesNotThrow(() -> advice.before(
++		    declaredMethod(NarrowedTestServiceImpl.class, "getThingRequiringAuthenticationOnly"), NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldCheckNothingOnADaemonThread() {
++		userHolds();
++
++		try (MockedStatic<Daemon> daemon = mockStatic(Daemon.class)) {
++			daemon.when(Daemon::isDaemonThread).thenReturn(true);
++
++			assertDoesNotThrow(
++			    () -> advice.before(declaredMethod(NarrowedTestServiceImpl.class, "getGuardedThing"), NO_ARGS, null));
++		}
++
++		verify(userContext, never()).hasPrivilege(anyString());
++	}
++
++	@Test
++	public void before_shouldResolveEachOverloadSeparatelyThroughTheSameAdvice() {
++		// the two overloads share a Method.hashCode() and a name, so a cache keyed on either would hand the
++		// first one's privileges to the second
++		userHolds(PrivilegeConstants.GET_CONCEPTS);
++		Method noArgument = declaredMethod(NarrowedTestServiceImpl.class, "getOverloadedThing");
++		Method oneArgument = declaredMethod(NarrowedTestServiceImpl.class, "getOverloadedThing", String.class);
++
++		assertDoesNotThrow(() -> advice.before(noArgument, NO_ARGS, null));
++		assertThrows(APIAuthenticationException.class, () -> advice.before(oneArgument, NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldResolveEachOverloadSeparatelyWhicheverIsSeenFirst() {
++		userHolds(PrivilegeConstants.GET_ENCOUNTERS);
++		Method noArgument = declaredMethod(NarrowedTestServiceImpl.class, "getOverloadedThing");
++		Method oneArgument = declaredMethod(NarrowedTestServiceImpl.class, "getOverloadedThing", String.class);
++
++		assertDoesNotThrow(() -> advice.before(oneArgument, NO_ARGS, null));
++		assertThrows(APIAuthenticationException.class, () -> advice.before(noArgument, NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldKeepEachMethodsPrivilegesApartAcrossRepeatedCalls() {
++		// the cached answer has to stay attached to the method it was resolved for, however many other
++		// methods pass through the same advice in between
++		userHolds(PrivilegeConstants.GET_CONCEPTS, PrivilegeConstants.GET_OBS);
++		Method guarded = declaredMethod(NarrowedTestServiceImpl.class, "getGuardedThing");
++		Method needsEncounters = declaredMethod(NarrowedTestServiceImpl.class, "getOverloadedThing", String.class);
++		Method unguarded = declaredMethod(NarrowedTestServiceImpl.class, "getUnguardedThing");
++
++		assertDoesNotThrow(() -> advice.before(guarded, NO_ARGS, null));
++		assertThrows(APIAuthenticationException.class, () -> advice.before(needsEncounters, NO_ARGS, null));
++		assertDoesNotThrow(() -> advice.before(unguarded, NO_ARGS, null));
++		assertDoesNotThrow(() -> advice.before(guarded, NO_ARGS, null));
++		assertThrows(APIAuthenticationException.class, () -> advice.before(needsEncounters, NO_ARGS, null));
++	}
++
++	@Test
++	public void before_shouldNotCheckAnyPrivilegeForAMethodWithNoAnnotationInItsHierarchy() {
++		userHolds();
++
++		assertDoesNotThrow(
++		    () -> advice.before(declaredMethod(NarrowedTestServiceImpl.class, "getUnguardedThing"), NO_ARGS, null));
++		verify(userContext, never()).hasPrivilege(anyString());
++	}
++
++	@Test
++	public void before_shouldWarnAboutAMethodWithNoAnnotationInItsHierarchy() throws Throwable {
++		advice.before(declaredMethod(NarrowedTestServiceImpl.class, "getUnguardedThing"), NO_ARGS, null);
++
++		assertThat(memoryAppender.getLogLines(), hasItem(containsString(
++		    "No @Authorized annotation applies to " + NarrowedTestServiceImpl.class.getName() + ".getUnguardedThing()")));
++	}
++
++	@Test
++	public void before_shouldWarnOnlyOnceAboutTheSameUnguardedMethod() throws Throwable {
++		Method unguarded = declaredMethod(NarrowedTestServiceImpl.class, "getUnguardedThing");
++
++		advice.before(unguarded, NO_ARGS, null);
++		advice.before(unguarded, NO_ARGS, null);
++
++		assertThat(memoryAppender.getLogLines(), contains(containsString("getUnguardedThing()")));
++	}
++
++	@Test
++	public void before_shouldNotWarnAboutTheBridgeMethodOfAnUnguardedMethod() throws Throwable {
++		// the bridge method stands in for a declaration that is reported in its own right, so warning
++		// about it as well would just double up
++		advice.before(bridgeMethod(NarrowedTestServiceImpl.class, "getUnguardedThing"), NO_ARGS, null);
++
++		assertThat(memoryAppender.getLogLines(), empty());
++	}
++
++	@Test
++	public void before_shouldNotWarnAboutAMethodGuardedThroughItsHierarchy() throws Throwable {
++		userHolds(PrivilegeConstants.GET_CONCEPTS);
++
++		advice.before(declaredMethod(NarrowedTestServiceImpl.class, "getGuardedThing"), NO_ARGS, null);
++
++		assertThat(memoryAppender.getLogLines(), empty());
++	}
++
++	@Test
++	public void before_shouldReportThePrivilegesOfTheResolvedAnnotationWhenNoneAreHeld() {
++		userHolds();
++
++		APIAuthenticationException thrown = assertThrows(APIAuthenticationException.class, () -> advice
++		        .before(declaredMethod(NarrowedTestServiceImpl.class, "getThingRequiringAnyPrivilege"), NO_ARGS, null));
++
++		// the privileges are those of the inherited annotation, in the order it declared them
++		assertThat(thrown.getMessage(),
++		    is("error.privilegesRequired[" + PrivilegeConstants.GET_CONCEPTS + "," + PrivilegeConstants.GET_OBS + "]"));
++	}
++}
+diff --git a/api/src/test/java/org/openmrs/aop/AuthorizationAdviceTest.java b/api/src/test/java/org/openmrs/aop/AuthorizationAdviceTest.java
+index ebb452d566b6..ce15a9c7221d 100644
+--- a/api/src/test/java/org/openmrs/aop/AuthorizationAdviceTest.java
++++ b/api/src/test/java/org/openmrs/aop/AuthorizationAdviceTest.java
+@@ -7,10 +7,6 @@
+  * Copyright (C) OpenMRS Inc. OpenMRS is a registered trademark and the OpenMRS
+  * graphic logo is a trademark of OpenMRS Inc.
+  */
+-/*
+- * To change this template, choose Tools | Templates
+- * and open the template in the editor.
+- */
+ package org.openmrs.aop;
+ 
+ import java.util.LinkedHashSet;

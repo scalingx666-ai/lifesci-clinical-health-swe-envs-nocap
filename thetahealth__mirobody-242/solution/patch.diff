@@ -1,0 +1,246 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fb07269ee..f35adfda6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,21 @@
+ 
+ ### Fixed
+ 
++- **A provider that answers nothing is no longer logged as a bug in this
++  repo.** The OpenAI client returns `None`, without raising, when an endpoint
++  answers HTTP 200 with a JSON `null` body. On 1.5.10 a 587 s `deepseek-utils`
++  call did that during the provider's 503 outage, and
++  `async_get_structured_output` dereferenced it, so the extraction log read
++  `AttributeError: 'NoneType' object has no attribute 'choices'` at
++  `utils/llm/utils.py` (found on 1.5.10, #239). Text completion and vision had
++  the same unguarded access. Structured output and text completion now return
++  their "no model answered" `None`; vision raises `NoResponse`, and an upload
++  that fails on it tells the person "… sent back an empty response, which an
++  overloaded provider does" instead of a type name. How to tell: the log reads
++  `structured output: no response` or `text completion: no response` with the
++  model name, and no traceback. The native Anthropic path streams and was not
++  affected.
++
+ - **A calculation step reads as a calculation.** 1.5.10 named the calculator
+   `code_exec`, and the web client, which knew it as `eval` and
+   `python_exec`, showed the step as "调用了 code_exec" with a generic tool
+diff --git a/mirobody/collect/files/errors.py b/mirobody/collect/files/errors.py
+index 5727699c7..edcd26434 100644
+--- a/mirobody/collect/files/errors.py
++++ b/mirobody/collect/files/errors.py
+@@ -19,11 +19,12 @@ class UploadError(Exception):
+ 
+ def failure_reason(e: BaseException) -> str:
+     """The message of an error written for the person who uploaded the file
+-    (`UploadError`, no routable model, a vision model that read nothing),
+-    else the error's type: the traceback is in the server log."""
++    (`UploadError`, no routable model, a vision model that read nothing, a
++    provider that sent back an empty response), else the error's type: the
++    traceback is in the server log."""
+     from mirobody.utils.config.llm import NoProviderError
+-    from mirobody.utils.llm import ImageNotRead
++    from mirobody.utils.llm import ImageNotRead, NoResponse
+ 
+-    if isinstance(e, UploadError | NoProviderError | ImageNotRead):
++    if isinstance(e, UploadError | NoProviderError | ImageNotRead | NoResponse):
+         return str(e)
+     return type(e).__name__
+diff --git a/mirobody/tests/test_llm_no_response.py b/mirobody/tests/test_llm_no_response.py
+new file mode 100644
+index 000000000..2f79c7e14
+--- /dev/null
++++ b/mirobody/tests/test_llm_no_response.py
+@@ -0,0 +1,94 @@
++"""A completion of `None` is "no model answered", not an AttributeError.
++
++The OpenAI client returns `None`, without raising, when an endpoint answers
++HTTP 200 with a JSON `null` body. On 1.5.10 a 587 s call did that during a
++provider's 503 outage and the `response.choices` access raised
++`AttributeError`, so the log named a line in this repo instead of the model
++that did not answer (see #239). The three OpenAI-compatible surfaces each met
++it: structured output and text completion return their None, and vision, whose
++contract is that a failed request raises, raises `NoResponse`, whose message
++is what the uploader is told.
++"""
++
++from __future__ import annotations
++
++import logging
++
++import pytest
++
++# The model-client factory arrives with the `[parse]` extra (`openai`, the PDF
++# library), so CI's minimal job — `pip install -e '.[test]'` — would abort
++# COLLECTION here rather than skip. Decided at import time, which is the only
++# point early enough (see conftest.py).
++try:
++    from mirobody.utils.config.llm import RouteSpec
++    from mirobody.utils.llm import NoResponse, clients, utils
++    from mirobody.utils.llm.file_processors import backends_openai
++    from mirobody.utils.llm.file_processors.media import VisionImage
++except ImportError as missing:  # pragma: no cover - the minimal install
++    pytest.skip(f"needs the [parse] extra: {missing}", allow_module_level=True)
++
++_SPEC = RouteSpec(
++    alias="test", model="test-model", api_key_env="", base_url="http://127.0.0.1:9"
++)
++_MESSAGES = [{"role": "user", "content": '{"hello": "kitty"}'}]
++_SCHEMA = {
++    "type": "json_schema",
++    "json_schema": {"name": "answer", "schema": {"type": "object"}},
++}
++
++
++class _Completions:
++    async def create(self, **_kwargs):
++        return None
++
++
++class _Chat:
++    completions = _Completions()
++
++
++class _Client:
++    chat = _Chat()
++
++
++@pytest.fixture
++def empty_endpoint(monkeypatch):
++    monkeypatch.setattr(utils, "_route", lambda *_args, **_kwargs: _SPEC)
++    monkeypatch.setattr(clients.client_manager, "for_spec", lambda _spec: _Client())
++
++
++async def test_structured_output_returns_no_answer(empty_endpoint, caplog):
++    with caplog.at_level(logging.WARNING, logger="mirobody.utils.llm.utils"):
++        answer = await utils.async_get_structured_output(_MESSAGES, _SCHEMA)
++
++    assert answer is None
++    # Without the guard the None is caught by the broad handler below it and
++    # still returns None, so the return value alone proves nothing: the log did
++    # name an AttributeError in this file rather than a model that did not
++    # answer, which is what sent a 1.5.10 report looking for a bug here.
++    assert "structured output: no response" in caplog.text
++    assert "AttributeError" not in caplog.text
++
++
++async def test_text_completion_returns_no_answer(empty_endpoint, caplog):
++    with caplog.at_level(logging.WARNING, logger="mirobody.utils.llm.utils"):
++        answer = await utils.async_get_text_completion(_MESSAGES)
++
++    assert answer is None
++    assert "text completion: no response" in caplog.text
++    assert "AttributeError" not in caplog.text
++
++
++async def test_vision_raises_no_response(empty_endpoint):
++    image = VisionImage(data="", mime="image/png")
++    with pytest.raises(NoResponse, match="test-model sent back an empty response"):
++        await backends_openai.image_extract(_SPEC, image, "read it", json_mode=False)
++
++
++def test_the_uploader_is_told_why():
++    try:
++        from mirobody.collect.files.errors import failure_reason
++    except ImportError as missing:  # pragma: no cover - an install without [app]
++        pytest.skip(f"needs the [app] extra: {missing}")
++    # Any other exception shows only its type name; this one says what to do.
++    assert failure_reason(NoResponse("deepseek-flash")).startswith("deepseek-flash sent back an empty response")
+diff --git a/mirobody/utils/llm/__init__.py b/mirobody/utils/llm/__init__.py
+index 8d8e5146b..07b2622c1 100644
+--- a/mirobody/utils/llm/__init__.py
++++ b/mirobody/utils/llm/__init__.py
+@@ -15,12 +15,14 @@
+     vision_route,
+ )
+ from .utils import (
++    NoResponse,
+     async_get_structured_output,
+     async_get_text_completion,
+ )
+ 
+ __all__ = [
+     "ImageNotRead",
++    "NoResponse",
+     "client_manager",
+     "vision_extract",
+     "vision_route",
+diff --git a/mirobody/utils/llm/file_processors/backends_openai.py b/mirobody/utils/llm/file_processors/backends_openai.py
+index f0234e459..7610859fb 100644
+--- a/mirobody/utils/llm/file_processors/backends_openai.py
++++ b/mirobody/utils/llm/file_processors/backends_openai.py
+@@ -12,7 +12,7 @@
+ 
+ from mirobody.utils.config.llm import RouteSpec
+ from mirobody.utils.llm import clients
+-from mirobody.utils.llm.utils import _max_tokens_param
++from mirobody.utils.llm.utils import NoResponse, _max_tokens_param
+ 
+ from .media import VisionImage
+ 
+@@ -40,7 +40,8 @@ def _api_params(spec: RouteSpec, messages: list[dict], json_mode: bool,
+ async def image_extract(spec: RouteSpec, image: VisionImage, prompt: str, *, json_mode: bool,
+                         max_tokens: int | None = None) -> str:
+     """One request: the image, then the prompt. The answer as the model wrote
+-    it, "" for none; a failed request raises."""
++    it, "" for none; a failed request raises, and so does an empty 200
++    (`NoResponse`)."""
+     messages = [{
+         "role": "user",
+         "content": [
+@@ -50,4 +51,6 @@ async def image_extract(spec: RouteSpec, image: VisionImage, prompt: str, *, jso
+     }]
+     response = await clients.client_manager.for_spec(spec).chat.completions.create(
+         **_api_params(spec, messages, json_mode, max_tokens))
++    if response is None:
++        raise NoResponse(spec.model)
+     return response.choices[0].message.content or ""
+diff --git a/mirobody/utils/llm/utils.py b/mirobody/utils/llm/utils.py
+index 679e7a2c8..ba51ff2bc 100644
+--- a/mirobody/utils/llm/utils.py
++++ b/mirobody/utils/llm/utils.py
+@@ -18,6 +18,20 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++class NoResponse(RuntimeError):
++    """The endpoint answered and the answer held no completion. The OpenAI
++    client returns None, without raising, for an HTTP 200 whose body is JSON
++    `null` (measured on openai 3.28, also after leading blank lines), so this
++    is the provider's failure, not a request this code got wrong. The text
++    surfaces turn it into their None; vision, whose contract is that a failed
++    request raises, raises this, with a message written for the person whose
++    upload failed (`collect/files/errors.failure_reason`)."""
++
++    def __init__(self, model: str) -> None:
++        super().__init__(f"{model} sent back an empty response, which an overloaded provider does; "
++                         "try again later, or point the route at another model.")
++
++
+ def _max_tokens_param(spec: RouteSpec) -> str:
+     """OpenAI's current models reject `max_tokens` in favour of
+     `max_completion_tokens`; every other OpenAI-compatible endpoint still
+@@ -140,6 +154,13 @@ async def async_get_structured_output(
+             messages=messages,
+             **params,
+         )
++        # The client returns None for a 200 whose body is `null` (`NoResponse`):
++        # on 1.5.10 a 587 s call did, during a provider's 503 outage, and the
++        # attribute access below raised AttributeError, which the log blamed
++        # on this file. None is already this function's "no model answered".
++        if response is None:
++            logger.warning("structured output: no response: model=%s", spec.model)
++            return None
+         result = response.choices[0].message.to_dict()
+         if result.get("refusal") is not None:
+             logger.warning("structured output refused: model=%s", spec.model)
+@@ -203,6 +224,10 @@ async def async_get_text_completion(
+             messages=messages,
+             **params,
+         )
++        if response is None:
++            # The same empty 200 as `async_get_structured_output` meets.
++            logger.warning("text completion: no response: model=%s", spec.model)
++            return None
+         choice = response.choices[0]
+         content, cut = choice.message.content, choice.finish_reason == "length"
+     except Exception as e:

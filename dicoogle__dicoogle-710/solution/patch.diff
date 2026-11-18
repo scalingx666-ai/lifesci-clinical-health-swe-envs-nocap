@@ -1,0 +1,416 @@
+diff --git a/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/CMoveServiceSCP.java b/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/CMoveServiceSCP.java
+index cbe8672fa..33ca962eb 100755
+--- a/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/CMoveServiceSCP.java
++++ b/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/CMoveServiceSCP.java
+@@ -18,13 +18,16 @@
+  */
+ package pt.ua.dicoogle.server.queryretrieve;
+ 
++import java.io.IOException;
+ import java.net.InetAddress;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.util.ArrayList;
++import java.util.List;
+ import java.util.concurrent.Executor;
+ 
+ import org.dcm4che2.data.Tag;
++import org.dcm4che2.data.VR;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -32,6 +35,7 @@
+ import org.dcm4che2.data.DicomElement;
+ import org.dcm4che2.data.DicomObject;
+ import org.dcm4che2.net.Association;
++import org.dcm4che2.net.ConfigurationException;
+ import org.dcm4che2.net.DicomServiceException;
+ import org.dcm4che2.net.DimseRSP;
+ import org.dcm4che2.net.Status;
+@@ -41,6 +45,9 @@
+ import pt.ua.dicoogle.DicomLog.LogLine;
+ import pt.ua.dicoogle.DicomLog.LogXML;
+ import pt.ua.dicoogle.core.settings.ServerSettingsManager;
++import pt.ua.dicoogle.plugins.PluginController;
++import pt.ua.dicoogle.sdk.StorageInputStream;
++import pt.ua.dicoogle.sdk.StorageInterface;
+ import pt.ua.dicoogle.sdk.datastructs.MoveDestination;
+ import pt.ua.dicoogle.sdk.settings.server.ServerSettings;
+ import pt.ua.dicoogle.server.DicomNetwork;
+@@ -68,8 +75,6 @@ public CMoveServiceSCP(String sopClass, Executor executor) {
+ 
+     protected DimseRSP doCMove(Association as, int pcid, DicomObject cmd, DicomObject data, DicomObject rsp)
+             throws DicomServiceException {
+-        DimseRSP replay = null;
+-
+         /**
+          * Verify Permited AETs
+          */
+@@ -112,7 +117,7 @@ protected DimseRSP doCMove(Association as, int pcid, DicomObject cmd, DicomObjec
+ 
+         /** Verify if it have the field destination */
+         if (destination == null) {
+-            throw new DicomServiceException(cmd, Status.UnrecognizedOperation, "Missing Move Destination");
++            throw new DicomServiceException(cmd, 0xC000 | Status.UnrecognizedOperation, "Missing Move Destination");
+         }
+ 
+         String SOPUID = new String(data.get(Integer.parseInt("0020000D", 16)).getBytes());
+@@ -211,18 +216,42 @@ protected DimseRSP doCMove(Association as, int pcid, DicomObject cmd, DicomObjec
+             }
+             try {
+                 logger.debug("Destination: {}", destination);
+-                new CallDCMSend(files, portAddr, hostDest, destination, CMoveID);
++                SendReport report = callDCMSend(files, portAddr, hostDest, destination, CMoveID);
++
++                // fill in properties about sub-operations
++                rsp.putInt(Tag.NumberOfCompletedSuboperations, VR.US, report.filesSent);
++                int remaining = report.filesToSend - report.filesSent - report.filesFailed;
++                if (remaining > 0) {
++                    rsp.putInt(Tag.NumberOfRemainingSuboperations, VR.US, remaining);
++                }
++                int totalErrors = report.filesFailed + report.filesSkipped;
++                if (totalErrors > 0) {
++                    rsp.putInt(Tag.NumberOfFailedSuboperations, VR.US, totalErrors);
++                }
++                if (report.errorID == 0) {
++                    // report warning if there is at least one file failure
++                    int code = totalErrors > 0 ? 0xB000 : Status.Success;
++                    rsp.putInt(Tag.Status, VR.US, code);
++                } else {
++                    rsp.putInt(Tag.Status, VR.US, 0xC000 | Status.ProcessingFailure);
++                    rsp.putInt(Tag.ErrorID, VR.US, ERROR_ID_FILE_TRANSMISSION);
++                    rsp.putString(Tag.ErrorComment, VR.LO, "DICOM file transmission failed");
++                }
++
+             } catch (Exception ex) {
+-                logger.error("Error Sending files to Storage Server! ", ex);
++                logger.error("Failed to send files to DICOM node {}", destination, ex);
++                rsp.putInt(Tag.Status, VR.US, 0xC000 | Status.ProcessingFailure);
++                rsp.putInt(Tag.ErrorID, VR.US, ERROR_ID_GENERAL_FAILURE);
++                rsp.putString(Tag.ErrorComment, VR.LO, ex.getMessage());
+             }
+         }
+ 
+-
+-        replay = new MoveRSP(data, rsp); // Third Party Move
+-        return replay;
+-
++        return new MoveRSP(data, rsp);
+     }
+ 
++    private static final int ERROR_ID_FILE_TRANSMISSION = 1;
++    private static final int ERROR_ID_GENERAL_FAILURE = 10;
++
+     /**
+      * @return the service
+      */
+@@ -236,4 +265,65 @@ public DicomNetwork getService() {
+     public void setService(DicomNetwork service) {
+         this.service = service;
+     }
++
++    private static class SendReport {
++        final int errorID;
++        final int filesSent;
++        final int filesToSend;
++        final int filesFailed;
++        final int filesSkipped;
++
++        public SendReport(int errorID, int filesSent, int filesToSend, int filesFailed, int filesSkipped) {
++            this.errorID = errorID;
++            this.filesSent = filesSent;
++            this.filesToSend = filesToSend;
++            this.filesFailed = filesFailed;
++            this.filesSkipped = filesSkipped;
++        }
++    }
++
++    private static SendReport callDCMSend(List<URI> files, int port, String hostname, String AETitle, String cmoveID)
++            throws IOException, ConfigurationException, InterruptedException {
++
++        DicoogleDcmSend dcmsnd = new DicoogleDcmSend();
++
++        dcmsnd.setRemoteHost(hostname);
++        dcmsnd.setRemotePort(port);
++
++        for (URI uri : files) {
++            StorageInterface plugin = PluginController.getInstance().getStorageForSchema(uri);
++            logger.debug("uri: {}", uri);
++
++            if (plugin != null) {
++                logger.debug("Retrieving {}", uri);
++                Iterable<StorageInputStream> it = plugin.at(uri);
++
++                for (StorageInputStream file : it) {
++                    dcmsnd.addFile(file);
++                    logger.debug("Added file to DcmSend: {}", uri);
++                }
++            }
++
++        }
++        dcmsnd.setCalledAET(AETitle);
++
++        dcmsnd.configureTransferCapability();
++
++        dcmsnd.setMoveOriginatorMessageID(cmoveID);
++        dcmsnd.start();
++        dcmsnd.open();
++        int errorID;
++        try {
++            dcmsnd.send();
++            errorID = 0;
++        } catch (IOException ex) {
++            // assume that there was a fatal error in the transmission
++            errorID = ERROR_ID_FILE_TRANSMISSION;
++        } finally {
++            dcmsnd.close();
++        }
++
++        return new SendReport(errorID, dcmsnd.getNumberOfFilesSent(), dcmsnd.getNumberOfFilesToSend(),
++                dcmsnd.getNumberOfFilesFailed(), dcmsnd.getNumberOfFilesSkipped());
++    }
+ }
+diff --git a/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/CallDCMSend.java b/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/CallDCMSend.java
+deleted file mode 100755
+index bdb8a3385..000000000
+--- a/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/CallDCMSend.java
++++ /dev/null
+@@ -1,71 +0,0 @@
+-/**
+- * Copyright (C) 2014  Universidade de Aveiro, DETI/IEETA, Bioinformatics Group - http://bioinformatics.ua.pt/
+- *
+- * This file is part of Dicoogle/dicoogle.
+- *
+- * Dicoogle/dicoogle is free software: you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation, either version 3 of the License, or
+- * (at your option) any later version.
+- *
+- * Dicoogle/dicoogle is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with Dicoogle.  If not, see <http://www.gnu.org/licenses/>.
+- */
+-package pt.ua.dicoogle.server.queryretrieve;
+-
+-import java.net.URI;
+-import java.util.List;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-import pt.ua.dicoogle.plugins.PluginController;
+-import pt.ua.dicoogle.sdk.StorageInputStream;
+-import pt.ua.dicoogle.sdk.StorageInterface;
+-
+-/**
+- *
+- * @author Luís A. Bastião Silva <bastiao@ua.pt>
+- */
+-public class CallDCMSend {
+-    private static final Logger logger = LoggerFactory.getLogger(CallDCMSend.class);
+-
+-    public CallDCMSend(List<URI> files, int port, String hostname, String AETitle, String cmoveID) throws Exception {
+-
+-        DicoogleDcmSend dcmsnd = new DicoogleDcmSend();
+-
+-        dcmsnd.setRemoteHost(hostname);
+-        dcmsnd.setRemotePort(port);
+-
+-        for (URI uri : files) {
+-            StorageInterface plugin = PluginController.getInstance().getStorageForSchema(uri);
+-            logger.debug("uri: {}", uri);
+-
+-            if (plugin != null) {
+-                logger.debug("Retrieving {}", uri);
+-                Iterable<StorageInputStream> it = plugin.at(uri);
+-
+-                for (StorageInputStream file : it) {
+-                    dcmsnd.addFile(file);
+-                    logger.debug("Added file to DcmSend: {}", uri);
+-                }
+-            }
+-
+-        }
+-        dcmsnd.setCalledAET(AETitle);
+-
+-        dcmsnd.configureTransferCapability();
+-
+-        dcmsnd.setMoveOriginatorMessageID(cmoveID);
+-        dcmsnd.start();
+-        dcmsnd.open();
+-        try {
+-            dcmsnd.send();
+-        } finally {
+-            dcmsnd.close();
+-        }
+-    }
+-}
+diff --git a/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/DicoogleDcmSend.java b/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/DicoogleDcmSend.java
+index 4fa146923..b14ca68da 100644
+--- a/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/DicoogleDcmSend.java
++++ b/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/DicoogleDcmSend.java
+@@ -129,8 +129,17 @@ public class DicoogleDcmSend extends StorageCommitmentService {
+ 
+     private int transcoderBufferSize = 1024;
+ 
++    /** Number of files sent successfully */
+     private int filesSent = 0;
+ 
++    /** Number of files skipped upon addition due to storage problems of the DICOM file
++     */
++    private int filesSkipped = 0;
++
++    /** Number of files which failed to be sent due to presentation context negotation issues
++     */
++    private int filesFailed = 0;
++
+     private long totalSize = 0L;
+ 
+     private boolean fileref = false;
+@@ -344,6 +353,14 @@ public final int getNumberOfFilesSent() {
+         return filesSent;
+     }
+ 
++    public final int getNumberOfFilesSkipped() {
++        return filesSkipped;
++    }
++
++    public final int getNumberOfFilesFailed() {
++        return filesFailed;
++    }
++
+     public final long getTotalSizeSent() {
+         return totalSize;
+     }
+@@ -360,6 +377,7 @@ public synchronized void addFile(StorageInputStream item) {
+             inStream = info.getInputStream();
+         } catch (IOException e) {
+             LOGGER.error("Failed to fetch file {} - skipped.", item.getURI(), e);
++            this.filesSkipped += 1;
+             return;
+         }
+         DicomObject dcmObj = new BasicDicomObject();
+@@ -372,6 +390,7 @@ public synchronized void addFile(StorageInputStream item) {
+             info.fmiEndPos = in.getEndOfFileMetaInfoPosition();
+         } catch (IOException e) {
+             LOGGER.warn("Failed to parse file {} - skipped.", item.getURI(), e);
++            this.filesSkipped += 1;
+             return;
+         } finally {
+             CloseUtils.safeClose(in);
+@@ -380,11 +399,13 @@ public synchronized void addFile(StorageInputStream item) {
+         info.cuid = dcmObj.getString(Tag.SOPClassUID);
+         if (info.cuid == null) {
+             LOGGER.warn("Missing SOP Class UID in {} - skipped.", item.getURI());
++            this.filesSkipped += 1;
+             return;
+         }
+         info.iuid = dcmObj.getString(Tag.SOPInstanceUID);
+         if (info.iuid == null) {
+             LOGGER.warn("Missing SOP Instance UID in {} - skipped.", item.getURI());
++            this.filesSkipped += 1;
+             return;
+         }
+ 
+@@ -454,7 +475,7 @@ public void openToStgcmtAE() throws IOException, ConfigurationException, Interru
+         assoc = ae.connect(remoteStgcmtAE, executor);
+     }
+ 
+-    public void send() {
++    public void send() throws IOException {
+         for (int i = 0, n = files.size(); i < n; ++i) {
+             FileInfo info = files.get(i);
+             TransferCapability tc = assoc.getTransferCapabilityAsSCU(info.cuid);
+@@ -491,24 +512,31 @@ public void onDimseRSP(Association as, DicomObject cmd, DicomObject data) {
+                     assoc.cstore(info.cuid, info.iuid, priority, new DataWriter(info), tsuid, rspHandler);
+                 }
+ 
+-
+-
+-                // assoc.cstore(info.cuid, info.iuid, priority, assoc.getCallingAET(), priority, new DataWriter(info), tsuid, rspHandler);
+-
+             } catch (NoPresentationContextException e) {
+                 LOGGER.warn("Cannot send {}: {}", info.item.getURI(), e.getMessage());
++                filesFailed += 1;
+             } catch (IOException e) {
+-                LOGGER.error("Failed to send {}", info.item.getURI(), e);
++                LOGGER.error("Fatal I/O error while sending {}", info.item.getURI(), e);
++                // since this exception can be thrown mid-transfer,
++                // the sending process cannot be recovered.
++                // Try to abort the association and propagate exception
++                try {
++                    assoc.abort();
++                } catch (Exception ex) {
++                    // ignore
++                    LOGGER.warn("Association could not be aborted: {}", ex.getMessage());
++                }
++                throw e;
+             } catch (InterruptedException e) {
+                 // should not happen
+-                e.printStackTrace();
++                throw new RuntimeException(e);
+             }
+         }
+         try {
+             assoc.waitForDimseRSP();
+         } catch (InterruptedException e) {
+             // should not happen
+-            e.printStackTrace();
++            throw new RuntimeException(e);
+         }
+     }
+ 
+diff --git a/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/MoveRSP.java b/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/MoveRSP.java
+index ea5ac70a9..717a80dc7 100755
+--- a/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/MoveRSP.java
++++ b/dicoogle/src/main/java/pt/ua/dicoogle/server/queryretrieve/MoveRSP.java
+@@ -31,10 +31,9 @@
+ import org.dcm4che2.net.DimseRSP;
+ import org.dcm4che2.net.Status;
+ 
+-
+ import pt.ua.dicoogle.server.SearchDicomResult;
+ 
+-/**
++/** Custom C-MOVE response for {@linkplain CMoveServiceSCP}
+  *
+  * @author Luís A. Bastião Silva <bastiao@ua.pt>
+  */
+@@ -52,30 +51,16 @@ public MoveRSP(DicomObject keys, DicomObject rsp) {
+         this.keys = keys;
+         this.current = rsp;
+ 
+-
+-        // DebugManager.getInstance().debug("--> Creating MoveRSP");
+-
+-
+-
+-        /** Debug - show keys, rsp, index */
+-        if (keys != null) {
+-            // DebugManager.getInstance().debug("keys object: ");
+-            // DebugManager.getInstance().debug(keys.toString());
++        if (!this.rsp.contains(Tag.Status)) {
++            this.rsp.putInt(Tag.Status, VR.US, Status.Success);
+         }
+-        if (rsp != null) {
+-            // DebugManager.getInstance().debug("Rsp object");
+-            // DebugManager.getInstance().debug(rsp.toString());
+-        }
+-
+-        this.rsp.putInt(Tag.Status, VR.US, Status.Success);
+-
+     }
+ 
+     @Override
+     public boolean next() throws IOException, InterruptedException {
+-
+-        /** Sucess */
+-        this.rsp.putInt(Tag.Status, VR.US, Status.Success);
++        if (this.current == null) {
++            return false;
++        }
+         /** Clean pointers */
+         this.current = null;
+         return true;

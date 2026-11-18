@@ -1,0 +1,762 @@
+diff --git a/grails-app/controllers/org/pih/warehouse/JsonController.groovy b/grails-app/controllers/org/pih/warehouse/JsonController.groovy
+index c77d7f1789..520d084886 100644
+--- a/grails-app/controllers/org/pih/warehouse/JsonController.groovy
++++ b/grails-app/controllers/org/pih/warehouse/JsonController.groovy
+@@ -1463,7 +1463,9 @@ class JsonController {
+                 command.products,
+                 startDate,
+                 endDate,
+-                isCsvReport)
++                isCsvReport,
++                params.boolean("includeProductsWithNoActivity") ?: false,
++                params.boolean("includeInternalTransfers") ?: false)
+ 
+         if (isCsvReport) {
+             String csv = dataService.generateCsv(data)
+diff --git a/grails-app/i18n/messages.properties b/grails-app/i18n/messages.properties
+index 07afa78725..9ebca07f8e 100644
+--- a/grails-app/i18n/messages.properties
++++ b/grails-app/i18n/messages.properties
+@@ -2590,7 +2590,12 @@ report.period.last3Months.label=Last 3 months
+ report.period.thisYear.label=This year
+ report.period.lastYear.label=Last year
+ report.transaction.notRun.message=Choose a facility and period, then click Run Report.
+-report.transaction.noRows.message=No products had credits or debits in this period.
++report.transaction.noRows.message=No products had activity in this period. Check Include products with no activity to see products that had stock.
++report.transaction.includeProductsWithNoActivity.label=Include products with no activity
++report.transaction.includeProductsWithNoActivity.hint=Also lists products that had stock but no activity, i.e. their credits, debits and differences are all 0.
++report.transaction.includeInternalTransfers.label=Include internal transfers
++report.transaction.includeInternalTransfers.hint=Counts transfers between bin locations of the facility (e.g. putaways and stock transfers) in the credits and debits. They move stock between bins without changing the facility's quantity on hand, so they're left out by default.
++report.transaction.internalTransfer.hint=A transfer between two bin locations of this facility (e.g. a putaway or stock transfer). It moves stock between bins without changing the balance, so it isn't counted in the credits and debits of the report.
+ report.transaction.download.hint=Downloads the report as a CSV file, with a column for each transaction type
+ report.transaction.unrecordedChange.label=Unrecorded change
+ report.transaction.unrecordedChange.hint=The difference between the count below and the balance before it, i.e. a change that was not recorded as a transaction (e.g. a loss, or a transaction that was deleted after the count). These add up to the Differences column.
+diff --git a/grails-app/services/org/pih/warehouse/report/ReportService.groovy b/grails-app/services/org/pih/warehouse/report/ReportService.groovy
+index 0fc1cffdfc..16626af627 100644
+--- a/grails-app/services/org/pih/warehouse/report/ReportService.groovy
++++ b/grails-app/services/org/pih/warehouse/report/ReportService.groovy
+@@ -44,12 +44,14 @@ import org.pih.warehouse.inventory.InventoryItem
+ import org.pih.warehouse.inventory.InventoryAuditDetails
+ import org.pih.warehouse.inventory.InventoryAuditRollup
+ import org.pih.warehouse.inventory.InventoryAuditSummary
++import org.pih.warehouse.inventory.LocalTransfer
+ import org.pih.warehouse.inventory.ProductAvailabilityService
+ import org.pih.warehouse.inventory.Transaction
+ import org.pih.warehouse.inventory.TransactionCode
+ import org.pih.warehouse.inventory.TransactionEntry
+ import org.pih.warehouse.inventory.TransactionType
+ import org.pih.warehouse.inventory.product.availability.AvailableItemMap
++import org.pih.warehouse.jobs.GparsService
+ import org.pih.warehouse.invoice.InvoiceType
+ import org.pih.warehouse.invoice.InvoiceTypeCode
+ import org.pih.warehouse.order.OrderAdjustment
+@@ -94,6 +96,13 @@ class ReportService implements ApplicationContextAware {
+ 
+     ApplicationContext applicationContext
+ 
++    /**
++     * Whether the transaction report calculates the opening and closing balances at the same time, on two database
++     * connections. Integration tests turn this off, because their data is in a transaction that's rolled back, which
++     * other connections can't see.
++     */
++    boolean calculateTransactionReportBalancesInParallel = true
++
+     void generateShippingReport(ChecklistReportCommand command) {
+         def shipmentItems = command?.shipment?.shipmentItems?.sort()
+         shipmentItems.each { shipmentItem ->
+@@ -1432,9 +1441,61 @@ class ReportService implements ApplicationContextAware {
+         return getFilteredTransactionEntries(transactionCodes, startDate, endDate, null, null, null, location, products, orderBy, sortOrder)
+     }
+ 
++    /**
++     * The conditions on a product (aliased p) for the transaction report's product filters. Each filter that's set
++     * must match. Its parameters are set by setProductFilterParameters.
++     */
++    private static String getProductFilterConditions(List<Category> categories,
++                                                     List<Tag> tags,
++                                                     List<ProductCatalog> catalogs,
++                                                     List<Product> products) {
++        return """
++            ${categories ? "AND p.category_id IN (:categoryIds)" : ""}
++            ${products ? "AND p.id IN (:productIds)" : ""}
++            ${tags ? "AND EXISTS (SELECT 1 FROM product_tag pt WHERE pt.product_id = p.id AND pt.tag_id IN (:tagIds))" : ""}
++            ${catalogs ? """AND EXISTS (SELECT 1 FROM product_catalog_item pci
++                                       WHERE pci.product_id = p.id AND pci.product_catalog_id IN (:catalogIds))""" : ""}
++        """
++    }
++
++    private static void setProductFilterParameters(SQLQuery sqlQuery,
++                                                   List<Category> categories,
++                                                   List<Tag> tags,
++                                                   List<ProductCatalog> catalogs,
++                                                   List<Product> products) {
++        if (categories) {
++            sqlQuery.setParameterList("categoryIds", categories*.id)
++        }
++        if (products) {
++            sqlQuery.setParameterList("productIds", products*.id)
++        }
++        if (tags) {
++            sqlQuery.setParameterList("tagIds", tags*.id)
++        }
++        if (catalogs) {
++            sqlQuery.setParameterList("catalogIds", catalogs*.id)
++        }
++    }
++
++    /**
++     * A condition that excludes transactions (aliased t) that are one side of an internal transfer: a transfer between
++     * two bin locations of the same facility, e.g. a putaway, a stock transfer or a bin replenishment.
++     * InventoryService.transferStock records it as a Transfer Out and a Transfer In at the facility, linked by a local
++     * transfer. It moves stock without changing the facility's quantity on hand, so it isn't a credit or debit of the
++     * facility (OBPIH-7878). A local transfer between two facilities (e.g. from a request) isn't internal.
++     */
++    private static final String NOT_INTERNAL_TRANSFER_CONDITION = """
++            AND NOT EXISTS (SELECT 1 FROM local_transfer lt
++                            JOIN transaction other ON other.id = lt.destination_transaction_id
++                            WHERE lt.source_transaction_id = t.id AND other.inventory_id = t.inventory_id)
++            AND NOT EXISTS (SELECT 1 FROM local_transfer lt
++                            JOIN transaction other ON other.id = lt.source_transaction_id
++                            WHERE lt.destination_transaction_id = t.id AND other.inventory_id = t.inventory_id)
++    """
++
+     /**
+      * Sums the credit and debit transactions of each product at a facility over a period, grouped by transaction
+-     * type. The totals are calculated in the database so that we don't need to load the transaction entries into
++     * type. Internal transfers are left out unless includeInternalTransfers is true. The totals are calculated in the database so that we don't need to load the transaction entries into
+      * memory (see #6201).
+      *
+      * @return a row per product and transaction type, with:
+@@ -1450,7 +1511,8 @@ class ReportService implements ApplicationContextAware {
+                                                  List<ProductCatalog> catalogs,
+                                                  List<Product> products,
+                                                  Date startDate,
+-                                                 Date endDate) {
++                                                 Date endDate,
++                                                 Boolean includeInternalTransfers) {
+         if (!location?.inventory) {
+             return []
+         }
+@@ -1474,11 +1536,8 @@ class ReportService implements ApplicationContextAware {
+             AND tt.transaction_code IN ('CREDIT', 'DEBIT')
+             AND t.transaction_date > :startDate
+             AND t.transaction_date < :endDate
+-            ${categories ? "AND p.category_id IN (:categoryIds)" : ""}
+-            ${products ? "AND ii.product_id IN (:productIds)" : ""}
+-            ${tags ? "AND EXISTS (SELECT 1 FROM product_tag pt WHERE pt.product_id = p.id AND pt.tag_id IN (:tagIds))" : ""}
+-            ${catalogs ? """AND EXISTS (SELECT 1 FROM product_catalog_item pci
+-                                       WHERE pci.product_id = p.id AND pci.product_catalog_id IN (:catalogIds))""" : ""}
++            ${includeInternalTransfers ? "" : NOT_INTERNAL_TRANSFER_CONDITION}
++            ${getProductFilterConditions(categories, tags, catalogs, products)}
+             GROUP BY ii.product_id, t.transaction_type_id
+         """
+ 
+@@ -1493,19 +1552,57 @@ class ReportService implements ApplicationContextAware {
+                 .setTimestamp("startDate", startDate)
+                 .setTimestamp("endDate", endDate)
+                 .setResultTransformer(Criteria.ALIAS_TO_ENTITY_MAP)
+-        if (categories) {
+-            sqlQuery.setParameterList("categoryIds", categories*.id)
+-        }
+-        if (products) {
+-            sqlQuery.setParameterList("productIds", products*.id)
++        setProductFilterParameters(sqlQuery, categories, tags, catalogs, products)
++        return sqlQuery.list()
++    }
++
++    /**
++     * @return the ids of the given products that match the transaction report's product filters
++     */
++    private List<String> filterTransactionReportProductIds(Collection<String> productIds,
++                                                           List<Category> categories,
++                                                           List<Tag> tags,
++                                                           List<ProductCatalog> catalogs,
++                                                           List<Product> products) {
++        if (!productIds) {
++            return []
+         }
+-        if (tags) {
+-            sqlQuery.setParameterList("tagIds", tags*.id)
++        SQLQuery sqlQuery = sessionFactory.currentSession.createSQLQuery("""
++            SELECT p.id FROM product p
++            WHERE p.id IN (:candidateIds)
++            ${getProductFilterConditions(categories, tags, catalogs, products)}
++        """)
++        sqlQuery.setParameterList("candidateIds", productIds)
++        setProductFilterParameters(sqlQuery, categories, tags, catalogs, products)
++        return sqlQuery.list() as List<String>
++    }
++
++    /**
++     * Calculates the total quantity on hand of each product at a facility at each of the given dates.
++     *
++     * Each date takes a few seconds at a large facility, mostly reading its transaction history (see
++     * ProductAvailabilityService.getQuantityOnHandAtDate), so the dates are calculated at the same time, each on its
++     * own database connection and Hibernate session (see calculateTransactionReportBalancesInParallel). Only ids are
++     * passed to the other threads, and they return plain totals, so no entity is shared between sessions.
++     *
++     * @return the total quantity on hand of each product keyed on product id, for each date in the same order
++     */
++    private List<Map<String, Integer>> getQuantityOnHandByProductAtDates(Location location,
++                                                                         List<Product> products,
++                                                                         List<Date> dates) {
++        Closure<Map<String, Integer>> getQuantityOnHandByProduct = { Date date ->
++            sumQuantityOnHandByProduct(productAvailabilityService.getQuantityOnHandAtDateAsMap(location, products, date))
+         }
+-        if (catalogs) {
+-            sqlQuery.setParameterList("catalogIds", catalogs*.id)
++        if (!calculateTransactionReportBalancesInParallel) {
++            return dates.collect(getQuantityOnHandByProduct)
+         }
+-        return sqlQuery.list()
++        // Load the facility's inventory in this session, so the other threads only read its id
++        location.inventory?.id
++        return GparsService.withPool("TransactionReport", dates.size()) {
++            dates.collectParallel { Date date ->
++                Transaction.withNewSession { getQuantityOnHandByProduct(date) }
++            }
++        } as List<Map<String, Integer>>
+     }
+ 
+     /**
+@@ -1582,15 +1679,16 @@ class ReportService implements ApplicationContextAware {
+                                       List<Product> productList,
+                                       Date startDate,
+                                       Date endDate,
+-                                      Boolean includeDetails) {
++                                      Boolean includeDetails,
++                                      Boolean includeProductsWithNoActivity = false,
++                                      Boolean includeInternalTransfers = false) {
+ 
+         List<TransactionCode> adjustmentTransactionCodes = [
+                 TransactionCode.CREDIT,
+                 TransactionCode.DEBIT
+         ]
+ 
+-        // The credits and debits of each product between startDate and endDate, by transaction type. Only products
+-        // with a credit or debit in that period are included in the report.
++        // The credits and debits of each product between startDate and endDate, by transaction type
+         Map<String, List<Map>> totalsByProduct = getTransactionReportTotals(
+                 location,
+                 categories,
+@@ -1598,19 +1696,24 @@ class ReportService implements ApplicationContextAware {
+                 catalogsList,
+                 productList,
+                 startDate,
+-                endDate
++                endDate,
++                includeInternalTransfers
+         ).groupBy { it.product_id }
+-        if (!totalsByProduct) {
+-            return []
+-        }
+-        List<Product> products = Product.getAll(totalsByProduct.keySet().toList()).sort { it.productCode }
+ 
+-        // Quantity on hand of each product at the startDate (opening balance) and endDate (closing balance)
+-        Map<String, Integer> openingBalanceByProduct = sumQuantityOnHandByProduct(
+-                productAvailabilityService.getQuantityOnHandAtDateAsMap(location, products, startDate))
+-        Map<String, Integer> closingBalanceByProduct = sumQuantityOnHandByProduct(
+-                productAvailabilityService.getQuantityOnHandAtDateAsMap(
+-                        location, products, endDate.before(new Date()) ? endDate : new Date()))
++        // Quantity on hand of each product at the startDate (opening balance) and endDate (closing balance), for all
++        // products at the facility (or the selected products), so that products with stock but no credits or debits
++        // in the period are included too
++        List<Map<String, Integer>> balancesByProduct = getQuantityOnHandByProductAtDates(
++                location, productList ?: [], [startDate, endDate.before(new Date()) ? endDate : new Date()])
++        Map<String, Integer> openingBalanceByProduct = balancesByProduct[0]
++        Map<String, Integer> closingBalanceByProduct = balancesByProduct[1]
++
++        // The report includes every product that matches the filters and had stock at the start or end of the period,
++        // or a credit or debit during it. A product whose stock was counted during the period has either stock or a
++        // difference, so it's included too.
++        Set<String> productIds = totalsByProduct.keySet() + openingBalanceByProduct.keySet() + closingBalanceByProduct.keySet()
++        List<Product> products = Product.getAll(filterTransactionReportProductIds(
++                productIds, categories, tagsList, catalogsList, productList)).sort { it.productCode }
+ 
+         // AvailableTransactionTypes are only used in case of generating CSV. The CSV file should contain
+         // additional information about the product and the quantities should be grouped by transaction types
+@@ -1627,8 +1730,8 @@ class ReportService implements ApplicationContextAware {
+         // and the quantity of that transaction entry is greater than 0
+         // 2. DEBITS = transaction entries in relation with transaction that are DEBIT type
+         // and transaction that are CREDIT type, but with quantity lower than 0
+-        return products.collect { Product key ->
+-            List<Map> totals = totalsByProduct[key.id]
++        return products.findResults { Product key ->
++            List<Map> totals = totalsByProduct[key.id] ?: []
+             Integer openingBalance = openingBalanceByProduct[key.id] ?: 0
+             Integer closingBalance = closingBalanceByProduct[key.id] ?: 0
+             Integer credits = totals.sum { it.credits } as Integer ?: 0
+@@ -1638,6 +1741,11 @@ class ReportService implements ApplicationContextAware {
+             // total difference between what was counted and the balance before each count.
+             Integer differences = closingBalance - openingBalance - credits + debits
+ 
++            // No activity: the quantity on hand didn't change, and nothing was added or removed
++            if (!includeProductsWithNoActivity && !credits && !debits && !differences) {
++                return null
++            }
++
+             if (includeDetails) {
+                 return getTransactionReportDetailedRow(
+                         productCode: key.productCode,
+@@ -1728,6 +1836,25 @@ class ReportService implements ApplicationContextAware {
+         }
+     }
+ 
++    /**
++     * @return the ids of the given transactions that are one side of an internal transfer (see
++     *         NOT_INTERNAL_TRANSFER_CONDITION), and of the other side
++     */
++    Set<String> getInternalTransferTransactionIds(List<String> transactionIds) {
++        if (!transactionIds) {
++            return [] as Set
++        }
++        List<Object[]> rows = LocalTransfer.executeQuery("""
++            SELECT source.id, destination.id
++            FROM LocalTransfer lt
++            JOIN lt.sourceTransaction source
++            JOIN lt.destinationTransaction destination
++            WHERE source.inventory = destination.inventory
++            AND (source.id IN (:transactionIds) OR destination.id IN (:transactionIds))
++        """, [transactionIds: transactionIds])
++        return rows.collectMany { Object[] row -> row as List<String> } as Set<String>
++    }
++
+     /**
+      * A lot and bin location of a product, for following the quantity of each in the transaction report details.
+      */
+@@ -1832,14 +1959,16 @@ class ReportService implements ApplicationContextAware {
+             quantityByStockKey[key.id] = (quantityByStockKey[key.id] ?: 0) + (availableItem.quantityOnHand as Integer)
+         }
+ 
+-        Map<String, Map> referencesByTransactionId = getTransactionReferences(
+-                transactionEntriesWithinDateRange*.transaction*.id.unique())
++        List<String> transactionIds = transactionEntriesWithinDateRange*.transaction*.id.unique()
++        Map<String, Map> referencesByTransactionId = getTransactionReferences(transactionIds)
++        Set<String> internalTransferTransactionIds = getInternalTransferTransactionIds(transactionIds)
+ 
+         // Add transaction entries to the list that took place within selected time range
+         Transaction productInventoryTransaction = null
+         transactionEntriesWithinDateRange.each { TransactionEntry it ->
+             // The change to the balance (negative for debits), or null for counts, which set the balance instead
+             Integer quantityChange = null
++            boolean internal = internalTransferTransactionIds.contains(it.transaction.id)
+             if (isCountTransaction(it.transaction)) {
+                 // A product inventory transaction (e.g. an inventory baseline) sets the quantity on hand of each lot
+                 // and bin of the product to the quantity of its entries, and of every lot and bin it doesn't include
+@@ -1871,7 +2000,11 @@ class ReportService implements ApplicationContextAware {
+                 }
+             } else {
+                 quantityChange = isTransactionEntryDebit(it) ? -Math.abs(it.quantity) : Math.abs(it.quantity)
+-                openingBalance += quantityChange
++                // An internal transfer moves stock between bins, so it changes the quantity of each bin but not the
++                // balance of the facility (its Transfer Out and Transfer In cancel out)
++                if (!internal) {
++                    openingBalance += quantityChange
++                }
+                 StockKey key = new StockKey(it.inventoryItem, it.binLocation)
+                 stockKeys[key.id] = key
+                 quantityByStockKey[key.id] = (quantityByStockKey[key.id] ?: 0) + quantityChange
+@@ -1893,6 +2026,7 @@ class ReportService implements ApplicationContextAware {
+                     quantity: it.quantity,
+                     quantityChange: quantityChange,
+                     balance: openingBalance,
++                    internal: internal,
+             ])
+         }
+ 
+diff --git a/grails-app/views/report/_dataTableDialog.gsp b/grails-app/views/report/_dataTableDialog.gsp
+index c36d9d5add..0b9272c2db 100644
+--- a/grails-app/views/report/_dataTableDialog.gsp
++++ b/grails-app/views/report/_dataTableDialog.gsp
+@@ -1,3 +1,7 @@
++<label class="internal-transfers-toggle" title="${g.message(code: 'report.transaction.internalTransfer.hint', default: 'A transfer between two bin locations of this facility (e.g. a putaway or stock transfer). It moves stock between bins without changing the balance, so it isn\'t counted in the credits and debits of the report.')}">
++    <input type="checkbox" id="dialogIncludeInternalTransfers"/>
++    <g:message code="report.transaction.includeInternalTransfers.label" default="Include internal transfers"/>
++</label>
+ <table id="dialogDataTable" class="dataTable">
+     <thead>
+         <tr>
+@@ -40,6 +44,21 @@
+             UNRECONCILED: "${g.message(code: 'report.transaction.unreconciled.hint', default: 'The transactions above do not add up to the closing balance. This is the rest of the difference.')}"
+         };
+         var countHint = "${g.message(code: 'report.transaction.countQuantity.hint', default: 'Counted quantity. The balance is set to the counted quantity instead of adding to it.')}";
++        var internalTransferHint = $('.internal-transfers-toggle').attr('title');
++
++        // Hide internal transfers unless "Include internal transfers" is checked. The filter is added once, since this
++        // dialog is loaded each time a product is clicked, and only applies to this table.
++        if (!$.fn.dataTableExt.internalTransferFilterAdded) {
++            $.fn.dataTableExt.internalTransferFilterAdded = true;
++            $.fn.dataTableExt.afnFiltering.push(function (oSettings, aData, iDataIndex) {
++                return oSettings.nTable.id !== 'dialogDataTable'
++                    || !oSettings.aoData[iDataIndex]._aData.internal
++                    || $('#dialogIncludeInternalTransfers').is(':checked');
++            });
++        }
++        $('#dialogIncludeInternalTransfers').change(function () {
++            $('#dialogDataTable').dataTable().fnDraw();
++        });
+ 
+         // Until the transactions have loaded, the empty table shows that they're loading instead of "No records found"
+         var loadingMessage = "<img alt='spinner' src=\"${resource(dir: 'images', file: 'spinner.gif')}\" /> ${g.message(code: 'default.loading.label', default: 'Loading...')}";
+@@ -106,6 +125,11 @@
+                 {"mData": "quantity", "sClass": "right", "sWidth": "80px", "sDefaultContent": ""},
+                 {"mData": "balance", "sClass": "right", "sWidth": "80px", "sDefaultContent": ""}
+             ],
++            // DataTables doesn't filter the first draw after loading the data when sorting is off, so redraw to hide
++            // the internal transfers
++            "fnInitComplete": function () {
++                this.fnDraw();
++            },
+             "fnDrawCallback": function () {
+                 // Dim a date that's the same as the row above, and draw a line above the first row of each day, so
+                 // that it's easier to see where each day starts
+@@ -152,6 +176,12 @@
+                     return nRow;
+                 }
+ 
++                // Internal transfers are dimmed, since they don't change the balance
++                $(nRow).toggleClass('internal-row', !!aData.internal);
++                if (aData.internal) {
++                    $(nRow).attr('title', internalTransferHint);
++                }
++
+                 if (aData.transactionId) {
+                     cells.eq(2).empty().append($('<a target="_blank">')
+                         .attr('href', transactionUrl + aData.transactionId)
+diff --git a/grails-app/views/report/showTransactionReport.gsp b/grails-app/views/report/showTransactionReport.gsp
+index fe3dfa5c24..2d3346c5a0 100644
+--- a/grails-app/views/report/showTransactionReport.gsp
++++ b/grails-app/views/report/showTransactionReport.gsp
+@@ -219,6 +219,24 @@
+ 		border-left: 3px dashed #ccc;
+ 	}
+ 
++	/* Internal transfers in the details dialog: they move stock between bins without changing the balance */
++	#dialogDataTable_wrapper tbody tr.internal-row td,
++	#dialogDataTable_wrapper tbody tr.internal-row td.credit,
++	#dialogDataTable_wrapper tbody tr.internal-row td.debit,
++	#dialogDataTable_wrapper tbody tr.internal-row td a {
++		color: #aaa;
++	}
++
++	#dialogDataTable_wrapper tbody tr.internal-row {
++		cursor: help;
++	}
++
++	.internal-transfers-toggle {
++		display: inline-block;
++		margin-bottom: 8px;
++		cursor: help;
++	}
++
+ 	/* Fixed layout, so that the columns keep their widths and the product name gets the rest. Otherwise the browser
+ 	   spreads the extra width over every column, which pushes the quantities away from the product. Applies to the
+ 	   header and body tables, which DataTables splits the table into when it scrolls. */
+@@ -468,6 +486,18 @@
+ 									</p>
+ 								</div>
+ 							</div>
++							<div class="filter-list-item">
++								<label class="hint" title="${g.message(code: 'report.transaction.includeProductsWithNoActivity.hint', default: 'Also lists products that had stock but no activity, i.e. their credits, debits and differences are all 0.')}">
++									<g:checkBox name="includeProductsWithNoActivity" value="${params?.includeProductsWithNoActivity}"/>
++									<g:message code="report.transaction.includeProductsWithNoActivity.label" default="Include products with no activity"/>
++								</label>
++							</div>
++							<div class="filter-list-item">
++								<label class="hint" title="${g.message(code: 'report.transaction.includeInternalTransfers.hint', default: 'Counts transfers between bin locations of the facility (e.g. putaways and stock transfers) in the credits and debits. They move stock between bins without changing the facility\'s quantity on hand, so they\'re left out by default.')}">
++									<g:checkBox name="includeInternalTransfers" value="${params?.includeInternalTransfers}"/>
++									<g:message code="report.transaction.includeInternalTransfers.label" default="Include internal transfers"/>
++								</label>
++							</div>
+ 						</div>
+ 						<div class="buttons">
+ 							<button class="submit-button button primary">
+@@ -752,6 +782,12 @@
+ 
+ 				data.push({ name: "tags", value: $("#tags").val() });
+ 				data.push({ name: "catalogs", value: $("#catalogs").val() });
++				if ($('#includeProductsWithNoActivity').is(':checked')) {
++					data.push({ name: "includeProductsWithNoActivity", value: true });
++				}
++				if ($('#includeInternalTransfers').is(':checked')) {
++					data.push({ name: "includeInternalTransfers", value: true });
++				}
+ 				if($('#includeCategoryChildren').is(':checked')) {
+ 					data.push({ name: "includeCategoryChildren", value: $("#includeCategoryChildren").val() });
+ 				}
+@@ -778,7 +814,7 @@
+ 					}
+ 				})
+ 			},
+-			"oLanguage": getDataTableLanguage("${g.message(code: 'report.transaction.noRows.message', default: 'No products had credits or debits in this period.')}"),
++			"oLanguage": getDataTableLanguage("${g.message(code: 'report.transaction.noRows.message', default: 'No products had activity in this period. Check Include products with no activity to see products that had stock.')}"),
+ 			"bUseRendered": false,
+ 			"dom": '<"top"i>rt<"bottom"flp><"clear">',
+             "fnRowCallback": function (nRow, aData) {
+@@ -1014,6 +1050,12 @@
+ 				catalogs: $("#catalogs").val(),
+ 				format: "text/csv"
+ 			};
++			if ($('#includeProductsWithNoActivity').is(':checked')) {
++				params.includeProductsWithNoActivity = true;
++			}
++			if ($('#includeInternalTransfers').is(':checked')) {
++				params.includeInternalTransfers = true;
++			}
+ 			if($('#includeCategoryChildren').is(':checked')) {
+ 				params.includeCategoryChildren = $("#includeCategoryChildren").val();
+ 			}
+diff --git a/src/integration-test/groovy/org/pih/warehouse/report/spec/ReportServiceTransactionReportModalDataSpec.groovy b/src/integration-test/groovy/org/pih/warehouse/report/spec/ReportServiceTransactionReportModalDataSpec.groovy
+index e383c767d4..55abc8d566 100644
+--- a/src/integration-test/groovy/org/pih/warehouse/report/spec/ReportServiceTransactionReportModalDataSpec.groovy
++++ b/src/integration-test/groovy/org/pih/warehouse/report/spec/ReportServiceTransactionReportModalDataSpec.groovy
+@@ -29,6 +29,7 @@ class ReportServiceTransactionReportModalDataSpec extends IntegrationSpec {
+ 
+     private static final String ADJUSTMENT_CREDIT = Constants.ADJUSTMENT_CREDIT_TRANSACTION_TYPE_ID
+     private static final String TRANSFER_OUT = Constants.TRANSFER_OUT_TRANSACTION_TYPE_ID
++    private static final String TRANSFER_IN = Constants.TRANSFER_IN_TRANSACTION_TYPE_ID
+     private static final String PRODUCT_INVENTORY = Constants.PRODUCT_INVENTORY_TRANSACTION_TYPE_ID
+     private static final String INVENTORY_BASELINE = Constants.INVENTORY_BASELINE_TRANSACTION_TYPE_ID
+ 
+@@ -178,6 +179,33 @@ class ReportServiceTransactionReportModalDataSpec extends IntegrationSpec {
+         !rows.any { it.transactionCode == "UNRECONCILED" }
+     }
+ 
++    void 'an internal transfer is marked and moves stock between bins without changing the balance'() {
++        given:
++        Location binA = new LocationTestBuilder().name(new RandomUtil().randomStringFieldValue("bin")).asBinLocation(facility).build(true)
++        Location binB = new LocationTestBuilder().name(new RandomUtil().randomStringFieldValue("bin")).asBinLocation(facility).build(true)
++        // So that the transaction entries inserted with SQL can reference the bin locations
++        sessionFactory.currentSession.flush()
++        insertTransaction(ADJUSTMENT_CREDIT, day(1), [[item1, 100, binA]])
++
++        and: 'a putaway of 30 from bin A to bin B'
++        insertLocalTransfer(
++                insertTransaction(TRANSFER_OUT, day(6), [[item1, 30, binA]]),
++                insertTransaction(TRANSFER_IN, day(6, 1), [[item1, 30, binB]]))
++
++        and: 'a count that matches the quantity in each bin after the putaway'
++        insertTransaction(INVENTORY_BASELINE, day(7), [[item1, 70, binA], [item1, 30, binB]])
++
++        when:
++        List<Map> rows = modalData()
++
++        then:
++        rows.transactionCode == ["BALANCE_OPENING", "DEBIT", "CREDIT", "PRODUCT_INVENTORY", "PRODUCT_INVENTORY",
++                                 "BALANCE_CLOSING"]
++        rows.internal == [null, true, true, false, false, null]
++        rows.quantityChange == [null, -30, 30, null, null, null]
++        rows.balance == [100, 100, 100, 100, 100, 100]
++    }
++
+     private List<Map> modalData() {
+         // So that the transaction entries inserted with SQL are loaded from the database
+         sessionFactory.currentSession.clear()
+@@ -195,9 +223,12 @@ class ReportServiceTransactionReportModalDataSpec extends IntegrationSpec {
+     }
+ 
+     /**
+-     * Inserts a transaction with the given entries, each given as [inventory item, quantity].
++     * Inserts a transaction with the given entries, each given as [inventory item, quantity] or [inventory item,
++     * quantity, bin location].
++     *
++     * @return the id of the transaction
+      */
+-    private void insertTransaction(String transactionTypeId, Date transactionDate, List<List> entries,
++    private String insertTransaction(String transactionTypeId, Date transactionDate, List<List> entries,
+                                    Date dateCreated = transactionDate) {
+         String transactionId = UUID.randomUUID().toString()
+         sessionFactory.currentSession.createSQLQuery("""
+@@ -215,15 +246,32 @@ class ReportServiceTransactionReportModalDataSpec extends IntegrationSpec {
+         entries.eachWithIndex { entry, int index ->
+             sessionFactory.currentSession.createSQLQuery("""
+                     INSERT INTO transaction_entry (id, version, transaction_id, inventory_item_id, quantity,
+-                                                   transaction_entries_idx)
+-                    VALUES (:id, 0, :transactionId, :inventoryItemId, :quantity, :index)
++                                                   bin_location_id, transaction_entries_idx)
++                    VALUES (:id, 0, :transactionId, :inventoryItemId, :quantity, :binLocationId, :index)
+                 """)
+                     .setString("id", UUID.randomUUID().toString())
+                     .setString("transactionId", transactionId)
+                     .setString("inventoryItemId", (entry[0] as InventoryItem).id)
+                     .setInteger("quantity", entry[1] as Integer)
++                    .setString("binLocationId", entry.size() > 2 ? (entry[2] as Location).id : null)
+                     .setInteger("index", index)
+                     .executeUpdate()
+         }
++        return transactionId
++    }
++
++    /**
++     * Links a Transfer Out and a Transfer In, like InventoryService.transferStock and saveLocalTransfer do.
++     */
++    private void insertLocalTransfer(String sourceTransactionId, String destinationTransactionId) {
++        sessionFactory.currentSession.createSQLQuery("""
++                INSERT INTO local_transfer (id, version, date_created, last_updated, source_transaction_id,
++                                            destination_transaction_id)
++                VALUES (:id, 0, NOW(), NOW(), :sourceTransactionId, :destinationTransactionId)
++            """)
++                .setString("id", UUID.randomUUID().toString())
++                .setString("sourceTransactionId", sourceTransactionId)
++                .setString("destinationTransactionId", destinationTransactionId)
++                .executeUpdate()
+     }
+ }
+diff --git a/src/integration-test/groovy/org/pih/warehouse/report/spec/ReportServiceTransactionReportSpec.groovy b/src/integration-test/groovy/org/pih/warehouse/report/spec/ReportServiceTransactionReportSpec.groovy
+index a50205645c..5b477a59ab 100644
+--- a/src/integration-test/groovy/org/pih/warehouse/report/spec/ReportServiceTransactionReportSpec.groovy
++++ b/src/integration-test/groovy/org/pih/warehouse/report/spec/ReportServiceTransactionReportSpec.groovy
+@@ -75,10 +75,13 @@ class ReportServiceTransactionReportSpec extends IntegrationSpec {
+     void setup() {
+         // The report uses Product.displayName, which looks up the locale in the session of the current request
+         GrailsWebMockUtil.bindMockWebRequest()
++        // Other database connections can't see the test data, which is in a transaction that's rolled back
++        reportService.calculateTransactionReportBalancesInParallel = false
+     }
+ 
+     void cleanup() {
+         RequestContextHolder.resetRequestAttributes()
++        reportService.calculateTransactionReportBalancesInParallel = true
+     }
+ 
+     /**
+@@ -174,15 +177,74 @@ class ReportServiceTransactionReportSpec extends IntegrationSpec {
+         report().A.Credits == 4
+     }
+ 
+-    void 'products without credits or debits in the period are not included'() {
+-        given:
++    void 'includes products with stock or a count but no credits or debits in the period'() {
++        given: 'product A has stock, B was only counted, and C has no stock (and no activity)'
+         setupFacilityAndProducts()
+         insertTransaction(TRANSFER_IN, day(1), [[itemA1, 10]])
+         insertTransaction(INVENTORY_BASELINE, day(6), [[itemB1, 5]])
+-        insertTransaction(TRANSFER_IN, day(6), [[itemC1, 1]])
++        insertTransaction(TRANSFER_IN, day(2), [[itemC1, 3]])
++        insertTransaction(CONSUMPTION, day(3), [[itemC1, 3]])
+ 
+-        expect:
+-        report().keySet() == ["C"] as Set
++        when:
++        Map<String, Map> rows = report(includeProductsWithNoActivity: true)
++
++        then:
++        rows.keySet() == ["A", "B"] as Set
++        rows.A.subMap("Opening", "Credits", "Debits", "Differences", "Closing") ==
++                [Opening: 10, Credits: 0, Debits: 0, Differences: 0, Closing: 10]
++        rows.B.subMap("Opening", "Credits", "Debits", "Differences", "Closing") ==
++                [Opening: 0, Credits: 0, Debits: 0, Differences: 5, Closing: 5]
++        report(includeProductsWithNoActivity: true, includeDetails: true).keySet() == ["A", "B"] as Set
++
++        and: 'by default, only products with activity: B'
++        report().keySet() == ["B"] as Set
++        report(includeDetails: true).keySet() == ["B"] as Set
++    }
++
++    void 'leaves out transfers between bins of the same facility, but not transfers between facilities'() {
++        given:
++        setupFacilityAndProducts()
++        insertTransaction(ADJUSTMENT_CREDIT, day(1), [[itemA1, 100], [itemB1, 5]])
++
++        and: 'an internal transfer of product A (e.g. a putaway), recorded as a Transfer Out and a Transfer In'
++        insertLocalTransfer(
++                insertTransaction(TRANSFER_OUT, day(6), [[itemA1, 30]]),
++                insertTransaction(TRANSFER_IN, day(6), [[itemA1, 30]]))
++
++        and: 'a transfer of product A to another facility'
++        insertLocalTransfer(
++                insertTransaction(TRANSFER_OUT, day(7), [[itemA1, 20]]),
++                insertTransaction(TRANSFER_IN, day(7), [[itemA1, 20]], day(7), otherFacility))
++
++        and: 'product B only had an internal transfer'
++        insertLocalTransfer(
++                insertTransaction(TRANSFER_OUT, day(8), [[itemB1, 5]]),
++                insertTransaction(TRANSFER_IN, day(8), [[itemB1, 5]]))
++
++        when:
++        Map<String, Map> rows = report(includeDetails: true, includeProductsWithNoActivity: true)
++
++        then:
++        rows.A.subMap("Opening", "Credits", "Debits", "Differences", "Closing") ==
++                [Opening: 100, Credits: 0, Debits: 20, Differences: 0, Closing: 80]
++        rows.A["Transfer Out"] == 20
++        rows.A["Transfer In"] == 0
++        rows.B.subMap("Opening", "Credits", "Debits", "Differences", "Closing") ==
++                [Opening: 5, Credits: 0, Debits: 0, Differences: 0, Closing: 5]
++
++        and: 'B had no activity, so it is only listed when products with no activity are included'
++        report().keySet() == ["A"] as Set
++
++        when: 'internal transfers are included'
++        rows = report(includeDetails: true, includeInternalTransfers: true)
++
++        then:
++        rows.keySet() == ["A", "B"] as Set
++        rows.A.subMap("Opening", "Credits", "Debits", "Differences", "Closing") ==
++                [Opening: 100, Credits: 30, Debits: 50, Differences: 0, Closing: 80]
++        rows.A["Transfer Out"] == 50
++        rows.A["Transfer In"] == 30
++        rows.B.subMap("Credits", "Debits") == [Credits: 5, Debits: 5]
+     }
+ 
+     void 'filters by category, tag, catalog and product'() {
+@@ -272,9 +334,17 @@ class ReportServiceTransactionReportSpec extends IntegrationSpec {
+         ].each { Map filters ->
+             [false, true].each { Boolean includeDetails ->
+                 Map args = filters + [includeDetails: includeDetails]
+-                Map<String, Map> actual = report(args)
++                Map<String, Map> actual = report(args + [includeProductsWithNoActivity: true])
+                 Map<String, Map> expected = previousReport(args)
+-                assert actual.keySet() == expected.keySet(), "Different products for ${args}"
++                // The previous implementation only included products with credits or debits in the period. The others
++                // are included now if they had stock, and have no credits or debits.
++                assert actual.keySet().containsAll(expected.keySet()), "Missing products for ${args}"
++                (actual.keySet() - expected.keySet()).each { String product ->
++                    assert actual[product].subMap("Credits", "Debits") == [Credits: 0, Debits: 0], "Extra product ${product} for ${args}"
++                }
++                assert report(args).keySet() ==
++                        actual.findAll { product, row -> row.Credits || row.Debits || row.Differences ||
++                                row.Closing != row.Opening }.keySet(), "Products with activity for ${args}"
+                 expected.each { String product, Map row ->
+                     Map differences = row.findAll { column, value -> actual[product][column] != value }
+                             .collectEntries { column, value -> [(column): [expected: value, actual: actual[product][column]]] }
+@@ -291,7 +361,8 @@ class ReportServiceTransactionReportSpec extends IntegrationSpec {
+     private Map<String, Map> report(Map args = [:]) {
+         return keyByProduct(reportService.getTransactionReport(facility, args.categories as List,
+                 args.tags as List, args.catalogs as List, args.products as List, startDate, endDate,
+-                args.includeDetails as Boolean))
++                args.includeDetails as Boolean, args.includeProductsWithNoActivity as Boolean,
++                args.includeInternalTransfers as Boolean))
+     }
+ 
+     /**
+@@ -405,8 +476,10 @@ class ReportServiceTransactionReportSpec extends IntegrationSpec {
+ 
+     /**
+      * Inserts a transaction with the given entries, each given as [inventory item, quantity].
++     *
++     * @return the id of the transaction
+      */
+-    private void insertTransaction(String transactionTypeId, Date transactionDate, List<List> entries,
++    private String insertTransaction(String transactionTypeId, Date transactionDate, List<List> entries,
+                                    Date dateCreated = transactionDate, Location location = facility) {
+         String transactionId = UUID.randomUUID().toString()
+         sessionFactory.currentSession.createSQLQuery("""
+@@ -434,5 +507,17 @@ class ReportServiceTransactionReportSpec extends IntegrationSpec {
+                     .setInteger("index", index)
+                     .executeUpdate()
+         }
++        return transactionId
++    }
++
++    /**
++     * Links a Transfer Out and a Transfer In, like InventoryService.transferStock and saveLocalTransfer do.
++     */
++    private void insertLocalTransfer(String sourceTransactionId, String destinationTransactionId) {
++        executeSql("""INSERT INTO local_transfer (id, version, date_created, last_updated, source_transaction_id,
++                                                  destination_transaction_id)
++                      VALUES (:id, 0, NOW(), NOW(), :sourceTransactionId, :destinationTransactionId)""",
++                [id: UUID.randomUUID().toString(), sourceTransactionId: sourceTransactionId,
++                 destinationTransactionId: destinationTransactionId])
+     }
+ }

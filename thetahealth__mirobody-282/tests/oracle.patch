@@ -1,0 +1,140 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index caaaa69c..4e71aedd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -180,6 +180,23 @@
+   catalogue and the raw readings already did, and stats rows sort by it. How
+   to tell: `view=stats` over two device metrics lists both by name, the same
+   names the catalogue shows.
++- **A reinstalled stack neither locks out its first account nor lets an old
++  token into it.** A stack started again on a new database (`docker compose
++  down -v`, then `./deploy.sh`) keeps `.env`, and so its signing key, and
++  numbers accounts from 1 again. A browser still holding a token from before
++  had two outcomes. If it asked before anyone signed up, the server found no
++  such account and remembered the id as closed for as long as it ran; the
++  next person to sign up got that id, and every token they were given was
++  refused: sign-up answered ok and the page went back to the sign-in form,
++  with a 401 in the console. If it asked after, the old token opened the new
++  account. Found while testing 1.6.1 on a reinstalled local stack. Now a new
++  account refuses every token minted before it existed (`tokens_valid_after`
++  defaults to its creation, less the minute `iat` allows for clock skew), and
++  an id with no account is looked up again on the next request; an account
++  closed in Settings is still refused for good. Accounts that already exist
++  are unchanged. How to tell: with the old page open, run `docker compose
++  down -v` and `./deploy.sh`, then sign up; the data page opens, and the old
++  page's token is refused.
+ 
+ ## 1.6.0
+ 
+diff --git a/mirobody/schema/10_accounts.sql b/mirobody/schema/10_accounts.sql
+index 69e7de18..3f6215c3 100644
+--- a/mirobody/schema/10_accounts.sql
++++ b/mirobody/schema/10_accounts.sql
+@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS health_app_user (
+     password_hash text,                                 -- bcrypt via pgcrypto crypt(); NULL = no password
+     managed_by    INTEGER REFERENCES health_app_user(id),
+     email_verified_at  TIMESTAMPTZ,                     -- last time a code sent to `email` came back
+-    tokens_valid_after TIMESTAMPTZ                      -- tokens minted before this are refused
++    tokens_valid_after TIMESTAMPTZ DEFAULT now() - interval '1 minute'  -- tokens minted before this are refused
+ );
+ ALTER TABLE health_app_user ADD COLUMN IF NOT EXISTS ethnicity VARCHAR(128);
+ ALTER TABLE health_app_user ADD COLUMN IF NOT EXISTS mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+@@ -49,6 +49,11 @@ ALTER TABLE health_app_user ADD COLUMN IF NOT EXISTS managed_by INTEGER REFERENC
+ -- signs out every session minted before it (user.prove_address).
+ ALTER TABLE health_app_user ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;
+ ALTER TABLE health_app_user ADD COLUMN IF NOT EXISTS tokens_valid_after TIMESTAMPTZ;
++-- A new account refuses every token minted before it existed. A database made
++-- again (`docker compose down -v`) numbers accounts from 1 again under the
++-- same JWT_KEY, so a browser's token for the old id 3 opened the new id 3.
++-- The minute is ISSUED_AT_SKEW: the database's clock may run ahead of the app's.
++ALTER TABLE health_app_user ALTER COLUMN tokens_valid_after SET DEFAULT now() - interval '1 minute';
+ 
+ CREATE        INDEX IF NOT EXISTS idx_health_app_user_apple_sub ON health_app_user USING btree (apple_sub);
+ CREATE UNIQUE INDEX IF NOT EXISTS idx_uni_health_app_user_email_active ON health_app_user USING btree (email) WHERE (is_del = false);
+diff --git a/mirobody/tests/test_postgres_regressions.py b/mirobody/tests/test_postgres_regressions.py
+index 761320da..7a453b32 100644
+--- a/mirobody/tests/test_postgres_regressions.py
++++ b/mirobody/tests/test_postgres_regressions.py
+@@ -1608,3 +1608,26 @@ async def read_again(**kwargs):
+     storage.objects.clear()
+     await FileDbService.update_file_content("web_uploads/failed.pdf", {"status": "failed"})
+     assert await fps.reprocess_file(await FileDbService.get_file_by_key("web_uploads/failed.pdf"), "1") == "missing"
++
++
++async def test_a_new_account_refuses_a_token_minted_before_it_existed(database, monkeypatch):
++    """A database made again (`docker compose down -v`) numbers its accounts
++    from 1 again, and `.env` keeps the JWT key. A browser's token for the old
++    id was accepted for the new account that took that id; and the server,
++    asked for it before anyone signed up, remembered the id as closed and
++    refused the new account's own tokens until a restart (1.6.0)."""
++    import time
++
++    from mirobody.user import user as user_module
++
++    monkeypatch.setattr(user_module, "_active", {})
++    monkeypatch.setattr(user_module, "_closed", set())
++    monkeypatch.setattr(user_module, "_valid_after", {})
++    before = time.time() - 3600  # a token from the install before
++    [row] = await database("SELECT COALESCE(MAX(id), 0) + 1 AS id FROM health_app_user", log_sql=False)
++    assert await user_module.is_active_account(int(row["id"]), before) is False  # nobody has that id yet
++    [account] = await database("INSERT INTO health_app_user(is_del,email,tz) VALUES (false,'new@example.invalid','UTC')"
++                               " RETURNING id", log_sql=False)
++    assert int(account["id"]) == int(row["id"])
++    assert await user_module.is_active_account(account["id"], before) is False
++    assert await user_module.is_active_account(account["id"], time.time()) is True
+diff --git a/mirobody/tests/test_security_gates.py b/mirobody/tests/test_security_gates.py
+index cde814ee..2eb802c5 100644
+--- a/mirobody/tests/test_security_gates.py
++++ b/mirobody/tests/test_security_gates.py
+@@ -1182,3 +1182,25 @@ def test_every_handler_config_init_installs_drops_a_value_bearing_extra(monkeypa
+     line = log_file.read_text(encoding="utf-8")
+     assert "reading stored" in line and '"row_count":1' in line
+     assert "HbA1c" not in line and "_phi_seen" not in line
++
++
++def test_a_token_for_an_account_not_there_yet_does_not_shut_it_out(monkeypatch):
++    """A database made again (`docker compose down -v`) numbers its accounts
++    from 1 again. A browser still holding a token for id 3 asked first, found
++    no account, and id 3 was remembered as closed: the next person to sign up
++    was id 3 and every token they got was refused until a restart (1.6.0)."""
++    from mirobody.user import user as user_module
++
++    rows: dict[int, dict] = {}
++
++    async def get_user(user_id):
++        return rows.get(int(user_id))
++
++    monkeypatch.setattr(user_module, "get_user", get_user)
++    monkeypatch.setattr(user_module, "_active", {})
++    monkeypatch.setattr(user_module, "_closed", set())
++    monkeypatch.setattr(user_module, "_valid_after", {})
++
++    assert asyncio.run(user_module.is_active_account(3)) is False  # the stale token, before sign-up
++    rows[3] = {"tokens_valid_after": 0}
++    assert asyncio.run(user_module.is_active_account(3)) is True  # the account that signed up as id 3
+diff --git a/mirobody/user/user.py b/mirobody/user/user.py
+index e47229f5..2a16314f 100644
+--- a/mirobody/user/user.py
++++ b/mirobody/user/user.py
+@@ -187,8 +187,8 @@ async def del_user(
+ #-----------------------------------------------------------------------------
+ 
+ #: How long a live account is taken on trust before it is looked up again. A
+-#: token outlives the account, or a revocation, by at most this long; a closed
+-#: account is final and is remembered for good.
++#: token outlives the account, or a revocation, by at most this long; an
++#: account closed here is final and is remembered for good.
+ _ACTIVE_TTL = 30.0
+ _active: dict[int, float] = {}
+ _closed: set[int] = set()
+@@ -218,7 +218,9 @@ async def is_active_account(user_id: int | str, minted_at: float | None = None)
+             logger.warning("account lookup failed; token accepted: error_type=%s", type(e).__name__)
+             return True
+         if row is None:
+-            _closed.add(uid)
++            # Not remembered as closed: a database made again (`down -v`)
++            # numbers its accounts from 1 again, so a stale browser token for
++            # id 3 shut the next account to sign up out until a restart.
+             return False
+         _active[uid] = now + _ACTIVE_TTL
+         _valid_after[uid] = float(row.get("tokens_valid_after") or 0)

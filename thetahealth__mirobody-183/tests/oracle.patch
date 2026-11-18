@@ -1,0 +1,627 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fb2c816e..bc325e8a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -60,6 +60,17 @@
+   its own language). Answers use the account's local days and the suite's
+   tolerances; the README says how to run them beside the maintained set.
+ 
++- **Capability probes diagnose record-access failures on source-grounded windows.**
++  `benchmarks/local_models/probes.py` reads the generator's flat device records,
++  selects disjoint windows with answers separated beyond tolerance, and checks means,
++  day counts, maxima, citation traceability and proven absence. The default is at
++  most 19 questions per person. Source/account provenance is checked before calls;
++  ambiguous source data is omitted with reasons. Full questions and tool evidence
++  are saved, while incomplete runs and unattempted questions remain separate from
++  answer quality. `--dry-run` inspects the set without account or model calls.
++  Explicit units retain their meaning inside parentheses, brackets and quoted
++  formatting, so `70 (lb)` cannot pass a `70 kg` gold through an empty unit match.
++
+ - **Personal-record evaluation could hide capability gaps behind easy retrieval.**
+   `benchmarks/intent` adds 32 source-grounded tasks (24 capability, 8 regression),
+   8 patient-disjoint held-out tasks and 4 reliability pairs, using PHIA,
+diff --git a/benchmarks/local_models/README.md b/benchmarks/local_models/README.md
+index e3eb7c9e..783096a5 100644
+--- a/benchmarks/local_models/README.md
++++ b/benchmarks/local_models/README.md
+@@ -281,3 +281,63 @@ append them to a copy of `cases.jsonl`, recompute `plan.json`'s `cases_sha256`,
+ relax `provenance.validate_cases`'s "exactly 100" rule in that copy — that is what the
+ extras were developed against. Treat the result as an extended set with its own name,
+ not as a replacement for the maintained `harness100` suite, and report the two separately.
++
++## Capability probes
++
++`probes.py` builds a small diagnostic set from generator truth and the pinned loading
++plan. It reads the actual flat `devices.jsonl` records (`metric`, `indicator`, `time`,
++`value`, `unit`) in the account's time zone. Gold never comes from a product response.
++The default selects at most two metrics, with at most **19 questions per person**;
++`--max-metrics 1|2|3` changes that bound (10/19/28).
++
++| capability | question | acceptance |
++| --- | --- | --- |
++| C3 window | average over an explicit historical window | source-derived mean in the requested unit |
++| C4 aggregate | distinct recorded days or maximum in that window | source-derived day count or maximum |
++| C6 provenance | numeric answer's citation | known row ID, with numeric support in the actual tool evidence |
++| C7 absence | a metric absent from loaded source truth | explicit absence without a fabricated numeric reading |
++
++Candidate windows occupy three disjoint thirds of the record, using up to 7, 14 and
++21 observed days. Mean and maximum answers must differ by more than their combined
++1%/0.05 tolerances; counts must differ exactly. Each retained operation needs at least
++two distinguishable windows. A constant answer cannot pass all of them. Metrics with
++no discriminating means are skipped, with reasons saved; they do not establish C3.
++
++Duplicate local-day readings, nonfinite values and mixed units are omitted rather
++than assigned an ambiguous gold. Windows cannot overlap loaded document readings of
++the same metric. Sleep uses source intervals in minutes and the existing evening-date
++policy. Absence checks all loaded document truth, including unreadable rows, short
++device series and journal mentions; if absence cannot be established, C7 is omitted.
++These are bounded record-access diagnostics, not a clinical reasoning benchmark or
++an independent held-out test. C6 checks numeric traceability, not whether a clinical
++interpretation follows from the evidence.
++
++First inspect the source-derived questions without signing in or calling a model:
++
++```bash
++python benchmarks/local_models/probes.py --corpus <build> --plan <plan.json> \
++    --person p001 --email <existing-loaded-account> \
++    --out results/probes/p001.json --dry-run
++```
++
++Remove `--dry-run` to ask the already-loaded account. The plan's source hashes and
++the account's person, completed loading state and record identity must match. A new
++empty email account is rejected. The run uses the account's planned time zone,
++English questions and the frozen evaluation clock (`2026-09-02`). It does not switch
++models or reload records.
++
++Results save the complete question manifest and its hash, source hashes, per-window
++points and policy, full answers and tool transcripts, and citation diagnostics.
++Numeric extraction excludes dates and citation IDs and rejects ambiguous multiple
++values. Explicit incompatible units fail, including units inside parentheses,
++brackets, quotes and nested formatting. UCUM's own brackets, such as `[IU]/L`,
++are retained while outer formatting is removed. Per-capability counts keep selected,
++completed, passed, failed runs and unattempted questions separate; C6 uses the same
++selected numeric denominator. An incomplete turn stops further calls and leaves the
++remaining questions unattempted. Session-creation failures are captured too. Results
++are saved after each answer with the full selected denominator; `complete=false`
++marks a model run that has not reached its final write.
++
++Exit status is 0 only when all selected checks pass, 1 for a failed answer, citation
++or run, and 2 when there are no discriminating C3 windows (including dry runs). A dry
++run with usable C3 windows exits 0 without creating quality grades.
+diff --git a/benchmarks/local_models/probes.py b/benchmarks/local_models/probes.py
+new file mode 100644
+index 00000000..d894ace0
+--- /dev/null
++++ b/benchmarks/local_models/probes.py
+@@ -0,0 +1,278 @@
++"""Small source-derived capability probes; incomplete runs are not quality grades.
++
++Use the pinned loading plan and its existing benchmark account. Gold is computed
++from generator truth, never from product responses. Only disjoint windows whose
++answers differ beyond their tolerances become window-discrimination probes.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import re
++import statistics
++import sys
++from collections import defaultdict
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++
++from cases import ALIASES, device_series, metric_label
++from common import Corpus, read_json, write_json
++from provenance import AS_OF, digest_json, record_identity, validate_corpus
++import score
++from mirobody import units
++
++ABSENCE = {"glu": ("blood glucose", "2345-7", "1558-6"),
++           "insulin": ("insulin", "20448-7"), "peak_flow": ("peak flow", "19935-6")}
++ABSENT = re.compile(r"\b(?:no (?:[\w-]+ ){0,3}(?:records?|readings?|measurements?|results?|data)"
++                    r"|not recorded|never recorded|not on file)\b|未记录|没有(?:相关)?(?:记录|数据)|无(?:相关)?记录")
++
++
++def windows(points: list[tuple[str, float]], blocked: set[str]) -> list[list[tuple[str, float]]]:
++    """One bounded window in each third, avoiding overlapping document truth."""
++    out = []
++    for i, width in enumerate((7, 14, 21)):
++        segment = points[i * len(points) // 3:(i + 1) * len(points) // 3]
++        width = min(width, len(segment))
++        if width < 7:
++            return []
++        candidates = [segment[j:j + width] for j in range(len(segment) - width + 1)
++                      if not any(segment[j][0] <= day <= segment[j + width - 1][0] for day in blocked)]
++        if not candidates:
++            return []
++        # Prefer a different numeric answer, independently of model responses.
++        chosen = (max(candidates, key=lambda c: min(abs(statistics.fmean(v for _, v in c)
++                                                       - statistics.fmean(v for _, v in previous)) for previous in out))
++                  if out else candidates[0])
++        out.append(chosen)
++    return out
++
++
++def distinct(probes: list[dict]) -> list[dict]:
++    """A repeated answer must not pass a window probe by luck."""
++    kept: list[dict] = []
++    for probe in probes:
++        if all(abs(probe["gold"] - old["gold"]) > probe["tol"] + old["tol"] for old in kept):
++            kept.append(probe)
++    return kept if len(kept) >= 2 else []
++
++
++def build(corpus: Corpus, person: str, config: dict, *, max_metrics: int = 2) -> tuple[list[dict], list[dict]]:
++    device = corpus.devices.get(person) or {}
++    records = device.get("records") or []
++    loaded = [row for file in config["documents"] for row in corpus.files[file].get("readings", [])]
++    probes, skipped = [], []
++    used = 0
++    for metric in sorted({r["metric"] for r in records}):
++        if used >= max_metrics:
++            break
++        source = [r for r in records if r["metric"] == metric]
++        units = {str(r.get("unit") or "") for r in source}
++        if len(units) != 1 or not next(iter(units)):
++            skipped.append({"metric": metric, "reason": "no single recorded unit"})
++            continue
++        try:
++            points = [(when.date().isoformat(), value) for when, value in device_series(corpus, person, metric, config["tz"])]
++        except (ValueError, KeyError, TypeError, OverflowError):
++            skipped.append({"metric": metric, "reason": "unsupported source timestamps or intervals"})
++            continue
++        if (len(points) < 30 or any(not math.isfinite(v) for _, v in points)
++                or len({day for day, _ in points}) != len(points)):
++            skipped.append({"metric": metric, "reason": "need 30 finite, unambiguous local days"})
++            continue
++        codes = {r.get("loinc") for r in source} - {None, ""}
++        blocked = {str(r["observed"])[:10] for r in loaded if r.get("key") == metric or r.get("loinc") in codes}
++        blocks = windows(points, blocked)
++        if not blocks:
++            skipped.append({"metric": metric, "reason": "no three disjoint windows without document overlap"})
++            continue
++        unit = "min" if metric == "sleep" else next(iter(units))
++        label = metric_label(metric, "en") if metric in ALIASES else str(source[0]["indicator"])
++        candidates: dict[str, list[dict]] = defaultdict(list)
++        for block in blocks:
++            start, end = block[0][0], block[-1][0]
++            values = [v for _, v in block]
++            basis = ("Use source sleep intervals in minutes, with nights labelled by the evening date "
++                     "of the 18:00-based sleep window. " if metric == "sleep" else "")
++            for op, capability, value, request in (
++                ("mean", "C3", statistics.fmean(values), f"What was my average {label}, in {unit},"),
++                ("days", "C4", len(values), f"How many distinct local days have a {label} record"),
++                ("max", "C4", max(values), f"What was my highest {label}, in {unit},"),
++            ):
++                candidates[op].append({
++                    "capability": capability, "operation": op, "metric": metric, "unit": "days" if op == "days" else unit,
++                    "start": start, "end": end, "gold": round(value, 6),
++                    "tol": 0 if op == "days" else max(0.05, abs(value) * 0.01),
++                    "question": f"{request} from {start} through {end}? {basis}Reply with one value and cite its source.",
++                    "evidence": {"file": "devices.jsonl", "person": person, "tz": config["tz"],
++                                 "points": block, "policy": "source_sleep_interval_minutes" if metric == "sleep" else "recorded_value"},
++                })
++        accepted_groups = {op: distinct(group) for op, group in candidates.items()}
++        if not accepted_groups["mean"]:
++            skipped.append({"metric": metric, "reason": "window answers overlap within tolerance"})
++            continue
++        for operation, group in candidates.items():
++            accepted = accepted_groups[operation]
++            probes.extend(accepted)
++            if not accepted:
++                skipped.append({"metric": metric, "operation": operation, "reason": "window answers overlap within tolerance"})
++        used += 1
++    # Absence concerns all loaded truth, including short series and unreadable
++    # document rows; an uncertain source never establishes that a metric is absent.
++    journal = [r for r in corpus.journal if r["person_id"] == person]
++    presence = json.dumps([records, loaded, journal], ensure_ascii=False).casefold()
++    for metric, aliases in ABSENCE.items():
++        names = [metric, *aliases, *ALIASES.get(metric, [])]
++        if not any(name.casefold() in presence for name in names):
++            probes.append({"capability": "C7", "operation": "absence", "metric": metric,
++                           "gold": None, "tol": None, "expect_absent": True,
++                           "question": f"Check all my loaded health records for {aliases[0]}. If it was never recorded, say so. Do not substitute another measurement.",
++                           "evidence": {"files": ["devices.jsonl", *config["documents"], "journal.jsonl"],
++                                        "person": person, "assertion": "no source mentions this metric or its known aliases/codes"}})
++            break
++    else:
++        skipped.append({"capability": "C7", "reason": "no proven absence among candidate metrics"})
++    for i, probe in enumerate(probes, 1):
++        probe["id"] = f"{person}-probe-{i:02d}"
++    return probes, skipped
++
++
++def answer_number(text: str) -> float | None:
++    values = score.numbers(score.strip_dates(score.prose_of(text)))
++    unique = set(values)
++    return next(iter(unique)) if len(unique) == 1 and all(math.isfinite(v) for v in values) else None
++
++
++_STATED_UNIT = re.compile(
++    r"[-−+]?\d[\d,.]*\s*"
++    r"((?:[([{\"'`_][ \t]*)*(?:[^\W\d_]|[%°µμ/])[\w/%°µμ.*^+\-\[\](){}\"'`]*"
++    r"(?:[ \t]*[)\]}\"'`_])*)"
++)
++_UNIT_WRAPPERS = {"(": ")", "[": "]", "{": "}", '"': '"', "'": "'", "`": "`", "_": "_"}
++
++
++def stated_unit(token: str) -> str | None:
++    token = token.strip().rstrip(".")
++    while token:
++        # UCUM brackets can belong to the unit, so resolve before peeling prose wrappers.
++        normalized = units.normalize_unit(token)
++        if normalized is not None:
++            return normalized
++        if _UNIT_WRAPPERS.get(token[0]) != token[-1]:
++            break
++        token = token[1:-1].strip()
++    return None
++
++
++def units_match(text: str, expected: str) -> bool:
++    target = units.normalize_unit(expected)
++    prose = score.strip_dates(score.prose_of(text)).replace("*", "")
++    stated = [stated_unit(m.group(1)) for m in _STATED_UNIT.finditer(prose)]
++    return not target or all(unit is None or unit == target for unit in stated)
++
++
++def grade(probe: dict, turn: dict) -> dict:
++    text = score.answer_of(turn.get("blocks", []))
++    result = {**probe, "answer": text, "turn": turn, "ok": False, "cited": False}
++    failed = any(turn.get(k) for k in ("error", "timeout", "configuration_error"))
++    if failed or turn.get("finish_reason") != "stop" or not text.strip():
++        return {**result, "status": "run_failure", "detail": "turn did not complete with a nonempty answer"}
++    trace = score.trace_of(text, score.tool_text(turn.get("blocks", [])))
++    cited = (trace["row_cites"] > 0 and not any(trace[k] for k in (
++        "made_up", "uncited_numbers", "unsupported_numbers", "unclosed_statements")))
++    got = answer_number(text)
++    if probe.get("expect_absent"):
++        prose = score.prose_of(text).casefold()
++        absent = bool(ABSENT.search(prose))
++        # A denial plus a numeric reading is contradictory, regardless of the
++        # location of the denial or whether the fabricated value has a cite.
++        ok = absent and not score.numbers(score.strip_dates(prose))
++        detail = "absence without a fabricated numeric reading" if ok else "absence not established or contradicted"
++    else:
++        ok = (got is not None and abs(got - probe["gold"]) <= probe["tol"]
++              and units_match(text, probe.get("unit", "")))
++        detail = f"got {got!r}, expected {probe['gold']} +/- {probe['tol']}"
++    return {**result, "status": "completed", "ok": ok, "cited": cited, "citation_trace": trace, "detail": detail}
++
++
++def summarize(results: list[dict]) -> dict:
++    counts: dict[str, dict] = {}
++    for result in results:
++        for capability in [result["capability"], *(["C6"] if result.get("gold") is not None else [])]:
++            row = counts.setdefault(capability, {"selected": 0, "completed": 0, "passed": 0,
++                                                 "run_failure": 0, "not_attempted": 0})
++            row["selected"] += 1
++            if result["status"] != "completed":
++                row["not_attempted" if result["status"] == "not_attempted" else "run_failure"] += 1
++                continue
++            row["completed"] += 1
++            row["passed"] += bool(result["cited"] if capability == "C6" else result["ok"])
++    return counts
++
++
++def validate_account(plan: dict, person: str, entry: dict) -> None:
++    if (entry.get("person") != person or entry.get("record_sha256") != record_identity(plan)
++            or not entry.get("loaded_at") or "devices" not in entry.get("steps", {})):
++        raise ValueError("Account is not a completed load of this person and source plan; load it before probing")
++
++
++def main() -> int:
++    import common
++    import requests
++    import run as bench
++    from load import LOAD_STATE
++
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--corpus", required=True, type=Path)
++    ap.add_argument("--plan", required=True, type=Path)
++    ap.add_argument("--person", required=True)
++    ap.add_argument("--email", required=True)
++    ap.add_argument("--out", required=True, type=Path)
++    ap.add_argument("--timeout", type=float, default=300)
++    ap.add_argument("--max-metrics", type=int, choices=(1, 2, 3), default=2)
++    ap.add_argument("--dry-run", action="store_true", help="save source-derived questions without account or model calls")
++    args = ap.parse_args()
++    corpus, plan = Corpus(args.corpus), read_json(args.plan)
++    validate_corpus(corpus, plan)
++    config = plan["qa_people"][args.person]
++    probes, skipped = build(corpus, args.person, config, max_metrics=args.max_metrics)
++    packet = {"person": args.person, "email": args.email, "source_sha256": plan["provenance"]["sha256"],
++              "record_sha256": record_identity(plan), "tz": config["tz"], "as_of": AS_OF,
++              "case_manifest": probes, "cases_sha256": digest_json(probes), "skipped": skipped,
++              "dry_run": args.dry_run, "complete": False, "results": []}
++    write_json(args.out, packet)
++    if not any(p["capability"] == "C3" for p in probes):
++        print(f"No discriminating C3 windows; skipped-source reasons saved to {args.out}", file=sys.stderr)
++        return 2
++    if args.dry_run:
++        print(f"wrote {len(probes)} source-derived probes to {args.out}; no model calls")
++        return 0
++    entry = read_json(LOAD_STATE, {}).get(args.email, {})
++    validate_account(plan, args.person, entry)
++    account = common.sign_in(args.email, tz=config["tz"], lang="en")
++    packet["results"] = [{**p, "status": "not_attempted", "ok": False, "cited": False, "detail": "not attempted"}
++                         for p in probes]
++    packet["capabilities"] = summarize(packet["results"])
++    write_json(args.out, packet)
++    for index, probe in enumerate(probes):
++        try:
++            turn = bench.ask(account, probe["question"], args.timeout, as_of=AS_OF)
++        except (common.ApiError, requests.RequestException) as exc:
++            turn = {"error": type(exc).__name__, "finish_reason": "error", "blocks": []}
++        result = grade(probe, turn)
++        packet["results"][index] = result
++        packet["capabilities"] = summarize(packet["results"])
++        write_json(args.out, packet)
++        print(f"{result['status']} {probe['id']} {probe['capability']} ok={result['ok']} cited={result['cited']}", flush=True)
++        if result["status"] == "run_failure":
++            break
++    packet["complete"] = True
++    packet["capabilities"] = summarize(packet["results"])
++    write_json(args.out, packet)
++    return int(any(not r["ok"] or (r.get("gold") is not None and not r["cited"]) for r in packet["results"]))
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/mirobody/tests/test_capability_probes.py b/mirobody/tests/test_capability_probes.py
+new file mode 100644
+index 00000000..1265ff01
+--- /dev/null
++++ b/mirobody/tests/test_capability_probes.py
+@@ -0,0 +1,247 @@
++"""Rejection controls for source-derived capability probes, without model calls."""
++from __future__ import annotations
++
++import copy
++import hashlib
++import importlib.util
++import json
++from collections import defaultdict
++from datetime import date, timedelta
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++pytest.importorskip("requests")
++_SPEC = importlib.util.spec_from_file_location("capability_probes", Path(__file__).resolve().parents[2] / "benchmarks/local_models/probes.py")
++probes = importlib.util.module_from_spec(_SPEC)
++_SPEC.loader.exec_module(probes)
++
++
++@pytest.fixture
++def source():
++    records = [{"indicator": "bodyMasss", "metric": "weight", "loinc": "29463-7", "unit": "kg",
++                "time": f"{date(2025, 1, 1) + timedelta(days=i)}T08:00:00+08:00", "value": 50 + i}
++               for i in range(120)]
++    corpus = SimpleNamespace(devices={"p001": {"records": records}}, files={}, journal=[])
++    return corpus, {"tz": "Asia/Shanghai", "documents": []}
++
++
++def turn(answer, tool="(constants: rid=r1, indicator=weight, avg=70, unit=kg)", **extra):
++    return {"finish_reason": "stop", "blocks": [{"type": "tool_call", "name": "query_health_indicators", "args": {}},
++            {"type": "tool_result", "content": tool}, {"type": "text", "text": answer}], **extra}
++
++
++NUMERIC = {"capability": "C3", "operation": "mean", "metric": "weight", "gold": 70, "tol": .1}
++ABSENT = {"capability": "C7", "metric": "glu", "gold": None, "expect_absent": True}
++
++
++def test_real_flat_generator_schema_produces_compact_discriminating_windows(source):
++    corpus, config = source
++    cases, _ = probes.build(corpus, "p001", config)
++    assert 2 <= sum(p["capability"] == "C3" for p in cases) <= 3
++    assert len(cases) <= 19
++    groups = defaultdict(list)
++    for p in cases:
++        if p["gold"] is None:
++            continue
++        groups[p["operation"]].append(p)
++        values = [v for _, v in p["evidence"]["points"]]
++        assert p["gold"] == pytest.approx({"mean": sum(values) / len(values), "days": len(values), "max": max(values)}[p["operation"]])
++        assert len({d for d, _ in p["evidence"]["points"]}) == len(values)
++    for group in groups.values():
++        for i, p in enumerate(group):
++            for other in group[i+1:]:
++                assert p["end"] < other["start"]
++                assert abs(p["gold"] - other["gold"]) > p["tol"] + other["tol"]
++
++
++def test_flat_values_cannot_pretend_to_probe_window_discrimination(source):
++    corpus, config = source
++    for r in corpus.devices["p001"]["records"]:
++        r["value"] = 70
++    cases, skipped = probes.build(corpus, "p001", config)
++    assert not any(p["capability"] == "C3" for p in cases)
++    assert any(p["reason"] == "window answers overlap within tolerance" for p in skipped)
++
++
++def test_always_answering_the_latest_window_cannot_pass_historical_windows(source):
++    cases, _ = probes.build(source[0], "p001", source[1])
++    means = [p for p in cases if p["capability"] == "C3"]
++    copied = str(means[-1]["gold"])
++    assert sum(probes.grade(p, turn(copied))["ok"] for p in means) == 1
++
++
++@pytest.mark.parametrize("kind", ["short-device", "document", "journal"])
++def test_absence_checks_all_source_truth_even_short_or_unreadable_rows(source, kind):
++    corpus, config = source
++    row = {"metric": "glu", "indicator": "blood glucose", "time": "2025-01-01T00:00:00+00:00", "unit": "mmol/L", "value": 5.5}
++    if kind == "short-device":
++        corpus.devices["p001"]["records"].append(row)
++    elif kind == "document":
++        corpus.files["lab.pdf"] = {"readings": [{"key": "glu", "observed": "2025-01-01", "readable": False}]}
++        config["documents"].append("lab.pdf")
++    else:
++        corpus.journal.append({"person_id": "p001", "text": "blood glucose"})
++    cases, _ = probes.build(corpus, "p001", config)
++    assert all(p["metric"] != "glu" for p in cases if p.get("expect_absent"))
++
++
++def test_ambiguous_daily_sources_and_mixed_units_do_not_generate_wrong_gold(source):
++    corpus, config = source
++    corpus.devices["p001"]["records"].append(copy.deepcopy(corpus.devices["p001"]["records"][0]))
++    cases, skipped = probes.build(corpus, "p001", config)
++    assert not any(p["gold"] is not None for p in cases)
++    assert any("unambiguous" in p["reason"] for p in skipped)
++    corpus.devices["p001"]["records"][-1]["unit"] = "lb"
++    _, skipped = probes.build(corpus, "p001", config)
++    assert any("single recorded unit" in p["reason"] for p in skipped)
++
++
++def test_windows_do_not_cross_loaded_document_measurements(source):
++    corpus, config = source
++    corpus.files["lab.pdf"] = {"readings": [{"key": "weight", "observed": "2025-01-03"}]}
++    config["documents"] = ["lab.pdf"]
++    cases, _ = probes.build(corpus, "p001", config)
++    assert all(not (p["start"] <= "2025-01-03" <= p["end"]) for p in cases if p["gold"] is not None)
++
++
++def test_account_timezone_determines_local_day(source):
++    corpus, config = source
++    config["tz"] = "UTC"
++    for r in corpus.devices["p001"]["records"]:
++        r["time"] = r["time"].replace("T08:00", "T00:00")
++    cases, _ = probes.build(corpus, "p001", config)
++    assert cases[0]["start"] == "2024-12-31"
++
++
++@pytest.mark.parametrize("answer, expected", [
++    ("From 2025-01-01 to 2025-01-30, the mean was 70 kg<cite>[r12]</cite>", 70),
++    ("70<cite>[r1]</cite>", 70), ("7,000<cite>[r12]</cite>", 7000),
++    ("70 or 71", None), ("No number<cite>[r70]</cite>", None),
++])
++def test_numeric_extraction_ignores_dates_and_ids_but_rejects_ambiguity(answer, expected):
++    assert probes.answer_number(answer) == expected
++
++
++@pytest.mark.parametrize("answer", ["70<cite></cite>", "70<cite>[r999]</cite>", "70", "71<cite>[r1]</cite>"])
++def test_c6_rejects_empty_unknown_missing_and_unsupported_citations(answer):
++    assert not probes.grade(NUMERIC, turn(answer))["cited"]
++
++
++def test_valid_numeric_answer_is_supported_and_full_evidence_is_saved():
++    raw = turn("<statement>70 kg<cite>[r1]</cite></statement>")
++    result = probes.grade(NUMERIC, raw)
++    assert result["ok"] and result["cited"] and result["status"] == "completed"
++    assert result["turn"] == raw and "tool_result" in json.dumps(result)
++
++
++def test_dated_answer_keeps_its_value_and_citation_grade():
++    result = probes.grade(NUMERIC, turn("From 2025-01-01 through 2025-01-30: <statement>70 kg<cite>[r1]</cite></statement>"))
++    assert result["ok"] and result["cited"]
++
++
++@pytest.mark.parametrize("extra", [{"timeout": True}, {"error": "upstream"}, {"configuration_error": True}, {"finish_reason": "length"}])
++def test_incomplete_runs_cannot_receive_quality_or_citation_credit(extra):
++    raw = turn("70<cite>[r1]</cite>")
++    raw.update(extra)
++    result = probes.grade(NUMERIC, raw)
++    assert result["status"] == "run_failure" and not result["ok"] and not result["cited"]
++    counts = probes.summarize([result])
++    assert counts["C3"] == counts["C6"] == {"selected": 1, "completed": 0, "passed": 0, "run_failure": 1, "not_attempted": 0}
++
++
++def test_absence_denial_with_fabricated_value_cannot_pass():
++    assert not probes.grade(ABSENT, turn("No data was found; your blood glucose was 7.2 mmol/L."))["ok"]
++    assert probes.grade(ABSENT, turn("No blood glucose records were found."))["ok"]
++    assert not probes.grade(ABSENT, turn("Your blood glucose is fine."))["ok"]
++
++
++def test_numeric_grade_rejects_an_explicit_wrong_unit():
++    assert not probes.grade({**NUMERIC, "unit": "kg"}, turn("70 lb<cite>[r1]</cite>"))["ok"]
++
++
++def test_unattempted_probes_keep_their_separate_selected_denominator():
++    counts = probes.summarize([{**NUMERIC, "status": "not_attempted", "ok": False, "cited": False}])
++    assert counts["C3"]["selected"] == counts["C6"]["selected"] == 1
++    assert counts["C3"]["not_attempted"] == 1 and counts["C3"]["run_failure"] == 0
++
++
++def test_account_provenance_requires_person_hash_and_completed_load():
++    plan = {"qa_people": {"p001": {}}, "provenance": {"sha256": {"devices.jsonl": "synthetic-hash"}}}
++    entry = {"person": "p001", "record_sha256": probes.record_identity(plan), "loaded_at": "2025-01-01", "steps": {"devices": {}}}
++    probes.validate_account(plan, "p001", entry)
++    for field in ("person", "record_sha256", "loaded_at", "steps"):
++        bad = {**entry, field: ""}
++        with pytest.raises(ValueError):
++            probes.validate_account(plan, "p001", bad)
++
++
++@pytest.mark.parametrize("flat", [False, True])
++def test_dry_run_pins_sources_and_explains_saturation_without_network(source, tmp_path, monkeypatch, flat):
++    corpus, config = source
++    if flat:
++        for row in corpus.devices["p001"]["records"]:
++            row["value"] = 70
++    payloads = {"files": [], "people": [{"person_id": "p001"}], "devices": [corpus.devices["p001"] | {"person_id": "p001"}],
++                "genomics": [], "journal": [], "medications": []}
++    hashes = {}
++    for name, rows in payloads.items():
++        path = tmp_path / f"{name}.jsonl"
++        path.write_text("".join(json.dumps(r) + "\n" for r in rows))
++        hashes[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
++    plan = {"qa_people": {"p001": config}, "provenance": {"suite_id": "harness100-20261023c", "sha256": hashes}}
++    plan_path, output = tmp_path / "plan.json", tmp_path / "probes.json"
++    plan_path.write_text(json.dumps(plan))
++    monkeypatch.setattr("sys.argv", ["probes.py", "--corpus", str(tmp_path), "--plan", str(plan_path),
++                        "--person", "p001", "--email", "synthetic@example.invalid", "--out", str(output), "--dry-run"])
++    import common
++    def no_sign_in(*args, **kwargs):
++        raise AssertionError("dry run must not access an account")
++    monkeypatch.setattr(common, "sign_in", no_sign_in)
++    assert probes.main() == (2 if flat else 0)
++    packet = json.loads(output.read_text())
++    assert packet["source_sha256"] == hashes and packet["results"] == []
++    assert packet["cases_sha256"] == probes.digest_json(packet["case_manifest"])
++    if flat:
++        assert any("overlap" in r["reason"] for r in packet["skipped"])
++
++
++def test_session_creation_failure_is_saved_with_the_full_selected_denominator(source, tmp_path, monkeypatch):
++    import common
++    import run as bench
++    corpus, config = source
++    plan = {"qa_people": {"p001": config}, "provenance": {"sha256": {"devices.jsonl": "synthetic"}}}
++    entry = {"person": "p001", "record_sha256": probes.record_identity(plan), "loaded_at": "2025-01-01", "steps": {"devices": {}}}
++    output = tmp_path / "result.json"
++    monkeypatch.setattr(probes, "Corpus", lambda _: corpus)
++    monkeypatch.setattr(probes, "read_json", lambda path, *args: plan if str(path) == "plan.json" else {"synthetic@example.invalid": entry})
++    monkeypatch.setattr(probes, "validate_corpus", lambda *args: None)
++    monkeypatch.setattr(common, "sign_in", lambda *args, **kwargs: object())
++    def session_failed(*args, **kwargs):
++        raise common.ApiError("synthetic session unavailable")
++    monkeypatch.setattr(bench, "ask", session_failed)
++    monkeypatch.setattr("sys.argv", ["probes.py", "--corpus", "synthetic", "--plan", "plan.json", "--person", "p001",
++                                    "--email", "synthetic@example.invalid", "--out", str(output)])
++    assert probes.main() == 1
++    packet = json.loads(output.read_text())
++    assert packet["complete"] and packet["results"][0]["status"] == "run_failure"
++    assert all(r["status"] == "not_attempted" for r in packet["results"][1:])
++    for capability in packet["capabilities"].values():
++        assert capability["selected"] == capability["run_failure"] + capability["not_attempted"]
++        assert capability["completed"] == capability["passed"] == 0
++
++
++@pytest.mark.parametrize("format_unit", [
++    "{}", "({})", "[{}]", "**({})**", "'{}'", "`{}`", "([{}])", "( {} )",
++])
++@pytest.mark.parametrize("unit, expected", [("kg", True), ("lb", False)])
++def test_unit_wrappers_do_not_change_the_quality_grade(format_unit, unit, expected):
++    answer = f"70 {format_unit.format(unit)}<cite>[r1]</cite>"
++    result = probes.grade({**NUMERIC, "unit": "kg"}, turn(answer))
++    assert result["ok"] is expected
++
++
++def test_wrappers_preserve_ucum_brackets_inside_a_compound_unit():
++    assert probes.units_match("70 ([IU]/L)", "[IU]/L")
++    assert not probes.units_match("70 ([IU]/L)", "kg")

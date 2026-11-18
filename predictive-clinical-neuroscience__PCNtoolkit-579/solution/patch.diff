@@ -1,0 +1,275 @@
+diff --git a/pcntoolkit/regression_model/blr.py b/pcntoolkit/regression_model/blr.py
+index 9af45630..06e58a1b 100644
+--- a/pcntoolkit/regression_model/blr.py
++++ b/pcntoolkit/regression_model/blr.py
+@@ -14,23 +14,31 @@
+ from __future__ import annotations
+ 
+ import copy
+-from typing import Generator, Literal, Optional
++from typing import TYPE_CHECKING, Generator, Literal, Optional
+ 
+ import numpy as np
+ import xarray as xr
+ from scipy import linalg, optimize  # type: ignore
+ from scipy.linalg import LinAlgError  # type: ignore
++from scipy.stats import norm  # type: ignore
+ 
+ from pcntoolkit.math_functions.basis_function import (
+     BasisFunction,
+     create_basis_function,
+ )
+ from pcntoolkit.math_functions.warp import *
+-from pcntoolkit.regression_model.regression_model import RegressionModel
++from pcntoolkit.regression_model.regression_model import (
++    YHAT_N_Z,
++    YHAT_Z_MAX,
++    RegressionModel,
++)
+ from pcntoolkit.util.data_utils import iter_batch_combinations
+ from pcntoolkit.util.migration import registry
+ from pcntoolkit.util.output import Errors, Messages, Output, Warnings
+ 
++if TYPE_CHECKING:
++    from pcntoolkit.dataio.norm_data import NormData
++
+ 
+ class BLR(RegressionModel):
+     """
+@@ -347,30 +355,8 @@ def forward(
+         """
+         if not self.is_fitted:
+             raise ValueError(Output.error(Errors.BLR_MODEL_NOT_FITTED))
+-        np_X = X.values
+-        if self.transfered:
+-            # Create synthetic batch effect data
+-            np_be = np.tile(
+-                np.array([list(v.values())[0] for v in self.be_maps.values()]),
+-                (X.shape[0], 1),
+-            )
+-        else:
+-            np_be = be.values
+         np_Y = Y.values
+-        self.ys_s2(np_X, np_be)
+-
+-        if self.transfered:
+-            # Loop over the unique batch effects:
+-            # This creates a list of dictionaries
+-            # Each dictionary contains a unique combination of batch effects:
+-            # [{"sex":"F", "site":"A"}, {"sex":"F", "site":"B"}, {"sex":"M", "site":"A"}, {"sex":"M", "site":"B"}]
+-            for t, mask in self.be_idx_gen(be, self.transfered_be_maps):
+-                residual_mean, correction_factor = self.correction_coefficients[
+-                    str(tuple(t.values()))
+-                ]
+-
+-                self.ys[mask] = self.ys[mask] + residual_mean
+-                self.s2[mask] = np.square(np.sqrt(self.s2[mask]) * correction_factor)
++        self.predictive_ys_s2(X, be)
+ 
+         if self.warp:
+             warped_y = self.warp.f(np_Y, self.gamma)
+@@ -402,6 +388,36 @@ def backward(
+         """
+         if not self.is_fitted:
+             raise ValueError(Output.error(Errors.BLR_MODEL_NOT_FITTED))
++        np_Z = Z.values
++        self.predictive_ys_s2(X, be)
++
++        # Compute the centiles in the original Y space: centiles = Z * std + mean
++        centiles = np_Z * np.sqrt(self.s2) + self.ys
++        if self.warp:
++            centiles = self.warp.invf(centiles, self.gamma)
++
++        return xr.DataArray(centiles, dims=("observations",))
++
++    def predictive_ys_s2(
++        self, X: xr.DataArray, be: xr.DataArray
++    ) -> tuple[np.ndarray, np.ndarray]:
++        """Compute the predictive mean and variance in the latent (warped) space.
++
++        For a transferred model, the per-batch-effect corrections are applied.
++        The results are also stored in ``self.ys`` and ``self.s2``.
++
++        Parameters
++        ----------
++        X : xr.DataArray
++            Covariate data
++        be : xr.DataArray
++            Batch effect data
++
++        Returns
++        -------
++        tuple[np.ndarray, np.ndarray]
++            Predictive mean ``ys`` and variance ``s2``, one value per observation.
++        """
+         np_X = X.values
+         if self.transfered:
+             # Create synthetic batch effect data
+@@ -411,9 +427,13 @@ def backward(
+             )
+         else:
+             np_be = be.values
+-        np_Z = Z.values
+         self.ys_s2(np_X, np_be)
++
+         if self.transfered:
++            # Loop over the unique batch effects:
++            # This creates a list of dictionaries
++            # Each dictionary contains a unique combination of batch effects:
++            # [{"sex":"F", "site":"A"}, {"sex":"F", "site":"B"}, {"sex":"M", "site":"A"}, {"sex":"M", "site":"B"}]
+             for t, mask in self.be_idx_gen(be, self.transfered_be_maps):
+                 residual_mean, correction_factor = self.correction_coefficients[
+                     str(tuple(t.values()))
+@@ -421,13 +441,48 @@ def backward(
+ 
+                 self.ys[mask] = self.ys[mask] + residual_mean
+                 self.s2[mask] = np.square(np.sqrt(self.s2[mask]) * correction_factor)
++        return self.ys, self.s2
+ 
+-        # Compute the centiles in the original Y space: centiles = Z * std + mean
+-        centiles = np_Z * np.sqrt(self.s2) + self.ys
+-        if self.warp:
+-            centiles = self.warp.invf(centiles, self.gamma)
++    def compute_yhat(
++        self, data: NormData, responsevar: str, X: xr.DataArray, be: xr.DataArray
++    ) -> np.ndarray:
++        """Compute the predicted mean of Y for each observation.
+ 
+-        return xr.DataArray(centiles, dims=("observations",))
++        Same result as ``RegressionModel.compute_yhat``, which calls
++        ``backward`` once for each of 200 Z values. Here the predictive mean
++        and variance are computed once and the 200 Z values are mapped in
++        one array operation.
++
++        Parameters
++        ----------
++        data : NormData
++            Data of one response variable (only used for its size).
++        responsevar : str
++            Name of the response variable, for the progress message.
++        X : xr.DataArray
++            Covariate data
++        be : xr.DataArray
++            Batch effect data
++
++        Returns
++        -------
++        np.ndarray
++            Predicted mean of Y, one value per observation.
++        """
++        if not self.is_fitted:
++            raise ValueError(Output.error(Errors.BLR_MODEL_NOT_FITTED))
++        Z_space = np.linspace(-YHAT_Z_MAX, YHAT_Z_MAX, YHAT_N_Z)
++        Output.print(Messages.COMPUTING_YHAT_MODEL, model_name=responsevar)
++        ys, s2 = self.predictive_ys_s2(X, be)
++        # Column i is backward() at Z = Z_space[i]: Z * std + mean.
++        Y_space = (
++            Z_space[np.newaxis, :] * np.sqrt(s2)[:, np.newaxis] + ys[:, np.newaxis]
++        )
++        if self.warp:
++            Y_space = self.warp.invf(Y_space, self.gamma)
++        Z_pdf = norm.pdf(Z_space)
++        Y_space *= Z_pdf
++        return Y_space.sum(axis=1) / Z_pdf.sum()
+ 
+     def elemwise_logp(
+         self, X: xr.DataArray, be: xr.DataArray, Y: xr.DataArray
+@@ -454,25 +509,8 @@ def elemwise_logp(
+         if not self.is_fitted:
+             raise ValueError(Output.error(Errors.BLR_MODEL_NOT_FITTED))
+ 
+-        np_X = X.values
+-        if self.transfered:
+-            # Create synthetic batch effect data
+-            np_be = np.tile(
+-                np.array([list(v.values())[0] for v in self.be_maps.values()]),
+-                (X.shape[0], 1),
+-            )
+-        else:
+-            np_be = be.values
+         np_Y = Y.values
+-        self.ys_s2(np_X, np_be)
+-
+-        if self.transfered:
+-            for t, mask in self.be_idx_gen(be, self.transfered_be_maps):
+-                residual_mean, correction_factor = self.correction_coefficients[
+-                    str(tuple(t.values()))
+-                ]
+-                self.ys[mask] = self.ys[mask] + residual_mean
+-                self.s2[mask] = np.square(np.sqrt(self.s2[mask]) * correction_factor)
++        self.predictive_ys_s2(X, be)
+ 
+         ys = self.ys
+         s2 = self.s2
+diff --git a/pcntoolkit/regression_model/regression_model.py b/pcntoolkit/regression_model/regression_model.py
+index ce2b116e..919c302e 100644
+--- a/pcntoolkit/regression_model/regression_model.py
++++ b/pcntoolkit/regression_model/regression_model.py
+@@ -21,6 +21,10 @@
+ from pcntoolkit.util.migration import ptk_version
+ from pcntoolkit.util.output import Messages, Output
+ 
++# Z grid that compute_yhat averages backward() over.
++YHAT_N_Z = 200
++YHAT_Z_MAX = 4.0
++
+ 
+ class RegressionModel(ABC):
+     """
+@@ -200,9 +204,8 @@ def regmodel_dict(self) -> dict:
+         return my_dict
+ 
+     def compute_yhat(self, data, responsevar, X, be):
+-        n_importance_samples = 200
+-        Z_space = np.linspace(-4, 4, n_importance_samples)
+-        Y_space = np.zeros((data.X.shape[0], n_importance_samples))
++        Z_space = np.linspace(-YHAT_Z_MAX, YHAT_Z_MAX, YHAT_N_Z)
++        Y_space = np.zeros((data.X.shape[0], YHAT_N_Z))
+         Output.print(Messages.COMPUTING_YHAT_MODEL, model_name=responsevar)
+         Z = xr.DataArray(np.zeros(data.X.shape[0]), dims=("observations",))
+         for i, s in enumerate(Z_space):
+diff --git a/test/test_regression_models/test_blr.py b/test/test_regression_models/test_blr.py
+index 236b350b..93abfa0f 100644
+--- a/test/test_regression_models/test_blr.py
++++ b/test/test_regression_models/test_blr.py
+@@ -12,6 +12,7 @@
+     BLR,
+     create_design_matrix,
+ )
++from pcntoolkit.regression_model.regression_model import RegressionModel
+ from pcntoolkit.util.migration import registry
+ from test.fixtures.blr_model_fixtures import *
+ from test.fixtures.norm_data_fixtures import *
+@@ -119,6 +120,32 @@ def test_forward_backward(
+     assert np.allclose(Y_prime, Y)
+ 
+ 
++def test_compute_yhat_matches_between_subclass_and_base_class(
++    blr_model_factory,
++    norm_data_from_arrays: NormData,
++    fitted_norm_blr_model: NormativeModel,
++) -> None:
++    """BLR.compute_yhat computes bit-identical yhat as the base-class 
++    RegressionModel.compute_yhat.
++
++    Uses a heteroskedastic, warped, transferred model, so the warp and the
++    transfer corrections are both checked.
++    
++    Introduced in PR #579.
++    """
++    response_var = norm_data_from_arrays.response_vars[0]
++    resp_data = norm_data_from_arrays.sel(response_vars=response_var)
++    X, be, be_maps, Y, _ = fitted_norm_blr_model.extract_data(resp_data)
++    model = blr_model_factory()
++    model.fit(X, be, be_maps, Y)
++    model = model.transfer(X, be, be_maps, Y)
++    assert model.transfered and model.warp is not None
++    new = model.compute_yhat(resp_data, response_var, X, be)
++    old = RegressionModel.compute_yhat(model, resp_data, response_var, X, be)
++    # Yhat's have zero tolerance (they are bit-identical) 
++    np.testing.assert_array_equal(new, old)
++
++
+ def test_parse_hyps(norm_data_from_arrays: NormData):
+     X = norm_data_from_arrays.X.to_numpy()
+     var_X = norm_data_from_arrays.X.to_numpy()

@@ -1,0 +1,210 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8779-write-only-patch-returns-success-without-body.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8779-write-only-patch-returns-success-without-body.yaml
+new file mode 100644
+index 000000000000..bac0846de84e
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8779-write-only-patch-returns-success-without-body.yaml
+@@ -0,0 +1,8 @@
++---
++type: fix
++issue: 8779
++title: "When a client with write access but no read access to a resource sent a PATCH, the change was saved
++but the client received HTTP 403 Forbidden. This has been fixed. The PATCH now returns success, and the patched
++resource is left out of the response body. `AuthorizationInterceptor#hookOutgoingResponse(RequestDetails, IBaseResource, Pointcut)`
++is deprecated and is no longer a hook. Subclasses should override the variant that takes `ResponseDetails` instead,
++and must not annotate an override of the deprecated method with `@Hook`."
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/r4/AuthorizationInterceptorWriteResponseJpaR4Test.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/r4/AuthorizationInterceptorWriteResponseJpaR4Test.java
+index 2669da85d835..f3d89c4b960f 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/r4/AuthorizationInterceptorWriteResponseJpaR4Test.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/r4/AuthorizationInterceptorWriteResponseJpaR4Test.java
+@@ -3,6 +3,7 @@
+ import ca.uhn.fhir.jpa.provider.BaseResourceProviderR4Test;
+ import ca.uhn.fhir.rest.api.Constants;
+ import ca.uhn.fhir.rest.api.server.RequestDetails;
++import ca.uhn.fhir.rest.api.server.SystemRequestDetails;
+ import ca.uhn.fhir.rest.server.exceptions.ForbiddenOperationException;
+ import ca.uhn.fhir.rest.server.interceptor.auth.AuthorizationInterceptor;
+ import ca.uhn.fhir.rest.server.interceptor.auth.IAuthRule;
+@@ -95,13 +96,24 @@ void beforeEach() {
+ 			}
+ 
+ 			@Test
+-			void patch_writeOnly_returnsForbidden() {
+-				String body = patchObservation().assertStatus(403).getBody();
++			void patch_writeOnly_returnsSuccessAndNoBody() {
++				String body = patchObservation().assertStatus(200).getBody();
+ 
+ 				assertThat(body)
+ 					.as("the stored resource body must not be disclosed to a caller without read scope")
+-					.doesNotContain("SECRET-DIAGNOSIS")
+-					.doesNotContain(myPatientId.getIdPart());
++					.isEmpty();
++				assertThat(myObservationDao.read(myObservationId, new SystemRequestDetails()).getStatus())
++					.as("the patch must have been applied")
++					.isEqualTo(Observation.ObservationStatus.AMENDED);
++			}
++
++			@Test
++			void patch_writeOnlyWithPreferReturnRepresentation_returnsSuccessAndNoBody() {
++				String body = patchObservation(Constants.HEADER_PREFER_RETURN_REPRESENTATION).assertStatus(200).getBody();
++
++				assertThat(body)
++					.as("suppression must hold even when the caller explicitly asks for the representation")
++					.isEmpty();
+ 			}
+ 
+ 			@Test
+@@ -114,7 +126,7 @@ void patch_writeOnlyWithPreferReturnMinimal_returnsSuccessAndNoBody() {
+ 			}
+ 
+ 			@Test
+-			void patch_writeOnlyOnStoredBundleResource_returnsSameVerdictAsReadOfSameBundle() {
++			void patch_writeOnlyOnStoredBundleResource_returnsSuccessWithoutDisclosingBundle() {
+ 				IIdType bundleId = setupBundle();
+ 
+ 				HttpTestResponse patchResponse = request("/Bundle/" + bundleId.getIdPart()).patch("""
+@@ -123,8 +135,10 @@ void patch_writeOnlyOnStoredBundleResource_returnsSameVerdictAsReadOfSameBundle(
+ 				HttpTestResponse readResponse = request("/Bundle/" + bundleId.getIdPart()).get();
+ 
+ 				assertThat(patchResponse.getStatusCode())
+-					.as("a PATCH of a stored Bundle must be authorized exactly as a plain read of it")
+-					.isEqualTo(readResponse.getStatusCode())
++					.as("the write is authorized, so the PATCH succeeds")
++					.isEqualTo(200);
++				assertThat(readResponse.getStatusCode())
++					.as("a plain read of the same Bundle is still denied")
+ 					.isEqualTo(403);
+ 				assertThat(patchResponse.getBody())
+ 					.as("the stored resource body must not be disclosed via PATCH to a caller without read scope")
+diff --git a/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/interceptor/auth/AuthorizationInterceptor.java b/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/interceptor/auth/AuthorizationInterceptor.java
+index 9c0c1e650df5..82b74238f48e 100644
+--- a/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/interceptor/auth/AuthorizationInterceptor.java
++++ b/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/interceptor/auth/AuthorizationInterceptor.java
+@@ -30,6 +30,7 @@
+ import ca.uhn.fhir.rest.api.RestOperationTypeEnum;
+ import ca.uhn.fhir.rest.api.server.IPreResourceShowDetails;
+ import ca.uhn.fhir.rest.api.server.RequestDetails;
++import ca.uhn.fhir.rest.api.server.ResponseDetails;
+ import ca.uhn.fhir.rest.api.server.bulk.BulkExportJobParameters;
+ import ca.uhn.fhir.rest.server.exceptions.ForbiddenOperationException;
+ import ca.uhn.fhir.util.BundleUtil;
+@@ -503,17 +504,42 @@ public void incomingRequestPreHandled(RequestDetails theRequest, Pointcut thePoi
+ 	@Hook(Pointcut.STORAGE_PRESHOW_RESOURCES)
+ 	public void hookPreShow(
+ 			RequestDetails theRequestDetails, IPreResourceShowDetails theDetails, Pointcut thePointcut) {
++		if (theRequestDetails.getRestOperationType() == RestOperationTypeEnum.PATCH) {
++			// The PATCH response body is read-authorized, and hidden if needed, in hookOutgoingResponse
++			return;
++		}
+ 		for (IBaseResource resource : theDetails.getAllResources()) {
+ 			checkOutgoingResourceAndFailIfDeny(theRequestDetails, resource, thePointcut);
+ 		}
+ 	}
+ 
+-	@Hook(Pointcut.SERVER_OUTGOING_RESPONSE)
++	/**
++	 * @deprecated Use {@link #hookOutgoingResponse(RequestDetails, IBaseResource, ResponseDetails, Pointcut)}.
++	 * No longer a hook. The {@link ResponseDetails} variant calls this method for every response whose body
++	 * it does not hide, so overrides still apply.
++	 * Do not annotate an override of this method with {@link Hook}.
++	 */
++	@Deprecated(since = "9.0.0")
+ 	public void hookOutgoingResponse(
+ 			RequestDetails theRequestDetails, IBaseResource theResponseObject, Pointcut thePointcut) {
+ 		checkOutgoingResourceAndFailIfDeny(theRequestDetails, theResponseObject, thePointcut);
+ 	}
+ 
++	@Hook(Pointcut.SERVER_OUTGOING_RESPONSE)
++	public void hookOutgoingResponse(
++			@Nonnull RequestDetails theRequestDetails,
++			@Nullable IBaseResource theResponseObject,
++			@Nonnull ResponseDetails theResponseDetails,
++			@Nonnull Pointcut thePointcut) {
++		if (theRequestDetails.getRestOperationType() == RestOperationTypeEnum.PATCH
++				&& isPatchResponseHiddenFromCaller(theRequestDetails, theResponseObject, thePointcut)) {
++			theResponseDetails.setResponseResource(null);
++			return;
++		}
++		// Dispatch through the former hook method so that subclasses overriding it still apply
++		hookOutgoingResponse(theRequestDetails, theResponseObject, thePointcut);
++	}
++
+ 	@Hook(Pointcut.STORAGE_CASCADE_DELETE)
+ 	public void hookCascadeDeleteForConflict(
+ 			RequestDetails theRequestDetails, Pointcut thePointcut, IBaseResource theResourceToDelete) {
+@@ -904,4 +930,23 @@ private void logReachableResourcesVerdict(ReverseChainLink theLink, Verdict theV
+ 					theLink.resourceType());
+ 		}
+ 	}
++
++	/**
++	 * A PATCH has already been committed by the time its response is examined, so denying here
++	 * would report an applied write as forbidden. Instead, a caller who has no read access to the patched
++	 * resource gets the response without it, as if it had sent {@literal Prefer: return=minimal}.
++	 */
++	private boolean isPatchResponseHiddenFromCaller(
++			RequestDetails theRequestDetails, IBaseResource theResponseObject, Pointcut thePointcut) {
++		if (theResponseObject == null || isStatusOnlyOperationOutcome(theRequestDetails, theResponseObject)) {
++			return false;
++		}
++		Verdict verdict = applyRulesAndReturnDecision(
++				RestOperationTypeEnum.PATCH, theRequestDetails, null, null, theResponseObject, thePointcut);
++		if (verdict.getDecision() == PolicyEnum.ALLOW) {
++			return false;
++		}
++		getTroubleshootingLog().debug("Omitting PATCH response body that the caller is not authorized to read");
++		return true;
++	}
+ }
+diff --git a/hapi-fhir-validation/src/test/java/ca/uhn/fhir/rest/server/interceptor/auth/AuthorizationInterceptorR4Test.java b/hapi-fhir-validation/src/test/java/ca/uhn/fhir/rest/server/interceptor/auth/AuthorizationInterceptorR4Test.java
+index bab8336666d9..5f379bcf98c9 100644
+--- a/hapi-fhir-validation/src/test/java/ca/uhn/fhir/rest/server/interceptor/auth/AuthorizationInterceptorR4Test.java
++++ b/hapi-fhir-validation/src/test/java/ca/uhn/fhir/rest/server/interceptor/auth/AuthorizationInterceptorR4Test.java
+@@ -43,6 +43,7 @@
+ import ca.uhn.fhir.rest.param.TokenAndListParam;
+ import ca.uhn.fhir.rest.server.FifoMemoryPagingProvider;
+ import ca.uhn.fhir.rest.server.IResourceProvider;
++import ca.uhn.fhir.rest.server.exceptions.ForbiddenOperationException;
+ import ca.uhn.fhir.rest.server.exceptions.ResourceNotFoundException;
+ import ca.uhn.fhir.rest.server.servlet.ServletRequestDetails;
+ import ca.uhn.fhir.rest.server.tenant.UrlBaseTenantIdentificationStrategy;
+@@ -3315,6 +3316,40 @@ public List<IAuthRule> buildRuleList(RequestDetails theRequestDetails) {
+ 		assertThat(ourHitMethod).isTrue();
+ 	}
+ 
++	// Remove together with the deprecated hookOutgoingResponse(RequestDetails, IBaseResource, Pointcut)
++	@Test
++	void hookOutgoingResponse_subclassOverridesDeprecatedOverload_overrideStillRuns() {
++		ourServer.registerInterceptor(new AuthorizationInterceptor(PolicyEnum.DENY) {
++			@Override
++			public List<IAuthRule> buildRuleList(RequestDetails theRequestDetails) {
++				return new RuleBuilder()
++					.allow().read().allResources().withAnyId().andThen()
++					.allow().patch().allRequests().andThen()
++					.allow().write().instance("Patient/900").andThen()
++					.build();
++			}
++
++			@SuppressWarnings("deprecation")
++			@Override
++			public void hookOutgoingResponse(
++				RequestDetails theRequestDetails, IBaseResource theResponseObject, Pointcut thePointcut) {
++				throw new ForbiddenOperationException("Denied by subclass override");
++			}
++		});
++
++		ourReturn = Collections.singletonList(createPatient(1));
++		String readBody = ourServer.fhirRequest("/Patient/1").get().assertStatus(403).getBody();
++		assertThat(readBody)
++			.as("an override of the former hook method must still run for a READ response")
++			.contains("Denied by subclass override");
++
++		String input = "[ { \"op\": \"replace\", \"path\": \"/gender\", \"value\": \"male\" }  ]";
++		String patchBody = ourServer.fhirRequest("/Patient/900").patch(input).assertStatus(403).getBody();
++		assertThat(patchBody)
++			.as("an override of the former hook method must still run for a PATCH response it does not hide")
++			.contains("Denied by subclass override");
++	}
++
+ 	@Test
+ 	void testPreFlightCheck_writePatch_AllowedByWriteRuleOfType() {
+ 		ourServer.registerInterceptor(new AuthorizationInterceptor(PolicyEnum.DENY) {

@@ -1,0 +1,119 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 31599559..9a6b4a04 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,6 +24,11 @@
+   mass to join them (albumin in g/L and umol/L, vitamin D in nmol/L and
+   ng/mL), g/L and mol/L values were averaged under one unit. Canonical means
+   are now unrounded, and such a series gets no min, max or average.
++- **Readings in the same second showed the same time.** Raw readings, latest
++  values and the records list formatted times to the whole second, so distinct
++  device samples (an intraday heart-rate stream, a burst of uploads) were shown
++  at one instant. They now keep the stored microseconds, trailing zeros trimmed;
++  whole-second times and bucket periods read as before.
+ 
+ ## 1.5.7
+ 
+diff --git a/docs/answers.md b/docs/answers.md
+index 2e2b408b..d1074b65 100644
+--- a/docs/answers.md
++++ b/docs/answers.md
+@@ -129,6 +129,10 @@ And `view` is a dispatch TABLE, not a chain of `if`s (`query.DISPATCH`):
+ | `latest` | the most recent value per indicator |
+ | any, with no `keywords` or `indicators` | the catalogue, and a note that the view waits for names |
+ 
++Raw and latest rows, and the records list, show the reading's local time with
++its stored microseconds when it has any (`2026-06-01 12:00:00.000001`), trailing
++zeros trimmed; a whole second stays `2026-06-01 12:00:00`.
++
+ A view with nothing selected used to be refused ("the catalogue has one
+ shape"). In the 2026-10-06 local-model evaluation MiniCPM5-2B opened with
+ `view="latest"` and no indicator 3 times and MiniCPM5-1B 7 times, then
+diff --git a/mirobody/collect/query.py b/mirobody/collect/query.py
+index 386c2e12..e0ee4002 100644
+--- a/mirobody/collect/query.py
++++ b/mirobody/collect/query.py
+@@ -86,6 +86,10 @@
+     " ELSE o.observed_start AT TIME ZONE o.tz END"
+ )
+ 
++# Whole-second formatting collapsed distinct device samples onto one displayed
++# instant. Keep PostgreSQL's microseconds without padding whole-second rows.
++_LOCAL_TIME = f"rtrim(rtrim(to_char({_LOCAL_TS}, 'YYYY-MM-DD HH24:MI:SS.US'), '0'), '.')"
++
+ #: The number a statistic runs over, per group: the printed values when the
+ #: group has one unit, the canonical values when every numeric reading has
+ #: one in a single canonical unit, and none otherwise. With no molar mass,
+@@ -278,7 +282,7 @@ async def records(
+         comment = ", decrypt_content(o.note_text) AS comment" if notes else ""
+         columns = f"""o.id, o.series_id, o.display, o.name_text, o.value_text, o.unit_text,
+                    o.ref_text, o.flag_text, o.value_num, o.unit_ucum, o.value_canonical, o.unit_canonical,
+-                   to_char({_LOCAL_TS}, 'YYYY-MM-DD HH24:MI:SS') AS local_time,
++                   {_LOCAL_TIME} AS local_time,
+                    o.observed_start, o.observed_end,
+                    o.local_date, o.modality, o.code_system, o.code, o.elected, o.outcome,
+                    o.source_kind, p.period_start,
+@@ -456,7 +460,7 @@ async def readings(
+             SELECT * FROM (
+                 SELECT o.id, o.series_id, o.display, o.name_text, o.value_text, o.unit_text,
+                        o.ref_text, o.flag_text, o.value_num, o.value_canonical, o.unit_canonical, o.comparator,
+-                       to_char({_LOCAL_TS}, 'YYYY-MM-DD HH24:MI:SS') AS local_time,
++                       {_LOCAL_TIME} AS local_time,
+                        o.tz, o.local_date, o.modality, o.code_system, o.code, o.elected, o.outcome,
+                        {_REPORTED_COLUMNS},
+                        {_FILE_KEY} AS file_key, {_FILE_NAME},
+@@ -560,7 +564,7 @@ async def latest(self, subject_id: str, sel: query.Selection, window: query.Wind
+                    o.value_canonical, o.unit_canonical, o.code_system, o.code, o.local_date, o.elected, o.modality,
+                    o.outcome, {_REPORTED_COLUMNS},
+                    {_FILE_KEY} AS file_key, {_FILE_NAME},
+-                   to_char({_LOCAL_TS}, 'YYYY-MM-DD HH24:MI:SS') AS local_time
++                   {_LOCAL_TIME} AS local_time
+               FROM v_observation o
+             {_FILE_JOIN}
+              WHERE o.user_id = :uid AND o.series_id = ANY(:names) {where}
+diff --git a/mirobody/tests/test_postgres_regressions.py b/mirobody/tests/test_postgres_regressions.py
+index c015d70c..7b5c4b95 100644
+--- a/mirobody/tests/test_postgres_regressions.py
++++ b/mirobody/tests/test_postgres_regressions.py
+@@ -74,6 +74,41 @@ async def _write_glucose():
+     ], observations.Provenance(modality="lab-report", source_kind="file", source_ref="th_files:synthetic-glucose"), user_tz="UTC")
+ 
+ 
++@pytest.mark.parametrize("zone", ["UTC", "UTC+08:00", "UTC-05:30", "Asia/Shanghai", "America/New_York"])
++async def test_reading_times_retain_microseconds_across_raw_latest_and_records(database, zone):
++    from datetime import timedelta, timezone
++    from zoneinfo import ZoneInfo
++    from mirobody.collect.observations import Draft, Provenance, ingest
++    from mirobody.collect.query import PostgresHealthQuery
++    from mirobody.kernel import query
++
++    if zone.startswith(("UTC+", "UTC-")):
++        hours, minutes = map(int, zone[4:].split(":"))
++        delta = timedelta(hours=hours, minutes=minutes)
++        local_zone = timezone(delta if zone[3] == "+" else -delta)
++    else:
++        local_zone = ZoneInfo(zone)
++    base = datetime(2026, 6, 1, 23, 59, 59, tzinfo=UTC)
++    instants = [base + timedelta(microseconds=n) for n in (0, 1, 10, 100, 1000, 10000, 100000, 120000, 123456, 999999, 1000000, 1000001)]
++    drafts = [Draft(name_text=f"Synthetic clock {i}", value_text=str(i), tz=zone, observed_start=at)
++              for i, at in enumerate(instants)]
++    report = await ingest("1", drafts, Provenance("device-sensed", "device", "synthetic-subsecond"), user_tz="UTC")
++    assert report.inserted == len(drafts)
++    expected = {}
++    for row_id, instant in zip(report.ids, instants, strict=True):
++        local = instant.astimezone(local_zone).replace(tzinfo=None)
++        text = local.isoformat(sep=" ")
++        expected[row_id] = text.rstrip("0").rstrip(".") if local.microsecond else text
++    hq = PostgresHealthQuery()
++    selection = query.Selection(indicators=tuple(d.name_text for d in drafts))
++    window = query.Window(0, 0, "UTC")
++    for rows in (await hq.readings("1", selection, window, limit=50),
++                 await hq.latest("1", selection, window),
++                 (await hq.records("1", limit=None))["rows"],
++                 (await hq.records("1", created_since=datetime(2026, 1, 1, tzinfo=UTC), limit=None))["rows"]):
++        assert {row["row_id"]: row["time"] for row in rows} == expected
++
++
+ async def test_confirmation_without_unit_does_not_silently_join_a_standard_series(database):
+     router = importlib.import_module("mirobody.server.routers.indicator_router")
+     report = await _write_glucose()

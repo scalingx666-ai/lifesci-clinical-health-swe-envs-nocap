@@ -1,0 +1,258 @@
+diff --git a/packages/docs/docs/access/access-policies.md b/packages/docs/docs/access/access-policies.md
+index b87d32824a8..430feed3d7d 100644
+--- a/packages/docs/docs/access/access-policies.md
++++ b/packages/docs/docs/access/access-policies.md
+@@ -676,20 +676,9 @@ Because the `ClientApplication` default makes `Bot` read-only, a client with tha
+ 
+ ### Switching a user to (or from) admin
+ 
+-The `admin` flag does **not** bypass a user's access policy — it only grants access to project administration resource types (such as [`ProjectMembership`](/docs/api/fhir/medplum/projectmembership) and [`User`](/docs/api/fhir/medplum/user)) on top of the existing policy. This means that promoting a Practitioner to admin without also changing their policy would leave them "half-upgraded": still restricted by the read-only rules of the `Practitioner` default.
++The `admin` flag does **not** bypass a user's access policy — it only grants access to project administration resource types (such as [`ProjectMembership`](/docs/api/fhir/medplum/projectmembership) and [`User`](/docs/api/fhir/medplum/user)) on top of the existing policy. Changing the `admin` flag never changes the membership's `accessPolicy`.
+ 
+-To avoid this, Medplum automatically **reconciles the default access policy when the admin flag is toggled**:
+-
+-- Promoting a user to admin: if their current policy is exactly the project's `Practitioner` default, it is swapped to the `Admin` default.
+-- Demoting an admin: if their current policy is exactly the project's `Admin` default, it is swapped back to the `Practitioner` default.
+-
+-This reconciliation only happens when the user's current policy is exactly the **opposite role's recognized default** — the `Practitioner` default when promoting, or the `Admin` default when demoting. Any other policy is left as-is. In particular, **custom (non-default) access policies are never modified**: if you have assigned a user a bespoke policy, toggling the admin flag leaves that policy untouched.
+-
+-:::tip[Custom access policy combinations]
+-
+-If a user needs a more specific combination of access than the role defaults provide, we recommend **overriding the default by supplying an explicit access policy when you invite (or edit) the user**. Assigning a custom policy both gives the user exactly the access they need and opts them out of the automatic admin/practitioner reconciliation described above, so their policy will not be swapped when the admin flag changes.
+-
+-:::
++When you promote a user to admin, also set their `accessPolicy` to the access they need, such as the project's `Admin` default. Otherwise they remain restricted by their current policy, for example the read-only rules of the `Practitioner` default. Likewise, when you demote an admin, replace the `Admin` default with a non-admin policy such as the `Practitioner` default.
+ 
+ ## Related Resources
+ 
+diff --git a/packages/server/src/admin/project.test.ts b/packages/server/src/admin/project.test.ts
+index 4aeddb43274..6cb8a86062e 100644
+--- a/packages/server/src/admin/project.test.ts
++++ b/packages/server/src/admin/project.test.ts
+@@ -98,6 +98,8 @@ describe('Project Admin routes', () => {
+     expect(res4.body.resourceType).toStrictEqual('ProjectMembership');
+     expect(res4.body.id).toBeDefined();
+     expect(res4.body.meta.project).toStrictEqual(project.id);
++    const practitionerDefault = project.defaultAccessPolicies?.find((p) => p.profileType === 'Practitioner');
++    expect(res4.body.accessPolicy).toStrictEqual(practitionerDefault?.accessPolicy);
+ 
+     // Try a naughty request using a different resource type
+     const res5 = await request(app)
+@@ -139,6 +141,8 @@ describe('Project Admin routes', () => {
+       .set('Authorization', 'Bearer ' + accessToken);
+     expect(res8).toHaveStatus(200);
+     expect(res8.body.admin).toBe(true);
++    // Promoting to admin does not change the access policy
++    expect(res8.body.accessPolicy).toStrictEqual(practitionerDefault?.accessPolicy);
+   });
+ 
+   test('Get project access denied', async () => {
+diff --git a/packages/server/src/admin/project.ts b/packages/server/src/admin/project.ts
+index 481adaa145a..672aff3af9e 100644
+--- a/packages/server/src/admin/project.ts
++++ b/packages/server/src/admin/project.ts
+@@ -13,7 +13,6 @@ import { getEnrolledMfaMethods } from '../auth/utils';
+ import { MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH } from '../constants';
+ import { getAuthenticatedContext } from '../context';
+ import { sendEmail } from '../email/email';
+-import { reconcileDefaultAccessPolicy } from '../fhir/accesspolicy';
+ import { sendOutcome } from '../fhir/outcomes';
+ import { authenticateRequest } from '../oauth/middleware';
+ import { getUserByEmailInProject } from '../oauth/utils';
+@@ -136,10 +135,7 @@ projectAdminRouter.post('/:projectId/members/:membershipId', async (req: Request
+     sendOutcome(res, forbidden);
+     return;
+   }
+-  // Keep the default access policy in sync when the admin flag is toggled, so an upgraded
+-  // admin isn't left restricted by the Practitioner default (and vice versa).
+-  const reconciled = reconcileDefaultAccessPolicy(ctx.project, resource as ProjectMembership);
+-  const result = await ctx.repo.updateResource(reconciled);
++  const result = await ctx.repo.updateResource<ProjectMembership>(resource);
+   res.json(result);
+ });
+ 
+diff --git a/packages/server/src/fhir/accesspolicy.test.ts b/packages/server/src/fhir/accesspolicy.test.ts
+index 30512109dee..551fe8f4e00 100644
+--- a/packages/server/src/fhir/accesspolicy.test.ts
++++ b/packages/server/src/fhir/accesspolicy.test.ts
+@@ -47,7 +47,7 @@ import { loadTestConfig } from '../config/loader';
+ import { globalLogger } from '../logger';
+ import { tryLogin } from '../oauth/utils';
+ import { addTestUser, createTestProject, withTestContext } from '../test.setup';
+-import { buildAccessPolicy, getRepoForLogin, getRepoForProject, reconcileDefaultAccessPolicy } from './accesspolicy';
++import { buildAccessPolicy, getRepoForLogin, getRepoForProject } from './accesspolicy';
+ import type { SystemRepository } from './repo';
+ import { getGlobalSystemRepo, getProjectSystemRepo, Repository } from './repo';
+ import type { RepositoryContext } from './repository/repository-context';
+@@ -3614,109 +3614,3 @@ describe('AccessPolicy', () => {
+       }));
+   });
+ });
+-
+-describe('reconcileDefaultAccessPolicy', () => {
+-  const practitionerDefault = { reference: 'AccessPolicy/practitioner-default' };
+-  const adminDefault = { reference: 'AccessPolicy/admin-default' };
+-  const customPolicy = { reference: 'AccessPolicy/custom' };
+-
+-  const project: Project = {
+-    resourceType: 'Project',
+-    defaultAccessPolicies: [
+-      { profileType: 'Practitioner', accessPolicy: practitionerDefault },
+-      { profileType: 'Admin', accessPolicy: adminDefault },
+-    ],
+-  };
+-
+-  test('Upgrades Practitioner default to Admin default when admin', () => {
+-    const membership: ProjectMembership = {
+-      resourceType: 'ProjectMembership',
+-      project: { reference: 'Project/123' },
+-      user: { reference: 'User/123' },
+-      profile: { reference: 'Practitioner/123' },
+-      admin: true,
+-      accessPolicy: practitionerDefault,
+-    };
+-    expect(reconcileDefaultAccessPolicy(project, membership).accessPolicy).toStrictEqual(adminDefault);
+-  });
+-
+-  test('Downgrades Admin default to Practitioner default when not admin', () => {
+-    const membership: ProjectMembership = {
+-      resourceType: 'ProjectMembership',
+-      project: { reference: 'Project/123' },
+-      user: { reference: 'User/123' },
+-      profile: { reference: 'Practitioner/123' },
+-      accessPolicy: adminDefault,
+-    };
+-    expect(reconcileDefaultAccessPolicy(project, membership).accessPolicy).toStrictEqual(practitionerDefault);
+-  });
+-
+-  test('Leaves a custom access policy untouched', () => {
+-    const membership: ProjectMembership = {
+-      resourceType: 'ProjectMembership',
+-      project: { reference: 'Project/123' },
+-      user: { reference: 'User/123' },
+-      profile: { reference: 'Practitioner/123' },
+-      admin: true,
+-      accessPolicy: customPolicy,
+-    };
+-    expect(reconcileDefaultAccessPolicy(project, membership).accessPolicy).toStrictEqual(customPolicy);
+-  });
+-
+-  test('No-op when the policy already matches the role', () => {
+-    const membership: ProjectMembership = {
+-      resourceType: 'ProjectMembership',
+-      project: { reference: 'Project/123' },
+-      user: { reference: 'User/123' },
+-      profile: { reference: 'Practitioner/123' },
+-      admin: true,
+-      accessPolicy: adminDefault,
+-    };
+-    expect(reconcileDefaultAccessPolicy(project, membership).accessPolicy).toStrictEqual(adminDefault);
+-  });
+-
+-  test('Switching to admin is a no-op when there is no Admin default', () => {
+-    // A project with a Practitioner default but no Admin default (e.g. a project created before
+-    // the Admin default existed). Promoting the member to admin must not change their policy.
+-    const projectWithoutAdminDefault: Project = {
+-      resourceType: 'Project',
+-      defaultAccessPolicies: [{ profileType: 'Practitioner', accessPolicy: practitionerDefault }],
+-    };
+-    const membership: ProjectMembership = {
+-      resourceType: 'ProjectMembership',
+-      project: { reference: 'Project/123' },
+-      user: { reference: 'User/123' },
+-      profile: { reference: 'Practitioner/123' },
+-      admin: true,
+-      accessPolicy: practitionerDefault,
+-    };
+-    expect(reconcileDefaultAccessPolicy(projectWithoutAdminDefault, membership).accessPolicy).toStrictEqual(
+-      practitionerDefault
+-    );
+-  });
+-
+-  test('No-op when membership has no access policy', () => {
+-    const membership: ProjectMembership = {
+-      resourceType: 'ProjectMembership',
+-      project: { reference: 'Project/123' },
+-      user: { reference: 'User/123' },
+-      profile: { reference: 'Practitioner/123' },
+-      admin: true,
+-    };
+-    expect(reconcileDefaultAccessPolicy(project, membership).accessPolicy).toBeUndefined();
+-  });
+-
+-  test('No-op when project has no default access policies', () => {
+-    const membership: ProjectMembership = {
+-      resourceType: 'ProjectMembership',
+-      project: { reference: 'Project/123' },
+-      user: { reference: 'User/123' },
+-      profile: { reference: 'Practitioner/123' },
+-      admin: true,
+-      accessPolicy: practitionerDefault,
+-    };
+-    expect(reconcileDefaultAccessPolicy({ resourceType: 'Project' }, membership).accessPolicy).toStrictEqual(
+-      practitionerDefault
+-    );
+-  });
+-});
+diff --git a/packages/server/src/fhir/accesspolicy.ts b/packages/server/src/fhir/accesspolicy.ts
+index d7ce353b5ca..8041ddcd1c4 100644
+--- a/packages/server/src/fhir/accesspolicy.ts
++++ b/packages/server/src/fhir/accesspolicy.ts
+@@ -28,7 +28,6 @@ import type {
+ } from '@medplum/fhirtypes';
+ import { getLogger } from '../logger';
+ import type { AuthState } from '../oauth/middleware';
+-import { getDefaultAccessPolicy } from './default-access-policies';
+ import { membershipProfileTypes, readMembershipReference } from './projectmembership';
+ import type { SystemRepository } from './repo';
+ import { getGlobalSystemRepo, getProjectSystemRepo, Repository } from './repo';
+@@ -170,10 +169,7 @@ export async function getAccessPolicyForLogin(authState: AuthState): Promise<Acc
+     throw new OperationOutcomeError(badRequest('SMART scopes are not supported for super admin logins'));
+   }
+ 
+-  // Heal any drift between the admin flag and the default access policy before building.
+-  // If a member's admin flag was toggled without updating their (still-default) access policy,
+-  // this substitutes the correct role default so an upgraded admin isn't left half-restricted.
+-  const membership = reconcileDefaultAccessPolicy(project, authState.onBehalfOfMembership ?? authState.membership);
++  const membership = authState.onBehalfOfMembership ?? authState.membership;
+ 
+   let accessPolicy = await buildAccessPolicy(membership);
+ 
+@@ -192,37 +188,6 @@ export async function getAccessPolicyForLogin(authState: AuthState): Promise<Acc
+   return accessPolicy;
+ }
+ 
+-/**
+- * Reconciles a project membership's default access policy with its admin flag.
+- *
+- * The `admin` flag does not bypass the access policy, so toggling it without also swapping the
+- * access policy leaves a member "half-upgraded" (e.g. an admin still blocked from editing knowledge
+- * resources by the Practitioner default). This keeps the two in sync: when the membership's current
+- * access policy is exactly the *other* role's recognized project default, it is swapped to the
+- * default that matches the current admin flag. Custom (non-default) access policies are left
+- * untouched, and the operation is idempotent.
+- * @param project - The project, which holds the recognized role defaults in `defaultAccessPolicies`.
+- * @param membership - The project membership to reconcile.
+- * @returns The membership, with its `accessPolicy` swapped to the matching role default if needed.
+- */
+-export function reconcileDefaultAccessPolicy<T extends ProjectMembership>(project: Project, membership: T): T {
+-  const currentPolicy = membership.accessPolicy?.reference;
+-  if (!currentPolicy) {
+-    return membership;
+-  }
+-
+-  const practitionerDefault = getDefaultAccessPolicy(project, 'Practitioner');
+-  const adminDefault = getDefaultAccessPolicy(project, 'Admin');
+-
+-  if (membership.admin && adminDefault && currentPolicy === practitionerDefault?.reference) {
+-    return { ...membership, accessPolicy: adminDefault };
+-  }
+-  if (!membership.admin && practitionerDefault && currentPolicy === adminDefault?.reference) {
+-    return { ...membership, accessPolicy: practitionerDefault };
+-  }
+-  return membership;
+-}
+-
+ /**
+  * Builds a parameterized compound access policy.
+  * @param membership - The user project membership.

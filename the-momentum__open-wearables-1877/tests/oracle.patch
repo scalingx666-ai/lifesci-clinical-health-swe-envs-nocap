@@ -1,0 +1,810 @@
+diff --git a/backend/app/api/routes/v1/health_scores.py b/backend/app/api/routes/v1/health_scores.py
+index d6fb1d1d1e..04002ddf4e 100644
+--- a/backend/app/api/routes/v1/health_scores.py
++++ b/backend/app/api/routes/v1/health_scores.py
+@@ -30,6 +30,8 @@ def list_health_scores(
+ ) -> PaginatedResponse[HealthScoreResponse]:
+     """Returns health scores (sleep, recovery, readiness, etc.) for a user.
+ 
++    One OW score (provider `internal`) per category and day, from the highest-priority source.
++
+     Scores computed by Open Wearables (`provider: internal`) are deprecated: no new ones are
+     computed starting November 6, 2026. Previously computed scores are still returned.
+     """
+@@ -41,9 +43,7 @@ def list_health_scores(
+         limit=limit,
+         offset=offset,
+     )
+-    scores, total_count = health_score_service.get_scores_with_filters(db, user_id, params)
+-
+-    data = [HealthScoreResponse.model_validate(s) for s in scores]
++    data, total_count = health_score_service.get_scores_with_filters(db, user_id, params)
+     has_more = (offset + len(data)) < total_count
+ 
+     return PaginatedResponse(
+diff --git a/backend/app/models/health_score.py b/backend/app/models/health_score.py
+index bc5091a931..dda13e07ad 100644
+--- a/backend/app/models/health_score.py
++++ b/backend/app/models/health_score.py
+@@ -14,12 +14,15 @@ class HealthScore(BaseDbModel):
+ 
+     __tablename__ = "health_score"
+     __table_args__ = (
++        # NULLS NOT DISTINCT keeps provider scores, which have no source, unique per provider
+         UniqueConstraint(
+             "user_id",
+             "provider",
++            "data_source_id",
+             "category",
+             "recorded_at",
+-            name="uq_health_score_user_provider_category_time",
++            name="uq_health_score_user_provider_source_category_time",
++            postgresql_nulls_not_distinct=True,
+         ),
+         # SQLAlchemy's UniqueConstraint doesn't support postgresql_where, so we
+         # use Index(..., unique=True) to express this partial unique constraint.
+diff --git a/backend/app/repositories/health_score_repository.py b/backend/app/repositories/health_score_repository.py
+index eb9152a4de..276813f2bb 100644
+--- a/backend/app/repositories/health_score_repository.py
++++ b/backend/app/repositories/health_score_repository.py
+@@ -1,20 +1,26 @@
+-from datetime import date, datetime, timedelta, timezone
++from datetime import date, datetime, time, timedelta, timezone
+ from typing import Any
+ from typing import cast as typing_cast
+ from uuid import UUID
+ 
+-from sqlalchemy import Date, and_, cast, func, select, tuple_
++from sqlalchemy import Date, and_, cast, func, or_, select, tuple_
+ from sqlalchemy.dialects.postgresql import insert
+ 
+ from app.database import DbSession
+-from app.models import DataSource, HealthScore
++from app.models import DataSource, HealthScore, SleepDetails
+ from app.repositories.data_point_series_repository import WriteCounts
+ from app.repositories.repositories import CrudRepository, source_priority_order
+ from app.schemas.enums import DeviceType, HealthScoreCategory, ProviderName
+ from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
++from app.utils.dates import as_utc
+ from app.utils.pagination import decode_cursor
+ 
+ 
++def _utc_midnight(moment: datetime) -> datetime:
++    """Start of the UTC day ``moment`` falls on; a naive moment is read as UTC."""
++    return datetime.combine(typing_cast(datetime, as_utc(moment)).date(), time.min, tzinfo=timezone.utc)
++
++
+ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, HealthScoreUpdate]):
+     def get_by_all_components(self, db_session: DbSession, components: list[str]) -> list[HealthScore]:
+         """Return health scores whose components JSONB contains all specified keys (?& operator)."""
+@@ -29,7 +35,10 @@ def get_with_filters(
+         db_session: DbSession,
+         user_id: UUID,
+         params: HealthScoreQueryParams,
+-    ) -> tuple[list[HealthScore], int]:
++        provider_order: dict[ProviderName, int],
++        device_type_order: dict[DeviceType, int],
++    ) -> tuple[list[tuple[HealthScore, DataSource | None]], int]:
++        """Scores newest first, with their data source; one OW score per category and day, picked before paging."""
+         filters = [HealthScore.user_id == user_id]
+ 
+         if params.category:
+@@ -38,16 +47,62 @@ def get_with_filters(
+             filters.append(HealthScore.provider == params.provider)
+         if params.data_source_id:
+             filters.append(HealthScore.data_source_id == params.data_source_id)
++        # The pick sees whole days, so a bound inside a day can't hand the day to a lower-priority source
++        rank_filters = list(filters)
+         if params.start_datetime:
+             filters.append(HealthScore.recorded_at >= params.start_datetime)
++            rank_filters.append(HealthScore.recorded_at >= _utc_midnight(params.start_datetime))
+         if params.end_datetime:
+             filters.append(HealthScore.recorded_at < params.end_datetime)
++            rank_filters.append(
++                HealthScore.recorded_at
++                < _utc_midnight(params.end_datetime - timedelta(microseconds=1)) + timedelta(days=1)
++            )
+ 
+-        query = db_session.query(HealthScore).filter(and_(*filters))
++        # Ranked by source: an OW score's own provider is always internal
++        ranked = (
++            select(
++                HealthScore.id,
++                func.row_number()
++                .over(
++                    # UTC date: a bare cast follows the session time zone
++                    partition_by=(HealthScore.category, cast(func.timezone("UTC", HealthScore.recorded_at), Date)),
++                    order_by=(
++                        DataSource.id.is_(None),  # a score without a source comes last
++                        *source_priority_order(provider_order, device_type_order),
++                        # Longest sleep first, so an unflagged nap (#938) doesn't beat the night
++                        func.coalesce(SleepDetails.sleep_total_duration_minutes, 0).desc(),
++                        HealthScore.recorded_at.desc(),
++                        HealthScore.id,
++                    ),
++                )
++                .label("source_rank"),
++            )
++            .outerjoin(DataSource, HealthScore.data_source_id == DataSource.id)
++            .outerjoin(SleepDetails, SleepDetails.record_id == HealthScore.event_record_id)
++            .where(*rank_filters, HealthScore.provider == ProviderName.INTERNAL)
++            .subquery()
++        )
++        filters.append(
++            or_(
++                HealthScore.provider != ProviderName.INTERNAL,
++                HealthScore.id.in_(select(ranked.c.id).where(ranked.c.source_rank == 1)),
++            )
++        )
+ 
++        query = (
++            db_session.query(HealthScore, DataSource)
++            .outerjoin(DataSource, HealthScore.data_source_id == DataSource.id)
++            .filter(and_(*filters))
++        )
+         total_count = query.count()
+-        results = query.order_by(HealthScore.recorded_at.desc()).offset(params.offset).limit(params.limit).all()
+-        return results, total_count
++        rows = (
++            query.order_by(HealthScore.recorded_at.desc(), HealthScore.id.desc())
++            .offset(params.offset)
++            .limit(params.limit)
++            .all()
++        )
++        return [(score, data_source) for score, data_source in rows], total_count
+ 
+     def bulk_create(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> WriteCounts:
+         """Bulk insert health scores, doing nothing on conflict with the unique constraint.
+diff --git a/backend/app/schemas/model_crud/activities/health_score.py b/backend/app/schemas/model_crud/activities/health_score.py
+index 1ce267e3f2..7f5059f022 100644
+--- a/backend/app/schemas/model_crud/activities/health_score.py
++++ b/backend/app/schemas/model_crud/activities/health_score.py
+@@ -6,6 +6,7 @@
+ from pydantic import BaseModel, ConfigDict, Field, model_validator
+ 
+ from app.schemas.enums import HealthScoreCategory, ProviderName
++from app.schemas.utils.metadata import SourceMetadata
+ from app.utils.dates import ZoneOffset
+ from app.utils.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+ 
+@@ -68,3 +69,7 @@ class HealthScoreResponse(HealthScoreBase):
+     event_record_id: UUID | None = Field(
+         None, description="The sleep session or workout this score describes. Null for whole-day scores."
+     )
++    source: SourceMetadata | None = Field(
++        None,
++        description="The data source the score was computed from or reported by. Null for scores without one.",
++    )
+diff --git a/backend/app/services/health_score_service.py b/backend/app/services/health_score_service.py
+index ebde61db50..7b7f163e57 100644
+--- a/backend/app/services/health_score_service.py
++++ b/backend/app/services/health_score_service.py
+@@ -2,11 +2,18 @@
+ from uuid import UUID
+ 
+ from app.database import DbSession
+-from app.models import HealthScore
+-from app.repositories import HealthScoreRepository
++from app.models import DataSource, HealthScore, ProviderPriority
++from app.repositories import HealthScoreRepository, ProviderPriorityRepository
+ from app.repositories.data_point_series_repository import WriteCounts
++from app.repositories.device_type_priority_repository import DeviceTypePriorityRepository
+ from app.schemas.enums import HealthScoreCategory
+-from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
++from app.schemas.model_crud.activities import (
++    HealthScoreCreate,
++    HealthScoreQueryParams,
++    HealthScoreResponse,
++    HealthScoreUpdate,
++)
++from app.schemas.utils.metadata import SourceMetadata
+ from app.services.services import AppService
+ from app.utils.exceptions import handle_exceptions
+ 
+@@ -54,8 +61,33 @@ def get_scores_with_filters(
+         db_session: DbSession,
+         user_id: UUID,
+         params: HealthScoreQueryParams,
+-    ) -> tuple[list[HealthScore], int]:
+-        return self.crud.get_with_filters(db_session, user_id, params)
++    ) -> tuple[list[HealthScoreResponse], int]:
++        """Scores with their source, one OW score per category and day."""
++        rows, total_count = self.crud.get_with_filters(
++            db_session,
++            user_id,
++            params,
++            ProviderPriorityRepository(ProviderPriority).get_priority_order(db_session),
++            DeviceTypePriorityRepository().get_priority_order(db_session),
++        )
++        return [self._to_response(score, data_source) for score, data_source in rows], total_count
++
++    @staticmethod
++    def _to_response(score: HealthScore, data_source: DataSource | None) -> HealthScoreResponse:
++        response = HealthScoreResponse.model_validate(score)
++        if data_source is None:
++            return response
++        return response.model_copy(
++            update={
++                "source": SourceMetadata(
++                    provider=data_source.provider,
++                    source=data_source.source,
++                    device=data_source.device_model,
++                    device_type=data_source.device_type,
++                    device_id=data_source.device_id,
++                )
++            }
++        )
+ 
+ 
+ health_score_service = HealthScoreService(log=getLogger(__name__))
+diff --git a/backend/migrations/versions/2026_10_30_1335-9ffc050235bd_health_score_unique_key_per_source.py b/backend/migrations/versions/2026_10_30_1335-9ffc050235bd_health_score_unique_key_per_source.py
+new file mode 100644
+index 0000000000..7cc84b2a53
+--- /dev/null
++++ b/backend/migrations/versions/2026_10_30_1335-9ffc050235bd_health_score_unique_key_per_source.py
+@@ -0,0 +1,52 @@
++"""health score unique key per source
++
++Revision ID: 9ffc050235bd
++Revises: 2785d37e79cc
++
++Adds data_source_id to the unique key, NULLS NOT DISTINCT so provider scores (no source) stay unique
++per provider. downgrade fails if two sources have a score at the same time by then.
++"""
++
++from typing import Sequence, Union
++
++from alembic import op
++
++# revision identifiers, used by Alembic.
++revision: str = "9ffc050235bd"
++down_revision: Union[str, None] = "2785d37e79cc"
++branch_labels: Union[str, Sequence[str], None] = None
++depends_on: Union[str, Sequence[str], None] = None
++
++
++def upgrade() -> None:
++    # Built concurrently so writes aren't blocked, then promoted to the constraint
++    with op.get_context().autocommit_block():
++        # A failed earlier build leaves an invalid index behind; drop it so a retry rebuilds it
++        op.drop_index(
++            "uq_health_score_user_provider_source_category_time",
++            table_name="health_score",
++            postgresql_concurrently=True,
++            if_exists=True,
++        )
++        op.create_index(
++            "uq_health_score_user_provider_source_category_time",
++            "health_score",
++            ["user_id", "provider", "data_source_id", "category", "recorded_at"],
++            unique=True,
++            postgresql_nulls_not_distinct=True,
++            postgresql_concurrently=True,
++        )
++    op.drop_constraint("uq_health_score_user_provider_category_time", "health_score", type_="unique")
++    op.execute(
++        "ALTER TABLE health_score ADD CONSTRAINT uq_health_score_user_provider_source_category_time "
++        "UNIQUE USING INDEX uq_health_score_user_provider_source_category_time"
++    )
++
++
++def downgrade() -> None:
++    op.drop_constraint("uq_health_score_user_provider_source_category_time", "health_score", type_="unique")
++    op.create_unique_constraint(
++        "uq_health_score_user_provider_category_time",
++        "health_score",
++        ["user_id", "provider", "category", "recorded_at"],
++    )
+diff --git a/backend/tests/api/v1/test_health_scores.py b/backend/tests/api/v1/test_health_scores.py
+index 2e2dbdbc87..fd6142a101 100644
+--- a/backend/tests/api/v1/test_health_scores.py
++++ b/backend/tests/api/v1/test_health_scores.py
+@@ -13,12 +13,47 @@
+ from fastapi.testclient import TestClient
+ from sqlalchemy.orm import Session
+ 
++from app.models import ProviderPriority
++from app.repositories import ProviderPriorityRepository
+ from app.schemas.enums import HealthScoreCategory, ProviderName
+ from tests.factories import ApiKeyFactory, DataSourceFactory, HealthScoreFactory, UserFactory
+ from tests.utils import api_key_headers
+ 
+ 
+ class TestHealthScoresEndpoint:
++    def test_one_ow_score_per_day_with_its_source(self, client: TestClient, db: Session) -> None:
++        priorities = ProviderPriorityRepository(ProviderPriority)
++        priorities.upsert(db, ProviderName.GARMIN, 1)
++        priorities.upsert(db, ProviderName.OURA, 2)
++        user = UserFactory()
++        night = datetime(2026, 9, 24, 7, tzinfo=timezone.utc)
++        garmin = DataSourceFactory(user=user, provider=ProviderName.GARMIN)
++        oura = DataSourceFactory(user=user, provider=ProviderName.OURA)
++        # Oura first, so the pick can't come from the order of writes
++        HealthScoreFactory(data_source=oura, provider=ProviderName.INTERNAL, recorded_at=night)
++        garmin_ow = HealthScoreFactory(data_source=garmin, provider=ProviderName.INTERNAL, recorded_at=night)
++        garmin_own = HealthScoreFactory(
++            data_source_id=None, user_id=user.id, provider=ProviderName.GARMIN, recorded_at=night
++        )
++        # The next day only Oura has a score, so it is the one returned
++        oura_next_day = HealthScoreFactory(
++            data_source=oura, provider=ProviderName.INTERNAL, recorded_at=night + timedelta(days=1)
++        )
++        headers = api_key_headers(ApiKeyFactory().plain_key)
++
++        picked = client.get(f"/api/v1/users/{user.id}/health-scores", headers=headers).json()["data"]
++
++        assert sorted(score["id"] for score in picked) == sorted(
++            [str(garmin_ow.id), str(garmin_own.id), str(oura_next_day.id)]
++        )
++        assert {
++            (score["provider"], score["recorded_at"][:10], (score["source"] or {}).get("provider")) for score in picked
++        } == {
++            ("internal", "2026-09-24", "garmin"),
++            ("garmin", "2026-09-24", None),
++            ("internal", "2026-09-25", "oura"),
++        }
++
+     def test_list_health_scores_success(self, client: TestClient, db: Session) -> None:
+         user = UserFactory()
+         data_source = DataSourceFactory(user=user)
+diff --git a/backend/tests/repositories/test_health_score_repository.py b/backend/tests/repositories/test_health_score_repository.py
+index 201536e88a..21a55bc8e3 100644
+--- a/backend/tests/repositories/test_health_score_repository.py
++++ b/backend/tests/repositories/test_health_score_repository.py
+@@ -11,16 +11,25 @@
+ 
+ from datetime import datetime, timedelta, timezone
+ from decimal import Decimal
++from typing import Any
+ from uuid import uuid4
+ 
+ import pytest
++from sqlalchemy import text
+ from sqlalchemy.orm import Session
+ 
+-from app.models import HealthScore
++from app.models import HealthScore, ProviderPriority
++from app.repositories import ProviderPriorityRepository
+ from app.repositories.health_score_repository import HealthScoreRepository
+-from app.schemas.enums import HealthScoreCategory, ProviderName
++from app.schemas.enums import DeviceType, HealthScoreCategory, ProviderName
+ from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams
+-from tests.factories import DataSourceFactory, HealthScoreFactory, UserFactory
++from tests.factories import (
++    DataSourceFactory,
++    EventRecordFactory,
++    HealthScoreFactory,
++    SleepDetailsFactory,
++    UserFactory,
++)
+ 
+ 
+ @pytest.fixture
+@@ -28,6 +37,19 @@ def repo() -> HealthScoreRepository:
+     return HealthScoreRepository(HealthScore)
+ 
+ 
++NIGHT = datetime(2026, 9, 24, 7, tzinfo=timezone.utc)
++
++
++def _orders(db: Session) -> tuple[dict[ProviderName, int], dict[DeviceType, int]]:
++    return ProviderPriorityRepository(ProviderPriority).get_priority_order(db), {}
++
++
++def _prioritise(db: Session, *providers: ProviderName) -> None:
++    priorities = ProviderPriorityRepository(ProviderPriority)
++    for rank, provider in enumerate(providers, start=1):
++        priorities.upsert(db, provider, rank)
++
++
+ class TestHealthScoreRepositoryCreate:
+     def test_create(self, db: Session, repo: HealthScoreRepository) -> None:
+         data_source = DataSourceFactory()
+@@ -77,6 +99,27 @@ def test_create_duplicate_returns_existing(self, db: Session, repo: HealthScoreR
+         assert result.id == score.id
+         assert result.value == Decimal("82.00")
+ 
++    def test_create_duplicate_without_a_source_returns_existing(self, db: Session, repo: HealthScoreRepository) -> None:
++        user = UserFactory()
++        recorded_at = datetime(2026, 9, 24, 7, tzinfo=timezone.utc)
++        scores = [
++            HealthScoreCreate(
++                id=uuid4(),
++                user_id=user.id,
++                provider=ProviderName.WHOOP,
++                category=HealthScoreCategory.RECOVERY,
++                value=Decimal(value),
++                recorded_at=recorded_at,
++            )
++            for value in ("70.00", "75.00")
++        ]
++
++        first = repo.create(db, scores[0])
++        result = repo.create(db, scores[1])
++
++        assert result.id == first.id
++        assert result.value == Decimal("70.00")
++
+ 
+ class TestHealthScoreRepositoryGetWithFilters:
+     def test_filter_by_category(self, db: Session, repo: HealthScoreRepository) -> None:
+@@ -86,10 +129,12 @@ def test_filter_by_category(self, db: Session, repo: HealthScoreRepository) -> N
+         HealthScoreFactory(data_source=data_source, category=HealthScoreCategory.SLEEP)
+         HealthScoreFactory(data_source=data_source, category=HealthScoreCategory.RECOVERY)
+ 
+-        results, total = repo.get_with_filters(db, user.id, HealthScoreQueryParams(category=HealthScoreCategory.SLEEP))
++        results, total = repo.get_with_filters(
++            db, user.id, HealthScoreQueryParams(category=HealthScoreCategory.SLEEP), {}, {}
++        )
+ 
+         assert total == 2
+-        assert all(s.category == HealthScoreCategory.SLEEP for s in results)
++        assert all(s.category == HealthScoreCategory.SLEEP for s, _ in results)
+ 
+     def test_filter_by_provider(self, db: Session, repo: HealthScoreRepository) -> None:
+         user = UserFactory()
+@@ -97,10 +142,12 @@ def test_filter_by_provider(self, db: Session, repo: HealthScoreRepository) -> N
+         HealthScoreFactory(data_source=data_source, provider=ProviderName.GARMIN)
+         HealthScoreFactory(data_source=data_source, provider=ProviderName.OURA)
+ 
+-        results, total = repo.get_with_filters(db, user.id, HealthScoreQueryParams(provider=ProviderName.GARMIN))
++        results, total = repo.get_with_filters(
++            db, user.id, HealthScoreQueryParams(provider=ProviderName.GARMIN), {}, {}
++        )
+ 
+         assert total == 1
+-        assert results[0].provider == ProviderName.GARMIN
++        assert results[0][0].provider == ProviderName.GARMIN
+ 
+     def test_filter_by_date_range(self, db: Session, repo: HealthScoreRepository) -> None:
+         user = UserFactory()
+@@ -117,6 +164,8 @@ def test_filter_by_date_range(self, db: Session, repo: HealthScoreRepository) ->
+                 start_datetime=now - timedelta(days=6),
+                 end_datetime=now,
+             ),
++            {},
++            {},
+         )
+ 
+         assert total == 2
+@@ -127,7 +176,7 @@ def test_scoped_to_user(self, db: Session, repo: HealthScoreRepository) -> None:
+         HealthScoreFactory(data_source=DataSourceFactory(user=user_a))
+         HealthScoreFactory(data_source=DataSourceFactory(user=user_b))
+ 
+-        results, total = repo.get_with_filters(db, user_a.id, HealthScoreQueryParams())
++        results, total = repo.get_with_filters(db, user_a.id, HealthScoreQueryParams(), {}, {})
+ 
+         assert total == 1
+ 
+@@ -230,3 +279,236 @@ def test_bulk_create_ignores_duplicates(self, db: Session, repo: HealthScoreRepo
+         results = db.query(HealthScore).filter(HealthScore.data_source_id == data_source.id).all()
+         assert len(results) == 1
+         assert results[0].value == Decimal("80.00")
++
++    def test_bulk_create_keeps_scores_of_two_sources_at_the_same_time(
++        self, db: Session, repo: HealthScoreRepository
++    ) -> None:
++        user = UserFactory()
++        garmin = DataSourceFactory(user=user, provider=ProviderName.GARMIN)
++        oura = DataSourceFactory(user=user, provider=ProviderName.OURA)
++        recorded_at = datetime(2026, 9, 24, 7, tzinfo=timezone.utc)
++
++        repo.bulk_create(
++            db,
++            [
++                HealthScoreCreate(
++                    id=uuid4(),
++                    user_id=user.id,
++                    data_source_id=source.id,
++                    provider=ProviderName.INTERNAL,
++                    category=HealthScoreCategory.SLEEP,
++                    value=Decimal("80.00"),
++                    recorded_at=recorded_at,
++                )
++                for source in (garmin, oura)
++            ],
++        )
++        db.commit()
++
++        assert db.query(HealthScore).filter(HealthScore.user_id == user.id).count() == 2
++
++    def test_bulk_create_ignores_duplicate_scores_without_a_source(
++        self, db: Session, repo: HealthScoreRepository
++    ) -> None:
++        user = UserFactory()
++        recorded_at = datetime(2026, 9, 24, 7, tzinfo=timezone.utc)
++        for value in ("80.00", "99.00"):
++            repo.bulk_create(
++                db,
++                [
++                    HealthScoreCreate(
++                        id=uuid4(),
++                        user_id=user.id,
++                        provider=ProviderName.OURA,
++                        category=HealthScoreCategory.SLEEP,
++                        value=Decimal(value),
++                        recorded_at=recorded_at,
++                    )
++                ],
++            )
++            db.commit()
++
++        scores = db.query(HealthScore).filter(HealthScore.user_id == user.id).all()
++        assert [score.value for score in scores] == [Decimal("80.00")]
++
++
++class TestHealthScoreRepositorySourcePriority:
++    def _ow(self, data_source: Any, recorded_at: datetime = NIGHT, **kwargs: Any) -> HealthScore:
++        return HealthScoreFactory(
++            data_source=data_source, provider=ProviderName.INTERNAL, recorded_at=recorded_at, **kwargs
++        )
++
++    def test_keeps_the_ow_score_of_the_highest_priority_source(self, db: Session, repo: HealthScoreRepository) -> None:
++        _prioritise(db, ProviderName.GARMIN, ProviderName.OURA)
++        user = UserFactory()
++        garmin = self._ow(DataSourceFactory(user=user, provider=ProviderName.GARMIN))
++        self._ow(DataSourceFactory(user=user, provider=ProviderName.OURA), NIGHT + timedelta(hours=1))
++
++        results, total = repo.get_with_filters(db, user.id, HealthScoreQueryParams(), *_orders(db))
++
++        assert total == 1
++        assert [score.id for score, _ in results] == [garmin.id]
++
++    def test_priority_decides_not_the_order_of_writes(self, db: Session, repo: HealthScoreRepository) -> None:
++        _prioritise(db, ProviderName.OURA, ProviderName.GARMIN)
++        user = UserFactory()
++        self._ow(DataSourceFactory(user=user, provider=ProviderName.GARMIN))
++        oura = self._ow(DataSourceFactory(user=user, provider=ProviderName.OURA))
++
++        results, _ = repo.get_with_filters(db, user.id, HealthScoreQueryParams(), *_orders(db))
++
++        assert [score.id for score, _ in results] == [oura.id]
++
++    def test_one_ow_score_per_category(self, db: Session, repo: HealthScoreRepository) -> None:
++        user = UserFactory()
++        source = DataSourceFactory(user=user, provider=ProviderName.GARMIN)
++        self._ow(source, category=HealthScoreCategory.SLEEP)
++        self._ow(source, category=HealthScoreCategory.RESILIENCE)
++
++        _, total = repo.get_with_filters(db, user.id, HealthScoreQueryParams(), *_orders(db))
++
++        assert total == 2
++
++    def test_the_night_wins_over_an_unflagged_nap_of_the_same_source(
++        self, db: Session, repo: HealthScoreRepository
++    ) -> None:
++        """SDK naps can come without the nap flag (#938) and get a sleep score of their own."""
++        user = UserFactory()
++        source = DataSourceFactory(user=user, provider=ProviderName.APPLE)
++        scores = []
++        for wake_up, hours in ((NIGHT, 8), (NIGHT + timedelta(hours=8), 1)):
++            session = EventRecordFactory(
++                data_source=source,
++                category="sleep",
++                type="sleep",
++                start_datetime=wake_up - timedelta(hours=hours),
++                end_datetime=wake_up,
++                duration_seconds=hours * 3600,
++            )
++            SleepDetailsFactory(event_record=session, is_nap=False, sleep_total_duration_minutes=hours * 60 - 20)
++            scores.append(self._ow(source, wake_up, event_record_id=session.id))
++
++        results, _ = repo.get_with_filters(db, user.id, HealthScoreQueryParams(), *_orders(db))
++
++        assert [score.id for score, _ in results] == [scores[0].id]
++
++    def test_days_are_utc_dates_whatever_the_database_time_zone(self, db: Session, repo: HealthScoreRepository) -> None:
++        """01:00 UTC is still the previous evening in New York; it must not split the day."""
++        db.execute(text("SET LOCAL TIME ZONE 'America/New_York'"))
++        _prioritise(db, ProviderName.GARMIN, ProviderName.OURA)
++        user = UserFactory()
++        garmin = self._ow(DataSourceFactory(user=user, provider=ProviderName.GARMIN), NIGHT - timedelta(hours=6))
++        self._ow(DataSourceFactory(user=user, provider=ProviderName.OURA), NIGHT)
++
++        results, _ = repo.get_with_filters(db, user.id, HealthScoreQueryParams(), *_orders(db))
++
++        assert [score.id for score, _ in results] == [garmin.id]
++
++    @pytest.mark.parametrize(
++        ("garmin_at", "oura_at", "params"),
++        [
++            (NIGHT, NIGHT + timedelta(hours=6), HealthScoreQueryParams(start_datetime=NIGHT + timedelta(hours=5))),
++            (NIGHT + timedelta(hours=6), NIGHT, HealthScoreQueryParams(end_datetime=NIGHT + timedelta(hours=1))),
++        ],
++    )
++    def test_a_bound_inside_a_day_does_not_change_its_pick(
++        self,
++        db: Session,
++        repo: HealthScoreRepository,
++        garmin_at: datetime,
++        oura_at: datetime,
++        params: HealthScoreQueryParams,
++    ) -> None:
++        """The day's score is Garmin's; cutting it off returns nothing for the day, not Oura's."""
++        _prioritise(db, ProviderName.GARMIN, ProviderName.OURA)
++        user = UserFactory()
++        self._ow(DataSourceFactory(user=user, provider=ProviderName.GARMIN), garmin_at)
++        self._ow(DataSourceFactory(user=user, provider=ProviderName.OURA), oura_at)
++
++        results, total = repo.get_with_filters(db, user.id, params, *_orders(db))
++
++        assert (results, total) == ([], 0)
++
++    def test_a_bound_at_midnight_keeps_the_day_whole(self, db: Session, repo: HealthScoreRepository) -> None:
++        _prioritise(db, ProviderName.GARMIN, ProviderName.OURA)
++        user = UserFactory()
++        garmin = self._ow(DataSourceFactory(user=user, provider=ProviderName.GARMIN))
++        self._ow(DataSourceFactory(user=user, provider=ProviderName.OURA), NIGHT + timedelta(hours=1))
++        day = NIGHT.replace(hour=0)
++
++        results, _ = repo.get_with_filters(
++            db,
++            user.id,
++            HealthScoreQueryParams(start_datetime=day, end_datetime=day + timedelta(days=1)),
++            *_orders(db),
++        )
++
++        assert [score.id for score, _ in results] == [garmin.id]
++
++    def test_provider_scores_are_returned_as_they_are(self, db: Session, repo: HealthScoreRepository) -> None:
++        user = UserFactory()
++        garmin = DataSourceFactory(user=user, provider=ProviderName.GARMIN)
++        oura = DataSourceFactory(user=user, provider=ProviderName.OURA)
++        HealthScoreFactory(data_source=garmin, provider=ProviderName.GARMIN, recorded_at=NIGHT)
++        HealthScoreFactory(data_source=oura, provider=ProviderName.OURA, recorded_at=NIGHT)
++        self._ow(garmin)
++        self._ow(oura)
++
++        results, total = repo.get_with_filters(db, user.id, HealthScoreQueryParams(), *_orders(db))
++
++        assert total == 3
++        assert sorted(score.provider for score, _ in results) == ["garmin", "internal", "oura"]
++
++    def test_an_ow_score_with_a_source_beats_one_without(self, db: Session, repo: HealthScoreRepository) -> None:
++        """Even when the source's provider is missing from the priorities."""
++        user = UserFactory()
++        sourced = self._ow(
++            DataSourceFactory(user=user, provider=ProviderName.GARMIN), category=HealthScoreCategory.RESILIENCE
++        )
++        HealthScoreFactory(
++            data_source_id=None,
++            user_id=user.id,
++            provider=ProviderName.INTERNAL,
++            category=HealthScoreCategory.RESILIENCE,
++            recorded_at=NIGHT,
++        )
++
++        results, _ = repo.get_with_filters(db, user.id, HealthScoreQueryParams(), {}, {})
++
++        assert [score.id for score, _ in results] == [sourced.id]
++
++    def test_paging_counts_the_picked_scores(self, db: Session, repo: HealthScoreRepository) -> None:
++        user = UserFactory()
++        garmin = DataSourceFactory(user=user, provider=ProviderName.GARMIN)
++        oura = DataSourceFactory(user=user, provider=ProviderName.OURA)
++        for day in range(3):
++            self._ow(garmin, NIGHT + timedelta(days=day))
++            self._ow(oura, NIGHT + timedelta(days=day))
++
++        results, total = repo.get_with_filters(db, user.id, HealthScoreQueryParams(offset=1, limit=1), *_orders(db))
++
++        assert total == 3
++        assert [score.recorded_at.date() for score, _ in results] == [(NIGHT + timedelta(days=1)).date()]
++
++    def test_ow_score_without_a_source_is_kept(self, db: Session, repo: HealthScoreRepository) -> None:
++        user = UserFactory()
++        resilience = HealthScoreFactory(
++            data_source_id=None,
++            user_id=user.id,
++            provider=ProviderName.INTERNAL,
++            category=HealthScoreCategory.RESILIENCE,
++            recorded_at=NIGHT,
++        )
++
++        results, _ = repo.get_with_filters(db, user.id, HealthScoreQueryParams(), *_orders(db))
++
++        assert results == [(resilience, None)]
++
++    def test_returns_each_score_with_its_source(self, db: Session, repo: HealthScoreRepository) -> None:
++        user = UserFactory()
++        source = DataSourceFactory(user=user, provider=ProviderName.GARMIN)
++        score = self._ow(source)
++
++        results, _ = repo.get_with_filters(db, user.id, HealthScoreQueryParams(), *_orders(db))
++
++        assert results == [(score, source)]
+diff --git a/backend/tests/services/test_health_score_service.py b/backend/tests/services/test_health_score_service.py
+index 6dbe97a035..532ff1f802 100644
+--- a/backend/tests/services/test_health_score_service.py
++++ b/backend/tests/services/test_health_score_service.py
+@@ -52,6 +52,32 @@ def test_get_scores_with_filters_empty(self, db: Session) -> None:
+         assert total == 0
+         assert results == []
+ 
++    def test_get_scores_with_filters_tells_each_score_its_source(self, db: Session) -> None:
++        user = UserFactory()
++        data_source = DataSourceFactory(
++            user=user, provider=ProviderName.GARMIN, source="garmin", device_model="fenix7", device_type="watch"
++        )
++        HealthScoreFactory(data_source=data_source, provider=ProviderName.INTERNAL)
++        HealthScoreFactory(
++            data_source_id=None,
++            user_id=user.id,
++            provider=ProviderName.INTERNAL,
++            category=HealthScoreCategory.RESILIENCE,
++        )
++
++        results, _ = health_score_service.get_scores_with_filters(db, user.id, HealthScoreQueryParams())
++
++        sources = {score.category: score.source for score in results}
++        assert sources[HealthScoreCategory.RESILIENCE] is None
++        sleep_source = sources[HealthScoreCategory.SLEEP]
++        assert sleep_source is not None
++        assert (sleep_source.provider, sleep_source.source, sleep_source.device, sleep_source.device_type) == (
++            "garmin",
++            "garmin",
++            "fenix7",
++            "watch",
++        )
++
+ 
+ class TestHealthScoreServiceLatest:
+     def test_get_latest_by_category(self, db: Session) -> None:
+diff --git a/docs/developer-portal/settings/priorities.mdx b/docs/developer-portal/settings/priorities.mdx
+index e36cdb08d0..64efc6f7de 100644
+--- a/docs/developer-portal/settings/priorities.mdx
++++ b/docs/developer-portal/settings/priorities.mdx
+@@ -24,6 +24,7 @@ How it works:
+ 
+ - When data from multiple providers overlaps in time, the higher-priority provider's data is shown.
+ - Within the same provider, watch data is preferred over phone data by default. You can change that below.
++- When OW computes a score from several sources for the same day, the API returns the one from the highest-priority source (see [Health Scores](/scores/health-scores)).
+ 
+ ## Device Type Priorities
+ 
+diff --git a/docs/openapi.json b/docs/openapi.json
+index a976d3f048..ccff497729 100644
+--- a/docs/openapi.json
++++ b/docs/openapi.json
+@@ -3666,7 +3666,7 @@
+           "External: Health Scores"
+         ],
+         "summary": "List Health Scores",
+-        "description": "Returns health scores (sleep, recovery, readiness, etc.) for a user.\n\nScores computed by Open Wearables (`provider: internal`) are deprecated: no new ones are\ncomputed starting November 6, 2026. Previously computed scores are still returned.",
++        "description": "Returns health scores (sleep, recovery, readiness, etc.) for a user.\n\nOne OW score (provider `internal`) per category and day, from the highest-priority source.\n\nScores computed by Open Wearables (`provider: internal`) are deprecated: no new ones are\ncomputed starting November 6, 2026. Previously computed scores are still returned.",
+         "operationId": "list_health_scores_api_v1_users__user_id__health_scores_get",
+         "security": [
+           {
+@@ -13392,6 +13392,17 @@
+             ],
+             "title": "Event Record Id",
+             "description": "The sleep session or workout this score describes. Null for whole-day scores."
++          },
++          "source": {
++            "anyOf": [
++              {
++                "$ref": "#/components/schemas/SourceMetadata"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "The data source the score was computed from or reported by. Null for scores without one."
+           }
+         },
+         "type": "object",
+diff --git a/docs/scores/health-scores.mdx b/docs/scores/health-scores.mdx
+index 277e202be9..f769fe1f4b 100644
+--- a/docs/scores/health-scores.mdx
++++ b/docs/scores/health-scores.mdx
+@@ -41,6 +41,10 @@ In addition to the OW native scores described above, users may also see scores f
+ 
+ This means you can surface both in your application - the OW scores for a consistent cross-device baseline, and the provider scores for users who want to compare against what their device reports.
+ 
++### Which OW score the API returns
++
++OW can compute a score from each of a user's data sources. `GET /api/v1/users/{user_id}/health-scores` returns one OW score per category and day: the one from the source ranked highest in the [provider and device type priorities](/developer-portal/settings/priorities), the same ranking the summaries use. If one source has more than one sleep score on a day, for example an unflagged nap, the longest sleep is returned. Each score's `source` tells which source it came from. The pick is made over the whole day, so with a `start_date` or `end_date` inside a day, that day's score is returned only if it falls within the range. Provider scores are always returned as they are.
++
+ ---
+ 
+ ## Disabling OW Native Scores

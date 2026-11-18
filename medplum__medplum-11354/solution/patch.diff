@@ -1,0 +1,107 @@
+diff --git a/packages/docs/content/docs/bots/bot-run-as-user.md b/packages/docs/content/docs/bots/bot-run-as-user.md
+index 5e5ec48a7f3..d1a0ffb0a44 100644
+--- a/packages/docs/content/docs/bots/bot-run-as-user.md
++++ b/packages/docs/content/docs/bots/bot-run-as-user.md
+@@ -19,3 +19,17 @@ const Bot = await medplum.createResource({
+ ```
+ 
+ Then, when you execute the Bot, it will inherit the access of the User who triggered it instead of the Bot. For example, if [client credentials auth](/docs/auth/client-credentials) are used to generate the access token that is used to execute the Bot, then the Bot's access will be defined by the AccessPolicy on the ProjectMembership for that Client Application that was used to trigger the Bot.
++
++## Subscriptions
++
++When a [Subscription](/docs/subscriptions) triggers a `runAsUser` Bot, the "user" is the author of the triggering resource (its `meta.author`). The Bot runs with that author's ProjectMembership, in that membership's project:
++
++- The project must have Bots enabled.
++- The Bot receives that project's [secrets](/docs/bots/bot-secrets), which take precedence over secrets from the Bot's own project.
++- Bot execution AuditEvents are written to that project.
++
++{{< warning title="System-authored resources" >}}
++
++Resources written by the Medplum server itself (for example, by background jobs) have `meta.author` set to `system`, which has no ProjectMembership. A `runAsUser` Bot is **not** executed for these changes: the server logs a warning and skips the Bot, and no AuditEvent is written. If a Bot must react to system-authored changes, don't set `runAsUser`.
++
++{{< /warning >}}
+diff --git a/packages/docs/content/docs/subscriptions/server-scoped-subscriptions.md b/packages/docs/content/docs/subscriptions/server-scoped-subscriptions.md
+index cce1ef32aaa..b8a9077cbdb 100644
+--- a/packages/docs/content/docs/subscriptions/server-scoped-subscriptions.md
++++ b/packages/docs/content/docs/subscriptions/server-scoped-subscriptions.md
+@@ -21,7 +21,7 @@ A server-scoped Subscription is a `Subscription` with no `meta.project` (a proje
+ 
+ - **Access policies** are skipped for these Subscriptions, since they aren't bound to a project. This is safe: only a super admin can create a project-less resource, and they're only evaluated when the flag is on.
+ - **AuditEvents** from these firings are themselves project-less and live in the system scope.
+-- **Bot endpoints** (`channel.endpoint: Bot/<id>`) are supported. By default the Bot runs as its own membership in its own project, receives the triggering resource as input, and can only reach other projects' data if its membership allows it. A [`runAsUser`](/docs/bots/bot-run-as-user) Bot instead runs as the requester in the triggering project, which must have Bots enabled and whose secrets are passed to the Bot. Bot execution AuditEvents are written to the project the Bot ran in.
++- **Bot endpoints** (`channel.endpoint: Bot/<id>`) run in the Bot's own project by default, not the triggering project, so the Bot can only reach the triggering project's data if its membership allows it. A [`runAsUser`](/docs/bots/bot-run-as-user#subscriptions) Bot runs in the triggering project instead.
+ 
+ ## Enabling and Using
+ 
+diff --git a/packages/server/src/workers/subscription.test.ts b/packages/server/src/workers/subscription.test.ts
+index 24390e32979..1de0d717e5e 100644
+--- a/packages/server/src/workers/subscription.test.ts
++++ b/packages/server/src/workers/subscription.test.ts
+@@ -1535,6 +1535,44 @@ describe('Subscription Worker', () => {
+       expect(bundle.entry?.[0]?.resource?.outcome).toStrictEqual('0');
+     }));
+ 
++  test('Skip runAsUser bot subscriptions for system-authored resources', () =>
++    withTestContext(async () => {
++      const bot = await botRepo.createResource<Bot>({
++        resourceType: 'Bot',
++        name: 'Test Bot',
++        runAsUser: true,
++        runtimeVersion: 'awslambda',
++        code: `export async function handler(medplum, event) { return event.input; }`,
++      });
++
++      const subscription = await botRepo.createResource<Subscription>({
++        resourceType: 'Subscription',
++        reason: 'test',
++        status: 'active',
++        criteria: 'Patient',
++        channel: {
++          type: 'rest-hook',
++          endpoint: getReferenceString(bot),
++        },
++      });
++
++      const patient = await systemRepo.createResource<Patient>({
++        resourceType: 'Patient',
++        meta: { project: bot.meta?.project },
++        name: [{ given: ['Alice'], family: 'Smith' }],
++      });
++      expect(patient.meta?.author?.reference).toStrictEqual('system');
++
++      await findAndExecSubscriptionJob(patient, 'create');
++      expect(mockLambdaClient.commandCalls(InvokeCommand)).toHaveLength(0);
++
++      const bundle = await botRepo.search<AuditEvent>({
++        resourceType: 'AuditEvent',
++        filters: [{ code: 'entity', operator: Operator.EQUALS, value: getReferenceString(subscription) }],
++      });
++      expect(bundle.entry).toHaveLength(0);
++    }));
++
+   test('Bot subscription execution AuditEvent is always emitted to logs', () =>
+     withTestContext(async () => {
+       const config = await loadTestConfig();
+diff --git a/packages/server/src/workers/subscription.ts b/packages/server/src/workers/subscription.ts
+index 95ccd35878d..2df19703eab 100644
+--- a/packages/server/src/workers/subscription.ts
++++ b/packages/server/src/workers/subscription.ts
+@@ -979,6 +979,18 @@ async function execBot(
+   const requester = resource.meta?.author as Reference<
+     Bot | ClientApplication | Patient | Practitioner | RelatedPerson
+   >;
++
++  // A runAsUser Bot runs as the requester's membership, but the system user has none
++  if (bot.runAsUser && requester?.reference === 'system') {
++    ctx.logger.warn('Skipping runAsUser Bot for system-authored resource', {
++      subscription: getReferenceString(subscription),
++      project: subscription.meta?.project,
++      bot: getReferenceString(bot),
++      resource: getReferenceString(resource),
++    });
++    return;
++  }
++
+   let runAs: WithId<ProjectMembership> | undefined;
+   if (projectId) {
+     runAs = await findProjectMembership(projectId, bot.runAsUser ? requester : createReference(bot));

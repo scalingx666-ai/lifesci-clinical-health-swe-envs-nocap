@@ -1,0 +1,188 @@
+diff --git a/erpnext/buying/doctype/supplier_quotation/supplier_quotation.py b/erpnext/buying/doctype/supplier_quotation/supplier_quotation.py
+index d9a313896ee0..696d2c2bf48b 100644
+--- a/erpnext/buying/doctype/supplier_quotation/supplier_quotation.py
++++ b/erpnext/buying/doctype/supplier_quotation/supplier_quotation.py
+@@ -10,7 +10,7 @@
+ from frappe.utils import flt, getdate, nowdate
+ from pypika.terms import ExistsCriterion
+ 
+-from erpnext.buying.utils import validate_for_items
++from erpnext.buying.utils import get_qty_to_order, validate_for_items
+ from erpnext.controllers.buying_controller import BuyingController
+ from erpnext.controllers.mapper import get_qty_already_mapped
+ from erpnext.deprecation_dumpster import deprecated
+@@ -270,7 +270,8 @@ def get_list_context(context=None):
+ 
+ @frappe.whitelist()
+ def make_purchase_order(source_name, target_doc=None, args=None):
+-	if frappe.get_doc("Supplier Quotation", source_name).get_status()["status"] == "Expired":
++	supplier_quotation = frappe.get_doc("Supplier Quotation", source_name)
++	if supplier_quotation.get_status()["status"] == "Expired":
+ 		frappe.throw(_("Supplier Quotation {0} has expired.").format(source_name))
+ 
+ 	if args is None:
+@@ -278,7 +279,7 @@ def make_purchase_order(source_name, target_doc=None, args=None):
+ 	if isinstance(args, str):
+ 		args = json.loads(args)
+ 
+-	ordered_items = get_ordered_items(source_name)
++	qty_to_order = get_qty_to_order(supplier_quotation.items, "supplier_quotation_item")
+ 
+ 	mapped_items = get_qty_already_mapped(target_doc, "supplier_quotation_item")
+ 
+@@ -288,9 +289,8 @@ def set_missing_values(source, target):
+ 		target.run_method("calculate_taxes_and_totals")
+ 
+ 	def update_item(obj, target, source_parent):
+-		balance_stock_qty = obj.stock_qty - ordered_items.get(obj.name, 0.0)
+-		target.stock_qty = balance_stock_qty if balance_stock_qty > 0 else 0
+-		target.qty = flt(target.stock_qty) / flt(obj.conversion_factor)
++		target.qty = max(qty_to_order[obj.name], 0)
++		target.stock_qty = target.qty * flt(obj.conversion_factor)
+ 
+ 	def select_item(d):
+ 		filtered_items = args.get("filtered_children", [])
+@@ -319,7 +319,7 @@ def select_item(d):
+ 				],
+ 				"postprocess": update_item,
+ 				"condition": lambda item: item.name not in mapped_items
+-				and (item.stock_qty > ordered_items.get(item.name, 0.0) or item.qty == 0)
++				and (qty_to_order[item.name] > 0 or item.qty == 0)
+ 				and select_item(item),
+ 			},
+ 			"Purchase Taxes and Charges": {"doctype": "Purchase Taxes and Charges", "reset_value": True},
+diff --git a/erpnext/buying/doctype/supplier_quotation/test_supplier_quotation.py b/erpnext/buying/doctype/supplier_quotation/test_supplier_quotation.py
+index 43f4249578e6..bee420ffd9f0 100644
+--- a/erpnext/buying/doctype/supplier_quotation/test_supplier_quotation.py
++++ b/erpnext/buying/doctype/supplier_quotation/test_supplier_quotation.py
+@@ -524,6 +524,20 @@ def test_map_purchase_order_from_zero_qty_supplier_quotation(self):
+ 		self.assertEqual(po.get("items")[0].qty, 0)
+ 		self.assertEqual(po.get("items")[0].item_code, sq.get("items")[0].item_code)
+ 
++	@ERPNextTestSuite.change_settings("Stock Settings", {"allow_to_edit_stock_uom_qty_for_purchase": 1})
++	def test_map_purchase_order_qty_in_quoted_uom(self):
++		from erpnext.stock.doctype.item.test_item import make_item
++
++		item = make_item(
++			properties={"stock_uom": "Kg"}, uoms=[{"uom": "Box", "conversion_factor": 0.333333333}]
++		)
++		sq = frappe.copy_doc(self.globalTestRecords["Supplier Quotation"][0])
++		sq.items[0].update({"item_code": item.name, "qty": 1, "uom": "Box", "conversion_factor": 0.333333333})
++		sq.submit()
++
++		po = make_purchase_order(sq.name)
++		self.assertEqual(po.items[0].qty, 1)
++
+ 	def test_quotation_drops_terms_not_applicable_to_selling(self):
+ 		quotation = self.make_quotation_with_terms(selling=0)
+ 		quotation.insert()
+diff --git a/erpnext/buying/utils.py b/erpnext/buying/utils.py
+index e931802654fa..0621d363d236 100644
+--- a/erpnext/buying/utils.py
++++ b/erpnext/buying/utils.py
+@@ -6,6 +6,7 @@
+ 
+ import frappe
+ from frappe import _
++from frappe.query_builder.functions import Sum
+ from frappe.utils import cint, flt, getdate
+ 
+ from erpnext.stock.doctype.item.item import get_last_purchase_details, validate_end_of_life
+@@ -193,3 +194,21 @@ def get_linked_material_requests(items):
+ 			mr_list.extend(material_request)
+ 
+ 	return mr_list
++
++
++def get_qty_to_order(rows, link_field: str) -> dict:
++	"""Qty of each row left to order, in its UOM, from the unrounded stock qty of submitted Purchase Orders."""
++	po_item = frappe.qb.DocType("Purchase Order Item")
++	ordered_stock_qty = dict(
++		frappe.qb.from_(po_item)
++		.select(po_item[link_field], Sum(po_item.qty * po_item.conversion_factor))
++		.where((po_item.docstatus == 1) & po_item[link_field].isin([row.name for row in rows]))
++		.groupby(po_item[link_field])
++		.run()
++	)
++	return {
++		row.name: flt(
++			row.qty - flt(ordered_stock_qty.get(row.name)) / row.conversion_factor, row.precision("qty")
++		)
++		for row in rows
++	}
+diff --git a/erpnext/selling/doctype/sales_order/sales_order.py b/erpnext/selling/doctype/sales_order/sales_order.py
+index 61ab28bf6e4b..f2a2e758bcd6 100755
+--- a/erpnext/selling/doctype/sales_order/sales_order.py
++++ b/erpnext/selling/doctype/sales_order/sales_order.py
+@@ -25,7 +25,7 @@
+ 	validate_inter_company_party,
+ )
+ from erpnext.accounts.party import CROSS_PARTY_FIELD_NO_MAP, get_party_account
+-from erpnext.buying.utils import check_on_hold_or_closed_status
++from erpnext.buying.utils import check_on_hold_or_closed_status, get_qty_to_order
+ from erpnext.controllers.mapper import get_qty_already_mapped
+ from erpnext.controllers.selling_controller import SellingController
+ from erpnext.manufacturing.doctype.blanket_order.blanket_order import (
+@@ -1996,8 +1996,8 @@ def set_missing_values(source, target):
+ 
+ 	def update_item(source, target, source_parent):
+ 		target.schedule_date = source.delivery_date
+-		target.qty = flt(source.qty) - (flt(source.ordered_qty) / flt(source.conversion_factor))
+-		target.stock_qty = flt(source.stock_qty) - flt(source.ordered_qty)
++		target.qty = qty_to_order[source.name]
++		target.stock_qty = target.qty * flt(source.conversion_factor)
+ 		target.project = source_parent.project
+ 
+ 	def update_item_for_packed_item(source, target, _):
+@@ -2005,7 +2005,7 @@ def update_item_for_packed_item(source, target, _):
+ 
+ 	def filter_items(item, supplier):
+ 		if (
+-			item.ordered_qty < item.stock_qty
++			qty_to_order[item.name] > 0
+ 			and not is_product_bundle(item.item_code)
+ 			and item.name in items_to_map
+ 			and items_to_map[item.name] == supplier
+@@ -2016,6 +2016,7 @@ def filter_items(item, supplier):
+ 
+ 	sales_order = frappe.get_doc("Sales Order", source_name)
+ 	sales_order.check_permission("read")
++	qty_to_order = get_qty_to_order(sales_order.items, "sales_order_item")
+ 	items_to_map = {}
+ 	for item in selected_items:
+ 		filters = {"name": item.get("name")} if item.get("name") else {"item_code": item.get("item_code")}
+diff --git a/erpnext/selling/doctype/sales_order/test_sales_order.py b/erpnext/selling/doctype/sales_order/test_sales_order.py
+index cf9c34a90ffa..21e6acf27e29 100644
+--- a/erpnext/selling/doctype/sales_order/test_sales_order.py
++++ b/erpnext/selling/doctype/sales_order/test_sales_order.py
+@@ -2040,6 +2040,30 @@ def test_drop_shipping_partial_order(self):
+ 		so.load_from_db()
+ 		so.cancel()
+ 
++	@ERPNextTestSuite.change_settings("Stock Settings", {"allow_to_edit_stock_uom_qty_for_purchase": 1})
++	def test_purchase_order_for_rest_of_row_ordered_in_parts(self):
++		item = make_item(
++			properties={"stock_uom": "Kg"}, uoms=[{"uom": "Box", "conversion_factor": 0.666666667}]
++		)
++		so = make_sales_order(item_code=item.name, qty=3, do_not_submit=True)
++		so.items[0].update({"uom": "Box", "conversion_factor": 0.666666667})
++		so.submit()
++
++		selected_items = [{"name": so.items[0].name, "item_code": item.name}]
++		for _ in range(2):
++			po = make_purchase_order(so.name, selected_items=selected_items)[0]
++			po.supplier = "_Test Supplier"
++			po.items[0].qty = 1
++			po.submit()
++
++		po = make_purchase_order(so.name, selected_items=selected_items)[0]
++		self.assertEqual(po.items[0].qty, 1)
++		po.supplier = "_Test Supplier"
++		po.submit()
++
++		so.reload()
++		self.assertEqual(so.items[0].ordered_qty, so.items[0].stock_qty)
++
+ 	def test_drop_shipping_full_for_default_suppliers(self):
+ 		"""Test if multiple POs are generated in one go against different default suppliers."""
+ 		if not frappe.db.exists("Item", "_Test Item for Drop Shipping 1"):

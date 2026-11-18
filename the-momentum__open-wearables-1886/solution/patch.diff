@@ -1,0 +1,308 @@
+diff --git a/backend/app/models/user.py b/backend/app/models/user.py
+index c6d91f7096..ba98af9178 100644
+--- a/backend/app/models/user.py
++++ b/backend/app/models/user.py
+@@ -1,7 +1,8 @@
+ from uuid import UUID
+ from datetime import datetime
+ 
+-from sqlalchemy.orm import Mapped, relationship
++from sqlalchemy import Index, text
++from sqlalchemy.orm import Mapped, mapped_column, relationship
+ 
+ from app.database import BaseDbModel
+ from app.mappings import PrimaryKey, Unique, email, str_100, str_255
+@@ -10,6 +11,8 @@
+ class User(BaseDbModel):
+     """Data owner model"""
+ 
++    __table_args__ = (Index("ix_user_is_seed", "id", postgresql_where=text("is_seed")),)
++
+     id: Mapped[PrimaryKey[UUID]]
+ 
+     first_name: Mapped[str_100 | None]
+@@ -18,6 +21,9 @@ class User(BaseDbModel):
+ 
+     external_user_id: Mapped[Unique[str_255] | None]
+ 
++    # Synthetic user created by the seed data generator
++    is_seed: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
++
+     personal_record: Mapped["PersonalRecord | None"] = relationship(
+         back_populates="user",
+         uselist=False,
+diff --git a/backend/app/repositories/telemetry_repository.py b/backend/app/repositories/telemetry_repository.py
+index 2032a5eafa..de2a43dc71 100644
+--- a/backend/app/repositories/telemetry_repository.py
++++ b/backend/app/repositories/telemetry_repository.py
+@@ -17,10 +17,17 @@
+ from app.schemas.auth import ConnectionStatus
+ 
+ _ACTIVE = UserConnection.status == ConnectionStatus.ACTIVE
++# Users made by the seed data generator. A small set served by the partial index
++# ix_user_is_seed, so the NOT IN filters below become a hashed lookup.
++_SEED_USER_IDS = select(User.id).where(User.is_seed)
++_REAL_CONNECTION = UserConnection.user_id.not_in(_SEED_USER_IDS)
+ 
+ 
+ class TelemetryRepository:
+-    """Data access for anonymous usage telemetry: the singleton state row and aggregate counts."""
++    """Data access for anonymous usage telemetry: the singleton state row and aggregate counts.
++
++    Every count excludes seed users and their data, which are reported only through count_seed_users.
++    """
+ 
+     def get_or_create_state(self, db: DbSession) -> TelemetryState:
+         state = db.get(TelemetryState, 1)
+@@ -77,17 +84,22 @@ def release_claim(self, db: DbSession, claimed_at: datetime, previous_sent_at: d
+         db.commit()
+ 
+     def count_users(self, db: DbSession) -> int:
+-        return db.scalar(select(func.count()).select_from(User)) or 0
++        return db.scalar(select(func.count()).select_from(User).where(~User.is_seed)) or 0
++
++    def count_seed_users(self, db: DbSession) -> int:
++        return db.scalar(select(func.count()).select_from(User).where(User.is_seed)) or 0
+ 
+     def count_users_with_active_connection(self, db: DbSession) -> int:
+-        return db.scalar(select(func.count(distinct(UserConnection.user_id))).where(_ACTIVE)) or 0
++        return db.scalar(select(func.count(distinct(UserConnection.user_id))).where(_ACTIVE, _REAL_CONNECTION)) or 0
+ 
+     def count_inactive_connections(self, db: DbSession) -> int:
+-        return db.scalar(select(func.count()).select_from(UserConnection).where(~_ACTIVE)) or 0
++        return db.scalar(select(func.count()).select_from(UserConnection).where(~_ACTIVE, _REAL_CONNECTION)) or 0
+ 
+     def count_active_connections_by_provider(self, db: DbSession) -> dict[str, int]:
+         rows = db.execute(
+-            select(UserConnection.provider, func.count()).where(_ACTIVE).group_by(UserConnection.provider)
++            select(UserConnection.provider, func.count())
++            .where(_ACTIVE, _REAL_CONNECTION)
++            .group_by(UserConnection.provider)
+         )
+         return {provider: count for provider, count in rows}
+ 
+@@ -110,6 +122,7 @@ def _count_by_provider(
+             select(DataSource.provider, func.count())
+             .select_from(model)
+             .join(DataSource, model.data_source_id == DataSource.id)
++            .where(DataSource.user_id.not_in(_SEED_USER_IDS))
+             .group_by(DataSource.provider)
+         )
+         if category is not None:
+diff --git a/backend/app/schemas/model_crud/user_management/user.py b/backend/app/schemas/model_crud/user_management/user.py
+index 1dd15045a5..bbda4d1fde 100644
+--- a/backend/app/schemas/model_crud/user_management/user.py
++++ b/backend/app/schemas/model_crud/user_management/user.py
+@@ -149,6 +149,7 @@ class UserCreate(BaseModel):
+ class UserCreateInternal(UserCreate):
+     id: UUID = Field(default_factory=uuid4)
+     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
++    is_seed: bool = False
+ 
+ 
+ class UserUpdate(BaseModel):
+diff --git a/backend/app/services/seed_data/service.py b/backend/app/services/seed_data/service.py
+index 33f4fb2129..b902911f65 100644
+--- a/backend/app/services/seed_data/service.py
++++ b/backend/app/services/seed_data/service.py
+@@ -151,6 +151,7 @@ def generate(self, db: Session, request: SeedDataRequest) -> dict:
+                     email=identity_fake.unique.email(),
+                     external_user_id=identity_fake.unique.uuid4() if fake.boolean(chance_of_getting_true=80) else None,
+                 ),
++                is_seed=True,
+             )
+             summary["users"] += 1
+ 
+diff --git a/backend/app/services/telemetry_service.py b/backend/app/services/telemetry_service.py
+index 85ed9ab57e..70e1a4f963 100644
+--- a/backend/app/services/telemetry_service.py
++++ b/backend/app/services/telemetry_service.py
+@@ -21,7 +21,7 @@
+ 
+ logger = getLogger(__name__)
+ 
+-TELEMETRY_SCHEMA_VERSION = 1
++TELEMETRY_SCHEMA_VERSION = 2
+ SEND_TIMEOUT_SECONDS = 5.0
+ 
+ 
+@@ -66,6 +66,7 @@ def build_payload(self, db: Session, event: str) -> dict:
+             "environment": settings.environment.value,
+             "instance_age_days": max((now - created_at).days, 0),
+             "total_users": count_bucket(self.repo.count_users(db)),
++            "seed_users": count_bucket(self.repo.count_seed_users(db)),
+             "users_with_active_connection": count_bucket(self.repo.count_users_with_active_connection(db)),
+             "active_connections": count_bucket(sum(connections_by_provider.values())),
+             "inactive_connections": count_bucket(self.repo.count_inactive_connections(db)),
+diff --git a/backend/app/services/user_service.py b/backend/app/services/user_service.py
+index fbefab44f6..8268c2955f 100644
+--- a/backend/app/services/user_service.py
++++ b/backend/app/services/user_service.py
+@@ -49,12 +49,12 @@ def get_count_in_range(self, db_session: DbSession, start_date: datetime, end_da
+         return self.crud.get_count_in_range(db_session, start_date, end_date)
+ 
+     @handle_exceptions
+-    def create(self, db_session: DbSession, creator: UserCreate) -> User:
++    def create(self, db_session: DbSession, creator: UserCreate, *, is_seed: bool = False) -> User:
+         """Create a user with server-generated id and created_at."""
+         if self.crud.get_by_email(db_session, creator.email):
+             raise ResourceAlreadyExistsError("User with this email already exists.")
+         creation_data = creator.model_dump()
+-        internal_creator = UserCreateInternal(**creation_data)
++        internal_creator = UserCreateInternal(**creation_data, is_seed=is_seed)
+         return super().create(db_session, internal_creator)
+ 
+     def update(
+diff --git a/backend/migrations/versions/2026_10_16_1200-c4e7a1d93b52_user_is_seed.py b/backend/migrations/versions/2026_10_16_1200-c4e7a1d93b52_user_is_seed.py
+new file mode 100644
+index 0000000000..c01d39b76e
+--- /dev/null
++++ b/backend/migrations/versions/2026_10_16_1200-c4e7a1d93b52_user_is_seed.py
+@@ -0,0 +1,29 @@
++"""user is_seed
++
++Revision ID: c4e7a1d93b52
++Revises: ca74b1b24e0a
++
++"""
++
++from typing import Sequence, Union
++
++import sqlalchemy as sa
++from alembic import op
++
++# revision identifiers, used by Alembic.
++revision: str = "c4e7a1d93b52"
++down_revision: Union[str, None] = "ca74b1b24e0a"
++branch_labels: Union[str, Sequence[str], None] = None
++depends_on: Union[str, Sequence[str], None] = None
++
++
++def upgrade() -> None:
++    op.add_column("user", sa.Column("is_seed", sa.Boolean(), server_default=sa.text("false"), nullable=False))
++    # Users created by the seed generator before this column existed carry this first_name prefix
++    op.execute("""UPDATE "user" SET is_seed = true WHERE first_name LIKE '[SEED:%'""")
++    op.create_index("ix_user_is_seed", "user", ["id"], unique=False, postgresql_where=sa.text("is_seed"))
++
++
++def downgrade() -> None:
++    op.drop_index("ix_user_is_seed", table_name="user", postgresql_where=sa.text("is_seed"))
++    op.drop_column("user", "is_seed")
+diff --git a/backend/tests/factories.py b/backend/tests/factories.py
+index 555e0ae7a4..f31c1bc43a 100644
+--- a/backend/tests/factories.py
++++ b/backend/tests/factories.py
+@@ -256,6 +256,7 @@ class Meta:
+     first_name = factory.Faker("first_name")
+     last_name = factory.Faker("last_name")
+     external_user_id = None
++    is_seed = False
+ 
+ 
+ class PersonalRecordFactory(BaseFactory):
+diff --git a/backend/tests/repositories/test_telemetry_repository.py b/backend/tests/repositories/test_telemetry_repository.py
+index 80a2281b85..7769dea318 100644
+--- a/backend/tests/repositories/test_telemetry_repository.py
++++ b/backend/tests/repositories/test_telemetry_repository.py
+@@ -90,3 +90,24 @@ def test_connection_and_event_counts(self, db: Session) -> None:
+         assert repo.count_active_connections_by_provider(db) == {"garmin": 1}
+         assert repo.count_events_by_provider(db, "workout") == {"garmin": 2}
+         assert repo.count_events_by_provider(db, "sleep") == {"garmin": 1}
++
++    def test_seed_users_and_their_data_are_counted_separately(self, db: Session) -> None:
++        repo = TelemetryRepository()
++        real = UserFactory()
++        seed = UserFactory(is_seed=True)
++        UserConnectionFactory(user=real, provider="garmin", status=ConnectionStatus.ACTIVE)
++        UserConnectionFactory(user=seed, provider="garmin", status=ConnectionStatus.ACTIVE)
++        UserConnectionFactory(user=seed, provider="oura", status=ConnectionStatus.ACTIVE)
++        UserConnectionFactory(user=seed, provider="polar", status=ConnectionStatus.REVOKED)
++        EventRecordFactory(data_source=DataSourceFactory(user=real, provider="garmin"), category="workout")
++        EventRecordFactory(data_source=DataSourceFactory(user=seed, provider="garmin"), category="workout")
++        EventRecordFactory(data_source=DataSourceFactory(user=seed, provider="oura"), category="sleep")
++        db.flush()
++
++        assert repo.count_users(db) == 1
++        assert repo.count_seed_users(db) == 1
++        assert repo.count_users_with_active_connection(db) == 1
++        assert repo.count_inactive_connections(db) == 0
++        assert repo.count_active_connections_by_provider(db) == {"garmin": 1}
++        assert repo.count_events_by_provider(db, "workout") == {"garmin": 1}
++        assert repo.count_events_by_provider(db, "sleep") == {}
+diff --git a/backend/tests/services/test_seed_data_service.py b/backend/tests/services/test_seed_data_service.py
+index 48d443e8b7..d1054a24c2 100644
+--- a/backend/tests/services/test_seed_data_service.py
++++ b/backend/tests/services/test_seed_data_service.py
+@@ -56,6 +56,7 @@ def test_generate_minimal_user(self, db: Session) -> None:
+ 
+         # Verify data in DB
+         assert db.query(User).count() == 1
++        assert db.query(User).one().is_seed is True
+         assert db.query(PersonalRecord).count() == 1
+         assert db.query(UserConnection).count() >= 1
+         assert db.query(EventRecord).filter_by(category="workout").count() == 2
+diff --git a/backend/tests/services/test_telemetry_service.py b/backend/tests/services/test_telemetry_service.py
+index 2c52b20703..7e06ed77b9 100644
+--- a/backend/tests/services/test_telemetry_service.py
++++ b/backend/tests/services/test_telemetry_service.py
+@@ -84,13 +84,14 @@ def test_payload_shape_and_counts(self, db: Session) -> None:
+ 
+         payload = telemetry_service.build_payload(db, event="daily")
+ 
+-        assert payload["schema_version"] == 1
++        assert payload["schema_version"] == 2
+         assert payload["event"] == "daily"
+         assert len(payload["instance_id"]) == 32
+         assert payload["app_version"]
+         assert payload["environment"]
+         assert payload["sent_at"]
+         assert payload["total_users"] == "1-10"
++        assert payload["seed_users"] == "0"
+         assert payload["active_connections"] == "1-10"
+         assert payload["inactive_connections"] == "1-10"
+         assert payload["users_with_active_connection"] == "1-10"
+diff --git a/docs/dev-guides/telemetry.mdx b/docs/dev-guides/telemetry.mdx
+index 0bca073129..d30a3ae489 100644
+--- a/docs/dev-guides/telemetry.mdx
++++ b/docs/dev-guides/telemetry.mdx
+@@ -40,7 +40,7 @@ count, reported as an order-of-magnitude bucket rather than an exact number, or
+ | `instance_id` | Random UUID generated locally on first run and stored in the `telemetry_state` table. Not derived from any secret, hostname or account. | `f11594b65f92...` | Count distinct instances and tell a new install from a restart |
+ | `event` | What triggered the ping: `daily` or `startup` | `daily` | Separate scheduled pings from restart pings |
+ | `sent_at` | Time the ping was built, UTC | `2026-07-23T04:12:00+00:00` | Order pings and detect gaps |
+-| `schema_version` | Version of this payload format | `1` | Parse old and new payloads correctly |
++| `schema_version` | Version of this payload format | `2` | Parse old and new payloads correctly |
+ | `app_version` | Open Wearables version | `0.6.3` | See how fast releases are adopted and which versions are still in use |
+ | `python_version` | Python interpreter version | `3.13.1` | Know when it is safe to drop a Python version |
+ | `platform` | OS and architecture string from Python's `platform.platform()` | `Linux-6.1.0-x86_64-with-glibc2.36` | Know which OS and CPU targets to test and support |
+@@ -54,9 +54,13 @@ Counts are sent as order-of-magnitude buckets, never exact numbers: `0`, `1-10`,
+ pings of a small instance read day-to-day activity off the differences, or match a total against a
+ public profile. A bucket only moves when the count crosses an order of magnitude.
+ 
++Seed users and everything they own (connections, data points, workouts, sleep) are left out of every
++count below except `seed_users`, so test data never shows up as real usage.
++
+ | Field | What it is | Example | Why we track it |
+ |-------|------------|---------|-----------------|
+-| `total_users` | Number of rows in the `users` table | `"11-100"` | Deployment size |
++| `total_users` | Number of users, not counting seed users | `"11-100"` | Deployment size |
++| `seed_users` | Synthetic users created by the [seed data generator](/developer-portal/settings/seed-data-generator) | `"0"` | Tell test and demo data apart from real usage |
+ | `users_with_active_connection` | Users with at least one active provider connection | `"11-100"` | How many users are actually syncing data |
+ | `active_connections` | Provider connections with status `active` | `"11-100"` | Deployment size and connections per user |
+ | `inactive_connections` | Provider connections with status `revoked` or `expired` | `"1-10"` | How often connections break, which drives reconnect and token refresh work |
+@@ -114,7 +118,7 @@ An example payload:
+ 
+ ```json
+ {
+-  "schema_version": 1,
++  "schema_version": 2,
+   "instance_id": "e0aaddaff6e648e0b1fbed12d9b73152",
+   "event": "daily",
+   "sent_at": "2026-09-23T09:02:16.598747+00:00",
+@@ -124,6 +128,7 @@ An example payload:
+   "environment": "local",
+   "instance_age_days": 5,
+   "total_users": "1-10",
++  "seed_users": "0",
+   "users_with_active_connection": "1-10",
+   "active_connections": "1-10",
+   "inactive_connections": "1-10",

@@ -1,0 +1,623 @@
+diff --git a/grails-app/i18n/messages.properties b/grails-app/i18n/messages.properties
+index cb6c652cfb..84c576952f 100644
+--- a/grails-app/i18n/messages.properties
++++ b/grails-app/i18n/messages.properties
+@@ -734,6 +734,7 @@ email.statusChange.message=Your request status has been updated to: {0}. Click <
+ email.withComment.message=With comment
+ email.fulfillment.message=Your request status has been updated to: {0}. Click <a href="{1}">here</a> to review your requests.
+ email.putawayDiscrepancy.message=Putaway Task discrepancy detected
++email.pickShortage.message=Pick shortage detected
+ email.productBarcodeUpdated.subject=Product Barcode Updated: {0}
+ email.stockTransfer.message.subject=Stock shortage quantity transfer
+ email.stockTransfer.message.transferNumber.label=Transfer Number
+diff --git a/grails-app/services/org/pih/warehouse/picking/PickShortageEventService.groovy b/grails-app/services/org/pih/warehouse/picking/PickShortageEventService.groovy
+new file mode 100644
+index 0000000000..bb03572355
+--- /dev/null
++++ b/grails-app/services/org/pih/warehouse/picking/PickShortageEventService.groovy
+@@ -0,0 +1,16 @@
++package org.pih.warehouse.picking
++
++import grails.gorm.transactions.Transactional
++import org.springframework.context.ApplicationListener
++
++@Transactional
++class PickShortageEventService implements ApplicationListener<PickShortageEvent> {
++
++    def notificationService
++
++    @Override
++    void onApplicationEvent(PickShortageEvent event) {
++        log.info "Application event $event has been published!"
++        notificationService.sendPickShortageNotification(event.picklistItem, event.quantityMovedToLostAndFound, event.lostAndFound)
++    }
++}
+diff --git a/grails-app/services/org/pih/warehouse/picking/PickTaskService.groovy b/grails-app/services/org/pih/warehouse/picking/PickTaskService.groovy
+index d400d12482..8abdb87e22 100644
+--- a/grails-app/services/org/pih/warehouse/picking/PickTaskService.groovy
++++ b/grails-app/services/org/pih/warehouse/picking/PickTaskService.groovy
+@@ -311,6 +311,19 @@ class PickTaskService {
+         }
+ 
+         PicklistItem existingPickItem = PicklistItem.get(task.id)
++
++        if (quantityPicked == null || quantityPicked < 0) {
++            throw new IllegalArgumentException("Quantity picked must be a non-negative integer")
++        }
++
++        // A shortage is handled once: a short pick with a reason code ends the task (PICKED or STAGED), so a new
++        // shortage is one recorded on a task that is still open. The stored reason code is not a reliable signal,
++        // because the web pick page also stores the reason for an allocation change on the picklist item.
++        // The stock that should have been in the bin is held in the facility's lost and found location, so it is
++        // not allocated again and Inventory can investigate it. When the facility has no lost and found location,
++        // the shortage is still recorded, but nothing is moved.
++        boolean newShortage = reasonCode && task.status in [PickTaskStatus.PENDING, PickTaskStatus.PICKING]
++
+         if (quantityPicked > 0) {
+             picklistService.updatePicklistItem(existingPickItem.id, task.product?.id, quantityPicked.toBigDecimal(), pickedById, reasonCode)
+             transferToContainer(task, outboundContainer, quantityPicked)
+@@ -333,6 +346,13 @@ class PickTaskService {
+         }
+ 
+         save(task)
++
++        if (newShortage) {
++            Location lostAndFound = findLostAndFoundLocation(task)
++            Integer quantityMovedToLostAndFound = lostAndFound ? transferShortageToLostAndFound(task, existingPickItem, lostAndFound) : 0
++            sendShortageNotification(existingPickItem, quantityMovedToLostAndFound, lostAndFound)
++        }
++
+         // has to be done after save() because we need new requisition status for isCanceledDuringPick() check
+         if (!existingPickItem.quantityPicked || existingPickItem.quantityPicked == 0) {
+             Set<PicklistItem> list = existingPickItem.picklist.picklistItems
+@@ -546,6 +566,69 @@ class PickTaskService {
+         transfer(task, command)
+     }
+ 
++    private Location findLostAndFoundLocation(PickTask task) {
++        Location lostAndFound = task.facility?.internalLocations?.find { it.supports(ActivityCode.LOST_AND_FOUND) }
++        if (!lostAndFound) {
++            log.warn("Skipping transfer to lost and found for pick task ${task.identifier}: facility ${task.facility?.name} has no lost and found location")
++        }
++        return lostAndFound
++    }
++
++    /**
++     * Moves the shorted quantity (quantity requested - quantity picked) from the pick bin to the lost and found
++     * location. The quantity is capped at what is still recorded in the bin; when internal transactions are not
++     * tracked, the picked quantity is still in the bin, so it is not available to move.
++     *
++     * The transfer is linked to the picklist (like the transfer to the outbound container), so rolling back the
++     * pick tasks moves the stock back to the pick bin.
++     *
++     * @return the quantity moved to lost and found
++     */
++    private Integer transferShortageToLostAndFound(PickTask task, PicklistItem picklistItem, Location lostAndFound) {
++        Integer quantityPicked = picklistItem.quantityPicked ?: 0
++        Integer quantityShorted = (picklistItem.quantity ?: 0) - quantityPicked
++        if (quantityShorted <= 0) {
++            return 0
++        }
++
++        Integer quantityInBin = inventoryService.getBinLocationsByInventoryItem(task.facility, task.inventoryItem).find {
++            it.binLocation == task.location
++        }?.quantity ?: 0
++        if (!task.facility.supports(ActivityCode.TRACK_INTERNAL_TRANSACTIONS)) {
++            quantityInBin -= quantityPicked
++        }
++
++        Integer quantity = Math.min(quantityShorted, quantityInBin)
++        if (quantity <= 0) {
++            log.warn("Skipping transfer to lost and found for pick task ${task.identifier}: no stock left in ${task.location?.name}")
++            return 0
++        }
++        if (quantity < quantityShorted) {
++            log.warn("Only ${quantity} of ${quantityShorted} shorted units are left in ${task.location?.name} for pick task ${task.identifier}")
++        }
++
++        TransferStockCommand command = new TransferStockCommand()
++        command.location = task.facility
++        command.binLocation = task.location
++        command.inventoryItem = task.inventoryItem
++        command.quantity = quantity
++        command.otherLocation = task.facility
++        command.otherBinLocation = lostAndFound
++        command.transferOut = Boolean.TRUE
++        command.disableRefresh = Boolean.TRUE
++        transfer(task, command)
++
++        return quantity
++    }
++
++    private void sendShortageNotification(PicklistItem picklistItem, Integer quantityMovedToLostAndFound, Location lostAndFound) {
++        try {
++            grailsApplication.mainContext.publishEvent(new PickShortageEvent(picklistItem, quantityMovedToLostAndFound, lostAndFound))
++        } catch (Exception e) {
++            log.error("Error while processing PickShortageEvent", e)
++        }
++    }
++
+     void transferToStaging(PickTask task, AvailableItem item, Location stagingLocation) {
+         if (!task.facility.supports(ActivityCode.TRACK_INTERNAL_TRANSACTIONS)) {
+             log.warn("Skipping transfer to staging: Facility does not support TRACK_INTERNAL_TRANSACTIONS activity")
+diff --git a/grails-app/services/org/pih/warehouse/report/NotificationService.groovy b/grails-app/services/org/pih/warehouse/report/NotificationService.groovy
+index ae011652ff..968593311b 100644
+--- a/grails-app/services/org/pih/warehouse/report/NotificationService.groovy
++++ b/grails-app/services/org/pih/warehouse/report/NotificationService.groovy
+@@ -30,6 +30,7 @@ import org.pih.warehouse.core.RoleType
+ import org.pih.warehouse.core.User
+ import org.pih.warehouse.core.localization.MessageLocalizer
+ import org.pih.warehouse.data.FileGenerationService
++import org.pih.warehouse.picklist.PicklistItem
+ import org.pih.warehouse.putaway.PutawayTask
+ import org.pih.warehouse.product.Product
+ import org.pih.warehouse.receiving.GoodsReceiptNoteDto
+@@ -298,6 +299,38 @@ class NotificationService {
+         }
+     }
+ 
++    /**
++     * Notifies the discrepancy notification users and the creator of the order that a picker recorded a shortage.
++     */
++    def sendPickShortageNotification(PicklistItem picklistItem, Integer quantityMovedToLostAndFound, Location lostAndFound) {
++        try {
++            def emailValidator = EmailValidator.getInstance()
++            List<User> recipients = new ArrayList<User>(userService.findUsersByRoleType(RoleType.ROLE_DISCREPANCY_NOTIFICATION) ?: [])
++            User orderCreator = picklistItem?.requisitionItem?.requisition?.createdBy
++            if (orderCreator) {
++                recipients << orderCreator
++            }
++            List<String> emails = recipients*.email.findAll { emailValidator.isValid(it) }.unique()
++            if (!emails) {
++                return
++            }
++            def locale = new Locale(grailsApplication.config.openboxes.locale.defaultLocale)
++            def subject = messageSource.getMessage('email.pickShortage.message', null, locale)
++            def body = renderTemplate("/email/pickShortage", [
++                    picklistItem               : picklistItem,
++                    quantityMovedToLostAndFound: quantityMovedToLostAndFound,
++                    lostAndFound               : lostAndFound,
++            ])
++            emails.each { String email ->
++                mailService.sendHtmlMail(subject, body.toString(), email)
++            }
++        } catch (Exception e) {
++            // Any failure here (mail, template, message lookup) must not reach the transactional event listener:
++            // it would mark the short pick's transaction rollback-only and silently undo the pick and stock moves.
++            log.error("Unable to send the pick shortage notification: " + e.message, e)
++        }
++    }
++
+     def sendProductBarcodeUpdatedNotification(User user, Product product, String oldUpc, String newUpc) {
+         try {
+             def emailValidator = EmailValidator.getInstance()
+diff --git a/grails-app/views/email/_pickShortage.gsp b/grails-app/views/email/_pickShortage.gsp
+new file mode 100644
+index 0000000000..1ffe453e60
+--- /dev/null
++++ b/grails-app/views/email/_pickShortage.gsp
+@@ -0,0 +1,28 @@
++<%@ page contentType="text/html"%>
++<g:set var="requisition" value="${picklistItem?.requisitionItem?.requisition}"/>
++<g:set var="reportedBy" value="${picklistItem?.pickedBy ?: picklistItem?.assignee}"/>
++<g:applyLayout name="email">
++    <p>
++        <strong>Order:</strong> ${requisition?.requestNumber} – ${requisition?.name}<br/>
++        <strong>Facility:</strong> ${requisition?.origin?.name}<br/>
++        <strong>Product:</strong> ${picklistItem?.inventoryItem?.product?.productCode} – ${picklistItem?.inventoryItem?.product?.name}<br/>
++        <strong>Lot:</strong> ${picklistItem?.inventoryItem?.lotNumber}<br/>
++        <strong>Bin Location:</strong> ${picklistItem?.binLocation?.name}<br/>
++        <strong>Quantity Requested:</strong> ${picklistItem?.quantity}<br/>
++        <strong>Quantity Picked:</strong> ${picklistItem?.quantityPicked ?: 0}<br/>
++        <strong>Quantity Shorted:</strong> ${picklistItem?.quantityCanceled}<br/>
++        <g:if test="${lostAndFound}">
++            <strong>Moved to ${lostAndFound.name}:</strong> ${quantityMovedToLostAndFound}<br/>
++        </g:if>
++        <strong>Shortage Reason:</strong> ${picklistItem?.reasonCode}<br/>
++        <strong>Reported By:</strong> ${reportedBy?.firstName} ${reportedBy?.lastName}<br/>
++        <strong>Date:</strong> <g:formatDate date="${new Date()}" format="yyyy-MM-dd HH:mm:ss" />
++    </p>
++
++    <p>
++        Please review and resolve this discrepancy in OpenBoxes:
++        <g:link controller="report" action="showLostAndFoundReport" params="[ 'location.id': requisition?.origin?.id ]" absolute="true">
++            <g:createLink controller="report" action="showLostAndFoundReport" params="[ 'location.id': requisition?.origin?.id ]" absolute="true" />
++        </g:link>
++    </p>
++</g:applyLayout>
+diff --git a/src/integration-test/groovy/org/pih/warehouse/api/regression/mobile/PickingContractSpec.groovy b/src/integration-test/groovy/org/pih/warehouse/api/regression/mobile/PickingContractSpec.groovy
+index 3fe12def03..f21947bd6b 100644
+--- a/src/integration-test/groovy/org/pih/warehouse/api/regression/mobile/PickingContractSpec.groovy
++++ b/src/integration-test/groovy/org/pih/warehouse/api/regression/mobile/PickingContractSpec.groovy
+@@ -74,6 +74,10 @@ class PickingContractSpec extends MobileContractSpec {
+         o.tote = newBin('PK-TOTE', [ActivityCode.OUTBOUND_CONTAINER.id, ActivityCode.HOLD_STOCK.id, delivery], BIN_TYPE, o.dc)
+         o.staging = newBin('PK-STAGE', [ActivityCode.STAGING_LOCATION.id, ActivityCode.HOLD_STOCK.id, delivery], BIN_TYPE, o.dc)
+         o.packing = newBin('PK-PACK', [ActivityCode.PACK_STOCK.id], BIN_TYPE, o.dc)
++        // A short pick moves the shorted quantity to lost and found, so the facility needs one
++        if (!Location.withNewTransaction { Location.findAllByParentLocation(Location.get(o.dc.id)).any { it.supports(ActivityCode.LOST_AND_FOUND) } }) {
++            newBin('PK-LNF', [ActivityCode.LOST_AND_FOUND.id, ActivityCode.HOLD_STOCK.id], BIN_TYPE, o.dc)
++        }
+         o.product = newProduct('PK')
+         String lotNumber = "LOT-${uid()}".toString()
+         Date expiry = new Date() + 365
+diff --git a/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/events/NotificationEventsIntegrationSpec.groovy b/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/events/NotificationEventsIntegrationSpec.groovy
+index bc5aa541ed..0ef6bc86f0 100644
+--- a/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/events/NotificationEventsIntegrationSpec.groovy
++++ b/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/events/NotificationEventsIntegrationSpec.groovy
+@@ -4,6 +4,8 @@ import org.springframework.transaction.TransactionStatus
+ import spock.lang.PendingFeature
+ 
+ import org.pih.warehouse.api.regression.obaf.events.support.ObafEventsIntegrationSpec
++import org.pih.warehouse.api.regression.obaf.support.ObafTaskIntegrationSpec.PickOrder
++import org.pih.warehouse.api.regression.obaf.support.ObafTaskIntegrationSpec.PickSite
+ import org.pih.warehouse.api.regression.obaf.support.ObafTaskIntegrationSpec.PutawaySite
+ import org.pih.warehouse.api.regression.obaf.events.support.RecordingMailService
+ import org.pih.warehouse.api.regression.support.RegressionRoleFixtures
+@@ -13,6 +15,7 @@ import org.pih.warehouse.core.User
+ import org.pih.warehouse.order.Order
+ import org.pih.warehouse.product.Product
+ import org.pih.warehouse.product.ProductBarcodeUpdatedEvent
++import org.pih.warehouse.requisition.Requisition
+ import org.pih.warehouse.stockTransfer.StockTransferEvent
+ 
+ /**
+@@ -23,7 +26,9 @@ import org.pih.warehouse.stockTransfer.StockTransferEvent
+  * - ProductBarcodeUpdatedEventService (a plain ApplicationListener, synchronous): a UPC change
+  *   e-mails the ROLE_PRODUCT_NOTIFICATION users with the old and new UPC;
+  * - PutawayDiscrepancyEventService (also a plain ApplicationListener): completing a putaway task
+- *   with "cancel remaining" e-mails the ROLE_DISCREPANCY_NOTIFICATION users.
++ *   with "cancel remaining" e-mails the ROLE_DISCREPANCY_NOTIFICATION users;
++ * - PickShortageEventService (also a plain ApplicationListener): a short pick with a reason code
++ *   e-mails the ROLE_DISCREPANCY_NOTIFICATION users and the creator of the order.
+  * The e-mail bodies are GSP templates rendered through the taglib, so the publishing thread has a
+  * (mock) web request, as the HTTP request that publishes them in production does.
+  */
+@@ -188,4 +193,42 @@ class NotificationEventsIntegrationSpec extends ObafEventsIntegrationSpec {
+         r.error == null
+         mail.sent*.to.flatten().count { it == to } == 1
+     }
++
++    // ------------------------------------------------------------------ pick shortage
++
++    void 'a short pick with a reason code e-mails each discrepancy recipient and the order creator once; a short pick without one e-mails nobody'() {
++        given:
++        String to = notified(RoleType.ROLE_DISCREPANCY_NOTIFICATION)
++        String creatorUsername = "test-creator-${uid().toLowerCase()}".toString()
++        String creatorId = RegressionRoleFixtures.ensureUser(creatorUsername, [RoleType.ROLE_ASSISTANT], [:]).id
++        PickSite s = pickSite('NT-SHORT')
++        PickOrder o = pickOrder(s, [5])
++        tx {
++            Requisition.executeUpdate('update Requisition r set r.createdBy = :creator where r.id = :id',
++                    [creator: User.get(creatorId), id: o.requisitionId])
++        }
++        String picker = person()
++        pickPatch(o.taskIds[0], [action: 'start', assigneeId: picker])
++        RecordingMailService mail = recordMail()
++
++        when:
++        Throwable partial = withWebRequest {
++            pickPatch(o.taskIds[0], [action: 'short-pick', outboundContainerId: s.tote, quantityPicked: 2, pickedById: picker])
++        } as Throwable
++
++        then:
++        partial == null
++        mail.sent.isEmpty()
++
++        when:
++        Throwable shortage = withWebRequest {
++            pickPatch(o.taskIds[0], [action: 'short-pick', outboundContainerId: s.tote, quantityPicked: 1,
++                                     pickedById: picker, reasonCode: 'STOCKOUT'])
++        } as Throwable
++
++        then:
++        shortage == null
++        mail.sent*.to.flatten().count { it == to } == 1
++        mail.sent*.to.flatten().count { it == "${creatorUsername}@example.com".toString() } == 1
++    }
+ }
+diff --git a/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/picking/PickTaskIntegrationSpec.groovy b/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/picking/PickTaskIntegrationSpec.groovy
+index 5bcdf8f56f..5b065d86c2 100644
+--- a/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/picking/PickTaskIntegrationSpec.groovy
++++ b/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/picking/PickTaskIntegrationSpec.groovy
+@@ -215,7 +215,7 @@ class PickTaskIntegrationSpec extends ObafTaskIntegrationSpec {
+         status(o.requisitionId) == RequisitionStatus.PICKED
+     }
+ 
+-    void 'short pick with a reason code: what was picked is moved, the task is PICKED with the shortage recorded'() {
++    void 'short pick with a reason code: what was picked is moved, the shorted quantity goes to lost and found, the task is PICKED with the shortage recorded'() {
+         given:
+         PickSite s = pickSite('PT-SPR')
+         PickOrder o = pickOrder(s, [5])
+@@ -230,10 +230,80 @@ class PickTaskIntegrationSpec extends ObafTaskIntegrationSpec {
+         e == null
+         pickTask(o.taskIds[0]).subMap(['status', 'quantityPicked', 'reasonCode']) == [status: 'PICKED', quantityPicked: 3, reasonCode: 'STOCKOUT']
+         tx { PicklistItem.get(o.taskIds[0]).quantityCanceled } == 2
+-        onHand(s.dc, s.product) == [BIN: 17, ALT: 20, TOTE: 3]
++        onHand(s.dc, s.product) == [BIN: 15, ALT: 20, TOTE: 3, LNF: 2]
+         status(o.requisitionId) == RequisitionStatus.PICKED
+     }
+ 
++    void 'short pick with a reason code at a facility without a lost and found location records the shortage without moving the shorted quantity'() {
++        given:
++        PickSite s = pickSite('PT-SPNL', DeliveryTypeCode.LOCAL_DELIVERY, true, 20, false)
++        PickOrder o = pickOrder(s, [5])
++        String picker = person()
++        pickPatch(o.taskIds[0], [action: 'start', assigneeId: picker])
++
++        when:
++        Throwable e = pickPatch(o.taskIds[0], [action: 'short-pick', outboundContainerId: s.tote, quantityPicked: 3,
++                                               pickedById: picker, reasonCode: 'STOCKOUT'])
++
++        then:
++        e == null
++        pickTask(o.taskIds[0]).subMap(['status', 'quantityPicked', 'reasonCode']) == [status: 'PICKED', quantityPicked: 3, reasonCode: 'STOCKOUT']
++        onHand(s.dc, s.product) == [BIN: 17, ALT: 20, TOTE: 3]
++    }
++
++    void 'short pick with a reason code without internal transactions: nothing goes to a tote, the shorted quantity still goes to lost and found'() {
++        given:
++        PickSite s = pickSite('PT-SPNI', DeliveryTypeCode.LOCAL_DELIVERY, false)
++        PickOrder o = pickOrder(s, [5])
++        String picker = person()
++        pickPatch(o.taskIds[0], [action: 'start', assigneeId: picker])
++
++        when:
++        Throwable e = pickPatch(o.taskIds[0], [action: 'short-pick', outboundContainerId: s.tote, quantityPicked: 3,
++                                               pickedById: picker, reasonCode: 'STOCKOUT'])
++
++        then:
++        e == null
++        pickTask(o.taskIds[0]).subMap(['status', 'quantityPicked', 'reasonCode']) == [status: 'PICKED', quantityPicked: 3, reasonCode: 'STOCKOUT']
++        onHand(s.dc, s.product) == [BIN: 18, ALT: 20, LNF: 2]
++    }
++
++    void 'short pick with a reason code moves no more to lost and found than is left in the bin'() {
++        given:
++        PickSite s = pickSite('PT-SPCAP', DeliveryTypeCode.LOCAL_DELIVERY, true, 3)
++        PickOrder o = pickOrder(s, [5])
++        String picker = person()
++        pickPatch(o.taskIds[0], [action: 'start', assigneeId: picker])
++
++        when:
++        Throwable e = pickPatch(o.taskIds[0], [action: 'short-pick', outboundContainerId: s.tote, quantityPicked: 2,
++                                               pickedById: picker, reasonCode: 'STOCKOUT'])
++
++        then:
++        e == null
++        tx { PicklistItem.get(o.taskIds[0]).quantityCanceled } == 3
++        onHand(s.dc, s.product) == [ALT: 3, TOTE: 2, LNF: 1]
++    }
++
++    void 'rolling back the pick tasks returns both the picked and the shorted quantity to the pick bin'() {
++        given:
++        PickSite s = pickSite('PT-SPRB')
++        PickOrder o = pickOrder(s, [5])
++        String picker = person()
++        pickPatch(o.taskIds[0], [action: 'start', assigneeId: picker])
++        pickPatch(o.taskIds[0], [action: 'short-pick', outboundContainerId: s.tote, quantityPicked: 3,
++                                 pickedById: picker, reasonCode: 'STOCKOUT'])
++
++        expect:
++        onHand(s.dc, s.product) == [BIN: 15, ALT: 20, TOTE: 3, LNF: 2]
++
++        when:
++        tx { pickTaskService.rollbackPickTasks(Requisition.get(o.requisitionId)) }
++
++        then:
++        onHand(s.dc, s.product) == [BIN: 20, ALT: 20]
++    }
++
+     void 'short pick: more than the task still needs is refused and nothing moves'() {
+         given:
+         PickSite s = pickSite('PT-SPX')
+@@ -264,7 +334,7 @@ class PickTaskIntegrationSpec extends ObafTaskIntegrationSpec {
+         e == null
+         tx { PicklistItem.get(o.taskIds[0]).status } == 'STAGED'
+         status(o.requisitionId) == RequisitionStatus.CANCELED
+-        onHand(s.dc, s.product) == [BIN: 20, ALT: 20]
++        onHand(s.dc, s.product) == [BIN: 15, ALT: 20, LNF: 5]
+     }
+ 
+     void 'short pick of zero with a reason on a task nobody started is refused (PENDING -> STAGED is not a transition)'() {
+@@ -297,6 +367,79 @@ class PickTaskIntegrationSpec extends ObafTaskIntegrationSpec {
+         e == null
+         pickTask(o.taskIds[0]).subMap(['status', 'quantityPicked', 'reasonCode']) == [status: 'PICKED', quantityPicked: 2, reasonCode: 'STOCKOUT']
+         status(o.requisitionId) == RequisitionStatus.PICKED
++        onHand(s.dc, s.product) == [BIN: 15, ALT: 20, TOTE: 2, LNF: 3]
++    }
++
++    void 'after a rollback the order is picked again on new picklist items, and a new shortage goes to lost and found again'() {
++        given:
++        PickSite s = pickSite('PT-SPRR')
++        PickOrder o = pickOrder(s, [5])
++        String picker = person()
++        pickPatch(o.taskIds[0], [action: 'start', assigneeId: picker])
++        pickPatch(o.taskIds[0], [action: 'short-pick', outboundContainerId: s.tote, quantityPicked: 3,
++                                 pickedById: picker, reasonCode: 'STOCKOUT'])
++        tx { pickTaskService.rollbackPickTasks(Requisition.get(o.requisitionId)) }
++
++        when: 'the order is allocated again: a new picklist item (a new pick task) without a reason code'
++        String taskId = tx {
++            Requisition r = Requisition.get(o.requisitionId)
++            PicklistItem item = new PicklistItem(requisitionItem: r.requisitionItems.first(),
++                    inventoryItem: InventoryItem.get(s.lotId), binLocation: Location.get(s.bin),
++                    quantity: 5, quantityPicked: 0, sortOrder: 0)
++            r.picklist.addToPicklistItems(item)
++            r.picklist.save(flush: true, failOnError: true)
++            r.status = RequisitionStatus.PICKING
++            r.save(flush: true, failOnError: true)
++            return item.id
++        } as String
++        pickPatch(taskId, [action: 'start', assigneeId: picker])
++        Throwable e = pickPatch(taskId, [action: 'short-pick', outboundContainerId: s.tote, quantityPicked: 3,
++                                         pickedById: picker, reasonCode: 'STOCKOUT'])
++
++        then:
++        taskId != o.taskIds[0]
++        e == null
++        pickTask(taskId).subMap(['status', 'quantityPicked', 'reasonCode']) == [status: 'PICKED', quantityPicked: 3, reasonCode: 'STOCKOUT']
++        onHand(s.dc, s.product) == [BIN: 15, ALT: 20, TOTE: 3, LNF: 2]
++    }
++
++    void 'a second short pick of a task already short-picked moves nothing more to lost and found'() {
++        given:
++        PickSite s = pickSite('PT-SPTW')
++        PickOrder o = pickOrder(s, [5])
++        String picker = person()
++        pickPatch(o.taskIds[0], [action: 'start', assigneeId: picker])
++        pickPatch(o.taskIds[0], [action: 'short-pick', outboundContainerId: s.tote, quantityPicked: 3,
++                                 pickedById: picker, reasonCode: 'STOCKOUT'])
++
++        when:
++        Throwable e = pickPatch(o.taskIds[0], [action: 'short-pick', quantityPicked: 0, pickedById: picker, reasonCode: 'STOCKOUT'])
++
++        then:
++        e == null
++        pickTask(o.taskIds[0]).subMap(['status', 'quantityPicked']) == [status: 'PICKED', quantityPicked: 3]
++        onHand(s.dc, s.product) == [BIN: 15, ALT: 20, TOTE: 3, LNF: 2]
++    }
++
++    void 'a reason code stored by the web pick page (an allocation change) does not hide a short pick: the shortage goes to lost and found'() {
++        given:
++        PickSite s = pickSite('PT-SPWEB')
++        PickOrder o = pickOrder(s, [5])
++        String picker = person()
++        tx {
++            PicklistItem item = PicklistItem.get(o.taskIds[0])
++            item.reasonCode = 'SUBSTITUTION'
++            item.save(flush: true, failOnError: true)
++        }
++        pickPatch(o.taskIds[0], [action: 'start', assigneeId: picker])
++
++        when:
++        Throwable e = pickPatch(o.taskIds[0], [action: 'short-pick', quantityPicked: 0, pickedById: picker, reasonCode: 'STOCKOUT'])
++
++        then:
++        e == null
++        tx { PicklistItem.get(o.taskIds[0]).reasonCode } == 'STOCKOUT'
++        onHand(s.dc, s.product) == [BIN: 15, ALT: 20, LNF: 5]
+     }
+ 
+     void 'short pick of zero with no reason changes nothing'() {
+diff --git a/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/support/ObafTaskIntegrationSpec.groovy b/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/support/ObafTaskIntegrationSpec.groovy
+index 601ad1c1dc..4cab6ff89a 100644
+--- a/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/support/ObafTaskIntegrationSpec.groovy
++++ b/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/support/ObafTaskIntegrationSpec.groovy
+@@ -69,17 +69,18 @@ abstract class ObafTaskIntegrationSpec extends ObafIntegrationSpec {
+     // ------------------------------------------------------------------ picking
+ 
+     static class PickSite {
+-        String dc, bin, alt, tote, staging, product, lot, lotId
++        String dc, bin, alt, tote, staging, lostAndFound, product, lot, lotId
+         DeliveryTypeCode deliveryType
+     }
+ 
+     /**
+      * A depot with TRACK_INTERNAL_TRANSACTIONS (unless {@code internal} is false), a storage bin
+      * and an alternative bin holding {@code onHand} each of one lot, a tote (outbound container)
+-     * and a staging lane for {@code deliveryType}.
++     * and a staging lane for {@code deliveryType}, and a lost and found bin (unless {@code withLostAndFound} is false)
++     * that a short pick moves the shorted quantity to.
+      */
+     PickSite pickSite(String prefix, DeliveryTypeCode deliveryType = DeliveryTypeCode.LOCAL_DELIVERY,
+-                      boolean internal = true, int onHand = 20) {
++                      boolean internal = true, int onHand = 20, boolean withLostAndFound = true) {
+         PickSite s = new PickSite(deliveryType: deliveryType)
+         s.dc = depot(prefix, internal ? [ActivityCode.TRACK_INTERNAL_TRANSACTIONS] : [])
+         ActivityCode lane = deliveryType.activityCode
+@@ -87,6 +88,9 @@ abstract class ObafTaskIntegrationSpec extends ObafIntegrationSpec {
+         s.alt = bin(s.dc, 'ALT')
+         s.tote = bin(s.dc, 'TOTE', [ActivityCode.OUTBOUND_CONTAINER, ActivityCode.HOLD_STOCK] + (lane ? [lane] : []), false)
+         s.staging = bin(s.dc, 'STAGE', [ActivityCode.STAGING_LOCATION, ActivityCode.HOLD_STOCK] + (lane ? [lane] : []), false)
++        if (withLostAndFound) {
++            s.lostAndFound = bin(s.dc, 'LNF', [ActivityCode.LOST_AND_FOUND, ActivityCode.HOLD_STOCK], false)
++        }
+         s.product = product(prefix)
+         s.lot = "L-${uid()}".toString()
+         stock(s.dc, s.product, [[s.bin, onHand, s.lot, SOON], [s.alt, onHand, s.lot, SOON]])
+diff --git a/src/integration-test/resources/openapi/openapi.yaml b/src/integration-test/resources/openapi/openapi.yaml
+index 23c10d43ff..75f3256b7a 100644
+--- a/src/integration-test/resources/openapi/openapi.yaml
++++ b/src/integration-test/resources/openapi/openapi.yaml
+@@ -376,6 +376,8 @@ paths:
+     $ref: 'paths/outbound-order.yaml#/~1api~1outbound-orders~1{id}'
+   '/api/outbound-orders/{id}/items/{itemId}/allocations':
+     $ref: 'paths/outbound-order.yaml#/~1api~1outbound-orders~1{id}~1items~1{itemId}~1allocations'
++  '/api/outbound-orders/{id}/items/{itemId}/amend':
++    $ref: 'paths/outbound-order.yaml#/~1api~1outbound-orders~1{id}~1items~1{itemId}~1amend'
+   '/api/outboundOrders/{id}':
+     $ref: 'paths/outbound-order.yaml#/~1api~1outboundOrders~1{id}'
+   '/api/partialReceiving':
+diff --git a/src/integration-test/resources/openapi/paths/outbound-order.yaml b/src/integration-test/resources/openapi/paths/outbound-order.yaml
+index 7fb7341e93..ad18aac39c 100644
+--- a/src/integration-test/resources/openapi/paths/outbound-order.yaml
++++ b/src/integration-test/resources/openapi/paths/outbound-order.yaml
+@@ -54,6 +54,38 @@
+         $ref: ../components/responses.yaml#/StubNoContent
+       default:
+         $ref: ../components/responses.yaml#/Error
++/api/outbound-orders/{id}/items/{itemId}/amend:
++  post:
++    operationId: outboundOrderApi_amend
++    summary: outboundOrderApi.amend
++    tags:
++    - Outbound Order
++    x-doc-status: stub
++    x-openboxes-controller: outboundOrderApi
++    x-openboxes-action: amend
++    x-openboxes-source: explicit
++    parameters:
++    - name: id
++      in: path
++      required: true
++      schema:
++        type: string
++    - name: itemId
++      in: path
++      required: true
++      schema:
++        type: string
++    requestBody:
++      $ref: ../components/request-bodies.yaml#/StubBody
++    responses:
++      '200':
++        $ref: ../components/responses.yaml#/StubSuccess
++      '201':
++        $ref: ../components/responses.yaml#/StubCreated
++      '204':
++        $ref: ../components/responses.yaml#/StubNoContent
++      default:
++        $ref: ../components/responses.yaml#/Error
+ /api/outboundOrders/{id}:
+   get:
+     operationId: outboundOrderApi_read_get
+diff --git a/src/main/groovy/org/pih/warehouse/picking/PickShortageEvent.groovy b/src/main/groovy/org/pih/warehouse/picking/PickShortageEvent.groovy
+new file mode 100644
+index 0000000000..d95cc47125
+--- /dev/null
++++ b/src/main/groovy/org/pih/warehouse/picking/PickShortageEvent.groovy
+@@ -0,0 +1,24 @@
++package org.pih.warehouse.picking
++
++import org.pih.warehouse.core.Location
++import org.pih.warehouse.picklist.PicklistItem
++import org.springframework.context.ApplicationEvent
++
++/**
++ * Published when a picker records a shortage (a reason code) on a pick task.
++ */
++class PickShortageEvent extends ApplicationEvent {
++
++    Integer quantityMovedToLostAndFound
++    Location lostAndFound
++
++    PickShortageEvent(PicklistItem picklistItem, Integer quantityMovedToLostAndFound, Location lostAndFound) {
++        super(picklistItem)
++        this.quantityMovedToLostAndFound = quantityMovedToLostAndFound
++        this.lostAndFound = lostAndFound
++    }
++
++    PicklistItem getPicklistItem() {
++        return (PicklistItem) source
++    }
++}

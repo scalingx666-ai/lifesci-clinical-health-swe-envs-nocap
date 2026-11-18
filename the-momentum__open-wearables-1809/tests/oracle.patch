@@ -1,0 +1,485 @@
+diff --git a/backend/app/integrations/celery/tasks/__init__.py b/backend/app/integrations/celery/tasks/__init__.py
+index 1401b14768..ef030477b0 100644
+--- a/backend/app/integrations/celery/tasks/__init__.py
++++ b/backend/app/integrations/celery/tasks/__init__.py
+@@ -10,6 +10,7 @@
+ 
+ from .archival_task import run_daily_archival
+ from .close_stale_sync_runs_task import close_stale_sync_runs
++from .delete_user_webhook_payloads_task import delete_user_webhook_payloads
+ from .emit_webhook_event_task import emit_webhook_event
+ from .fill_missing_resilience_scores_task import fill_missing_resilience_scores
+ from .fill_missing_sleep_scores_task import fill_missing_sleep_scores
+@@ -75,4 +76,5 @@
+     "send_telemetry_ping",
+     # Outgoing webhooks
+     "emit_webhook_event",
++    "delete_user_webhook_payloads",
+ ]
+diff --git a/backend/app/integrations/celery/tasks/delete_user_webhook_payloads_task.py b/backend/app/integrations/celery/tasks/delete_user_webhook_payloads_task.py
+new file mode 100644
+index 0000000000..901bfde047
+--- /dev/null
++++ b/backend/app/integrations/celery/tasks/delete_user_webhook_payloads_task.py
+@@ -0,0 +1,84 @@
++"""Celery task that deletes the outgoing webhook payloads of a deleted user from Svix.
++
++Scheduled by ``UserService.delete`` once the user's rows are gone, so the
++health data carried in their webhook payloads does not outlive the deletion
++in Svix's message store.
++"""
++
++from __future__ import annotations
++
++from logging import getLogger
++from typing import Any
++from uuid import UUID
++
++from celery import shared_task
++from svix.api.errors.http_error import HttpError
++
++from app.database import SessionLocal
++from app.services import developer_service
++from app.services.outgoing_webhooks import svix as svix_service
++from app.utils.sentry_helpers import log_and_capture_error
++from app.utils.structured_logging import log_structured
++
++logger = getLogger(__name__)
++
++
++def _load_developer_ids() -> list[str]:
++    """Return every developer ID; each one is also that developer's Svix application UID."""
++    with SessionLocal() as db:
++        page_size = 100
++        offset = 0
++        developer_ids: list[str] = []
++        while True:
++            batch = developer_service.crud.get_all(db, filters={}, offset=offset, limit=page_size, sort_by=None)
++            developer_ids.extend(str(dev.id) for dev in batch)
++            if len(batch) < page_size:
++                return developer_ids
++            offset += page_size
++
++
++@shared_task(
++    name="app.integrations.celery.tasks.delete_user_webhook_payloads_task.delete_user_webhook_payloads",
++    bind=True,
++    max_retries=5,
++    default_retry_delay=60,
++    acks_late=True,
++)
++def delete_user_webhook_payloads(self: Any, user_id: str) -> dict[str, Any]:
++    """Delete the user's message payloads in every developer's Svix application.
++
++    Messages are found through the ``user.{user_id}`` channel every OW message carries.
++    A failure in any application retries the whole task; deleting a payload twice is harmless.
++    """
++    if not svix_service.is_enabled():
++        return {"user_id": user_id, "deleted": 0, "errors": []}
++
++    try:
++        developer_ids = _load_developer_ids()
++    except Exception as exc:
++        raise self.retry(exc=exc)
++
++    deleted = 0
++    errors: list[str] = []
++    for app_id in developer_ids:
++        try:
++            deleted += svix_service.delete_user_message_payloads(app_id, UUID(user_id))
++        except Exception as exc:
++            if isinstance(exc, HttpError) and exc.status_code == 404:
++                # Application never created in Svix (it is created lazily on first emit).
++                continue
++            log_and_capture_error(
++                exc,
++                logger,
++                "Failed to delete webhook payloads of deleted user",
++                extra={"user_id": user_id, "app_id": app_id, "error": str(exc)},
++            )
++            errors.append(app_id)
++
++    if errors:
++        raise self.retry(
++            exc=RuntimeError(f"Webhook payload deletion failed for user {user_id} in app(s) {errors}"),
++        )
++
++    log_structured(logger, "info", "Deleted webhook payloads of deleted user", user_id=user_id, deleted=deleted)
++    return {"user_id": user_id, "deleted": deleted, "errors": errors}
+diff --git a/backend/app/services/outgoing_webhooks/svix.py b/backend/app/services/outgoing_webhooks/svix.py
+index a3ee85e96f..493201ead5 100644
+--- a/backend/app/services/outgoing_webhooks/svix.py
++++ b/backend/app/services/outgoing_webhooks/svix.py
+@@ -6,6 +6,7 @@
+ - Register / sync event types on startup
+ - Send (emit) webhook messages
+ - CRUD proxy for endpoint management
++- Delete message payloads of deleted users
+ """
+ 
+ from __future__ import annotations
+@@ -18,6 +19,8 @@
+ from jose import jwt
+ from svix.api import (
+     ApplicationIn,
++    BulkExpungeContentsIn,
++    BulkExpungeStatus,
+     EndpointIn,
+     EndpointListOptions,
+     EndpointOut,
+@@ -54,6 +57,10 @@
+ # Svix allows up to 5 channels per message; we always send exactly one.
+ _USER_CHANNEL_PREFIX = "user."
+ 
++# Svix caps message list pages at 250 items.
++_MESSAGE_LIST_PAGE_SIZE = 250
++_PAYLOAD_DELETE_BATCH_SIZE = 100
++
+ 
+ def _user_channels(user_id: UUID | None) -> list[str] | None:
+     if user_id is None:
+@@ -346,6 +353,55 @@ def list_messages(
+     return _client.message.list(app_id, options or MessageListOptions())
+ 
+ 
++def delete_user_message_payloads(app_id: str, user_id: UUID) -> int:
++    """Delete the payloads of every message sent on a user's channel in one application.
++
++    The message records themselves stay in Svix (there is no API to delete them), but
++    without the payload they can no longer be read, replayed or retried. Messages older
++    than Svix's 90-day payload retention are not listed and already have no payload.
++
++    Returns:
++        Number of messages whose payload was deleted.
++
++    Raises:
++        Any Svix/HTTP error, so the caller can retry.
++    """
++    if not is_enabled():
++        return 0
++    assert _client is not None
++    channel = f"{_USER_CHANNEL_PREFIX}{user_id}"
++
++    msg_ids: list[str] = []
++    iterator: str | None = None
++    while True:
++        page = _client.message.list(
++            app_id,
++            MessageListOptions(limit=_MESSAGE_LIST_PAGE_SIZE, iterator=iterator, channel=channel),
++        )
++        msg_ids.extend(msg.id for msg in page.data)
++        if page.done or not page.iterator:
++            break
++        if page.iterator == iterator:
++            raise RuntimeError(f"Svix returned the same message list iterator twice for app {app_id}")
++        iterator = page.iterator
++
++    deleted = 0
++    for start in range(0, len(msg_ids), _PAYLOAD_DELETE_BATCH_SIZE):
++        batch = msg_ids[start : start + _PAYLOAD_DELETE_BATCH_SIZE]
++        try:
++            result = _client.message.bulk_expunge_content(app_id, BulkExpungeContentsIn(ids=batch))
++        except HttpError as exc:
++            # bulk-expunge only exists on svix-server >= 1.101.0; delete one by one on older servers.
++            if exc.status_code not in (404, 405):
++                raise
++            for msg_id in batch:
++                _client.message.expunge_content(app_id, msg_id)
++            deleted += len(batch)
++            continue
++        deleted += sum(1 for status in result.results.values() if status == BulkExpungeStatus.EXPUNGED)
++    return deleted
++
++
+ def list_message_attempts(
+     app_id: str,
+     endpoint_id: str,
+diff --git a/backend/app/services/user_service.py b/backend/app/services/user_service.py
+index 1860e2ca23..fb1d1d8cea 100644
+--- a/backend/app/services/user_service.py
++++ b/backend/app/services/user_service.py
+@@ -6,6 +6,7 @@
+ from pydantic import ValidationError
+ 
+ from app.database import DbSession
++from app.integrations.celery.tasks.delete_user_webhook_payloads_task import delete_user_webhook_payloads
+ from app.models import User
+ from app.repositories.user_repository import UserRepository
+ from app.schemas.model_crud.user_management import (
+@@ -20,6 +21,7 @@
+     UserUpdateInternal,
+ )
+ from app.schemas.utils import OldPaginatedResponse
++from app.services.outgoing_webhooks import svix as svix_service
+ from app.services.providers.factory import ProviderFactory
+ from app.services.providers.garmin.backfill_state import force_release_backfill_lock
+ from app.services.services import AppService
+@@ -28,6 +30,10 @@
+ from app.utils.exceptions import ResourceAlreadyExistsError, ResourceNotFoundError, handle_exceptions
+ from app.utils.structured_logging import log_structured
+ 
++# Delay before deleting the webhook payloads of a deleted user, covering emit tasks already
++# queued (emit_webhook_event retries twice, 5 s apart).
++_WEBHOOK_PAYLOAD_DELETION_COUNTDOWN_SECONDS = 60
++
+ 
+ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdateInternal]):
+     def __init__(self, log: Logger, **kwargs):
+@@ -108,7 +114,32 @@ def delete(self, db_session: DbSession, object_id: UUID | str | int, raise_404:
+                 error=str(e),
+             )
+ 
+-        return self.crud.delete(db_session, user)
++        user_id = user.id
++        deleted = self.crud.delete(db_session, user)
++        self._schedule_webhook_payload_deletion(user_id)
++        return deleted
++
++    def _schedule_webhook_payload_deletion(self, user_id: UUID) -> None:
++        """Delete the user's outgoing webhook payloads from Svix in the background.
++
++        The countdown lets emit tasks already queued for this user land in Svix first,
++        so their payloads get deleted too.
++        """
++        if not svix_service.is_enabled():
++            return
++        try:
++            delete_user_webhook_payloads.apply_async(
++                args=[str(user_id)],
++                countdown=_WEBHOOK_PAYLOAD_DELETION_COUNTDOWN_SECONDS,
++            )
++        except Exception as e:
++            log_structured(
++                self.logger,
++                "warning",
++                "Failed to schedule webhook payload deletion on user deletion",
++                user_id=user_id,
++                error=str(e),
++            )
+ 
+     @handle_exceptions
+     def get_detail(
+diff --git a/backend/tests/tasks/test_delete_user_webhook_payloads_task.py b/backend/tests/tasks/test_delete_user_webhook_payloads_task.py
+new file mode 100644
+index 0000000000..1d296ed25a
+--- /dev/null
++++ b/backend/tests/tasks/test_delete_user_webhook_payloads_task.py
+@@ -0,0 +1,202 @@
++"""Tests for deleting the outgoing webhook payloads of a deleted user from Svix."""
++
++from collections.abc import Generator
++from unittest.mock import MagicMock, patch
++from uuid import uuid4
++
++import pytest
++from celery.exceptions import Retry
++from sqlalchemy.orm import Session
++from svix.api import BulkExpungeContentsOut, BulkExpungeStatus
++from svix.api.errors.http_error import HttpError
++
++from app.integrations.celery.tasks.delete_user_webhook_payloads_task import delete_user_webhook_payloads
++from app.services import user_service
++from app.services.outgoing_webhooks import svix as svix_service
++from tests.factories import UserFactory
++
++
++def _http_error(status_code: int) -> HttpError:
++    return HttpError.init_exception({"code": "err", "detail": "err"}, status_code)
++
++
++def _page(ids: list[str], *, done: bool, iterator: str | None = None) -> MagicMock:
++    return MagicMock(data=[MagicMock(id=msg_id) for msg_id in ids], done=done, iterator=iterator)
++
++
++@pytest.fixture
++def mock_client() -> Generator[MagicMock, None, None]:
++    mock = MagicMock()
++    with patch("app.services.outgoing_webhooks.svix._client", mock):
++        yield mock
++
++
++class TestDeleteUserMessagePayloads:
++    def test_lists_by_user_channel_across_pages_and_bulk_deletes(self, mock_client: MagicMock) -> None:
++        user_id = uuid4()
++        mock_client.message.list.side_effect = [
++            _page(["msg_1", "msg_2"], done=False, iterator="it_1"),
++            _page(["msg_3"], done=True),
++        ]
++        mock_client.message.bulk_expunge_content.return_value = BulkExpungeContentsOut(
++            results={
++                "msg_1": BulkExpungeStatus.EXPUNGED,
++                "msg_2": BulkExpungeStatus.EXPUNGED,
++                "msg_3": BulkExpungeStatus.NOT_FOUND,
++            }
++        )
++
++        deleted = svix_service.delete_user_message_payloads("app_1", user_id)
++
++        assert deleted == 2
++        first_opts = mock_client.message.list.call_args_list[0].args[1]
++        second_opts = mock_client.message.list.call_args_list[1].args[1]
++        assert first_opts.channel == f"user.{user_id}"
++        assert first_opts.iterator is None
++        assert second_opts.iterator == "it_1"
++        sent = mock_client.message.bulk_expunge_content.call_args.args[1]
++        assert sent.ids == ["msg_1", "msg_2", "msg_3"]
++
++    def test_batches_bulk_delete(self, mock_client: MagicMock) -> None:
++        ids = [f"msg_{i}" for i in range(250)]
++        mock_client.message.list.return_value = _page(ids, done=True)
++        mock_client.message.bulk_expunge_content.return_value = BulkExpungeContentsOut(results={})
++
++        svix_service.delete_user_message_payloads("app_1", uuid4())
++
++        batch_sizes = [len(c.args[1].ids) for c in mock_client.message.bulk_expunge_content.call_args_list]
++        assert batch_sizes == [100, 100, 50]
++
++    def test_no_messages_skips_delete(self, mock_client: MagicMock) -> None:
++        mock_client.message.list.return_value = _page([], done=True)
++
++        assert svix_service.delete_user_message_payloads("app_1", uuid4()) == 0
++        mock_client.message.bulk_expunge_content.assert_not_called()
++
++    def test_falls_back_to_single_delete_on_older_servers(self, mock_client: MagicMock) -> None:
++        mock_client.message.list.return_value = _page(["msg_1", "msg_2"], done=True)
++        mock_client.message.bulk_expunge_content.side_effect = _http_error(404)
++
++        assert svix_service.delete_user_message_payloads("app_1", uuid4()) == 2
++        assert [c.args for c in mock_client.message.expunge_content.call_args_list] == [
++            ("app_1", "msg_1"),
++            ("app_1", "msg_2"),
++        ]
++
++    def test_other_errors_propagate(self, mock_client: MagicMock) -> None:
++        mock_client.message.list.return_value = _page(["msg_1"], done=True)
++        mock_client.message.bulk_expunge_content.side_effect = _http_error(500)
++
++        with pytest.raises(HttpError):
++            svix_service.delete_user_message_payloads("app_1", uuid4())
++
++    def test_repeated_iterator_raises(self, mock_client: MagicMock) -> None:
++        mock_client.message.list.return_value = _page(["msg_1"], done=False, iterator="it_1")
++
++        with pytest.raises(RuntimeError):
++            svix_service.delete_user_message_payloads("app_1", uuid4())
++        assert mock_client.message.list.call_count == 2
++        mock_client.message.bulk_expunge_content.assert_not_called()
++
++
++class TestDeleteUserWebhookPayloadsTask:
++    @patch("app.integrations.celery.tasks.delete_user_webhook_payloads_task.svix_service")
++    @patch("app.integrations.celery.tasks.delete_user_webhook_payloads_task.developer_service")
++    def test_deletes_in_every_developer_app(self, mock_dev_service: MagicMock, mock_svix: MagicMock) -> None:
++        dev1, dev2 = MagicMock(id=uuid4()), MagicMock(id=uuid4())
++        mock_dev_service.crud.get_all.return_value = [dev1, dev2]
++        mock_svix.delete_user_message_payloads.return_value = 3
++        user_id = uuid4()
++
++        result = delete_user_webhook_payloads(str(user_id))
++
++        assert result["deleted"] == 6
++        assert [c.args for c in mock_svix.delete_user_message_payloads.call_args_list] == [
++            (str(dev1.id), user_id),
++            (str(dev2.id), user_id),
++        ]
++
++    @patch("app.integrations.celery.tasks.delete_user_webhook_payloads_task.svix_service")
++    @patch("app.integrations.celery.tasks.delete_user_webhook_payloads_task.developer_service")
++    def test_skips_apps_missing_in_svix(self, mock_dev_service: MagicMock, mock_svix: MagicMock) -> None:
++        mock_dev_service.crud.get_all.return_value = [MagicMock(id=uuid4()), MagicMock(id=uuid4())]
++        mock_svix.delete_user_message_payloads.side_effect = [_http_error(404), 2]
++
++        result = delete_user_webhook_payloads(str(uuid4()))
++
++        assert result == {"user_id": result["user_id"], "deleted": 2, "errors": []}
++
++    @patch("app.integrations.celery.tasks.delete_user_webhook_payloads_task.log_and_capture_error")
++    @patch("app.integrations.celery.tasks.delete_user_webhook_payloads_task.svix_service")
++    @patch("app.integrations.celery.tasks.delete_user_webhook_payloads_task.developer_service")
++    def test_retries_when_an_app_fails(
++        self, mock_dev_service: MagicMock, mock_svix: MagicMock, mock_capture: MagicMock
++    ) -> None:
++        app_id = uuid4()
++        mock_dev_service.crud.get_all.return_value = [MagicMock(id=app_id)]
++        mock_svix.delete_user_message_payloads.side_effect = _http_error(500)
++
++        with (
++            patch.object(delete_user_webhook_payloads, "retry", side_effect=Retry()) as mock_retry,
++            pytest.raises(Retry),
++        ):
++            delete_user_webhook_payloads(str(uuid4()))
++        mock_retry.assert_called_once()
++        mock_capture.assert_called_once()
++        assert mock_capture.call_args.kwargs["extra"]["app_id"] == str(app_id)
++
++    @patch("app.integrations.celery.tasks.delete_user_webhook_payloads_task.svix_service")
++    @patch("app.integrations.celery.tasks.delete_user_webhook_payloads_task.developer_service")
++    def test_retries_when_loading_developers_fails(self, mock_dev_service: MagicMock, mock_svix: MagicMock) -> None:
++        mock_dev_service.crud.get_all.side_effect = ConnectionError("db down")
++
++        with (
++            patch.object(delete_user_webhook_payloads, "retry", side_effect=Retry()) as mock_retry,
++            pytest.raises(Retry),
++        ):
++            delete_user_webhook_payloads(str(uuid4()))
++        mock_retry.assert_called_once()
++        mock_svix.delete_user_message_payloads.assert_not_called()
++
++    @patch("app.integrations.celery.tasks.delete_user_webhook_payloads_task.svix_service")
++    def test_noop_when_svix_disabled(self, mock_svix: MagicMock) -> None:
++        mock_svix.is_enabled.return_value = False
++
++        result = delete_user_webhook_payloads(str(uuid4()))
++
++        assert result["deleted"] == 0
++        mock_svix.delete_user_message_payloads.assert_not_called()
++
++
++class TestUserDeleteSchedulesPayloadDeletion:
++    @patch("app.services.user_service.delete_user_webhook_payloads")
++    def test_schedules_payload_deletion_after_user_delete(self, mock_task: MagicMock, db: Session) -> None:
++        user = UserFactory()
++        user_id = user.id
++
++        with patch("app.services.user_service.svix_service.is_enabled", return_value=True):
++            user_service.delete(db, user_id)
++
++        assert user_service.get(db, user_id) is None
++        mock_task.apply_async.assert_called_once()
++        assert mock_task.apply_async.call_args.kwargs["args"] == [str(user_id)]
++
++    @patch("app.services.user_service.delete_user_webhook_payloads")
++    def test_delete_succeeds_when_scheduling_fails(self, mock_task: MagicMock, db: Session) -> None:
++        mock_task.apply_async.side_effect = ConnectionError("broker down")
++        user = UserFactory()
++        user_id = user.id
++
++        with patch("app.services.user_service.svix_service.is_enabled", return_value=True):
++            user_service.delete(db, user_id)
++
++        assert user_service.get(db, user_id) is None
++
++    @patch("app.services.user_service.delete_user_webhook_payloads")
++    def test_skips_when_svix_disabled(self, mock_task: MagicMock, db: Session) -> None:
++        user = UserFactory()
++
++        with patch("app.services.user_service.svix_service.is_enabled", return_value=False):
++            user_service.delete(db, user.id)
++
++        mock_task.apply_async.assert_not_called()
+diff --git a/docs/api-reference/guides/webhooks.mdx b/docs/api-reference/guides/webhooks.mdx
+index 2e19455378..ec50272543 100644
+--- a/docs/api-reference/guides/webhooks.mdx
++++ b/docs/api-reference/guides/webhooks.mdx
+@@ -701,6 +701,11 @@ Open Wearables (via Svix) retries failed deliveries automatically with exponenti
+   <Accordion title="Webhook availability">
+     Data ingestion is **never** blocked by webhook failures — if delivery infrastructure is temporarily unavailable, data continues to be stored and events are queued for retry.
+   </Accordion>
++  <Accordion title="User deletion">
++    When you delete a user (`DELETE /api/v1/users/{user_id}`), Open Wearables deletes the payloads of all their webhook messages from Svix in a background task, about a minute after the user is removed. The messages stay in delivery history without the payload, and their event IDs can still contain the user ID.
++
++    The cleanup is best-effort. The one-minute delay lets webhooks already queued for that user reach Svix first, so they are cleaned up too, but a webhook queued for longer than that (for example when the worker is backlogged) is not covered. If the cleanup task cannot be queued at all, the user is still deleted and a warning is logged. In both cases the remaining payloads are removed when their payload retention period ends.
++  </Accordion>
+ </AccordionGroup>
+ 
+ ---

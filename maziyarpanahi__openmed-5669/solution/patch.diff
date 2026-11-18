@@ -1,0 +1,242 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 985405a2d..df37525bc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Fixed
+ 
++- Key opt-in result-cache entries on the model revision and a model generation
++  counter, and clear the cache when a registry promotion, pointer flip or
++  rollback changes the served weights, so a model that keeps its name no longer
++  returns the previous weights' cached results (#4538).
+ - Package the Android NDK r28c `libc++_shared.so` in the OpenMedKit AAR for
+   `arm64-v8a`, `armeabi-v7a`, `x86` and `x86_64`. DJL's `libdjl_tokenizer.so`
+   links against it and no dependency ships it, so the tokenizer failed to load
+diff --git a/openmed/__init__.py b/openmed/__init__.py
+index bcc3856e0..6a34be19a 100644
+--- a/openmed/__init__.py
++++ b/openmed/__init__.py
+@@ -142,6 +142,7 @@
+     "record_review_decision": ".core.review_workflow",
+     "get_result_cache": ".core.result_cache",
+     "make_cache_key": ".core.result_cache",
++    "notify_model_generation_change": ".core.result_cache",
+     "AnalyzeResult": ".core.results",
+     "StreamingBufferError": ".core.streaming",
+     "StreamingDeidentificationEvent": ".core.streaming",
+diff --git a/openmed/core/registry_service.py b/openmed/core/registry_service.py
+index e472a6f39..312323e99 100644
+--- a/openmed/core/registry_service.py
++++ b/openmed/core/registry_service.py
+@@ -22,6 +22,7 @@
+ from .registry_errors import (
+     RegistryStateError as RegistryStateError,
+ )
++from .result_cache import notify_model_generation_change
+ 
+ REGISTRY_STATE_SCHEMA_VERSION = 1
+ REGISTRY_STATE_PATH = (
+@@ -533,6 +534,7 @@ def _commit(self, candidate: dict[str, Any]) -> None:
+         self._validate_coherence(candidate)
+         _write_state_atomic(self.state_path, candidate)
+         self._state = candidate
++        notify_model_generation_change()
+ 
+ 
+ def _load_manifest_rows(path: Path) -> list[dict[str, Any]]:
+diff --git a/openmed/core/registry_slots.py b/openmed/core/registry_slots.py
+index 1a589a68e..22c6e61c8 100644
+--- a/openmed/core/registry_slots.py
++++ b/openmed/core/registry_slots.py
+@@ -29,6 +29,7 @@
+ from .audit import stable_hash
+ from .baseline import BASELINE_PATH, baseline_key
+ from .registry_errors import RegistryError, RegistryGateError, RegistryStateError
++from .result_cache import notify_model_generation_change
+ 
+ REGISTRY_STATE_SCHEMA_VERSION = 2
+ REGISTRY_STATE_PATH = (
+@@ -620,6 +621,7 @@ def _commit(self, candidate: dict[str, Any]) -> None:
+         self._validate_coherence(candidate)
+         _write_state_atomic(self.state_path, candidate)
+         self._state = candidate
++        notify_model_generation_change()
+ 
+ 
+ def _load_manifest_rows(path: Path) -> list[dict[str, Any]]:
+diff --git a/openmed/core/result_cache.py b/openmed/core/result_cache.py
+index f15f9fee5..13368de3b 100644
+--- a/openmed/core/result_cache.py
++++ b/openmed/core/result_cache.py
+@@ -12,6 +12,7 @@
+ 
+ RESULT_CACHE = None
+ _CACHE_LOCK = RLock()
++_MODEL_GENERATION = 0
+ 
+ 
+ class ResultCache:
+@@ -59,6 +60,40 @@ def get_result_cache(max_entries=128):
+         return RESULT_CACHE
+ 
+ 
++def current_model_generation():
++    """Return the counter that changes whenever served model weights may change."""
++    with _CACHE_LOCK:
++        return _MODEL_GENERATION
++
++
++def notify_model_generation_change():
++    """Invalidate cached results after a model activation, promotion or rollback.
++
++    A model can keep its name while its weights change. Bumping the generation
++    makes every later cache key differ from keys built before the change, and the
++    shared cache is cleared as a second guard.
++
++    Returns:
++        The new model generation.
++    """
++    global _MODEL_GENERATION
++
++    with _CACHE_LOCK:
++        _MODEL_GENERATION += 1
++        if RESULT_CACHE is not None:
++            RESULT_CACHE.clear()
++        return _MODEL_GENERATION
++
++
++def _resolve_model_revision(params):
++    revision = params.get("revision")
++    if revision is None:
++        pipeline_kwargs = params.get("pipeline_kwargs")
++        if isinstance(pipeline_kwargs, dict):
++            revision = pipeline_kwargs.get("revision")
++    return revision
++
++
+ def freeze_value(value):
+     if isinstance(value, dict):
+         return (
+@@ -91,6 +126,8 @@ def make_cache_key(inquiry_type, params):
+         normalized.get("model_name", normalized.get("model_id", "")),
+     )
+     normalized.pop("model_id", None)
++    normalized["model_revision"] = _resolve_model_revision(normalized)
++    normalized["model_generation"] = current_model_generation()
+ 
+     for name in (
+         "config",
+diff --git a/tests/unit/core/test_registry_service.py b/tests/unit/core/test_registry_service.py
+index bbcc9068d..b90ac8bfe 100644
+--- a/tests/unit/core/test_registry_service.py
++++ b/tests/unit/core/test_registry_service.py
+@@ -14,6 +14,7 @@
+ 
+ import pytest
+ 
++import openmed.core.result_cache as result_cache
+ from openmed.core.baseline import write_baseline_store
+ from openmed.core.registry_slots import (
+     RegistryGateError,
+@@ -127,6 +128,25 @@ def test_promote_and_rollback_are_reproducible_from_local_state(
+     assert restored.lineage(_NER_SLOT)[-1]["to"] == _NER_A
+ 
+ 
++def test_promote_and_rollback_invalidate_result_cache(tmp_path: Path) -> None:
++    manifest = _write_manifest(tmp_path)
++    state = tmp_path / "registry_state.json"
++    service = RegistryService(manifest_path=manifest, state_path=state)
++    cache = result_cache.get_result_cache(max_entries=4)
++    params = {"text": "History of asthma.", "model_name": _NER_A}
++
++    for change in (
++        lambda: service.promote(_NER_A, gate_report=_ner_gate(_NER_A)),
++        lambda: service.promote(_NER_B, gate_report=_ner_gate(_NER_B)),
++        lambda: service.rollback(_NER_SLOT, gate_report=_ner_gate(_NER_A)),
++    ):
++        key = result_cache.make_cache_key("analyze_text", params)
++        cache.set(key, "result from the previous weights")
++        change()
++        assert cache.get(key) is None
++        assert result_cache.make_cache_key("analyze_text", params) != key
++
++
+ def test_pointer_flip_requires_releasable_gate_without_mutating_state(
+     subtests, tmp_path
+ ) -> None:
+diff --git a/tests/unit/core/test_result_cache.py b/tests/unit/core/test_result_cache.py
+index 45132d78f..64ae6da1d 100644
+--- a/tests/unit/core/test_result_cache.py
++++ b/tests/unit/core/test_result_cache.py
+@@ -199,3 +199,70 @@ def run(self, text, **kwargs):
+     assert fourth is not first
+     assert fifth is not first
+     assert calls["count"] == 3
++
++
++def test_cache_key_includes_model_revision() -> None:
++    params = {"text": "Patient John", "model_name": "pii"}
++
++    unpinned = result_cache.make_cache_key("extract_pii", params)
++    rev_a = result_cache.make_cache_key("extract_pii", {**params, "revision": "a" * 40})
++    rev_b = result_cache.make_cache_key("extract_pii", {**params, "revision": "b" * 40})
++    via_kwargs = result_cache.make_cache_key(
++        "analyze_text", {**params, "pipeline_kwargs": {"revision": "a" * 40}}
++    )
++
++    assert len({unpinned, rev_a, rev_b}) == 3
++    assert via_kwargs != result_cache.make_cache_key("analyze_text", params)
++    for key in (unpinned, rev_a, rev_b, via_kwargs):
++        assert "Patient John" not in key
++        assert "a" * 40 not in key
++
++
++def test_model_generation_change_invalidates_cache() -> None:
++    reset_cache()
++    params = {"text": "Patient John", "model_name": "pii"}
++    cache = result_cache.get_result_cache(max_entries=4)
++    before = result_cache.make_cache_key("extract_pii", params)
++    cache.set(before, "old weights")
++
++    generation = result_cache.notify_model_generation_change()
++
++    after = result_cache.make_cache_key("extract_pii", params)
++    assert generation == result_cache.current_model_generation()
++    assert after != before
++    assert cache.get(before) is None
++    assert cache.get(after) is None
++    assert len(cache) == 0
++
++
++def test_analyze_text_misses_cache_after_model_generation_change() -> None:
++    reset_cache()
++
++    class FakeLoader:
++        config = None
++
++        def __init__(self):
++            self.create_calls = 0
++
++        def create_pipeline(self, *args, **kwargs):
++            self.create_calls += 1
++            return lambda text, **call_kwargs: []
++
++        def get_max_sequence_length(self, model_name, tokenizer=None):
++            return 128
++
++    loader = FakeLoader()
++    kwargs = dict(
++        model_name="fixture-ner-model",
++        loader=loader,
++        sentence_detection=False,
++        cache_results=True,
++    )
++
++    openmed.analyze_text("History of asthma.", **kwargs)
++    openmed.analyze_text("History of asthma.", **kwargs)
++    assert loader.create_calls == 1
++
++    result_cache.notify_model_generation_change()
++    openmed.analyze_text("History of asthma.", **kwargs)
++    assert loader.create_calls == 2

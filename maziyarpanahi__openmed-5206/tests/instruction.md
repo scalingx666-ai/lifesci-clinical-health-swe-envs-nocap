@@ -1,0 +1,19 @@
+# Issue
+
+**Title:** Bound pending async jobs and documents per job at submission
+
+## Description
+
+.
+
+`POST /jobs` now checks capacity before it writes any job metadata. The new `openmed/service/job_admission.py` adds a small, thread-safe `JobAdmission` class with three ceilings: pending jobs (queued or running), UTF-8 bytes of document text held by pending jobs, and documents per job. `DeidentifyJobQueue.submit` in `openmed/service/jobs.py` reserves capacity before `store.create`. If creating the record or submitting it to the executor fails, it releases the reservation and re-raises. Otherwise a future done callback releases it when the job finishes, fails, or is cancelled at shutdown. A full queue returns `503` with the code `job_queue_full`, a `Retry-After` header and a `pending_jobs` or `queued_text_bytes` reason. A job that can never fit returns `422` with `job_too_many_documents` or `job_too_large`. Rejections create no record, queue no work, and carry only the code, reason and configured limit, never document text or ids. `openmed/service/metrics.py` adds two unlabelled gauges, `openmed_service_job_queue_depth` and `openmed_service_job_queue_text_bytes`. They are updated by deltas, so they stay an accurate total even while an old queue drains after a runtime swap. The three new codes are registered as stable error categories in `api_compatibility.py`, and `docs/serving/async-jobs.md` documents the variables, responses and gauges.
+
+Breaking: `POST /jobs` used to accept unbounded work. It now applies these defaults: `OPENMED_SERVICE_JOBS_MAX_PENDING=64`, `OPENMED_SERVICE_JOBS_MAX_QUEUED_BYTES=67108864` (64 MiB) and `OPENMED_SERVICE_JOBS_MAX_DOCUMENTS=1000`, and an invalid value fails startup. Migration: raise these variables if a deployment needs more, and retry `503 job_queue_full` responses after `Retry-After`.
+
+Overlaps: #4918 (payload refs), #4136 and #4141 also edit `DeidentifyJobQueue.__init__`, `from_env` and `submit`. This change adds only one `admission` keyword, one `from_env` argument and the reserve/release lines around the existing create and submit calls, so a rebase only needs those lines carried over. With #4918, the reserve should stay ahead of `payloads.create` so a rejected job also stores no payload. With #4141, the reservation is released when `_run_job` returns, which is earlier once webhooks leave the worker thread. #3907 (principal binding) does not touch the admission path.
+
+Validation: `pytest tests/unit/service/test_job_admission.py` (17 passed), which covers per-job and env limits, concurrent reservations, a blocked single-worker queue that fills, rejects with no new record, drains and accepts again, failed jobs, an unexpected worker error, shutdown cancellation, store-create failure, and the REST 503/422 envelopes with `/metrics` gauges. A negative control that removes the done-callback release fails 7 of these tests. Also run: `pytest tests/unit/service/test_jobs_api.py tests/unit/service/test_metrics_endpoint.py tests/unit/service/test_api_compatibility.py tests/unit/service/test_openapi_spec.py` (passed), `pytest tests/unit -k "docs or publication or mkdocs"` (152 passed, 15 skipped), `ruff check .` and `ruff format --check .` (clean), `python scripts/security/check_effect_paths.py --check` (`effect_paths_verified`), `mypy` (clean), and `pytest tests/ -m "not slow and not fuzz"` (27003 passed, 226 skipped). `tests/unit/training/synthetic/test_dicom_overlays.py` was ignored because `pydicom` is not installed in the local venv. No page or nav changes; the strict MkDocs build is left to CI.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `7655442ff060`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

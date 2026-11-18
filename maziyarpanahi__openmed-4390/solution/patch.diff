@@ -1,0 +1,991 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9d2ddc5449..eb8e91e60a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Plan bounded multiresolution whole-slide tiles with explicit source transforms, overlap, conservative tissue-mask filtering, auditable exclusions and declared concurrent buffer ceilings (#2794).
++
+ - Measure bounded image resolution, exposure, contrast, sharpness and optional blank-margin quality before local visual extraction, with explicit reacquisition or review reasons and inference suppression on failure (#2800).
+ 
+ - Track transcript insert, delete, replace, timestamp-shift and finalize operations with stable segment/token identities, deterministic span remapping and explicit invalidation of ambiguous citations (#2814).
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index 3bded88666..ef1530a34d 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -479,6 +479,7 @@ classification:
+     - multimodal/processing-diffs.md
+     - multimodal/provider-results.md
+     - multimodal/vision/edge-vlm-provider-contract.md
++    - multimodal/vision/whole-slide-tiling.md
+     - multimodal/vision/quality-abstention.md
+     - multimodal/fused-evidence-graphs.md
+     - multimodal/audio-windows.md
+diff --git a/docs/multimodal/vision/whole-slide-tiling.md b/docs/multimodal/vision/whole-slide-tiling.md
+new file mode 100644
+index 0000000000..3136d16856
+--- /dev/null
++++ b/docs/multimodal/vision/whole-slide-tiling.md
+@@ -0,0 +1,76 @@
++# Whole-slide tile planning
++
++`openmed.multimodal.vision.pathology.plan_slide_tiles()` builds deterministic multiresolution plans for caller-owned slides. It plans native-level tile coordinates, overlap, outward-rounded level-zero coordinates, conservative tissue-mask routing and bounded batches. It never opens a slide, decodes a whole image, loads a model or writes tile pixels.
++
++The plan is an admission contract for an adapter that can read native regions. Source slides remain under caller control. An adapter must verify the slide digest and pyramid metadata, honor the declared buffer factors and batch limit, and release each batch before reading the next. Existing full-frame VLM memory estimates are separate; do not allocate a gigapixel frame merely to satisfy a tile plan. OpenMedKit parity is tracked separately in #3679.
++
++## Plan a synthetic slide
++
++```python
++from openmed.multimodal.vision.pathology import (
++    PyramidLevel, TilePolicy, TissueMask, plan_slide_tiles,
++)
++
++source_digest = "a" * 64  # Synthetic fixture, not a real slide digest.
++levels = (
++    PyramidLevel(index=0, width=4000, height=2000, scale_numerator=1),
++    PyramidLevel(index=1, width=1000, height=500, scale_numerator=4),
++)
++policy = TilePolicy(
++    width=512, height=512, overlap_x=32, overlap_y=32,
++    working_bytes_per_pixel=16, max_inflight_tiles=2,
++    budget_bytes=16 * 1024 * 1024, reserved_bytes=4 * 1024 * 1024,
++    min_tissue_percent=10,
++)
++mask = TissueMask(
++    source_digest=source_digest, width=4, height=2,
++    cells=bytes([0, 1, 1, 0, 0, 1, 2, 0]),
++)
++plan = plan_slide_tiles(
++    source_digest, 4000, 2000, levels, policy, tissue_mask=mask,
++)
++assert plan.peak_working_bytes <= policy.budget_bytes
++assert all(len(batch) <= 2 for batch in plan.iter_batches())
++assert plan.mask_digest == mask.digest
++audit_json = plan.to_json()
++```
++
++`iter_batches()` yields metadata only. Read those native regions through the caller's local slide adapter, keeping only one admitted batch resident. It does not open files or invoke a decoder, and it cannot enforce the behavior of arbitrary adapter code. The example's memory factors and mask are synthetic, not measured device requirements or clinically qualified tissue thresholds.
++
++## Native levels and source coordinates
++
++Each requested `PyramidLevel` supplies a native index, width, height and a reduced rational downsample factor. The factor must come from verified pyramid metadata. Do not infer it by dividing rounded dimensions: a 100-pixel source with a 33-pixel level can still have a declared scale of 3, leaving one source-edge pixel outside that level's represented extent. The report records such right/bottom gaps explicitly.
++
++The declared level dimensions must be a floor or ceiling of the source dimensions divided by the scale. Level zero, when requested, has scale 1 and exact source dimensions. Requested levels are sorted by native index and must have strictly increasing scales and nonincreasing dimensions; a subset is allowed. Both axes use the declared scale, so anisotropic pyramids need a different explicitly supported transform instead of a guessed ratio.
++
++Tile bounds use half-open native coordinates `(x0, y0, x1, y1)`. Stride is tile size minus overlap on each axis. The final tile is clipped to the native level edge, and no redundant tile is emitted after an earlier tile already covers that edge. Every native pixel is covered before tissue filtering. Level-zero starts use floor and ends use ceiling, clipped to the true source extent. Fractional scales can therefore introduce a small conservative overlap in source-coordinate rectangles. These rectangles describe provenance geometry, not a claim that every covered source pixel was independently sampled.
++
++## Conservative tissue filtering
++
++A `TissueMask` is a bounded full-slide grid whose cells uniformly partition the level-zero extent. It is bound to the slide digest and uses `0` for background candidate, `1` for tissue candidate and `2` for unknown. Its byte payload is protected in memory and excluded from representations and plan reports. The caller is responsible for the mask's provenance and qualification.
++
++For each tile, the planner counts mask-cell centers inside its half-open level-zero rectangle. Known tissue percentages are compared using integer arithmetic. A tile with any unknown cell, or no sampled center, is retained with `keep_uncertain_coverage`. A sufficiently high known tissue fraction produces `keep_tissue_candidate`; otherwise it produces `skip_background_candidate`. A zero minimum retains every sampled background tile. Missing masks retain every tile for review.
++
++Every candidate, including exclusions, remains in the plan with coordinates, sampled/tissue/unknown counts and a controlled decision. `selected_tiles` and `iter_batches()` omit only known background candidates. A coarse mask can miss small tissue regions even when a tile contains sample centers. These counts are sample coverage, not pixel-level completeness or a clinical tissue classifier. Validate the mask resolution and filtering policy for the intended slide type, and retain all tiles when that evidence is unavailable.
++
++`mask_from_rgb()` can derive the grid from a caller-supplied RGB thumbnail of at most 512 × 512 pixels. Its explicit `white_floor` requires all channels to meet the background threshold; other pixels with at least `min_chroma` channel spread become tissue candidates. Nonwhite low-chroma pixels remain unknown, preserving dark ink and uncertain regions for review. This deterministic color heuristic needs task-specific qualification. It does not extract a thumbnail from a slide, bundle a pathology dataset or diagnose tissue.
++
++## Resource admission
++
++The planner accepts at most 32 native levels and 4,096 total candidate tiles. It checks candidate counts before building mask indexes or enumerating tiles; filtering cannot be used to justify traversing an unbounded grid. Choose coarser requested levels or a separately managed source partition if a full plan exceeds that ceiling. Native tile sides are at most 8,192 pixels. Mask indexing uses two bounded native-integer prefix arrays of at most 513 × 513 entries each; no slide-sized array is created.
++
++Each tile's declared working bytes equal its actual clipped native area times `working_bytes_per_pixel`. Peak admitted working bytes are `reserved_bytes + largest_selected_tile_bytes × min(max_inflight_tiles, selected_count)`. The plan is rejected if this exceeds `budget_bytes`, including by one byte. All-background plans need only the reserve and emit no inference batches. Different-sized tiles are conservatively charged at the largest selected size for concurrent admission.
++
++The caller must account for every simultaneously resident representation in the per-pixel factor and reserve, including model memory, decoder scratch or compressed-block overhead where applicable. The ceiling bounds these declared working buffers. It is not a measurement of total process RSS, and planner metadata, application objects and an adapter that ignores the contract do not become covered by this estimate. Coordinate and mask limits independently bound the planner's own work. No cloud fallback is selected when admission fails.
++
++## Privacy and reproducibility
++
++The stdlib-only planner performs no network calls, logging or file access. Reports contain source/mask digests, native and source coordinates, level metadata, declared budget factors, mask counts and routing decisions. They contain no filenames, slide images, RGB thumbnails, masks, patient metadata or exception details. Saving the returned JSON persists only that metadata; any later pixel caching or export requires a separate explicit application policy.
++
++`tile_ref` hashes source identity, native level geometry and coordinates. It is a reproducible coordinate reference, not a digest of decoded tile pixels. `plan.digest` binds the complete plan, including thresholds, mask digest and exclusions. Digests and spatial metadata remain linkable provenance records and need application access and retention controls. Every plan retains `review_required: true`; it does not authorize autonomous clinical decisions.
++
++```bash
++.venv/bin/python -m pytest tests/unit/multimodal/vision/pathology/test_slide_tiler.py -q
++```
++
++Synthetic controls cover gigapixel coordinate planning, overlap coverage, multiple levels, fractional scale rounding, source-edge gaps, uncertain masks, threshold boundaries, exact budget rejection, bounded batches, deterministic replay and content-free reporting.
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 9dbc3c5c42..4b837ac3c7 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -419,6 +419,7 @@ nav:
+       - Processing Summary Diffs: multimodal/processing-diffs.md
+       - Content-free Provider Results: multimodal/provider-results.md
+       - Offline Edge-VLM Provider Contract: multimodal/vision/edge-vlm-provider-contract.md
++      - Whole-slide Tile Planning: multimodal/vision/whole-slide-tiling.md
+       - Image Quality and Abstention: multimodal/vision/quality-abstention.md
+       - Fused Image-Text Evidence: multimodal/fused-evidence-graphs.md
+       - Streaming Audio Windows: multimodal/audio-windows.md
+diff --git a/openmed/multimodal/vision/__init__.py b/openmed/multimodal/vision/__init__.py
+index 00c0a3950c..700015e33a 100644
+--- a/openmed/multimodal/vision/__init__.py
++++ b/openmed/multimodal/vision/__init__.py
+@@ -7,6 +7,6 @@
+ 
+ from __future__ import annotations
+ 
+-from . import runtime, safety
++from . import pathology, runtime, safety
+ 
+-__all__ = ["runtime", "safety"]
++__all__ = ["runtime", "pathology", "safety"]
+diff --git a/openmed/multimodal/vision/pathology/__init__.py b/openmed/multimodal/vision/pathology/__init__.py
+new file mode 100644
+index 0000000000..ff1785fc29
+--- /dev/null
++++ b/openmed/multimodal/vision/pathology/__init__.py
+@@ -0,0 +1,25 @@
++"""Bounded whole-slide planning without source-slide decoding or persistence."""
++
++from .slide_tiler import (
++    PyramidLevel,
++    SlideTile,
++    SlideTileError,
++    SlideTilePlan,
++    TileDecision,
++    TilePolicy,
++    TissueMask,
++    mask_from_rgb,
++    plan_slide_tiles,
++)
++
++__all__ = [
++    "PyramidLevel",
++    "SlideTile",
++    "SlideTileError",
++    "SlideTilePlan",
++    "TileDecision",
++    "TilePolicy",
++    "TissueMask",
++    "mask_from_rgb",
++    "plan_slide_tiles",
++]
+diff --git a/openmed/multimodal/vision/pathology/slide_tiler.py b/openmed/multimodal/vision/pathology/slide_tiler.py
+new file mode 100644
+index 0000000000..90d838e7c1
+--- /dev/null
++++ b/openmed/multimodal/vision/pathology/slide_tiler.py
+@@ -0,0 +1,468 @@
++"""Deterministic multiresolution tile plans with bounded mask and buffer work."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++import re
++from array import array
++from dataclasses import asdict, dataclass, field
++from enum import Enum
++from typing import Any, Iterator
++
++SLIDE_TILE_SCHEMA_VERSION = "openmed.vision.slide_tiles.v1"
++MAX_LEVELS = 32
++MAX_TILES = 4096
++MAX_MASK_SIDE = 512
++MAX_SLIDE_SIDE = 1_000_000_000
++MAX_MEMORY_BYTES = (1 << 63) - 1
++_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
++
++
++class SlideTileError(ValueError):
++    """Value-free rejection before a partial plan or pixel allocation is returned."""
++
++
++class TileDecision(str, Enum):
++    """Coarse-mask routing, never a clinical tissue classification."""
++
++    KEEP = "keep_tissue_candidate"
++    REVIEW = "keep_uncertain_coverage"
++    SKIP = "skip_background_candidate"
++
++
++def _require(condition: bool) -> None:
++    if not condition:
++        raise SlideTileError("invalid slide tile plan")
++
++
++def _integer(value: object, minimum: int, maximum: int) -> None:
++    _require(type(value) is int and minimum <= value <= maximum)
++
++
++def _digest(value: object) -> None:
++    _require(type(value) is str and _DIGEST.fullmatch(value) is not None)
++
++
++def _hash(payload: Any) -> str:
++    return hashlib.sha256(
++        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
++    ).hexdigest()
++
++
++def _ceil_div(numerator: int, denominator: int) -> int:
++    return -(-numerator // denominator)
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class PyramidLevel:
++    """Declared native level geometry with an explicit rational downsample.
++
++    Args:
++        index: Native pyramid level index, not a filename or slide identifier.
++        width: Native level width in pixels.
++        height: Native level height in pixels.
++        scale_numerator: Numerator of the native-to-level-zero pixel scale.
++        scale_denominator: Denominator, coprime to the numerator.
++
++    Both axes use the declared scale. Rounded level dimensions do not redefine
++    that scale. The planner reports source edge gaps caused by rounded metadata.
++    """
++
++    index: int
++    width: int
++    height: int
++    scale_numerator: int
++    scale_denominator: int = 1
++
++    def __post_init__(self) -> None:
++        _integer(self.index, 0, MAX_LEVELS - 1)
++        for side in (self.width, self.height):
++            _integer(side, 1, MAX_SLIDE_SIDE)
++        _integer(self.scale_numerator, 1, MAX_SLIDE_SIDE)
++        _integer(self.scale_denominator, 1, MAX_SLIDE_SIDE)
++        _require(self.scale_numerator >= self.scale_denominator)
++        _require(math.gcd(self.scale_numerator, self.scale_denominator) == 1)
++        _require((self.index == 0) == (self.scale_numerator == self.scale_denominator))
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class TilePolicy:
++    """Explicit geometry and declared concurrent working-buffer ceiling.
++
++    Args:
++        width: Maximum native tile width, at most 8192 pixels.
++        height: Maximum native tile height, at most 8192 pixels.
++        overlap_x: Horizontal overlap; must be smaller than width.
++        overlap_y: Vertical overlap; must be smaller than height.
++        working_bytes_per_pixel: All simultaneous decoded/input/output/scratch
++            bytes per pixel required by the caller's tile adapter.
++        max_inflight_tiles: Maximum number of concurrently resident tile buffers.
++        budget_bytes: Ceiling for reserved bytes plus admitted working buffers.
++        reserved_bytes: Model, decoder and other caller-accounted memory reserve.
++        min_tissue_percent: Minimum known tissue-cell percentage to retain a tile.
++            Unknown or unsampled coverage is always retained for review.
++    """
++
++    width: int
++    height: int
++    overlap_x: int
++    overlap_y: int
++    working_bytes_per_pixel: int
++    max_inflight_tiles: int
++    budget_bytes: int
++    reserved_bytes: int
++    min_tissue_percent: int
++
++    def __post_init__(self) -> None:
++        _integer(self.width, 1, 8192)
++        _integer(self.height, 1, 8192)
++        _integer(self.overlap_x, 0, self.width - 1)
++        _integer(self.overlap_y, 0, self.height - 1)
++        _integer(self.working_bytes_per_pixel, 1, 4096)
++        _integer(self.max_inflight_tiles, 1, MAX_TILES)
++        _integer(self.budget_bytes, 1, MAX_MEMORY_BYTES)
++        _integer(self.reserved_bytes, 0, self.budget_bytes - 1)
++        _integer(self.min_tissue_percent, 0, 100)
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class TissueMask:
++    """Protected coarse full-slide mask; 0=background, 1=tissue candidate, 2=unknown.
++
++    Args:
++        source_digest: Digest of the caller-owned slide this mask represents.
++        width: Mask columns, at most 512.
++        height: Mask rows, at most 512.
++        cells: Row-major bytes. No RGB image or mask is included in plan reports.
++
++    Cells uniformly partition the full level-zero extent. Caller-provided masks
++    must follow that convention and preserve unknown classifications as 2.
++    """
++
++    source_digest: str
++    width: int
++    height: int
++    cells: bytes = field(repr=False)
++
++    def __post_init__(self) -> None:
++        _digest(self.source_digest)
++        _integer(self.width, 1, MAX_MASK_SIDE)
++        _integer(self.height, 1, MAX_MASK_SIDE)
++        _require(
++            type(self.cells) is bytes and len(self.cells) == self.width * self.height
++        )
++        _require(all(value in (0, 1, 2) for value in self.cells))
++
++    @property
++    def digest(self) -> str:
++        """Bind coverage to mask geometry, classes and the caller's slide digest."""
++        return _hash(
++            [
++                self.source_digest,
++                self.width,
++                self.height,
++                hashlib.sha256(self.cells).hexdigest(),
++            ]
++        )
++
++
++def mask_from_rgb(
++    source_digest: str,
++    width: int,
++    height: int,
++    data: bytes,
++    *,
++    white_floor: int,
++    min_chroma: int,
++) -> TissueMask:
++    """Classify a bounded caller-owned RGB thumbnail without decoding a slide.
++
++    Args:
++        source_digest: Digest of the source slide, assigned by its owner.
++        width: Thumbnail width, at most 512.
++        height: Thumbnail height, at most 512.
++        data: Protected RGB bytes, row-major with no padding or metadata.
++        white_floor: All three channels must meet this threshold for background.
++        min_chroma: Minimum max-minus-min channel difference for a tissue candidate.
++
++    Returns:
++        A coarse mask. Nonwhite, low-chroma pixels remain unknown, so dark ink or
++        uncertain regions are not silently discarded. Thresholds require task
++        qualification; this is a color heuristic, not tissue identification.
++    """
++    _digest(source_digest)
++    _integer(width, 1, MAX_MASK_SIDE)
++    _integer(height, 1, MAX_MASK_SIDE)
++    _integer(white_floor, 1, 255)
++    _integer(min_chroma, 1, 255)
++    _require(type(data) is bytes and len(data) == width * height * 3)
++    cells = bytearray()
++    for offset in range(0, len(data), 3):
++        channels = data[offset : offset + 3]
++        cells.append(
++            0
++            if min(channels) >= white_floor
++            else 1
++            if max(channels) - min(channels) >= min_chroma
++            else 2
++        )
++    return TissueMask(
++        source_digest=source_digest, width=width, height=height, cells=bytes(cells)
++    )
++
++
++@dataclass(frozen=True, slots=True)
++class SlideTile:
++    """One immutable tile, including auditable exclusions and mask uncertainty."""
++
++    tile_ref: str
++    level: int
++    bounds: tuple[int, int, int, int]
++    source_bounds: tuple[int, int, int, int]
++    working_bytes: int
++    sampled_cells: int
++    tissue_cells: int
++    unknown_cells: int
++    decision: TileDecision
++
++
++@dataclass(frozen=True, slots=True)
++class SlideTilePlan:
++    """Coordinates and metadata only; no slide, thumbnail, mask or tile payload."""
++
++    source_digest: str
++    source_width: int
++    source_height: int
++    levels: tuple[PyramidLevel, ...]
++    policy: TilePolicy
++    mask_digest: str | None
++    tiles: tuple[SlideTile, ...]
++    peak_working_bytes: int
++
++    @property
++    def selected_tiles(self) -> tuple[SlideTile, ...]:
++        """Return kept and review-required tiles in native level/row/column order."""
++        return tuple(
++            tile for tile in self.tiles if tile.decision is not TileDecision.SKIP
++        )
++
++    def iter_batches(self) -> Iterator[tuple[SlideTile, ...]]:
++        """Yield ordered batches within the declared concurrent tile limit.
++
++        Adapters must release a batch's buffers before allocating the next one.
++        This iterator contains metadata only and cannot enforce adapter behavior.
++        """
++        selected = self.selected_tiles
++        count = self.policy.max_inflight_tiles
++        for start in range(0, len(selected), count):
++            yield selected[start : start + count]
++
++    def to_dict(self) -> dict[str, Any]:
++        """Export stable coordinates, digests, declared budgets and mask counts."""
++        return {
++            "schema_version": SLIDE_TILE_SCHEMA_VERSION,
++            "source_digest": self.source_digest,
++            "source_width": self.source_width,
++            "source_height": self.source_height,
++            "levels": [asdict(level) for level in self.levels],
++            "source_edge_gaps": [
++                {
++                    "level": level.index,
++                    "right_pixels": max(
++                        0,
++                        self.source_width
++                        - _ceil_div(
++                            level.width * level.scale_numerator, level.scale_denominator
++                        ),
++                    ),
++                    "bottom_pixels": max(
++                        0,
++                        self.source_height
++                        - _ceil_div(
++                            level.height * level.scale_numerator,
++                            level.scale_denominator,
++                        ),
++                    ),
++                }
++                for level in self.levels
++            ],
++            "policy": asdict(self.policy),
++            "mask_digest": self.mask_digest,
++            "tiles": [asdict(tile) for tile in self.tiles],
++            "selected_count": len(self.selected_tiles),
++            "peak_working_bytes": self.peak_working_bytes,
++            "review_required": True,
++        }
++
++    def to_json(self) -> str:
++        """Return deterministic JSON without writing any source or tile to disk."""
++        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
++
++    @property
++    def digest(self) -> str:
++        """Digest the complete coordinate/quality plan, not decoded image pixels."""
++        return hashlib.sha256(self.to_json().encode()).hexdigest()
++
++
++class _MaskIndex:
++    def __init__(self, mask: TissueMask) -> None:
++        self.width, self.height = mask.width, mask.height
++        self.stride = mask.width + 1
++        size = self.stride * (mask.height + 1)
++        # At most two bounded (513 x 513) native-integer prefix arrays.
++        self.tissue = array("I", [0]) * size
++        self.unknown = array("I", [0]) * size
++        for y in range(mask.height):
++            tissue = unknown = 0
++            for x in range(mask.width):
++                value = mask.cells[y * mask.width + x]
++                tissue += value == 1
++                unknown += value == 2
++                i = (y + 1) * self.stride + x + 1
++                self.tissue[i] = self.tissue[i - self.stride] + tissue
++                self.unknown[i] = self.unknown[i - self.stride] + unknown
++
++    def counts(
++        self, bounds: tuple[int, int, int, int], width: int, height: int
++    ) -> tuple[int, int, int]:
++        x0, y0, x1, y1 = bounds
++        # Select cell centers in the half-open source rectangle using integers.
++        left = max(0, _ceil_div(2 * x0 * self.width - width, 2 * width))
++        right = min(self.width, _ceil_div(2 * x1 * self.width - width, 2 * width))
++        top = max(0, _ceil_div(2 * y0 * self.height - height, 2 * height))
++        bottom = min(self.height, _ceil_div(2 * y1 * self.height - height, 2 * height))
++
++        def total(values: array[int]) -> int:
++            a, b = top * self.stride, bottom * self.stride
++            return (
++                values[b + right]
++                - values[b + left]
++                - values[a + right]
++                + values[a + left]
++            )
++
++        return (right - left) * (bottom - top), total(self.tissue), total(self.unknown)
++
++
++def plan_slide_tiles(
++    source_digest: str,
++    source_width: int,
++    source_height: int,
++    levels: tuple[PyramidLevel, ...],
++    policy: TilePolicy,
++    *,
++    tissue_mask: TissueMask | None = None,
++) -> SlideTilePlan:
++    """Plan bounded native-level tiles without opening or decoding a source slide.
++
++    Args:
++        source_digest: Digest binding the caller-owned slide to this plan.
++        source_width: Full level-zero width.
++        source_height: Full level-zero height.
++        levels: Requested native levels with explicit scale and geometry.
++        policy: Overlap, filtering and declared working-buffer limits.
++        tissue_mask: Optional coarse full-slide mask; missing or unknown coverage
++            retains tiles for review rather than assuming background.
++
++    Returns:
++        A complete plan, including skipped tiles and any source edge gaps.
++
++    Raises:
++        SlideTileError: Invalid metadata, more than 4096 candidate tiles, a mask
++            for another source, or declared concurrent buffers exceeding budget.
++    """
++    _digest(source_digest)
++    _integer(source_width, 1, MAX_SLIDE_SIDE)
++    _integer(source_height, 1, MAX_SLIDE_SIDE)
++    _require(type(policy) is TilePolicy)
++    _require(type(levels) is tuple and 0 < len(levels) <= MAX_LEVELS)
++    _require(all(type(level) is PyramidLevel for level in levels))
++    _require(len({level.index for level in levels}) == len(levels))
++    ordered = tuple(sorted(levels, key=lambda level: level.index))
++    grids = []
++    candidate_count = 0
++    sx, sy = policy.width - policy.overlap_x, policy.height - policy.overlap_y
++    for level in ordered:
++        n, d = level.scale_numerator, level.scale_denominator
++        _require(abs(level.width * n - source_width * d) < n)
++        _require(abs(level.height * n - source_height * d) < n)
++        columns = 1 + _ceil_div(max(0, level.width - policy.width), sx)
++        rows = 1 + _ceil_div(max(0, level.height - policy.height), sy)
++        candidate_count += columns * rows
++        _require(candidate_count <= MAX_TILES)
++        grids.append((level, columns, rows))
++    for left, right in zip(ordered, ordered[1:]):
++        _require(left.width >= right.width and left.height >= right.height)
++        _require(
++            left.scale_numerator * right.scale_denominator
++            < right.scale_numerator * left.scale_denominator
++        )
++    if tissue_mask is not None:
++        _require(
++            type(tissue_mask) is TissueMask
++            and tissue_mask.source_digest == source_digest
++        )
++    index = _MaskIndex(tissue_mask) if tissue_mask is not None else None
++    tiles = []
++    max_working = selected_count = 0
++    for level, columns, rows in grids:
++        n, d = level.scale_numerator, level.scale_denominator
++        for row in range(rows):
++            for column in range(columns):
++                x, y = column * sx, row * sy
++                end_x, end_y = (
++                    min(level.width, x + policy.width),
++                    min(level.height, y + policy.height),
++                )
++                bounds = (x, y, end_x, end_y)
++                source_bounds = (
++                    x * n // d,
++                    y * n // d,
++                    min(source_width, _ceil_div(end_x * n, d)),
++                    min(source_height, _ceil_div(end_y * n, d)),
++                )
++                sampled, tissue, unknown = (
++                    index.counts(source_bounds, source_width, source_height)
++                    if index
++                    else (0, 0, 0)
++                )
++                decision = (
++                    TileDecision.REVIEW
++                    if unknown or not sampled
++                    else TileDecision.KEEP
++                    if tissue * 100 >= sampled * policy.min_tissue_percent
++                    else TileDecision.SKIP
++                )
++                working = (end_x - x) * (end_y - y) * policy.working_bytes_per_pixel
++                if decision is not TileDecision.SKIP:
++                    max_working = max(max_working, working)
++                    selected_count += 1
++                tiles.append(
++                    SlideTile(
++                        _hash([source_digest, asdict(level), bounds]),
++                        level.index,
++                        bounds,
++                        source_bounds,
++                        working,
++                        sampled,
++                        tissue,
++                        unknown,
++                        decision,
++                    )
++                )
++    peak = policy.reserved_bytes + max_working * min(
++        policy.max_inflight_tiles, selected_count
++    )
++    _require(peak <= policy.budget_bytes)
++    return SlideTilePlan(
++        source_digest,
++        source_width,
++        source_height,
++        ordered,
++        policy,
++        tissue_mask.digest if tissue_mask else None,
++        tuple(tiles),
++        peak,
++    )
+diff --git a/tests/unit/multimodal/vision/pathology/__init__.py b/tests/unit/multimodal/vision/pathology/__init__.py
+new file mode 100644
+index 0000000000..d93bdb724e
+--- /dev/null
++++ b/tests/unit/multimodal/vision/pathology/__init__.py
+@@ -0,0 +1 @@
++"""Synthetic whole-slide coordinate and admission controls."""
+diff --git a/tests/unit/multimodal/vision/pathology/test_slide_tiler.py b/tests/unit/multimodal/vision/pathology/test_slide_tiler.py
+new file mode 100644
+index 0000000000..41bdd03ee3
+--- /dev/null
++++ b/tests/unit/multimodal/vision/pathology/test_slide_tiler.py
+@@ -0,0 +1,341 @@
++"""Multiresolution coverage, conservative filtering and bounded tile work."""
++
++import json
++import socket
++from dataclasses import replace
++
++import pytest
++
++from openmed.multimodal.vision.pathology import (
++    PyramidLevel,
++    SlideTileError,
++    TileDecision,
++    TilePolicy,
++    TissueMask,
++    mask_from_rgb,
++    plan_slide_tiles,
++)
++
++SOURCE = "a" * 64
++
++
++@pytest.fixture
++def policy():
++    return TilePolicy(
++        width=4,
++        height=3,
++        overlap_x=1,
++        overlap_y=1,
++        working_bytes_per_pixel=12,
++        max_inflight_tiles=2,
++        budget_bytes=4096,
++        reserved_bytes=128,
++        min_tissue_percent=25,
++    )
++
++
++def level(width, height, index=0, numerator=1, denominator=1):
++    return PyramidLevel(
++        index=index,
++        width=width,
++        height=height,
++        scale_numerator=numerator,
++        scale_denominator=denominator,
++    )
++
++
++def mask(width, height, cells, source=SOURCE):
++    return TissueMask(
++        source_digest=source, width=width, height=height, cells=bytes(cells)
++    )
++
++
++def test_overlap_covers_native_geometry_with_no_redundant_terminal_tiles(policy):
++    plan = plan_slide_tiles(SOURCE, 9, 7, (level(9, 7),), policy)
++    assert len(plan.tiles) == 9
++    assert plan.tiles[0].bounds == (0, 0, 4, 3)
++    assert plan.tiles[-1].bounds == (6, 4, 9, 7)
++    assert all(tile.bounds == tile.source_bounds for tile in plan.tiles)
++    for y in range(7):
++        for x in range(9):
++            assert any(
++                t.bounds[0] <= x < t.bounds[2] and t.bounds[1] <= y < t.bounds[3]
++                for t in plan.tiles
++            )
++    assert all(t.decision is TileDecision.REVIEW for t in plan.tiles)
++    assert all(t.sampled_cells == 0 for t in plan.tiles)
++
++
++def test_multiresolution_order_ids_and_json_are_deterministic_without_network(
++    policy, monkeypatch
++):
++    def deny(*args, **kwargs):
++        pytest.fail("unexpected network")
++
++    monkeypatch.setattr(socket, "socket", deny)
++    levels = (level(9, 7), level(5, 4, 1, 2))
++    first = plan_slide_tiles(SOURCE, 9, 7, levels, policy)
++    second = plan_slide_tiles(SOURCE, 9, 7, levels[::-1], policy)
++    assert first.to_json() == second.to_json() and first.digest == second.digest
++    assert len({t.tile_ref for t in first.tiles}) == len(first.tiles)
++    assert first.levels == levels
++    assert first.tiles[-1].source_bounds == (6, 4, 9, 7)
++    changed = plan_slide_tiles("b" * 64, 9, 7, levels, policy)
++    assert changed.tiles[0].tile_ref != first.tiles[0].tile_ref
++
++
++def test_fractional_native_scale_uses_outward_rounding_and_reports_source_edge_gaps(
++    policy,
++):
++    policy = replace(policy, width=1, height=1, overlap_x=0, overlap_y=0)
++    plan = plan_slide_tiles(SOURCE, 11, 6, (level(4, 2, 1, 5, 2),), policy)
++    assert plan.tiles[1].bounds == (1, 0, 2, 1)
++    assert plan.tiles[1].source_bounds == (2, 0, 5, 3)
++    assert plan.tiles[-1].source_bounds == (7, 2, 10, 5)
++    assert plan.to_dict()["source_edge_gaps"] == [
++        {"level": 1, "right_pixels": 1, "bottom_pixels": 1}
++    ]
++
++
++def test_color_mask_preserves_uncertain_dark_regions_without_retaining_rgb():
++    rgb = bytes([250, 250, 250, 160, 50, 120, 20, 20, 20])
++    tissue = mask_from_rgb(SOURCE, 3, 1, rgb, white_floor=240, min_chroma=30)
++    assert tissue.cells == b"\x00\x01\x02"
++    assert "cells=" not in repr(tissue)
++    assert rgb.hex() not in repr(tissue)
++    assert tissue.digest == mask(3, 1, [0, 1, 2]).digest
++    assert tissue.digest != mask(1, 3, [0, 1, 2]).digest
++
++
++def test_tissue_filter_retains_unknowns_and_records_background_exclusions(policy):
++    policy = replace(policy, width=4, height=4, overlap_x=0, overlap_y=0)
++    tissue = mask(6, 2, [1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2])
++    plan = plan_slide_tiles(SOURCE, 12, 4, (level(12, 4),), policy, tissue_mask=tissue)
++    assert [t.decision for t in plan.tiles] == [
++        TileDecision.KEEP,
++        TileDecision.SKIP,
++        TileDecision.REVIEW,
++    ]
++    assert [(t.sampled_cells, t.tissue_cells, t.unknown_cells) for t in plan.tiles] == [
++        (4, 2, 0),
++        (4, 0, 0),
++        (4, 0, 1),
++    ]
++    assert plan.selected_tiles == (plan.tiles[0], plan.tiles[2])
++    report = plan.to_dict()
++    assert len(report["tiles"]) == 3 and report["selected_count"] == 2
++    assert report["mask_digest"] == tissue.digest
++    assert "cells" not in report and "data" not in report
++
++
++def test_tissue_percent_boundary_is_inclusive_and_zero_can_disable_background_filter(
++    policy,
++):
++    policy = replace(policy, width=4, height=4, overlap_x=0, overlap_y=0)
++    tissue = mask(2, 2, [1, 0, 0, 0])
++    assert (
++        plan_slide_tiles(SOURCE, 4, 4, (level(4, 4),), policy, tissue_mask=tissue)
++        .tiles[0]
++        .decision
++        is TileDecision.KEEP
++    )
++    assert (
++        plan_slide_tiles(
++            SOURCE,
++            4,
++            4,
++            (level(4, 4),),
++            replace(policy, min_tissue_percent=26),
++            tissue_mask=tissue,
++        )
++        .tiles[0]
++        .decision
++        is TileDecision.SKIP
++    )
++    background = mask(1, 1, [0])
++    assert (
++        plan_slide_tiles(
++            SOURCE,
++            4,
++            4,
++            (level(4, 4),),
++            replace(policy, min_tissue_percent=0),
++            tissue_mask=background,
++        )
++        .tiles[0]
++        .decision
++        is TileDecision.KEEP
++    )
++
++
++def test_mask_cell_centers_use_half_open_bounds_and_unsampled_tiles_are_retained(
++    policy,
++):
++    policy = replace(policy, width=2, height=2, overlap_x=0, overlap_y=0)
++    tissue = mask(1, 1, [0])
++    plan = plan_slide_tiles(SOURCE, 4, 4, (level(4, 4),), policy, tissue_mask=tissue)
++    assert [t.sampled_cells for t in plan.tiles] == [0, 0, 0, 1]
++    assert [t.decision for t in plan.tiles] == [TileDecision.REVIEW] * 3 + [
++        TileDecision.SKIP
++    ]
++
++
++def test_declared_concurrent_buffers_reject_over_budget_without_partial_plan(policy):
++    policy = replace(
++        policy, width=4, height=4, overlap_x=0, overlap_y=0, reserved_bytes=100
++    )
++    required = 100 + 2 * 4 * 4 * 12
++    exact = plan_slide_tiles(
++        SOURCE, 8, 4, (level(8, 4),), replace(policy, budget_bytes=required)
++    )
++    assert exact.peak_working_bytes == required
++    with pytest.raises(SlideTileError):
++        plan_slide_tiles(
++            SOURCE, 8, 4, (level(8, 4),), replace(policy, budget_bytes=required - 1)
++        )
++    one = plan_slide_tiles(
++        SOURCE,
++        8,
++        4,
++        (level(8, 4),),
++        replace(policy, max_inflight_tiles=1, budget_bytes=100 + 4 * 4 * 12),
++    )
++    assert [len(batch) for batch in one.iter_batches()] == [1, 1]
++    assert tuple(t for batch in one.iter_batches() for t in batch) == one.selected_tiles
++
++
++def test_all_background_plan_needs_no_tile_buffers_and_emits_no_batches(policy):
++    policy = replace(
++        policy,
++        width=4,
++        height=4,
++        overlap_x=0,
++        overlap_y=0,
++        reserved_bytes=8,
++        budget_bytes=9,
++    )
++    plan = plan_slide_tiles(
++        SOURCE, 4, 4, (level(4, 4),), policy, tissue_mask=mask(1, 1, [0])
++    )
++    assert plan.peak_working_bytes == 8
++    assert plan.selected_tiles == () and list(plan.iter_batches()) == []
++    assert len(plan.tiles) == 1
++
++
++def test_gigapixel_plan_never_materializes_source_pixels(policy):
++    policy = replace(
++        policy,
++        width=1024,
++        height=1024,
++        overlap_x=32,
++        overlap_y=32,
++        working_bytes_per_pixel=8,
++        budget_bytes=20 * 1024 * 1024,
++    )
++    plan = plan_slide_tiles(
++        SOURCE, 40000, 40000, (level(40000, 40000), level(10000, 10000, 1, 4)), policy
++    )
++    assert len(plan.tiles) < 4096
++    assert plan.peak_working_bytes <= policy.budget_bytes
++    assert plan.tiles[-1].source_bounds[2:] == (40000, 40000)
++
++
++def test_candidate_limit_precedes_mask_index_or_tile_enumeration(policy, monkeypatch):
++    from openmed.multimodal.vision.pathology import slide_tiler
++
++    def fail(*args, **kwargs):
++        pytest.fail("mask allocation preceded candidate admission")
++
++    monkeypatch.setattr(slide_tiler, "_MaskIndex", fail)
++    with pytest.raises(SlideTileError):
++        plan_slide_tiles(
++            SOURCE,
++            1_000_000,
++            1_000_000,
++            (level(1_000_000, 1_000_000),),
++            policy,
++            tissue_mask=mask(1, 1, [1]),
++        )
++
++
++def test_prefix_counts_match_cell_centers_at_fractional_source_boundaries(policy):
++    tissue = mask(5, 3, [i % 3 for i in range(15)])
++    plan = plan_slide_tiles(
++        SOURCE, 11, 7, (level(11, 7), level(7, 5, 1, 3, 2)), policy, tissue_mask=tissue
++    )
++    for tile in plan.tiles:
++        x0, y0, x1, y1 = tile.source_bounds
++        cells = [
++            tissue.cells[y * 5 + x]
++            for y in range(3)
++            for x in range(5)
++            if 2 * x0 * 5 <= (2 * x + 1) * 11 < 2 * x1 * 5
++            and 2 * y0 * 3 <= (2 * y + 1) * 7 < 2 * y1 * 3
++        ]
++        assert (tile.sampled_cells, tile.tissue_cells, tile.unknown_cells) == (
++            len(cells),
++            cells.count(1),
++            cells.count(2),
++        )
++
++
++@pytest.mark.parametrize(
++    "levels",
++    [
++        (),
++        (level(9, 7), level(9, 7)),
++        (level(8, 7),),
++        (level(5, 4, 1, 2), level(6, 5, 2, 3, 2)),
++        (level(8, 6, 1, 11, 10), level(9, 7, 2, 10, 9)),
++    ],
++)
++def test_inconsistent_pyramid_metadata_fails_closed(policy, levels):
++    with pytest.raises(SlideTileError, match="^invalid slide tile plan$"):
++        plan_slide_tiles(SOURCE, 9, 7, levels, policy)
++
++
++@pytest.mark.parametrize(
++    "change",
++    [
++        {"width": 0},
++        {"height": True},
++        {"overlap_x": 4},
++        {"working_bytes_per_pixel": 0},
++        {"max_inflight_tiles": 0},
++        {"budget_bytes": 128},
++        {"min_tissue_percent": 101},
++    ],
++)
++def test_invalid_policy_never_echoes_inputs(policy, change):
++    with pytest.raises(SlideTileError, match="^invalid slide tile plan$"):
++        replace(policy, **change)
++
++
++def test_malformed_masks_and_cross_source_mask_fail_without_echo(policy):
++    for cells in (b"\x03", b"SYNTHETIC-PRIVATE"):
++        with pytest.raises(SlideTileError, match="^invalid slide tile plan$"):
++            mask(1, 1, cells)
++    with pytest.raises(SlideTileError):
++        plan_slide_tiles(
++            SOURCE, 9, 7, (level(9, 7),), policy, tissue_mask=mask(1, 1, [1], "b" * 64)
++        )
++    with pytest.raises(SlideTileError):
++        mask_from_rgb(
++            SOURCE, 1, 1, b"SYNTHETIC-PRIVATE", white_floor=240, min_chroma=30
++        )
++
++
++def test_report_copies_do_not_mutate_plan_and_contain_no_payloads(policy, caplog):
++    plan = plan_slide_tiles(
++        SOURCE, 9, 7, (level(9, 7),), policy, tissue_mask=mask(1, 1, [2])
++    )
++    original = plan.to_json()
++    report = plan.to_dict()
++    report["tiles"][0]["bounds"] = (99, 99, 100, 100)
++    assert plan.to_json() == original
++    assert json.loads(original)["review_required"] is True
++    assert all(
++        field not in original
++        for field in ('"path":', '"pixels":', '"cells":', '"data":')
++    )
++    assert caplog.records == []

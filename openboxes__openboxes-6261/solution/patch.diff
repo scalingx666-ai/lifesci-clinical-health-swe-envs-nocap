@@ -1,0 +1,183 @@
+diff --git a/src/integration-test/groovy/org/pih/warehouse/api/regression/mobile/ShippingContractSpec.groovy b/src/integration-test/groovy/org/pih/warehouse/api/regression/mobile/ShippingContractSpec.groovy
+index f4f1ddbda0..1cdfdf6f96 100644
+--- a/src/integration-test/groovy/org/pih/warehouse/api/regression/mobile/ShippingContractSpec.groovy
++++ b/src/integration-test/groovy/org/pih/warehouse/api/regression/mobile/ShippingContractSpec.groovy
+@@ -169,6 +169,14 @@ class ShippingContractSpec extends MobileContractSpec {
+ 
+         when:
+         CallResult step1 = call('src/apis/inbound.ts#submitPartialReceiving', [id: s.id], pending)
++        // The pending receipt is delivered "now", stored to the second: the database can round that up to a second
++        // that has not begun yet, and the completed receipt's transaction would then be refused as dated in the
++        // future. A handheld is never that fast; wait until the stored date has passed.
++        Date delivered = Shipment.withNewTransaction { Shipment.get(s.id).receipts*.actualDeliveryDate.max() }
++        long ahead = (delivered?.time ?: 0L) - System.currentTimeMillis()
++        if (ahead >= 0) {
++            sleep(ahead + 1)
++        }
+         Map resp = step1.data.data as Map
+         Map completed = [isShipmentFromPurchaseOrder: resp.isShipmentFromPurchaseOrder, receiptStatus: 'COMPLETED',
+                          containers: (resp.containers as List<Map>).collect { Map c ->
+diff --git a/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/support/ObafIntegrationSpec.groovy b/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/support/ObafIntegrationSpec.groovy
+index 61e8dc5f93..d554ff8ef3 100644
+--- a/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/support/ObafIntegrationSpec.groovy
++++ b/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/support/ObafIntegrationSpec.groovy
+@@ -2,11 +2,16 @@ package org.pih.warehouse.api.regression.obaf.support
+ 
+ import grails.core.GrailsApplication
+ import grails.util.Holders
++import org.pih.warehouse.jobs.AutomaticBackorderReallocationJob
++import org.pih.warehouse.jobs.AutomaticReceiptJob
+ import org.quartz.CronTrigger
++import org.quartz.JobExecutionContext
+ import org.quartz.Scheduler
+ import org.quartz.Trigger
+ import org.quartz.TriggerKey
++import org.quartz.impl.matchers.EverythingMatcher
+ import org.quartz.impl.matchers.GroupMatcher
++import org.quartz.listeners.TriggerListenerSupport
+ import org.springframework.beans.factory.annotation.Autowired
+ 
+ import org.pih.warehouse.api.AvailableItem
+@@ -94,6 +99,7 @@ abstract class ObafIntegrationSpec extends IntegrationSpec {
+     void setup() {
+         config = new ConfigOverride(grailsApplication)
+         pauseCronTriggers()
++        vetoEventScheduledJobs()
+         actAs('admin')
+     }
+ 
+@@ -150,6 +156,37 @@ abstract class ObafIntegrationSpec extends IntegrationSpec {
+         }
+     }
+ 
++    /**
++     * Jobs that application events schedule a second after a shipment changes. Run by the scheduler on its own, they
++     * would race the feature that changed the shipment - for example receive the shipment it is about to receive
++     * itself. Only the runs a feature fires through {@link QuartzRunner} are let through.
++     */
++    static final List<Class> EVENT_SCHEDULED_JOBS = [AutomaticReceiptJob, AutomaticBackorderReallocationJob]
++
++    static final String EVENT_JOB_VETO = 'regression-event-scheduled-job-veto'
++
++    /**
++     * Installs, once per JVM, a trigger listener that vetoes every run of the {@link #EVENT_SCHEDULED_JOBS} not fired
++     * by {@link QuartzRunner}. Quartz asks it on the worker thread just before the job runs, so a run scheduled at
++     * any time (by an event, a resumed cron trigger or an earlier spec) is stopped.
++     */
++    static synchronized void vetoEventScheduledJobs() {
++        Scheduler s = scheduler()
++        if (s.listenerManager.getTriggerListener(EVENT_JOB_VETO)) {
++            return
++        }
++        Set<String> jobNames = EVENT_SCHEDULED_JOBS*.name as Set
++        s.listenerManager.addTriggerListener(new TriggerListenerSupport() {
++            @Override
++            String getName() { return EVENT_JOB_VETO }
++
++            @Override
++            boolean vetoJobExecution(Trigger trigger, JobExecutionContext context) {
++                return context.jobDetail.key.name in jobNames && !context.mergedJobDataMap.containsKey(QuartzRunner.RUN_ID)
++            }
++        }, EverythingMatcher.allTriggers())
++    }
++
+     static synchronized void resumeCronTriggers() {
+         Scheduler s = scheduler()
+         pausedCronTriggers.each { s.resumeTrigger(it) }
+diff --git a/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/support/QuartzRunner.groovy b/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/support/QuartzRunner.groovy
+index 0bccc8c056..dddd545610 100644
+--- a/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/support/QuartzRunner.groovy
++++ b/src/integration-test/groovy/org/pih/warehouse/api/regression/obaf/support/QuartzRunner.groovy
+@@ -24,6 +24,9 @@ import java.util.concurrent.TimeUnit
+  */
+ class QuartzRunner {
+ 
++    /** The JobDataMap key that marks a run fired here (see ObafIntegrationSpec.vetoEventScheduledJobs). */
++    static final String RUN_ID = 'regressionRunId'
++
+     static class Run {
+         JobExecutionException exception
+         boolean finished
+@@ -47,7 +50,7 @@ class QuartzRunner {
+ 
+             @Override
+             void jobWasExecuted(JobExecutionContext context, JobExecutionException jobException) {
+-                if (context.mergedJobDataMap.get('regressionRunId') == runId) {
++                if (context.mergedJobDataMap.get(RUN_ID) == runId) {
+                     run.exception = jobException
+                     done.countDown()
+                 }
+@@ -57,7 +60,7 @@ class QuartzRunner {
+         long start = System.currentTimeMillis()
+         try {
+             JobDataMap map = new JobDataMap(data)
+-            map.put('regressionRunId', runId)
++            map.put(RUN_ID, runId)
+             scheduler.triggerJob(key, map)
+             run.finished = done.await(timeoutMs, TimeUnit.MILLISECONDS)
+         } finally {
+diff --git a/src/integration-test/groovy/org/pih/warehouse/api/regression/platform/common/base/ServiceIntegrationSpec.groovy b/src/integration-test/groovy/org/pih/warehouse/api/regression/platform/common/base/ServiceIntegrationSpec.groovy
+index 0a649c1962..9de3755aaa 100644
+--- a/src/integration-test/groovy/org/pih/warehouse/api/regression/platform/common/base/ServiceIntegrationSpec.groovy
++++ b/src/integration-test/groovy/org/pih/warehouse/api/regression/platform/common/base/ServiceIntegrationSpec.groovy
+@@ -18,6 +18,7 @@ import org.pih.warehouse.inventory.Inventory
+ import org.pih.warehouse.inventory.InventoryItem
+ import org.pih.warehouse.inventory.ProductAvailabilityService
+ import org.pih.warehouse.inventory.Transaction
++import org.pih.warehouse.inventory.TransactionCode
+ import org.pih.warehouse.inventory.TransactionEntry
+ import org.pih.warehouse.inventory.TransactionType
+ import org.pih.warehouse.common.domain.builder.product.CategoryTestBuilder
+@@ -125,26 +126,45 @@ abstract class ServiceIntegrationSpec extends IntegrationSpec {
+         }
+     }
+ 
++    // The default baseline date of stock(): one value for the whole feature, so its baselines can share a transaction
++    protected final Date defaultStockDate = new Date() - 1
++
++    // Baseline transactions made by stock(), by depot, product and date
++    protected final Map<String, String> baselineTransactionIds = [:]
++
+     /**
+      * Records the quantity of a lot of the product in the depot (an inventory baseline entry, dated the day before
+      * by default) and refreshes the product availability of the depot.
++     *
++     * A baseline (any PRODUCT_INVENTORY transaction) is a product-wide count: the latest one replaces every earlier count of the product. So the lots of a
++     * product stocked as baselines at the same date go into one transaction, as in a real count. Separate baselines
++     * with the same date would count all lots or only the last one, depending on whether they were saved in the same
++     * second.
+      */
+     protected InventoryItem stock(Location depot, Product product, String lotNumber, Date expirationDate, int quantity,
+-                                  Location bin = null, Date transactionDate = new Date() - 1,
++                                  Location bin = null, Date transactionDate = null,
+                                   String transactionTypeId = Constants.INVENTORY_BASELINE_TRANSACTION_TYPE_ID) {
++        Date date = transactionDate ?: defaultStockDate
++        String baselineKey = "${depot.id}:${product.id}:${date.time}"
+         InventoryItem inventoryItem = committed {
++            boolean baseline = TransactionType.get(transactionTypeId).transactionCode == TransactionCode.PRODUCT_INVENTORY
+             InventoryItem item = InventoryItem.findByProductAndLotNumber(Product.get(product.id), lotNumber) ?:
+                     new InventoryItem(product: Product.get(product.id), lotNumber: lotNumber, expirationDate: expirationDate)
+                             .save(failOnError: true, flush: true)
+-            Transaction transaction = new Transaction(
+-                    inventory: Location.get(depot.id).inventory,
+-                    transactionType: TransactionType.get(transactionTypeId),
+-                    transactionDate: transactionDate,
+-                    transactionNumber: uniqueName('T'),
+-                    disableRefresh: true)
++            Transaction transaction = baseline && baselineTransactionIds[baselineKey] ?
++                    Transaction.get(baselineTransactionIds[baselineKey]) :
++                    new Transaction(
++                            inventory: Location.get(depot.id).inventory,
++                            transactionType: TransactionType.get(transactionTypeId),
++                            transactionDate: date,
++                            transactionNumber: uniqueName('T'))
++            transaction.disableRefresh = true
+             transaction.addToTransactionEntries(new TransactionEntry(product: item.product, inventoryItem: item, quantity: quantity,
+                     binLocation: bin?.id ? Location.get(bin.id) : null))
+             transaction.save(failOnError: true, flush: true)
++            if (baseline) {
++                baselineTransactionIds[baselineKey] = transaction.id
++            }
+             return item
+         }
+         committed {

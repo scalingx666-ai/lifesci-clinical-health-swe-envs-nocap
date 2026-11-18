@@ -1,0 +1,382 @@
+diff --git a/packages/core/src/command/ai-brief/create.ts b/packages/core/src/command/ai-brief/create.ts
+index 48b9b38283..2fba47aafc 100644
+--- a/packages/core/src/command/ai-brief/create.ts
++++ b/packages/core/src/command/ai-brief/create.ts
+@@ -11,12 +11,20 @@ import { analytics, EventTypes } from "../../external/analytics/posthog";
+ import { getAnthropicModelId } from "../../external/bedrock/model/anthropic/version";
+ import { BedrockChat } from "../../external/langchain/bedrock";
+ import { out } from "../../util";
+-import { isPcpVisitAiSummaryFeatureFlagEnabledForCx } from "../feature-flags/domain-ffs";
++import {
++  isPcpVisitAiSummaryFeatureFlagEnabledForCx,
++  isRecentVisitAiSummaryEnabledForCx,
++} from "../feature-flags/domain-ffs";
+ import {
+   documentVariableName as pcpVisitDocumentVariableName,
+   mainSummaryPrompt as pcpVisitMainSummaryPrompt,
+   refinedSummaryPrompt as pcpVisitRefinedSummaryPrompt,
+ } from "./pcp-visit-prompt";
++import {
++  documentVariableName as recentVisitDocumentVariableName,
++  mainSummaryPrompt as recentVisitMainSummaryPrompt,
++  refinedSummaryPrompt as recentVisitRefinedSummaryPrompt,
++} from "./recent-visit-prompt";
+ import { documentVariableName, mainSummaryPrompt, refinedSummaryPrompt } from "./prompts";
+ import { AiBriefControls } from "./shared";
+ 
+@@ -147,8 +155,17 @@ async function getInputsForAiBriefGeneration(cxId: string): Promise<{
+   refinedPrompt: string;
+   documentVariable: string;
+ }> {
++  const isRecentVisit = await isRecentVisitAiSummaryEnabledForCx(cxId);
+   const isPcpVisit = await isPcpVisitAiSummaryFeatureFlagEnabledForCx(cxId);
+ 
++  if (isRecentVisit) {
++    return {
++      mainPrompt: recentVisitMainSummaryPrompt,
++      refinedPrompt: recentVisitRefinedSummaryPrompt,
++      documentVariable: recentVisitDocumentVariableName,
++    };
++  }
++
+   if (isPcpVisit) {
+     return {
+       mainPrompt: pcpVisitMainSummaryPrompt,
+diff --git a/packages/core/src/command/ai-brief/filter.ts b/packages/core/src/command/ai-brief/filter.ts
+index 31723a4867..16dffafc30 100644
+--- a/packages/core/src/command/ai-brief/filter.ts
++++ b/packages/core/src/command/ai-brief/filter.ts
+@@ -8,6 +8,7 @@ import {
+ } from "@medplum/fhirtypes";
+ import { toArray } from "@metriport/shared";
+ import { buildDayjs, ISO_DATE } from "@metriport/shared/common/date";
++import { Dayjs } from "dayjs";
+ import { cloneDeep } from "lodash";
+ import { condenseBundle } from "../../domain/ai-brief/condense-bundle";
+ import {
+@@ -25,7 +26,9 @@ import { filterBundleByDate } from "../consolidated/consolidated-filter-by-date"
+ import { getDatesFromEffectiveDateTimeOrPeriod } from "../consolidated/consolidated-filter-shared";
+ 
+ const NUM_HISTORICAL_YEARS = 1;
++const MAX_HISTORICAL_YEARS = 2; // Maximum 24 months for recent visit prompt
+ const MAX_REPORTS_PER_GROUP = 3;
++const MIN_RESOURCES_FOR_SUFFICIENT_DATA = 50;
+ 
+ /**
+  * List of resource types that are referenced by other resources but not directly relevant
+@@ -60,10 +63,10 @@ export function prepareBundleForAiSummarization(bundle: Bundle, log: typeof cons
+     .filter((date): date is string => date !== undefined)
+     .sort((a, b) => b.localeCompare(a))[0];
+   const initialDate = latestReportDate ? buildDayjs(latestReportDate) : buildDayjs(new Date());
+-  const dateFrom = initialDate.subtract(NUM_HISTORICAL_YEARS, "year").format(ISO_DATE);
+-  const filteredBundle = filterBundleByDate(bundle, dateFrom);
+-  const slimPayloadBundle = buildSlimmerPayload(filteredBundle);
+-  const bundleText = JSON.stringify(slimPayloadBundle);
++
++  const { finalSlimPayloadBundle, timeframeUsed } = determineOptimalTimeframe(bundle, initialDate);
++
++  const bundleText = JSON.stringify(finalSlimPayloadBundle);
+ 
+   const duration = Date.now() - startedAt;
+   // TODO At some point we should remove this, at least the metrics on initial bundle since we're
+@@ -71,8 +74,9 @@ export function prepareBundleForAiSummarization(bundle: Bundle, log: typeof cons
+   const metrics = {
+     initialBundleSize: bundle.entry?.length,
+     initialBundleBytes: sizeInBytes(JSON.stringify(bundle)),
+-    finalBundleSize: slimPayloadBundle?.length,
++    finalBundleSize: finalSlimPayloadBundle.length,
+     finalBundleBytes: sizeInBytes(bundleText),
++    timeframeUsed,
+     durationMs: duration,
+   };
+   log(`Bundle filtering metrics: ${JSON.stringify(metrics)}`);
+@@ -80,6 +84,37 @@ export function prepareBundleForAiSummarization(bundle: Bundle, log: typeof cons
+   return bundleText;
+ }
+ 
++function determineOptimalTimeframe(
++  bundle: Bundle,
++  initialDate: Dayjs
++): {
++  finalSlimPayloadBundle: SlimResource[];
++  timeframeUsed: number;
++} {
++  const initialStartDate = initialDate.subtract(NUM_HISTORICAL_YEARS, "year").format(ISO_DATE);
++  const filteredBundleOneYear = filterBundleByDate(bundle, initialStartDate);
++  const slimPayloadBundleOneYear = buildSlimmerPayload(filteredBundleOneYear) ?? [];
++  const resourceCount = slimPayloadBundleOneYear.length;
++
++  const hasSufficientData = resourceCount >= MIN_RESOURCES_FOR_SUFFICIENT_DATA;
++
++  if (hasSufficientData) {
++    return {
++      finalSlimPayloadBundle: slimPayloadBundleOneYear,
++      timeframeUsed: NUM_HISTORICAL_YEARS,
++    };
++  }
++
++  const maxStartDate = initialDate.subtract(MAX_HISTORICAL_YEARS, "year").format(ISO_DATE);
++  const finalFilteredBundle = filterBundleByDate(bundle, maxStartDate);
++  const finalSlimPayloadBundle = buildSlimmerPayload(finalFilteredBundle) ?? [];
++
++  return {
++    finalSlimPayloadBundle,
++    timeframeUsed: MAX_HISTORICAL_YEARS,
++  };
++}
++
+ export function buildSlimmerPayload(bundle: Bundle): SlimResource[] | undefined {
+   if (bundle.entry?.length === 0) return undefined;
+ 
+@@ -156,7 +191,7 @@ function removeUselessAttributes(res: Resource) {
+ 
+   // Remove unknown coding displays, empty arrays, and "unknown" string values recursively
+   // eslint-disable-next-line @typescript-eslint/no-explicit-any
+-  const cleanupObject = (obj: any): void => {
++  function cleanupObject(obj: any): void {
+     if (!obj || typeof obj !== "object") return;
+ 
+     if (Array.isArray(obj)) {
+@@ -201,7 +236,7 @@ function removeUselessAttributes(res: Resource) {
+         }
+       }
+     }
+-  };
++  }
+ 
+   cleanupObject(res);
+   return res;
+diff --git a/packages/core/src/command/ai-brief/pcp-visit-prompt.ts b/packages/core/src/command/ai-brief/pcp-visit-prompt.ts
+index e1a75e3b0a..e92387f881 100644
+--- a/packages/core/src/command/ai-brief/pcp-visit-prompt.ts
++++ b/packages/core/src/command/ai-brief/pcp-visit-prompt.ts
+@@ -1,4 +1,6 @@
+-const todaysDate = new Date().toISOString().split("T")[0];
++import { buildDayjs } from "@metriport/shared/common/date";
++
++const todaysDate = buildDayjs().format("YYYY-MM-DD");
+ const systemPrompt =
+   "You are a medical record reviewer and your task is to extract key information from a patient's medical chart. Do not include any demographic information such as name, date of birth, address, or other personal identifiers in your summary.";
+ 
+diff --git a/packages/core/src/command/ai-brief/prompts.ts b/packages/core/src/command/ai-brief/prompts.ts
+index 1523242af7..c4a3910d8b 100644
+--- a/packages/core/src/command/ai-brief/prompts.ts
++++ b/packages/core/src/command/ai-brief/prompts.ts
+@@ -1,4 +1,6 @@
+-const todaysDate = new Date().toISOString().split("T")[0];
++import { buildDayjs } from "@metriport/shared/common/date";
++
++const todaysDate = buildDayjs().format("YYYY-MM-DD");
+ const systemPrompt = "You are an expert primary care doctor.";
+ 
+ export const documentVariableName = "text";
+diff --git a/packages/core/src/command/ai-brief/recent-visit-prompt.ts b/packages/core/src/command/ai-brief/recent-visit-prompt.ts
+new file mode 100644
+index 0000000000..d6968888a3
+--- /dev/null
++++ b/packages/core/src/command/ai-brief/recent-visit-prompt.ts
+@@ -0,0 +1,76 @@
++import { buildDayjs } from "@metriport/shared/common/date";
++
++const todaysDate = buildDayjs().format("YYYY-MM-DD");
++const systemPrompt = `You are a medical record reviewer and your task is to extract key information from a patient's medical chart.
++  Do not include any demographic information such as name, date of birth, address, or other personal identifiers in your summary.`;
++
++export const documentVariableName = "text";
++
++const instructions = `
++Instructions:
++
++Review the patient medical records and format the output EXACTLY as follows, including the bullet points and indentation:
++    PCP Visits (up to last 24 months)
++    - [PCP Name], [PCP Specialty]
++      - [Visit Date MM/DD/YYYY]
++    - [PCP Name], [PCP Specialty]
++      - [Visit Date MM/DD/YYYY]
++
++Problem List (up to last 24 months):
++For any condition found, provide the most recent diagnosis date from the patient's record.
++  - [Condition] ([MM/DD/YYYY])
++  - [Condition] ([MM/DD/YYYY])
++Make sure any HCCs or Conditions are flagged.
++
++Medications Prescribed (up to last 24 months):
++Only include medications that have a MedicationRequest (prescription).
++For each prescription found, provide the prescription date from the MedicationRequest.
++  - [Medication Name] ([Prescription Date MM/DD/YYYY])
++   - [Medication Name] ([Prescription Date MM/DD/YYYY])
++
++For the PCP visit:
++- Find any visit with a provider who is an MD, DO, NP, or PA AND in the specialty of Family Medicine, Internal Medicine, or OB/GYN
++- Group all visits by provider (up to last 24 months).
++- Do not include telephone encounters
++- Provider specialty must be Family Medicine, Internal Medicine, or OB/GYN
++- ONLY include providers where you can clearly see their specialty information in the medical records
++- If a provider's specialty is not clearly documented or is missing, DO NOT include them in the PCP visits list
++
++For PCP name, only include the physician if they are a MD, DO, NP, PA and are associated with the specialty of Family Medicine,
++Internal Medicine or OB/GYN. If you cannot determine their specialty from the available data, exclude them from the list.
++
++CRITICAL DATE FILTERING: All dates must be within the last 24 months from the latest report date.
++The data has already been filtered to include the most relevant timeframe of medical records (up to 24 months maximum).
++
++CRITICAL: If there is no data within the available timeframe (up to 24 months), DO NOT include that section at all.
++Do not show sections with old data. Do not modify dates to make them appear recent.
++
++If any of the above information is not present, do not include that section in the summary at all.
++Do not write "No data available" or similar messages for empty sections - simply omit those sections entirely.
++Don't tell me that you are writing a summary, just write the summary. Also, don't tell me about any limitations of the information provided.
++Consolidate information and link directly to original sources. Avoid any relative terms, e.g. "recently" or "currently." Use specific dates only.
++`;
++
++export const mainSummaryPrompt = `
++${systemPrompt}
++
++Today's date is ${todaysDate}.
++Review the patient medical records:
++--------
++{${documentVariableName}}
++--------
++${instructions}
++`;
++
++export const refinedSummaryPrompt = `
++${systemPrompt}
++
++Today's date is ${todaysDate}.
++Here are the previous summaries written by you of sections of the patient's medical history:
++--------
++{${documentVariableName}}
++--------
++
++Combine these summaries into a single, comprehensive summary.
++Use these ${instructions}.
++`;
+diff --git a/packages/core/src/command/feature-flags/domain-ffs.ts b/packages/core/src/command/feature-flags/domain-ffs.ts
+index b9ffbc9da0..a3682f65bc 100644
+--- a/packages/core/src/command/feature-flags/domain-ffs.ts
++++ b/packages/core/src/command/feature-flags/domain-ffs.ts
+@@ -253,6 +253,14 @@ export async function isPcpVisitAiSummaryFeatureFlagEnabledForCx(cxId: string):
+   return cxIdsWithPcpVisitAiSummaryEnabled.some(i => i === cxId);
+ }
+ 
++export async function getCxsWithRecentVisitAiSummary(): Promise<string[]> {
++  return getCxsWithFeatureFlagEnabled("cxsWithRecentVisitAiSummary");
++}
++export async function isRecentVisitAiSummaryEnabledForCx(cxId: string): Promise<boolean> {
++  const cxIdsWithRecentVisitAiSummaryEnabled = await getCxsWithRecentVisitAiSummary();
++  return cxIdsWithRecentVisitAiSummaryEnabled.some(i => i === cxId);
++}
++
+ export async function getCxsWithHl7NotificationWebhookFeatureFlag(): Promise<string[]> {
+   return getCxsWithFeatureFlagEnabled("cxsWithHl7NotificationWebhookFeatureFlag");
+ }
+diff --git a/packages/core/src/command/feature-flags/ffs-on-dynamodb.ts b/packages/core/src/command/feature-flags/ffs-on-dynamodb.ts
+index 919649c321..7a41199922 100644
+--- a/packages/core/src/command/feature-flags/ffs-on-dynamodb.ts
++++ b/packages/core/src/command/feature-flags/ffs-on-dynamodb.ts
+@@ -60,6 +60,7 @@ export const initialFeatureFlags: FeatureFlagDatastore = {
+   carequalityFeatureFlag: { enabled: false },
+   debugFeatureFlag: { enabled: false },
+   cxsWithPcpVisitAiSummaryFeatureFlag: { enabled: false, values: [] },
++  cxsWithRecentVisitAiSummary: { enabled: false, values: [] },
+   cxsWithHl7NotificationWebhookFeatureFlag: { enabled: false, values: [] },
+   cxsWithDischargeRequeryFeatureFlag: { enabled: false, values: [] },
+   cxsWithDischargeSlackNotificationFeatureFlag: { enabled: false, values: [] },
+diff --git a/packages/core/src/command/feature-flags/types.ts b/packages/core/src/command/feature-flags/types.ts
+index aa1a219565..9d605847bb 100644
+--- a/packages/core/src/command/feature-flags/types.ts
++++ b/packages/core/src/command/feature-flags/types.ts
+@@ -41,6 +41,7 @@ export const cxBasedFFsSchema = z.object({
+   cxsWithStrictMatchingAlgorithm: ffStringValuesSchema,
+   cxsWithAthenaCustomFieldsEnabled: ffStringValuesSchema,
+   cxsWithPcpVisitAiSummaryFeatureFlag: ffStringValuesSchema,
++  cxsWithRecentVisitAiSummary: ffStringValuesSchema,
+   cxsWithHl7NotificationWebhookFeatureFlag: ffStringValuesSchema,
+   cxsWithDischargeSlackNotificationFeatureFlag: ffStringValuesSchema,
+   cxsWithDischargeRequeryFeatureFlag: ffStringValuesSchema,
+diff --git a/packages/core/src/external/aws/lambda-logic/bundle-to-html.ts b/packages/core/src/external/aws/lambda-logic/bundle-to-html.ts
+index cfd1051099..8d6846b582 100644
+--- a/packages/core/src/external/aws/lambda-logic/bundle-to-html.ts
++++ b/packages/core/src/external/aws/lambda-logic/bundle-to-html.ts
+@@ -24,6 +24,8 @@ import { sortObservationsForDisplay } from "@metriport/shared/medical";
+ import dayjs from "dayjs";
+ import { intersection, uniqWith } from "lodash";
+ import { Brief } from "../../../command/ai-brief/brief";
++import { isChronicCondition } from "../../ehr/shared";
++import { HCC_EXTENSION_URL } from "../../fhir/shared/extensions/hcc-extension";
+ import {
+   buildEncounterSections,
+   createBrief,
+@@ -923,7 +925,8 @@ function createMedicationSection(
+   });
+ 
+   const otherMedications = removeDuplicate.filter(
+-    medicationStatement => medicationStatement.status !== ("active" || "unknown")
++    medicationStatement =>
++      medicationStatement.status !== "active" && medicationStatement.status !== "unknown"
+   );
+ 
+   const activeMedications = removeDuplicate.filter(
+@@ -1040,6 +1043,7 @@ type RenderCondition = {
+   firstSeen: string | undefined;
+   lastSeen: string | undefined;
+   clinicalStatus: string;
++  isChronic: boolean;
+ };
+ 
+ function createConditionSection(conditions: Condition[], encounter: Encounter[]) {
+@@ -1093,13 +1097,26 @@ function createConditionSection(conditions: Condition[], encounter: Encounter[])
+         onsetEndTime = conditionDateDict[condition.id]?.end;
+       }
+ 
++      const isChronic = isChronicCondition(condition);
++
++      const hccExtensions = condition.extension?.filter(ext => ext.url === HCC_EXTENSION_URL) ?? [];
++      const hccCodes = hccExtensions
++        .map(ext => {
++          const code = ext.valueCodeableConcept?.coding?.[0]?.code;
++          const version = ext.valueCodeableConcept?.coding?.[0]?.version;
++          return version && code ? `HCC ${version}: ${code}` : "";
++        })
++        .filter(Boolean)
++        .join("; ");
++
+       const newCondition: RenderCondition = {
+         id: condition.id,
+-        code: codeName,
++        code: (codeName ?? "") + (hccCodes ? ` (${hccCodes})` : ""),
+         name,
+         firstSeen: onsetStartTime && onsetStartTime.length ? onsetStartTime : onsetDateTime,
+         lastSeen: onsetEndTime && onsetEndTime.length ? onsetEndTime : onsetDateTime,
+         clinicalStatus,
++        isChronic,
+       };
+ 
+       const existingCondition = acc.find(
+@@ -1170,11 +1187,12 @@ function createConditionSection(conditions: Condition[], encounter: Encounter[])
+ 
+     <thead>
+       <tr>
+-        <th style="width: 40%">Condition</th>
+-        <th style="width: 15%">Code</th>
+-        <th style="width: 15%">First seen</th>
+-        <th style="width: 15%">Last seen</th>
+-        <th style="width: 15%">Status</th>
++        <th style="width: 30%">Condition</th>
++        <th style="width: 25%">Code</th>
++        <th style="width: 10%">Chronic</th>
++        <th style="width: 12%">First seen</th>
++        <th style="width: 12%">Last seen</th>
++        <th style="width: 11%">Status</th>
+       </tr>
+     </thead>
+     <tbody>
+@@ -1184,6 +1202,7 @@ function createConditionSection(conditions: Condition[], encounter: Encounter[])
+             <tr>
+               <td>${condition.name}</td>
+               <td>${condition.code ?? ""}</td>
++              <td>${condition.isChronic ? "Yes" : "No"}</td>
+               <td>${formatDateForDisplay(condition.firstSeen)}</td>
+               <td>${formatDateForDisplay(condition.lastSeen)}</td>
+               <td>${condition.clinicalStatus}</td>

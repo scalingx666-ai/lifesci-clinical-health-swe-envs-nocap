@@ -1,0 +1,800 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5ca8c6a597..2df6056099 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Add an experimental CPU ONNX streaming speech adapter for pinned local character-CTC exports, with bounded timed hypotheses and content-free reports (#3842).
++
+ - Export a strict, self-contained Draft 2020-12 schema for provider capability matrix records, sharing Python identifiers, bounds and outcome/reason combinations (#3118).
+ 
+ - Add offline `openmed multimodal preflight` with opaque reports, bounded headers, shared resource admission and opt-in symlink-safe directory traversal (#3053).
+diff --git a/docs/multimodal/streaming/offline-asr-contract.md b/docs/multimodal/streaming/offline-asr-contract.md
+index 75cadf48e2..a35b592352 100644
+--- a/docs/multimodal/streaming/offline-asr-contract.md
++++ b/docs/multimodal/streaming/offline-asr-contract.md
+@@ -137,3 +137,26 @@ provider, its revision, model fingerprint, lifecycle state and counters. Provide
+ - [ASR audio profiles](../asr-audio-profiles.md)
+ - [OCR through memory](../ocr-streaming.md)
+ - Issue [#2812](https://github.com/maziyarpanahi/openmed/issues/2812)
++
++## Experimental ONNX speech adapter
++
++`openmed.onnx.streaming_asr.OnnxSpeechModel` runs a caller-supplied, self-contained, pinned character-CTC graph on the CPU using the optional `openmed[onnx]` dependencies. This is an experimental Python adapter. It does not qualify a checkpoint, estimate word error rate, ship an Android package, export graphs or transcribe using a remote provider.
++
++Use a trusted local export trained for **this exact frontend**: mono signed 16-bit little-endian PCM at 16 kHz, scaled by 32768; left-aligned periodic 400-sample Hann window, 160-sample hop, 512-point real FFT, squared magnitudes divided by 512, 40 unnormalized triangular HTK mel bands uniformly spaced in mel from 0 to 8 kHz, natural log floored at `1e-10` before taking the log. No pre-emphasis, mean subtraction or centered framing. Short windows are padded with zeros on the right. Input is float32 `features[1,T,40]`; output is float32 `logits[1,T,V]`. Choose 1–3,000 hops; the declared output alignment must be one row per 10 ms. Graphs with external tensor data, runtime-defined shapes, custom operators or nested graphs are refused. The graph digest is checked before graph parsing; signatures are checked before runtime initialization. Trusted pins identify code and assets; static shapes do not make arbitrary graphs safe.
++
++Supply the exact ordered character vocabulary (empty blank at index zero), its SHA-256 from the export manifest, and the model SHA-256. `vocabulary_digest` documents the canonical vocabulary hash: SHA-256 of compact, ASCII-escaped JSON. Use previously verified pins. Sites loading models from a Hub must download them separately; this adapter accepts an absolute local graph path and does not resolve Hub names or media URLs.
++
++```python
++from openmed.onnx.streaming_asr import OnnxSpeechModel, OnnxSpeechProfile
++from openmed.multimodal.streaming.speech.providers import AudioChunk
++
++profile = OnnxSpeechProfile(model_sha256=model_sha256, labels=labels,
++    vocabulary_sha256=vocabulary_sha256, frames=100, language="en")
++stream = OnnxSpeechModel.load(local_onnx_path, profile).open_stream()
++partial = stream.feed(AudioChunk(0, first_pcm, 16000, 1, len(first_pcm) // 32))
++final, aggregate = stream.finish()
++```
++
++Chunks must cover an integer number of milliseconds, with contiguous sequence numbers. Each feed re-decodes the current bounded utterance; `end_segment=True` commits a final segment and frees that window. Split longer speech explicitly before the limit. CTC collapses repeated classes and blanks; padded tail rows are ignored. Token timing is derived from the declared hop alignment. Token confidence is the minimum winning-class softmax probability across its run, not a calibrated clinical score.
++
++Use `stream.cancel()` to discard pending audio and request cancellation of an active native run. A racing result is withheld even when the runtime returns after cancellation. Protected text is available only on the typed hypothesis; serialize the separate `envelope` or `stream.report()` for content-free diagnostics. Hosts must supply consent, retention, review and any required PHI screening before using or releasing a transcript.
+diff --git a/openmed/onnx/streaming_asr.py b/openmed/onnx/streaming_asr.py
+new file mode 100644
+index 0000000000..776012a889
+--- /dev/null
++++ b/openmed/onnx/streaming_asr.py
+@@ -0,0 +1,490 @@
++"""Experimental, offline character-CTC speech inference using a pinned ONNX graph."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++import stat
++import threading
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++from openmed.multimodal.provider_result import (
++    ProviderResultEnvelope,
++    ProviderResultOutcome,
++)
++from openmed.multimodal.streaming.speech.providers import (
++    AudioChunk,
++    FinalizedSegment,
++    PartialHypothesis,
++    ProviderProvenance,
++    SpeechProviderDeclaration,
++    SpeechStreamLimits,
++    StreamingAsrSession,
++    StreamingAsrSessionReport,
++    StreamState,
++    TokenTime,
++)
++
++_MAX_MODEL = 512 * 1024 * 1024
++_RATE = 16000
++_HOP = 160
++_WINDOW = 400
++_FFT = 512
++_MELS = 40
++
++
++class OnnxSpeechError(ValueError):
++    """Fixed-code refusal that never includes samples, paths or transcript text."""
++
++
++def _check(value: bool, reason: str) -> None:
++    if not value:
++        raise OnnxSpeechError(reason)
++
++
++def vocabulary_digest(labels: tuple[str, ...]) -> str:
++    """Hash an ordered character vocabulary, with CTC blank at index zero."""
++    _check(
++        type(labels) is tuple
++        and 2 <= len(labels) <= 1024
++        and labels[0] == ""
++        and all(type(s) is str and len(s) == 1 and s.isprintable() for s in labels[1:])
++        and len(set(labels)) == len(labels),
++        "invalid_vocabulary",
++    )
++    return hashlib.sha256(
++        json.dumps(labels, ensure_ascii=True, separators=(",", ":")).encode()
++    ).hexdigest()
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class OnnxSpeechProfile:
++    """Pins for a single static float32 log-mel to character-logits graph.
++
++    The export must explicitly align one output row to each 10 ms input hop.
++    The supported preprocessing is described in the streaming speech guide.
++    """
++
++    model_sha256: str
++    labels: tuple[str, ...] = field(repr=False)
++    vocabulary_sha256: str
++    frames: int
++    language: str
++
++    def __post_init__(self) -> None:
++        _check(
++            type(self.model_sha256) is str
++            and re.fullmatch(r"[a-f0-9]{64}", self.model_sha256) is not None,
++            "invalid_model_pin",
++        )
++        _check(
++            self.vocabulary_sha256 == vocabulary_digest(self.labels),
++            "vocabulary_digest_mismatch",
++        )
++        _check(type(self.frames) is int and 1 <= self.frames <= 3000, "invalid_window")
++        _check(
++            type(self.language) is str
++            and re.fullmatch(r"[a-z]{2,3}", self.language) is not None,
++            "invalid_language",
++        )
++
++    @property
++    def declaration(self) -> SpeechProviderDeclaration:
++        """Return the existing speech contract for this bounded, local stream."""
++        return SpeechProviderDeclaration(
++            provenance=ProviderProvenance(
++                provider_id="onnx-ctc-asr",
++                provider_revision="v1",
++                model_fingerprint="sha256:" + self.model_sha256,
++            ),
++            languages=(self.language,),
++            sample_rates_hz=(_RATE,),
++            limits=SpeechStreamLimits(
++                max_buffered_chunks=min(self.frames * 10, 4096),
++                max_buffered_byte_count=self.frames * _HOP * 2,
++                max_buffered_duration_ms=self.frames * 10,
++                max_stream_duration_ms=3600000,
++                max_partial_hypotheses=4096,
++                max_segments=4096,
++            ),
++        )
++
++    def capability(self) -> dict[str, object]:
++        """Report experimental capability, not model or platform qualification."""
++        return {
++            "tier": "experimental",
++            "qualified": False,
++            "requires_network": False,
++            "model_sha256": self.model_sha256,
++            "vocabulary_sha256": self.vocabulary_sha256,
++            "sample_rate_hz": _RATE,
++            "window_frames": self.frames,
++            "frontend": "ctc-logmel-v1",
++        }
++
++
++def log_mel_features(pcm: bytes | bytearray, frames: int) -> Any:
++    """Right-pad mono S16LE and return [1,frames,40] natural-log power features."""
++    import numpy as np
++
++    _check(
++        type(frames) is int
++        and 1 <= frames <= 3000
++        and type(pcm) in (bytes, bytearray)
++        and 0 < len(pcm) <= frames * _HOP * 2
++        and len(pcm) % 2 == 0,
++        "invalid_pcm_window",
++    )
++    audio = np.zeros((frames - 1) * _HOP + _WINDOW, dtype=np.float64)
++    samples = np.frombuffer(pcm, dtype="<i2")
++    audio[: samples.size] = samples.astype(np.float64) / 32768.0
++    blocks = np.lib.stride_tricks.sliding_window_view(audio, _WINDOW)[::_HOP]
++    window = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(_WINDOW) / _WINDOW)
++    power = np.abs(np.fft.rfft(blocks * window, n=_FFT, axis=1)) ** 2 / _FFT
++    mel_edges = np.linspace(0, 2595 * np.log10(1 + (_RATE / 2) / 700), _MELS + 2)
++    hz = 700 * (10 ** (mel_edges / 2595) - 1)
++    bins = np.fft.rfftfreq(_FFT, 1 / _RATE)[:, None]
++    filters = np.maximum(
++        0,
++        np.minimum(
++            (bins - hz[:-2]) / (hz[1:-1] - hz[:-2]),
++            (hz[2:] - bins) / (hz[2:] - hz[1:-1]),
++        ),
++    )
++    return np.log(np.maximum(power @ filters, 1e-10)).astype(np.float32)[None, :, :]
++
++
++def _read_graph(path: Path, digest: str) -> bytes:
++    _check(
++        isinstance(path, Path)
++        and path.is_absolute()
++        and not str(path).startswith(("//", "\\\\")),
++        "local_graph_required",
++    )
++    try:
++        with os.fdopen(
++            os.open(
++                path,
++                os.O_RDONLY
++                | getattr(os, "O_NONBLOCK", 0)
++                | getattr(os, "O_NOFOLLOW", 0),
++            ),
++            "rb",
++        ) as f:
++            st = os.fstat(f.fileno())
++            _check(
++                stat.S_ISREG(st.st_mode) and 0 < st.st_size <= _MAX_MODEL,
++                "invalid_graph_size",
++            )
++            blob = f.read(st.st_size + 1)
++            _check(len(blob) == st.st_size, "invalid_graph_size")
++    except OSError:
++        pass
++    else:
++        _check(hashlib.sha256(blob).hexdigest() == digest, "graph_digest_mismatch")
++        return blob
++    raise OnnxSpeechError("graph_unavailable")
++
++
++def _inspect_graph(blob: bytes, profile: OnnxSpeechProfile) -> None:
++    """Inspect serialized bytes before the native runtime receives them."""
++    try:
++        import onnx
++    except ImportError:
++        raise OnnxSpeechError("onnx_extra_required") from None
++    try:
++        m = onnx.load_model_from_string(blob)
++        graph = m.graph
++        _check(
++            not m.functions
++            and not m.training_info
++            and not graph.sparse_initializer
++            and all(x.domain in ("", "ai.onnx") for x in m.opset_import),
++            "unsupported_graph",
++        )
++        # Reject external assets anywhere (including tensor-valued attributes).
++        # The small profile excludes custom operators, nested graphs and control flow.
++        for tensor in graph.initializer:
++            _check(
++                not tensor.external_data
++                and tensor.data_location != onnx.TensorProto.EXTERNAL,
++                "external_graph_data",
++            )
++        for node in graph.node:
++            _check(
++                node.domain in ("", "ai.onnx")
++                and node.op_type not in {"If", "Loop", "Scan"},
++                "unsupported_graph",
++            )
++            for a in node.attribute:
++                _check(
++                    a.type
++                    not in {a.GRAPH, a.GRAPHS, a.SPARSE_TENSOR, a.SPARSE_TENSORS},
++                    "unsupported_graph",
++                )
++                for t in ([a.t] if a.HasField("t") else []) + list(a.tensors):
++                    _check(
++                        not t.external_data
++                        and t.data_location != onnx.TensorProto.EXTERNAL,
++                        "external_graph_data",
++                    )
++        for values, name, shape in (
++            (graph.input, "features", [1, profile.frames, _MELS]),
++            (graph.output, "logits", [1, profile.frames, len(profile.labels)]),
++        ):
++            _check(
++                len(values) == 1 and values[0].name == name, "graph_signature_mismatch"
++            )
++            t = values[0].type.tensor_type
++            _check(
++                t.elem_type == onnx.TensorProto.FLOAT
++                and [d.dim_value for d in t.shape.dim] == shape,
++                "graph_signature_mismatch",
++            )
++        onnx.checker.check_model(m)
++    except OnnxSpeechError:
++        raise
++    except Exception:
++        pass
++    else:
++        return
++    raise OnnxSpeechError("invalid_onnx_graph")
++
++
++class _CpuEngine:
++    def __init__(self, blob: bytes):
++        import onnxruntime as ort
++
++        self._ort = ort
++        opts = ort.SessionOptions()
++        opts.enable_profiling = False
++        opts.log_severity_level = 4
++        opts.intra_op_num_threads = 1
++        self._session = ort.InferenceSession(
++            blob, sess_options=opts, providers=["CPUExecutionProvider"]
++        )
++
++    def options(self) -> Any:
++        option = self._ort.RunOptions()
++        option.log_severity_level = 4
++        return option
++
++    def run(self, features: Any, options: Any) -> Any:
++        return self._session.run(["logits"], {"features": features}, options)[0]
++
++
++class OnnxSpeechModel:
++    """An already verified, CPU-local model. Open independent bounded streams."""
++
++    def __init__(self, path: Path, profile: OnnxSpeechProfile):
++        _check(type(profile) is OnnxSpeechProfile, "invalid_profile")
++        blob = _read_graph(path, profile.model_sha256)
++        _inspect_graph(blob, profile)
++        try:
++            engine = _CpuEngine(blob)
++        except Exception:
++            pass
++        else:
++            self._profile = profile
++            self._engine = engine
++            return
++        raise OnnxSpeechError("onnx_runtime_unavailable")
++
++    @classmethod
++    def load(cls, path: Path, profile: OnnxSpeechProfile) -> OnnxSpeechModel:
++        """Load a caller-supplied pinned model; no repository or URL resolution."""
++        return cls(path, profile)
++
++    def open_stream(self) -> _OnnxSpeechStream:
++        """Create a new stream; sharing model weights does not share audio state."""
++        return _OnnxSpeechStream(self._profile, self._engine)
++
++
++@dataclass(frozen=True, slots=True)
++class SpeechWindowResult:
++    """Protected hypothesis plus a separately serializable content-free result."""
++
++    hypothesis: PartialHypothesis | FinalizedSegment = field(repr=False)
++    envelope: ProviderResultEnvelope
++
++
++def _decode(
++    logits: Any, profile: OnnxSpeechProfile, start: int, duration: int
++) -> tuple[TokenTime, ...]:
++    import numpy as np
++
++    _check(
++        type(logits) is np.ndarray
++        and logits.shape == (1, profile.frames, len(profile.labels))
++        and logits.dtype == np.float32
++        and bool(np.isfinite(logits).all()),
++        "invalid_runtime_output",
++    )
++    valid = (duration + 9) // 10
++    rows = logits[0, :valid].astype(np.float64)
++    winners = rows.argmax(axis=1)
++    # Max-class softmax probability. A run's confidence is its weakest frame.
++    confidence = 1 / np.exp(rows - rows.max(axis=1, keepdims=True)).sum(axis=1)
++    tokens: list[TokenTime] = []
++    i = 0
++    while i < valid:
++        label = int(winners[i])
++        end = i + 1
++        while end < valid and winners[end] == label:
++            end += 1
++        if label != 0:
++            tokens.append(
++                TokenTime(
++                    len(tokens),
++                    start + i * 10,
++                    start + min(end * 10, duration),
++                    round(float(confidence[i:end].min()) * 1000000),
++                    profile.labels[label],
++                )
++            )
++        i = end
++    return tuple(tokens)
++
++
++class _OnnxSpeechStream:
++    """One bounded, cancellable stream. One inference may be active at a time."""
++
++    def __init__(self, profile: OnnxSpeechProfile, engine: Any):
++        self._profile = profile
++        self._engine = engine
++        self._state = StreamingAsrSession(profile.declaration)
++        self._pcm = bytearray()
++        self._lock = threading.Lock()
++        self._active: Any = None
++        self._revision = 0
++        self._index = 0
++
++    def report(self) -> StreamingAsrSessionReport:
++        """Read aggregate state without exposing hypotheses or PCM."""
++        with self._lock:
++            return self._state.report()
++
++    def _clear(self) -> None:
++        self._pcm[:] = bytes(len(self._pcm))
++        self._pcm.clear()
++        self._state.drain()
++
++    def cancel(self) -> StreamingAsrSessionReport:
++        """Terminate the active native run and discard all unpublished output."""
++        with self._lock:
++            if self._state.state is StreamState.OPEN:
++                self._state.cancel()
++                self._clear()
++                if self._active is not None:
++                    self._active.terminate = True
++            return self._state.report()
++
++    def feed(
++        self, chunk: AudioChunk, *, end_segment: bool = False
++    ) -> SpeechWindowResult:
++        """Decode the bounded utterance prefix or finalize and drain this segment."""
++        _check(type(chunk) is AudioChunk and type(end_segment) is bool, "invalid_chunk")
++        result, _ = self._step(chunk, end_segment, False)
++        assert result is not None
++        return result
++
++    def finish(self) -> tuple[SpeechWindowResult | None, StreamingAsrSessionReport]:
++        """Flush any pending partial as a final segment, then seal the stream."""
++        return self._step(None, True, True)
++
++    def _step(
++        self, chunk: AudioChunk | None, final: bool, close: bool
++    ) -> tuple[SpeechWindowResult | None, StreamingAsrSessionReport]:
++        started = time.monotonic_ns()
++        with self._lock:
++            _check(self._state.state is StreamState.OPEN, "stream_closed")
++            _check(self._active is None, "stream_busy")
++            if chunk is not None:
++                _check(
++                    chunk.sample_rate_hz == _RATE
++                    and chunk.channel_count == 1
++                    and len(chunk.payload) == chunk.duration_ms * 32,
++                    "pcm_profile_mismatch",
++                )
++                # Validates sequence, cumulative lifetime and per-utterance bounds first.
++                self._state.push_chunk(chunk)
++                self._pcm.extend(chunk.payload)
++            if not self._pcm:
++                return None, self._state.finalize()
++            duration = len(self._pcm) // 32
++            start = self._state.stream_duration_ms - duration
++            digest = hashlib.sha256(self._pcm).hexdigest()
++            # Complete the bounded frontend under the lock: cancellation never
++            # races an array view of audio being overwritten in another thread.
++            failed = False
++            try:
++                opts = self._engine.options()
++                features = log_mel_features(self._pcm, self._profile.frames)
++            except Exception:
++                failed = True
++            if failed:
++                self._state.cancel()
++                self._clear()
++                raise OnnxSpeechError("frontend_unavailable")
++            self._active = opts
++        try:
++            logits = self._engine.run(features, opts)
++            tokens = _decode(logits, self._profile, start, duration)
++        except Exception:
++            failed = True
++        finally:
++            features.fill(0)
++        with self._lock:
++            self._active = None
++            _check(self._state.state is StreamState.OPEN, "stream_cancelled")
++            if failed:
++                self._state.cancel()
++                self._clear()
++                raise OnnxSpeechError("decode_failed")
++            text = "".join(t.token for t in tokens)
++            try:
++                hypothesis: PartialHypothesis | FinalizedSegment
++                if final:
++                    hypothesis = FinalizedSegment(
++                        segment_index=self._index,
++                        text=text,
++                        start_ms=start,
++                        end_ms=start + duration,
++                        token_times=tokens,
++                    )
++                    self._state.submit_segment(hypothesis)
++                    self._index += 1
++                    self._revision = 0
++                    self._clear()
++                else:
++                    hypothesis = PartialHypothesis(
++                        self._revision, text, token_times=tokens
++                    )
++                    self._state.submit_partial(hypothesis)
++                    self._revision += 1
++                envelope = ProviderResultEnvelope(
++                    provider_id="onnx-ctc-asr",
++                    model_id="local-ctc",
++                    input_digest=digest,
++                    outcome=ProviderResultOutcome.SUCCESS,
++                    duration_ms=(time.monotonic_ns() - started) / 1e6,
++                    count_metadata={
++                        "sample_count": duration * 16,
++                        "token_count": len(tokens),
++                        "segment_count": int(final),
++                    },
++                    output_digest=hashlib.sha256(text.encode()).hexdigest(),
++                )
++                report = self._state.finalize() if close else self._state.report()
++            except Exception:
++                if self._state.state is StreamState.OPEN:
++                    self._state.cancel()
++                self._clear()
++            else:
++                return SpeechWindowResult(hypothesis, envelope), report
++        raise OnnxSpeechError("speech_result_withheld")
+diff --git a/tests/unit/onnx/test_streaming_asr.py b/tests/unit/onnx/test_streaming_asr.py
+new file mode 100644
+index 0000000000..5e314b59f2
+--- /dev/null
++++ b/tests/unit/onnx/test_streaming_asr.py
+@@ -0,0 +1,254 @@
++"""Weight-free CTC contract checks and optional real CPU inference on a toy graph."""
++
++import hashlib
++import json
++import threading
++from dataclasses import replace
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++from openmed.multimodal.streaming.speech.providers import (
++    AudioChunk,
++    SpeechProviderError,
++    StreamState,
++)
++from openmed.onnx import streaming_asr as asr
++
++
++def profile(**kwargs):
++    labels = ("", "X", "Y", " ")
++    return replace(
++        asr.OnnxSpeechProfile(
++            model_sha256="a" * 64,
++            labels=labels,
++            vocabulary_sha256=asr.vocabulary_digest(labels),
++            frames=8,
++            language="en",
++        ),
++        **kwargs,
++    )
++
++
++def chunk(seq, ms):
++    payload = (
++        np.round(12000 * np.sin(2 * np.pi * 440 * np.arange(16 * ms) / 16000))
++        .astype("<i2")
++        .tobytes()
++    )
++    return AudioChunk(seq, payload, 16000, 1, ms)
++
++
++class Fake:
++    def options(self):
++        return SimpleNamespace(terminate=False)
++
++    def run(self, x, option):
++        assert x.shape == (1, 8, 40) and x.dtype == np.float32
++        scores = np.full((1, 8, 4), -3, dtype=np.float32)
++        for i, label in enumerate([1, 1, 0, 1, 2, 2, 3, 3]):
++            scores[0, i, label] = 3
++        return scores
++
++
++def test_synthetic_tone_matches_independent_scalar_spectrum():
++    # Independent scalar DFT and triangle accumulation, no FFT or matrix product.
++    import cmath
++    import math
++
++    wav = chunk(0, 30).payload
++    pcm = np.frombuffer(wav, dtype="<i2")[:400].tolist()
++    spectrum = []
++    for bin_ in range(257):
++        z = sum(
++            value
++            / 32768
++            * (0.5 - 0.5 * math.cos(2 * math.pi * j / 400))
++            * cmath.exp(-2j * math.pi * bin_ * j / 512)
++            for j, value in enumerate(pcm)
++        )
++        spectrum.append(abs(z) ** 2 / 512)
++    edges = [700 * (10 ** (i / 41 * math.log10(1 + 8000 / 700)) - 1) for i in range(42)]
++    reference = []
++    for lo, mid, hi in zip(edges, edges[1:], edges[2:]):
++        power = sum(
++            p
++            * max(
++                0,
++                min(
++                    (k * 16000 / 512 - lo) / (mid - lo),
++                    (hi - k * 16000 / 512) / (hi - mid),
++                ),
++            )
++            for k, p in enumerate(spectrum)
++        )
++        reference.append(math.log(max(power, 1e-10)))
++    actual = asr.log_mel_features(wav, 8)
++    np.testing.assert_allclose(actual[0, 0], reference, atol=2e-5, rtol=1e-6)
++    np.testing.assert_allclose(actual[0, 3:], np.log(1e-10), rtol=1e-6)
++
++
++def test_partial_final_repeats_blank_timing_and_no_padded_hallucinations():
++    s = asr._OnnxSpeechStream(profile(), Fake())
++    first = s.feed(chunk(0, 24))
++    assert first.hypothesis.text == "X" and first.hypothesis.token_times[0].end_ms == 20
++    second = s.feed(chunk(1, 31), end_segment=True)
++    assert second.hypothesis.text == "XXY"
++    assert [(t.start_ms, t.end_ms) for t in second.hypothesis.token_times] == [
++        (0, 20),
++        (30, 40),
++        (40, 55),
++    ]
++    assert all(
++        990000 < t.confidence_ppm < 1000000 for t in second.hypothesis.token_times
++    )
++    assert second.hypothesis.start_ms == 0 and second.hypothesis.end_ms == 55
++    s.feed(chunk(2, 10))
++    last, report = s.finish()
++    assert last.hypothesis.text == "X" and last.hypothesis.start_ms == 55
++    assert report.state == StreamState.FINALIZED.value and report.buffered_chunks == 0
++    assert "XXY" not in repr(second) and "XXY" not in second.envelope.to_json()
++    assert (
++        json.loads(second.envelope.to_json())["count_metadata"]["sample_count"] == 880
++    )
++    assert (
++        profile().capability()["tier"] == "experimental"
++        and not profile().capability()["qualified"]
++    )
++
++
++def test_limits_before_dispatch_and_value_free_failure():
++    class F(Fake):
++        def run(self, x, option):
++            raise ValueError("PRIVATE SYNTHETIC TRANSCRIPT")
++
++    s = asr._OnnxSpeechStream(profile(), F())
++    with pytest.raises(SpeechProviderError):
++        s.feed(chunk(0, 81))
++    with pytest.raises(asr.OnnxSpeechError, match="pcm_profile_mismatch"):
++        s.feed(AudioChunk(0, b"1234", 16000, 1, 20))
++    with pytest.raises(asr.OnnxSpeechError, match="decode_failed") as err:
++        s.feed(chunk(0, 50))
++    assert err.value.__context__ is None and s.report().buffered_byte_count == 0
++    with pytest.raises(asr.OnnxSpeechError, match="closed"):
++        s.finish()
++
++
++def test_cancel_fences_late_success_and_requests_native_termination():
++    started, finish = threading.Event(), threading.Event()
++
++    class Blocking(Fake):
++        def run(self, x, option):
++            started.set()
++            assert finish.wait(5) and option.terminate
++            return super().run(x, option)
++
++    s = asr._OnnxSpeechStream(profile(), Blocking())
++    errors = []
++
++    def worker():
++        try:
++            s.feed(chunk(0, 40))
++        except asr.OnnxSpeechError as e:
++            errors.append(str(e))
++
++    th = threading.Thread(target=worker)
++    th.start()
++    try:
++        assert started.wait(5)
++        with pytest.raises(asr.OnnxSpeechError, match="busy"):
++            s.feed(chunk(1, 5))
++        assert s.cancel().buffered_byte_count == 0
++    finally:
++        finish.set()
++        th.join(5)
++    assert errors == ["stream_cancelled"]
++
++
++def test_missing_digest_and_vocabulary_fail_before_parser_or_native_session(
++    tmp_path, monkeypatch
++):
++    def forbidden(*args):
++        pytest.fail("unexpected parser/runtime access")
++
++    monkeypatch.setattr(asr, "_CpuEngine", forbidden)
++    monkeypatch.setattr(asr, "_inspect_graph", forbidden)
++    for bad in ("https://private.invalid/x", Path("relative.onnx")):
++        with pytest.raises(asr.OnnxSpeechError, match="local_graph_required"):
++            asr.OnnxSpeechModel.load(bad, profile())
++    path = tmp_path / "private-identifier.onnx"
++    with pytest.raises(asr.OnnxSpeechError, match="graph_unavailable") as err:
++        asr.OnnxSpeechModel.load(path, profile())
++    assert err.value.__context__ is None
++    path.write_bytes(b"synthetic model")
++    with pytest.raises(asr.OnnxSpeechError, match="digest_mismatch"):
++        asr.OnnxSpeechModel.load(path, profile())
++    with pytest.raises(asr.OnnxSpeechError, match="vocabulary_digest"):
++        profile(vocabulary_sha256="0" * 64)
++
++
++def graph_blob(*, wrong=False, external=False):
++    onnx = pytest.importorskip("onnx")
++    h = onnx.helper
++    inp = h.make_tensor_value_info(
++        "features", onnx.TensorProto.FLOAT, [1, 8, 41 if wrong else 40]
++    )
++    out = h.make_tensor_value_info("logits", onnx.TensorProto.FLOAT, [1, 8, 4])
++    # Deterministic small graph actually consumes the synthetic feature tensor.
++    w = onnx.numpy_helper.from_array(np.zeros((40, 4), dtype=np.float32), name="W")
++    b = onnx.numpy_helper.from_array(
++        np.array([0, 5, 0, 0], dtype=np.float32), name="bias"
++    )
++    if external:
++        onnx.external_data_helper.set_external_data(w, location="outside.bin")
++        w.ClearField("raw_data")
++    g = h.make_graph(
++        [
++            h.make_node("MatMul", ["features", "W"], ["p"]),
++            h.make_node("Add", ["p", "bias"], ["logits"]),
++        ],
++        "synthetic",
++        [inp],
++        [out],
++        [w, b],
++    )
++    return h.make_model(
++        g, ir_version=9, opset_imports=[h.make_opsetid("", 17)]
++    ).SerializeToString()
++
++
++@pytest.mark.parametrize("variant", ["wrong", "external"])
++def test_invalid_signature_and_external_data_never_create_session(
++    tmp_path, monkeypatch, variant
++):
++    blob = graph_blob(**{variant: True})
++    p = tmp_path / "bad.onnx"
++    p.write_bytes(blob)
++    monkeypatch.setattr(
++        asr, "_CpuEngine", lambda b: pytest.fail("must fail before runtime creation")
++    )
++    with pytest.raises(
++        asr.OnnxSpeechError, match="graph_signature_mismatch|external_graph_data"
++    ):
++        asr.OnnxSpeechModel.load(
++            p, profile(model_sha256=hashlib.sha256(blob).hexdigest())
++        )
++
++
++@pytest.mark.integration
++def test_real_cpu_session_from_verified_bytes_offline(tmp_path):
++    pytest.importorskip("onnxruntime")
++    blob = graph_blob()
++    p = tmp_path / "synthetic.onnx"
++    p.write_bytes(blob)
++    model = asr.OnnxSpeechModel.load(
++        p, profile(model_sha256=hashlib.sha256(blob).hexdigest())
++    )
++    s = model.open_stream()
++    result = s.feed(chunk(0, 55), end_segment=True)
++    assert (
++        result.hypothesis.text == "X" and result.hypothesis.token_times[0].end_ms == 55
++    )
++    assert s.finish()[1].finalized_segments == 1

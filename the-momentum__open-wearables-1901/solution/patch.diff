@@ -1,0 +1,258 @@
+diff --git a/backend/app/constants/series_types/sdk/__init__.py b/backend/app/constants/series_types/sdk/__init__.py
+index 5d87f1cfa2..82bd9444a3 100644
+--- a/backend/app/constants/series_types/sdk/__init__.py
++++ b/backend/app/constants/series_types/sdk/__init__.py
+@@ -1,5 +1,5 @@
+ from .category_types import AppleCategoryType
+-from .metric_types import SDKMetricType, get_series_type_from_metric_type
++from .metric_types import INTERVAL_MINUTE_METRIC_TYPES, SDKMetricType, get_series_type_from_metric_type
+ from .sleep_types import SleepPhase, get_apple_sleep_phase
+ from .workout_statistics import (
+     WorkoutStatisticType,
+@@ -10,6 +10,7 @@
+ 
+ __all__ = [
+     "AppleCategoryType",
++    "INTERVAL_MINUTE_METRIC_TYPES",
+     "SDKMetricType",
+     "get_series_type_from_metric_type",
+     "get_apple_sleep_phase",
+diff --git a/backend/app/constants/series_types/sdk/metric_types.py b/backend/app/constants/series_types/sdk/metric_types.py
+index 36d9b7aa98..a59db45dc4 100644
+--- a/backend/app/constants/series_types/sdk/metric_types.py
++++ b/backend/app/constants/series_types/sdk/metric_types.py
+@@ -63,6 +63,8 @@ class SDKMetricType(StrEnum):
+     ANDROID_BASAL_METABOLIC_RATE = "BASAL_METABOLIC_RATE"
+     APPLE_STAND_TIME = "HKQuantityTypeIdentifierAppleStandTime"
+     APPLE_EXERCISE_TIME = "HKQuantityTypeIdentifierAppleExerciseTime"
++    ANDROID_ACTIVITY_INTENSITY_MODERATE = "ACTIVITY_INTENSITY_MODERATE"
++    ANDROID_ACTIVITY_INTENSITY_VIGOROUS = "ACTIVITY_INTENSITY_VIGOROUS"
+     FLIGHTS_CLIMBED = "HKQuantityTypeIdentifierFlightsClimbed"
+     ANDROID_FLOORS_CLIMBED = "FLOORS_CLIMBED"
+ 
+@@ -257,6 +259,11 @@ class SDKMetricType(StrEnum):
+     ANDROID_DIETARY_FOLIC_ACID = "DIETARY_FOLIC_ACID"
+ 
+ 
++# Health Connect's ActivityIntensityRecord has no value of its own: its minutes are the record's length.
++INTERVAL_MINUTE_METRIC_TYPES: frozenset[SDKMetricType] = frozenset(
++    {SDKMetricType.ANDROID_ACTIVITY_INTENSITY_MODERATE, SDKMetricType.ANDROID_ACTIVITY_INTENSITY_VIGOROUS}
++)
++
+ METRIC_TYPE_TO_SERIES_TYPE: dict[SDKMetricType, SeriesType] = {
+     # Heart & Cardiovascular
+     SDKMetricType.APPLE_HEART_RATE: SeriesType.heart_rate,
+@@ -317,6 +324,8 @@ class SDKMetricType(StrEnum):
+     SDKMetricType.ANDROID_BASAL_METABOLIC_RATE: SeriesType.basal_energy,
+     SDKMetricType.APPLE_STAND_TIME: SeriesType.stand_time,
+     SDKMetricType.APPLE_EXERCISE_TIME: SeriesType.exercise_time,
++    SDKMetricType.ANDROID_ACTIVITY_INTENSITY_MODERATE: SeriesType.exercise_time,
++    SDKMetricType.ANDROID_ACTIVITY_INTENSITY_VIGOROUS: SeriesType.exercise_time,
+     SDKMetricType.FLIGHTS_CLIMBED: SeriesType.flights_climbed,
+     SDKMetricType.ANDROID_FLOORS_CLIMBED: SeriesType.flights_climbed,
+     SDKMetricType.PHYSICAL_EFFORT: SeriesType.physical_effort,
+diff --git a/backend/app/schemas/providers/mobile_sdk/sync_request.py b/backend/app/schemas/providers/mobile_sdk/sync_request.py
+index 2c0303a530..3cc0673c4e 100644
+--- a/backend/app/schemas/providers/mobile_sdk/sync_request.py
++++ b/backend/app/schemas/providers/mobile_sdk/sync_request.py
+@@ -7,9 +7,14 @@
+ from enum import StrEnum
+ from typing import Any
+ 
+-from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
+-
+-from app.constants.series_types.sdk import SDKMetricType, SleepPhase, WorkoutStatisticType
++from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
++
++from app.constants.series_types.sdk import (
++    INTERVAL_MINUTE_METRIC_TYPES,
++    SDKMetricType,
++    SleepPhase,
++    WorkoutStatisticType,
++)
+ from app.constants.workout_types import SDKWorkoutType
+ from app.schemas.sync_status import SyncScope
+ 
+@@ -78,8 +83,14 @@ class MetricRecord(BaseModel):
+     endDate: datetime
+     zoneOffset: str | None = None
+     source: SourceInfo | None = None
+-    value: Decimal
+-    unit: str | None
++    value: Decimal = Field(
++        description="Ignored for ACTIVITY_INTENSITY_MODERATE and ACTIVITY_INTENSITY_VIGOROUS: "
++        "their minutes are computed from startDate and endDate."
++    )
++    unit: str | None = Field(
++        description="Ignored for ACTIVITY_INTENSITY_MODERATE and ACTIVITY_INTENSITY_VIGOROUS: "
++        "their minutes are computed from startDate and endDate."
++    )
+     count: int | None = Field(
+         None,
+         description=(
+@@ -88,6 +99,12 @@ class MetricRecord(BaseModel):
+     )
+     metadata: list[dict[str, Any]] | dict[str, Any] | None = None
+ 
++    @model_validator(mode="after")
++    def _interval_holds_minutes(self) -> MetricRecord:
++        if self.type in INTERVAL_MINUTE_METRIC_TYPES and self.endDate <= self.startDate:
++            raise ValueError("endDate must be after startDate for a record whose minutes are its length")
++        return self
++
+ 
+ class SleepRecord(BaseModel):
+     """Sleep analysis record from HealthKit."""
+diff --git a/backend/app/services/sdk/import_service.py b/backend/app/services/sdk/import_service.py
+index ceeb7e251e..1815730a6d 100644
+--- a/backend/app/services/sdk/import_service.py
++++ b/backend/app/services/sdk/import_service.py
+@@ -14,6 +14,7 @@
+ from app.config import settings
+ from app.constants.entry_source import get_unified_sdk_entry_source
+ from app.constants.series_types.sdk import (
++    INTERVAL_MINUTE_METRIC_TYPES,
+     WorkoutStatisticType,
+     get_detail_field_from_workout_statistic_type,
+     get_detail_field_precedence,
+@@ -438,6 +439,9 @@ def _build_statistic_bundles(
+             if series_type in _KCAL_SERIES and (rjson.unit or "").strip() == "cal":
+                 value = UnitConverter.energy(value, EnergyUnit.cal, EnergyUnit.kcal)
+ 
++            if record_type in INTERVAL_MINUTE_METRIC_TYPES:
++                value = Decimal(str((rjson.endDate - rjson.startDate).total_seconds() / 60))
++
+             # Extract device info
+             device_model, software_version, original_source_name = extract_device_info(rjson.source, provider)
+             device_id, source_app_id, device_manufacturer = extract_device_ids(rjson.source)
+diff --git a/backend/tests/integrations/test_sdk_import.py b/backend/tests/integrations/test_sdk_import.py
+index cd4b159ce2..aaf07f9fca 100644
+--- a/backend/tests/integrations/test_sdk_import.py
++++ b/backend/tests/integrations/test_sdk_import.py
+@@ -21,7 +21,7 @@
+ from app.schemas.model_crud.activities import EventRecordQueryParams
+ from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
+ from app.services.event_record_service import event_record_service
+-from app.services.sdk.import_service import ImportService
++from app.services.sdk.import_service import ImportService, _parse_sync_request
+ from tests.factories import DataSourceFactory, EventRecordFactory, UserFactory
+ 
+ SDK_ENVELOPE: dict[str, str] = {
+@@ -1150,6 +1150,66 @@ def test_health_connect_height_converted_meters_to_centimeters(
+         assert samples[0].series_type == SeriesType.height
+         assert samples[0].value == Decimal("175.2600")
+ 
++    @pytest.mark.parametrize("metric_type", ["ACTIVITY_INTENSITY_MODERATE", "ACTIVITY_INTENSITY_VIGOROUS"])
++    def test_health_connect_activity_intensity_minutes_are_exercise_time(
++        self,
++        import_service: ImportService,
++        metric_type: str,
++    ) -> None:
++        """Moderate and vigorous minutes are both exercise_time, taken from the record's length, not its value."""
++        record = self._record(metric_type, 999, unit="s") | {
++            "startDate": "2025-04-10T10:00:00Z",
++            "endDate": "2025-04-10T10:25:00Z",
++        }
++        request = self._build_request("health_connect", [record])
++        samples = import_service._build_statistic_bundles(request.data.records, request.provider, str(uuid4()))
++
++        assert len(samples) == 1
++        assert samples[0].series_type == SeriesType.exercise_time
++        assert samples[0].value == Decimal("25")
++
++    @pytest.mark.parametrize("end", ["2025-04-10T09:35:00Z", "2025-04-10T10:00:00Z"])
++    def test_health_connect_activity_intensity_without_minutes_is_dropped(self, end: str) -> None:
++        """A reversed or empty interval holds no minutes; the import reports it as dropped."""
++        intensity = self._record("ACTIVITY_INTENSITY_MODERATE", 999, unit="s") | {
++            "startDate": "2025-04-10T10:00:00Z",
++            "endDate": end,
++        }
++        raw = {
++            "provider": "health_connect",
++            "sdkVersion": "1.0.0",
++            "syncTimestamp": "2025-04-10T12:00:00Z",
++            "data": {"records": [intensity, self._record("STEPS", 100)]},
++        }
++
++        request, dropped = _parse_sync_request(raw)
++
++        assert [record.type for record in request.data.records] == ["STEPS"]
++        assert [(record["collection"], record["index"]) for record in dropped] == [("records", 0)]
++
++    def test_health_connect_moderate_and_vigorous_with_one_start_keep_one_sample(
++        self, db: Session, import_service: ImportService
++    ) -> None:
++        """Both intensities are exercise_time, so the later record from one source with the same start overwrites."""
++        user = UserFactory()
++        moderate = self._record("ACTIVITY_INTENSITY_MODERATE", 0) | {
++            "id": "moderate",
++            "startDate": "2025-04-10T10:00:00Z",
++            "endDate": "2025-04-10T10:30:00Z",
++        }
++        vigorous = self._record("ACTIVITY_INTENSITY_VIGOROUS", 0) | {
++            "id": "vigorous",
++            "startDate": "2025-04-10T10:00:00Z",
++            "endDate": "2025-04-10T10:10:00Z",
++        }
++        payload = {**SDK_ENVELOPE, "provider": "health_connect", "data": {"records": [moderate, vigorous]}}
++
++        import_service.import_data_from_request(db, json.dumps(payload), "application/json", str(user.id))
++
++        stored = db.query(SeriesSample).join(DataSource).filter(DataSource.user_id == user.id).one()
++        assert stored.series_type_definition_id == get_series_type_id(SeriesType.exercise_time)
++        assert (stored.external_id, stored.value) == ("vigorous", Decimal("10"))
++
+     @pytest.mark.parametrize(
+         ("unit", "expected"),
+         [
+diff --git a/docs/openapi.json b/docs/openapi.json
+index 59a62ab81a..076127c137 100644
+--- a/docs/openapi.json
++++ b/docs/openapi.json
+@@ -7951,6 +7951,8 @@
+                                     "BASAL_METABOLIC_RATE",
+                                     "HKQuantityTypeIdentifierAppleStandTime",
+                                     "HKQuantityTypeIdentifierAppleExerciseTime",
++                                    "ACTIVITY_INTENSITY_MODERATE",
++                                    "ACTIVITY_INTENSITY_VIGOROUS",
+                                     "HKQuantityTypeIdentifierFlightsClimbed",
+                                     "FLOORS_CLIMBED",
+                                     "DISTANCE",
+@@ -8355,6 +8357,7 @@
+                                   "type": "string"
+                                 }
+                               ],
++                              "description": "Ignored for ACTIVITY_INTENSITY_MODERATE and ACTIVITY_INTENSITY_VIGOROUS: their minutes are computed from startDate and endDate.",
+                               "title": "Value"
+                             },
+                             "unit": {
+@@ -8366,6 +8369,7 @@
+                                   "type": "null"
+                                 }
+                               ],
++                              "description": "Ignored for ACTIVITY_INTENSITY_MODERATE and ACTIVITY_INTENSITY_VIGOROUS: their minutes are computed from startDate and endDate.",
+                               "title": "Unit"
+                             },
+                             "count": {
+diff --git a/docs/providers/coverage.mdx b/docs/providers/coverage.mdx
+index d5c7fc4035..6252bb6118 100644
+--- a/docs/providers/coverage.mdx
++++ b/docs/providers/coverage.mdx
+@@ -164,7 +164,7 @@ Legend:
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>active_<wbr />energy</code> <span className="ow-cov-unit">kcal</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>active_<wbr />time</code> <span className="ow-cov-unit">minutes</span></th><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>basal_<wbr />energy</code> <span className="ow-cov-unit">kcal</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td></tr>
+-<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>exercise_<wbr />time</code> <span className="ow-cov-unit">minutes</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td></tr>
++<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>exercise_<wbr />time</code> <span className="ow-cov-unit">minutes</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>flights_<wbr />climbed</code> <span className="ow-cov-unit">count</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>physical_<wbr />effort</code> <span className="ow-cov-unit">met</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>stand_<wbr />time</code> <span className="ow-cov-unit">minutes</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+@@ -536,7 +536,7 @@ Legend: ✅ supported, ❌ not available.
+ | `active_energy` | kcal | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ |
+ | `active_time` | minutes | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `basal_energy` | kcal | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
+-| `exercise_time` | minutes | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ |
++| `exercise_time` | minutes | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ |
+ | `flights_climbed` | count | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `physical_effort` | met | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `stand_time` | minutes | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |

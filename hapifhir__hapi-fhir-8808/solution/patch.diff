@@ -1,0 +1,485 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8806-batch2-redelivery-row-lock.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8806-batch2-redelivery-row-lock.yaml
+new file mode 100644
+index 000000000000..298a6716ab2f
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8806-batch2-redelivery-row-lock.yaml
+@@ -0,0 +1,8 @@
++---
++type: fix
++issue: 8806
++jira: SMILE-13022
++title: "Previously, when a batch2 work chunk was redelivered while another worker was still processing it, the worker
++  handling the redelivery would wait for the first worker to finish while holding a database lock on the chunk. Lock
++  contention would prevent the first worker from completing the chunk, leading to stalled jobs. The lock is now
++  released before the wait, allowing the job to complete."
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/batch2/Batch2CoordinatorIT.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/batch2/Batch2CoordinatorIT.java
+index fecc88d1a7aa..b3578fda3da8 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/batch2/Batch2CoordinatorIT.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/batch2/Batch2CoordinatorIT.java
+@@ -29,6 +29,7 @@
+ import ca.uhn.fhir.batch2.model.WorkChunkStatusEnum;
+ import ca.uhn.fhir.batch2.models.JobInstanceFetchRequest;
+ import ca.uhn.fhir.broker.api.ChannelConsumerSettings;
++import ca.uhn.fhir.broker.api.IChannelConsumer;
+ import ca.uhn.fhir.interceptor.api.IAnonymousInterceptor;
+ import ca.uhn.fhir.interceptor.api.Pointcut;
+ import ca.uhn.fhir.jpa.batch.models.Batch2JobStartResponse;
+@@ -83,6 +84,7 @@
+ import java.time.Duration;
+ import java.time.temporal.ChronoUnit;
+ import java.util.ArrayList;
++import java.util.Date;
+ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -90,6 +92,10 @@
+ import java.util.Optional;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -106,6 +112,8 @@
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.junit.jupiter.api.Assertions.fail;
++import static org.assertj.core.api.Assertions.catchThrowable;
++import static org.mockito.Mockito.doAnswer;
+ import static org.mockito.Mockito.doNothing;
+ 
+ 
+@@ -187,6 +195,9 @@ public RetryPolicyProvider retryPolicyProvider() {
+ 	@Autowired
+ 	private WorkChannelMessageListener myWorkChannelMessageListener;
+ 
++	@Autowired
++	private IChannelConsumer<JobWorkNotification> myWorkChannelConsumer;
++
+ 	@Autowired
+ 	private RetryPolicyProvider myRetryPolicyProvider;
+ 
+@@ -386,6 +397,111 @@ public void replayingWorkChunkNotificationMessages_forFailedJobs_shouldNotThrowN
+ 		}
+ 	}
+ 
++	@Test
++	void redeliveredWorkNotification_whileOriginalWorkerStillRunning_doesNotBlockOriginalWorkerCompletion() throws Exception {
++		// ackTimeout is how long the broker waits on a consumer before handing its message to another consumer.
++		// This test uses the in-memory channel: nothing redelivers or times out
++		// on its own. ackTimeout only sets what the listener uses when it receives a chunk already IN_PROGRESS:
++		// a heartbeat within 2 x ackTimeout is redelivery, and a redelivered chunk is delayed by a third of ackTimeout.
++		// That delay is the time limit for the first worker to complete the chunk. A redelivery that held the chunk's
++		// row lock while being delayed would still hold it when the first worker tries to complete the chunk.
++		Duration ackTimeout = Duration.ofSeconds(6);
++		Duration redeliveryDelay = ackTimeout.dividedBy(3);
++		myWorkChannelMessageListener.setAckTimeout(ackTimeout);
++		String jobId = getMethodNameForJobId();
++
++		// Setup - a two-step job whose first step blocks on its first call until the test releases it. This keeps
++		// the first worker busy with the chunk while the test redelivers its message.
++		CountDownLatch firstStepStarted = new CountDownLatch(1);
++		CountDownLatch releaseFirstStep = new CountDownLatch(1);
++		AtomicInteger firstStepCalls = new AtomicInteger();
++
++		IJobStepWorker<TestJobParameters, VoidModel, FirstStepOutput> firstStep = (step, sink) -> {
++			if (firstStepCalls.incrementAndGet() == 1) {
++				firstStepStarted.countDown();
++				try {
++					assertTrue(releaseFirstStep.await(12, TimeUnit.SECONDS));
++				} catch (InterruptedException e) {
++					Thread.currentThread().interrupt();
++					throw new RuntimeException(e);
++				}
++			}
++			return RunOutcome.SUCCESS;
++		};
++
++		IJobStepWorker<TestJobParameters, FirstStepOutput, VoidModel> lastStep = (step, sink) -> RunOutcome.SUCCESS;
++		JobDefinition<? extends IModelJson> jobDefinition = buildGatedJobDefinition(jobId, firstStep, lastStep);
++		myJobDefinitionRegistry.addJobDefinition(jobDefinition);
++
++		ExecutorService executor = Executors.newSingleThreadExecutor();
++		Future<?> redeliveryFuture = null;
++		String instanceId = null;
++		try {
++			// Setup - the first worker picks up the first-step chunk and blocks in the step: the chunk is IN_PROGRESS
++			instanceId = myJobCoordinator.startInstance(new SystemRequestDetails(), buildRequest(jobId)).getInstanceId();
++			myBatch2JobHelper.forceRunActiveJobMaintenancePass();
++			assertTrue(firstStepStarted.await(6, TimeUnit.SECONDS));
++
++			// The heartbeat service runs on its own schedule. The test writes the chunk's heartbeat by hand to make
++			// sure the redelivery sees a recent one, as it would while the first worker is alive.
++			String startedInstanceId = instanceId; // effectively final copy for the lambda
++			String chunkId = runInTransaction(() -> myWorkChunkRepository.fetchChunksForStep(startedInstanceId, FIRST_STEP_ID).findFirst().orElseThrow().getId());
++			runInTransaction(() -> myWorkChunkRepository.updateWorkChunkHeartbeat(chunkId, new Date()));
++
++			// The first worker completes the chunk only after the redelivery has dequeued it, ie. while the
++			// redelivery's transaction read the chunk and determines that it needs to sleep to allow work completion
++			// by another worker.
++			CountDownLatch redeliveryDequeued = new CountDownLatch(1);
++			doAnswer(invocation -> {
++				Object retVal = invocation.callRealMethod();
++				redeliveryDequeued.countDown();
++				return retVal;
++			}).when(myJobPersistence).onWorkChunkDequeue(chunkId);
++
++			// Setup - the same work notification the first worker received, as a broker would redeliver it to another
++			// consumer (eg. after the ack timeout of the first consumer expires).
++			JobWorkNotification notification = new JobWorkNotification();
++			notification.setInstanceId(instanceId);
++			notification.setJobDefinitionId(jobId);
++			notification.setJobDefinitionVersion(TEST_JOB_VERSION);
++			notification.setTargetStepId(FIRST_STEP_ID);
++			notification.setChunkId(chunkId);
++			JobWorkNotificationJsonMessage msg = new JobWorkNotificationJsonMessage();
++			msg.setPayload(notification);
++			HapiMessageHeaders headers = new HapiMessageHeaders();
++			headers.setRetryCount(0);
++			msg.setHeaders(headers);
++
++			// Execute - the redelivery runs on a second thread, standing in for the second consumer. Once it has
++			// dequeued the chunk, the first worker is released and completes the chunk.
++			redeliveryFuture = executor.submit(() -> myWorkChannelMessageListener.handleMessage(msg));
++			assertTrue(redeliveryDequeued.await(6, TimeUnit.SECONDS));
++			releaseFirstStep.countDown();
++
++			// Verify - the first worker completes the chunk and the job before the redelivery's delay ends. If the
++			// redelivery held the row lock while being delayed, the chunk completion would wait on the lock and the job
++			// would stay IN_PROGRESS past the time limit. When the lock is not held, the job completes in milliseconds.
++			// The first step produces no output: the worker marks the job COMPLETED right after the chunk, and the
++			// ended job maintenance pass can delete the chunk at any time after that. The job instance outlives the
++			// chunk: this check reads the instance.
++			await().atMost(redeliveryDelay).until(() -> myJobCoordinator.getInstance(startedInstanceId).getStatus(), status -> status == StatusEnum.COMPLETED);
++		} finally {
++			// Cleanup - release the first step in case the test failed before doing so, and let the redelivery
++			// thread finish. It ends with DelayChunkException, which is expected and ignored here. Then cancel the
++			// job and restore the listener's ack timeout for the other tests.
++			releaseFirstStep.countDown();
++			if (redeliveryFuture != null) {
++				Future<?> submittedRedelivery = redeliveryFuture; // effectively final copy for the lambda
++				catchThrowable(() -> submittedRedelivery.get(2 * ackTimeout.toSeconds(), TimeUnit.SECONDS));
++			}
++			executor.shutdownNow();
++			if (instanceId != null) {
++				myJobCoordinator.cancelInstance(instanceId);
++			}
++			myWorkChannelMessageListener.setAckTimeout(myWorkChannelConsumer.getAckTimeout());
++		}
++	}
++
+ 	@Test
+ 	public void fetchAllJobInstances_withValidInput_returnsPage() {
+ 		int maxJobsToSave = 10;
+diff --git a/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/coordinator/WorkChannelMessageListener.java b/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/coordinator/WorkChannelMessageListener.java
+index 6dbab773e676..483cccffe34a 100644
+--- a/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/coordinator/WorkChannelMessageListener.java
++++ b/hapi-fhir-storage-batch2/src/main/java/ca/uhn/fhir/batch2/coordinator/WorkChannelMessageListener.java
+@@ -87,6 +87,21 @@ public void setAckTimeout(Duration theTimeout) {
+ 		myJobStepExecutorFactory.setAckTimeout(theTimeout);
+ 	}
+ 
++	/**
++	 * Returns how long to wait before a chunk that another worker is still processing is retried: a third of the
++	 * ack timeout.
++	 * <p>
++	 * This value lets the retry mechanism run within the broker's ack timeout: two retries fit before the timeout
++	 * expires. When the first worker completes the chunk in that time, a retry discards the message and this consumer
++	 * meets its broker deadline, which avoids the broker considering it failed and redelivering its messages to
++	 * another consumer. A wait of the full ack timeout leaves no room for a retry: the consumer misses its deadline on
++	 * the first wait.
++	 */
++	@Nonnull
++	private Duration getRedeliveryDelay() {
++		return myJobStepExecutorFactory.getAckTimeout().dividedBy(3);
++	}
++
+ 	public Class<JobWorkNotification> getPayloadType() {
+ 		return JobWorkNotification.class;
+ 	}
+@@ -188,8 +203,9 @@ Optional<MessageProcess> updateChunkStatusAndValidate() {
+ 		 * 1) it was picked up and is still being worked on by a slow worker
+ 		 * 2) it was picked up and the worker died while processing it
+ 		 *
+-		 * If it is a slow worker, we'll stall for a bit and throw; this should
+-		 * allow the broker to requeue the message for another worker
++		 * If it is a slow worker, we throw. This rolls back the dequeue transaction and releases
++		 * the chunk's row lock. The caller then waits for the redelivery delay, outside the
++		 * transaction, before the exception triggers a retry.
+ 		 * If the worker is dead, we'll wait a bit and retry later. if this timeout
+ 		 * becomes too great, we'll fail the job.
+ 		 *
+@@ -203,9 +219,12 @@ Optional<MessageProcess> updateChunkStatusAndValidate() {
+ 		private Optional<MessageProcess> handlePotentiallySlowWorkChunk() {
+ 			if (myWorkChunk.getPreviousStatus() == WorkChunkStatusEnum.IN_PROGRESS
+ 					&& myWorkChunk.getLastHeartbeat() != null) {
++				long ackTimeoutMs = myJobStepExecutorFactory.getAckTimeout().toMillis();
++
+ 				ourLog.debug(
+ 						"Acktimeout (how long a broker will wait for a listener before redelivery) is {}ms",
+-						myJobStepExecutorFactory.getAckTimeout().toMillis());
++						ackTimeoutMs);
++
+ 				long lastHeartbeatMs = myWorkChunk.getLastHeartbeat().getTime();
+ 				long now = Instant.now().toEpochMilli();
+ 
+@@ -215,27 +234,17 @@ private Optional<MessageProcess> handlePotentiallySlowWorkChunk() {
+ 				 *
+ 				 * But it could be a value that's very very small.
+ 				 */
+-				long minTimeout = myJobStepExecutorFactory.getAckTimeout().toMillis();
+-				long twiceAckTime = 2 * minTimeout;
++				long twiceAckTimeoutMs = 2 * ackTimeoutMs;
++				long timeElapsedSinceLastHeartbeatMs = now - lastHeartbeatMs;
+ 
+-				long duration = now - lastHeartbeatMs;
+-
+-				if (duration <= twiceAckTime) {
++				if (timeElapsedSinceLastHeartbeatMs <= twiceAckTimeoutMs) {
+ 					String msg = String.format(
+ 							"WorkChunk %s is stuck in step %s for job %s. This might be a redelivered message. Will retry later.",
+ 							myWorkChunk.getId(), myWorkChunk.getTargetStepId(), myWorkChunk.getJobDefinitionId());
+ 					ourLog.warn(msg);
+-					try {
+-						Thread.sleep(minTimeout);
+-					} catch (InterruptedException ex) {
+-						throw new RuntimeException(Msg.code(2913), ex);
+-					}
+ 					// throw to requeue chunk
+ 					throw new DelayChunkException(Msg.code(2887) + " " + msg);
+ 				} // else - do nothing and proceed
+-				// TODO LS - we might want to consider capping how long we wait,
+-				// 			but for now we'll keep sleeping forever until the
+-				//			slow worker finishes or stops updating the chunk
+ 			} else if (myWorkChunk.getPreviousStatus() == WorkChunkStatusEnum.COMPLETED) {
+ 				// our slow worker has completed this step; discard
+ 				return Optional.empty();
+@@ -326,22 +335,30 @@ private void handleWorkChannelMessage(JobWorkNotification theWorkNotification) {
+ 			// We use Optional chaining here to simplify all the cases where we short-circuit exit.
+ 			// A step that returns an empty Optional means discard the chunk.
+ 			//
+-			Optional<MessageProcess> processingPreparation = executeInTxRollbackWhenEmpty(() ->
+-
+-					// Use a chain of Optional flatMap to handle all the setup short-circuit exits cleanly.
+-					Optional.of(new MessageProcess(theWorkNotification))
+-							// validate and load info
+-							.flatMap(MessageProcess::validateChunkId)
+-							// no job definition should be retried - we must be a stale process encountering a new
+-							// job definition.
+-							.flatMap(MessageProcess::loadJobDefinitionOrThrow)
+-							.flatMap(MessageProcess::loadJobInstance)
+-							// update statuses now in the db: QUEUED->IN_PROGRESS
+-							.flatMap(MessageProcess::updateChunkStatusAndValidate)
+-							.flatMap(MessageProcess::updateAndValidateJobStatus)
+-							// ready to execute
+-							.flatMap(MessageProcess::buildCursor)
+-							.flatMap(MessageProcess::buildStepExecutor));
++			Optional<MessageProcess> processingPreparation;
++			try {
++				processingPreparation = executeInTxRollbackWhenEmpty(() ->
++
++						// Use a chain of Optional flatMap to handle all the setup short-circuit exits cleanly.
++						Optional.of(new MessageProcess(theWorkNotification))
++								// validate and load info
++								.flatMap(MessageProcess::validateChunkId)
++								// no job definition should be retried - we must be a stale process encountering a
++								// new job definition.
++								.flatMap(MessageProcess::loadJobDefinitionOrThrow)
++								.flatMap(MessageProcess::loadJobInstance)
++								// update statuses now in the db: QUEUED->IN_PROGRESS
++								.flatMap(MessageProcess::updateChunkStatusAndValidate)
++								.flatMap(MessageProcess::updateAndValidateJobStatus)
++								// ready to execute
++								.flatMap(MessageProcess::buildCursor)
++								.flatMap(MessageProcess::buildStepExecutor));
++			} catch (DelayChunkException e) {
++				// The transaction has rolled back: the chunk's row lock is released and the worker processing
++				// the chunk can keep writing to it while we wait.
++				delayRedelivery();
++				throw e;
++			}
+ 
+ 			processingPreparation.ifPresentOrElse(
+ 					// all the setup is happy and committed.  Do the work.
+@@ -368,6 +385,17 @@ private void handleWorkChannelMessage(JobWorkNotification theWorkNotification) {
+ 		}
+ 	}
+ 
++	/**
++	 * Spaces out the retries of a chunk that another worker is still processing.
++	 */
++	private void delayRedelivery() {
++		try {
++			Thread.sleep(getRedeliveryDelay().toMillis());
++		} catch (InterruptedException ex) {
++			throw new RuntimeException(Msg.code(2913), ex);
++		}
++	}
++
+ 	/**
+ 	 * Run theCallback in TX, rolling back if the supplied Optional is empty.
+ 	 */
+diff --git a/hapi-fhir-storage-batch2/src/test/java/ca/uhn/fhir/batch2/coordinator/WorkChannelMessageListenerTest.java b/hapi-fhir-storage-batch2/src/test/java/ca/uhn/fhir/batch2/coordinator/WorkChannelMessageListenerTest.java
+index cb29e00c1c7b..ebc964f26da2 100644
+--- a/hapi-fhir-storage-batch2/src/test/java/ca/uhn/fhir/batch2/coordinator/WorkChannelMessageListenerTest.java
++++ b/hapi-fhir-storage-batch2/src/test/java/ca/uhn/fhir/batch2/coordinator/WorkChannelMessageListenerTest.java
+@@ -1,5 +1,6 @@
+ package ca.uhn.fhir.batch2.coordinator;
+ 
++import ca.uhn.fhir.batch2.api.DelayChunkException;
+ import ca.uhn.fhir.batch2.api.IJobMaintenanceService;
+ import ca.uhn.fhir.batch2.api.IJobPersistence;
+ import ca.uhn.fhir.batch2.api.IJobStepExecutionServices;
+@@ -8,6 +9,8 @@
+ import ca.uhn.fhir.batch2.maintenance.WorkChunkHeartbeatService;
+ import ca.uhn.fhir.batch2.model.JobWorkNotification;
+ import ca.uhn.fhir.batch2.model.JobWorkNotificationJsonMessage;
++import ca.uhn.fhir.batch2.model.WorkChunk;
++import ca.uhn.fhir.batch2.model.WorkChunkStatusEnum;
+ import ca.uhn.fhir.broker.api.IChannelConsumer;
+ import ca.uhn.fhir.interceptor.api.IInterceptorBroadcaster;
+ import ca.uhn.fhir.interceptor.api.IInterceptorService;
+@@ -23,13 +26,21 @@
+ import org.mockito.ArgumentCaptor;
+ import org.mockito.Captor;
+ import org.mockito.Mock;
++import org.springframework.transaction.support.TransactionCallback;
+ 
++import java.time.Duration;
++import java.util.Date;
+ import java.util.Map;
++import java.util.Optional;
+ 
+ import static ca.uhn.fhir.batch2.coordinator.WorkChannelMessageListener.BatchJobTracingContext;
+ import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.catchThrowable;
++import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.atLeastOnce;
++import static org.mockito.Mockito.doReturn;
+ import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
+ 
+ class WorkChannelMessageListenerTest extends BaseBatch2Test {
+ 	@Mock
+@@ -84,6 +95,89 @@ public void testWorkChannelMessageHandlerLogging_containsJobAndBatchIdInLoggingC
+ 			});
+ 	}
+ 
++	@Test
++	void handleMessage_redeliveredChunkStillHeartbeating_doesNotHoldDequeueTransactionForAckTimeout() {
++		// ackTimeout is how long the broker waits on a consumer before handing its message to another consumer.
++		// Each broker defines it its own way. A consumer that receives a chunk already IN_PROGRESS uses it to decide
++		// whether a heartbeat is recent (within 2 x ackTimeout) and how long to delay (a third of ackTimeout) before
++		// retrying the redelivered chunk.
++		Duration ackTimeout = Duration.ofSeconds(2);
++
++		// Setup - a first worker dequeued this chunk and is still processing it: the chunk is IN_PROGRESS and the
++		// worker just heartbeated, ie., wrote LAST_HEARTBEAT to the database. While busy with the chunk, that worker
++		// has not acknowledged the message. The broker therefore redelivers the chunk's message to another worker
++		// through the 'listener'.
++		WorkChunk workChunk = JobCoordinatorImplTest.createWorkChunkStep1();
++		workChunk.setPreviousStatus(WorkChunkStatusEnum.IN_PROGRESS);
++		workChunk.setLastHeartbeat(new Date());
++		doReturn(createJobDefinition()).when(myJobDefinitionRegistry).getJobDefinitionOrThrowException(eq(JOB_DEFINITION_ID), eq(1));
++		when(myJobInstancePersister.fetchInstance(eq(INSTANCE_ID))).thenReturn(Optional.of(createInstance()));
++		when(myJobInstancePersister.onWorkChunkDequeue(eq(CHUNK_ID))).thenReturn(Optional.of(workChunk));
++
++		// Stands in for the database transaction and records how long each one ran. In production, the row lock
++		// that onWorkChunkDequeue takes is held until this transaction ends.
++		TransactionDurationRecordingService transactionService = new TransactionDurationRecordingService();
++
++		// Broker delivery mechanism
++		WorkChannelMessageListener listener = new WorkChannelMessageListener(myJobInstancePersister, myJobDefinitionRegistry, myBatchJobSender, jobStepExecutorSvc, myJobMaintenanceService, transactionService, myInterceptorBroadcaster, myInterceptorService, myWorkChunkHeartbeatService);
++		listener.setAckTimeout(ackTimeout);
++
++		// Execute - the redelivered message arrives. Inside one transaction, the listener dequeues the chunk
++		// (onWorkChunkDequeue locks its row). It sees the chunk as IN_PROGRESS with a heartbeat newer than
++		// 2 x ackTimeout: the conditions to assume that the first worker is still alive and busy processing the chunk.
++		// The listener delays the message by a third of ackTimeout and throws 'DelayChunkException', which indicates to the broker
++		// that the redelivered message was not processed and needs to be retried.
++		Throwable thrown = catchThrowable(() -> listener.handleMessage(new JobWorkNotificationJsonMessage(createWorkNotification(STEP_1))));
++
++		// Verify - DelayChunkException is thrown by the listener on the redelivery because the chunk is IN_PROGRESS and
++		// its heartbeat is within 2 x ackTimeout: it assumes that the first worker is still alive and processing it. The
++		// exception leaves the redelivered message as not acknowledged and the broker delivers it again later. If the
++		// first worker has finished by then, the chunk is COMPLETED and that later delivery is discarded.
++		assertThat(thrown).isInstanceOf(DelayChunkException.class);
++
++		// Verify - the listener processing the redelivered message dequeues the chunk within a transaction, acquiring a
++		// row lock. Analysing the chunk, it determines that another worker is currently processing the chunk and delays
++		// the message by a third of ackTimeout. While delaying, it must not hold the row lock: that would prevent the
++		// first worker from writing its heartbeat or its completion to the chunk row.
++		// We assert that the longest transaction is under a third of ackTimeout. On this path the listener opens a
++		// single transaction, the one that dequeues the chunk and holds its row lock. The mocked calls take a few
++		// milliseconds, while a transaction that includes the delay lasts at least a third of ackTimeout.
++		assertThat(transactionService.getLongestTransaction()).isLessThan(ackTimeout.dividedBy(3));
++	}
++
++	@Test
++	void handleMessage_redeliveredChunkStillHeartbeating_delaysForAThirdOfAckTimeout() {
++		// Setup
++		Duration ackTimeout = Duration.ofSeconds(3);
++		mockChunkStillProcessedByAnotherWorker();
++		WorkChannelMessageListener listener = new WorkChannelMessageListener(myJobInstancePersister, myJobDefinitionRegistry, myBatchJobSender, jobStepExecutorSvc, myJobMaintenanceService, myTransactionService, myInterceptorBroadcaster, myInterceptorService, myWorkChunkHeartbeatService);
++		listener.setAckTimeout(ackTimeout);
++
++		// Execute
++		long start = System.nanoTime();
++		Throwable thrown = catchThrowable(() -> listener.handleMessage(new JobWorkNotificationJsonMessage(createWorkNotification(STEP_1))));
++		Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
++
++		// Verify - a third of ackTimeout fits two retries within ackTimeout. When the other worker completes the chunk
++		// in that time, a retry discards the message and this consumer meets its broker deadline. The upper bound
++		// leaves a full second for the rest of the message handling.
++		assertThat(thrown).isInstanceOf(DelayChunkException.class);
++		assertThat(elapsed).isGreaterThanOrEqualTo(ackTimeout.dividedBy(3));
++		assertThat(elapsed).isLessThan(ackTimeout.multipliedBy(2).dividedBy(3));
++	}
++
++	/**
++	 * The chunk is IN_PROGRESS and its worker just heartbeated: another worker is still processing it.
++	 */
++	private void mockChunkStillProcessedByAnotherWorker() {
++		WorkChunk workChunk = JobCoordinatorImplTest.createWorkChunkStep1();
++		workChunk.setPreviousStatus(WorkChunkStatusEnum.IN_PROGRESS);
++		workChunk.setLastHeartbeat(new Date());
++		doReturn(createJobDefinition()).when(myJobDefinitionRegistry).getJobDefinitionOrThrowException(eq(JOB_DEFINITION_ID), eq(1));
++		when(myJobInstancePersister.fetchInstance(eq(INSTANCE_ID))).thenReturn(Optional.of(createInstance()));
++		when(myJobInstancePersister.onWorkChunkDequeue(eq(CHUNK_ID))).thenReturn(Optional.of(workChunk));
++	}
++
+ 	@Nonnull
+ 	private JobWorkNotification createWorkNotification(String theStepId) {
+ 		JobWorkNotification payload = new JobWorkNotification();
+@@ -94,4 +188,28 @@ private JobWorkNotification createWorkNotification(String theStepId) {
+ 		payload.setTargetStepId(theStepId);
+ 		return payload;
+ 	}
++
++	/**
++	 * Records how long the longest transaction callback ran for.
++	 */
++	private static class TransactionDurationRecordingService extends NonTransactionalHapiTransactionService {
++		private Duration myLongestTransaction = Duration.ZERO;
++
++		@Override
++		protected <T> T doExecute(ExecutionBuilder theExecutionBuilder, TransactionCallback<T> theCallback) {
++			long start = System.nanoTime();
++			try {
++				return super.doExecute(theExecutionBuilder, theCallback);
++			} finally {
++				Duration duration = Duration.ofNanos(System.nanoTime() - start);
++				if (duration.compareTo(myLongestTransaction) > 0) {
++					myLongestTransaction = duration;
++				}
++			}
++		}
++
++		Duration getLongestTransaction() {
++			return myLongestTransaction;
++		}
++	}
+ }

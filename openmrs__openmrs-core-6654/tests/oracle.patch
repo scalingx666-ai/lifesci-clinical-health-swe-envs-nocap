@@ -1,0 +1,443 @@
+diff --git a/api/src/main/java/org/openmrs/api/context/Context.java b/api/src/main/java/org/openmrs/api/context/Context.java
+index 93b6ce4b07a5..a9082b5ac2ba 100644
+--- a/api/src/main/java/org/openmrs/api/context/Context.java
++++ b/api/src/main/java/org/openmrs/api/context/Context.java
+@@ -1105,6 +1105,22 @@ public static synchronized void startup(String url, String username, String pass
+ 	 * Stops the OpenMRS System Should be called after all activity has ended and application is closing
+ 	 */
+ 	public static void shutdown() {
++		log.debug("Shutting down the scheduler");
++		try {
++			SchedulerService schedulerService = null;
++			try {
++				schedulerService = getSchedulerService();
++			} catch (APIException e) {
++				// pass
++			}
++			if (schedulerService != null) {
++				// stops running tasks before the modules and the database they use are shut down
++				schedulerService.onShutdown();
++			}
++		} catch (Exception e) {
++			log.warn("Error while shutting down the scheduler", e);
++		}
++
+ 		log.debug("Shutting down the modules");
+ 		try {
+ 			ModuleUtil.shutdown();
+diff --git a/api/src/main/java/org/openmrs/scheduler/jobrunr/JobRunrConfig.java b/api/src/main/java/org/openmrs/scheduler/jobrunr/JobRunrConfig.java
+index 3ed61117e5a0..073a829bc145 100644
+--- a/api/src/main/java/org/openmrs/scheduler/jobrunr/JobRunrConfig.java
++++ b/api/src/main/java/org/openmrs/scheduler/jobrunr/JobRunrConfig.java
+@@ -18,6 +18,7 @@
+ import org.jobrunr.jobs.filters.RetryFilter;
+ import org.jobrunr.scheduling.JobRequestScheduler;
+ import org.jobrunr.scheduling.JobScheduler;
++import org.jobrunr.server.BackgroundJobServerConfiguration;
+ import org.jobrunr.storage.StorageProvider;
+ import org.jobrunr.storage.sql.common.SqlStorageProviderFactory;
+ import org.jobrunr.utils.mapper.jackson.JacksonJsonMapper;
+@@ -51,7 +52,8 @@ public JobRunrConfiguration.JobRunrConfigurationResult jobRunrConfiguration(Obje
+ 
+ 		JobRunrConfiguration config = JobRunr.configure().useJsonMapper(new JacksonJsonMapper(objectMapper))
+ 		        .useStorageProvider(storageProvider).useJobActivator(applicationContext::getBean)
+-		        .withJobFilter(new RetryFilter(3)).useBackgroundJobServer();
++		        .withJobFilter(new RetryFilter(3)).useBackgroundJobServer(
++		            BackgroundJobServerConfiguration.usingStandardBackgroundJobServerConfiguration(), false);
+ 		if (dashboardEnabled) {
+ 			config.useDashboard(JobRunrDashboardWebServerConfiguration.usingStandardDashboardConfiguration().andPort(port)
+ 			        .andBasicAuthentication(user, password));
+@@ -59,6 +61,18 @@ public JobRunrConfiguration.JobRunrConfigurationResult jobRunrConfiguration(Obje
+ 		return config.initialize();
+ 	}
+ 
++	/**
++	 * Starts the background job server once the application context has finished refreshing and stops
++	 * it before the context is closed. Started while the context is still being created, it would run
++	 * jobs before the context is ready, e.g. against the already closed session factory of the context
++	 * being replaced when the context is refreshed after modules start.
++	 */
++	@Bean
++	public JobRunrServerLifecycle jobRunrServerLifecycle(
++	        JobRunrConfiguration.JobRunrConfigurationResult jobRunrConfiguration) {
++		return new JobRunrServerLifecycle(jobRunrConfiguration.getBackgroundJobServer());
++	}
++
+ 	@Bean
+ 	public JobRequestScheduler jobRequestScheduler(JobRunrConfiguration.JobRunrConfigurationResult jobRunrConfiguration) {
+ 		return jobRunrConfiguration.getJobRequestScheduler();
+diff --git a/api/src/main/java/org/openmrs/scheduler/jobrunr/JobRunrSchedulerService.java b/api/src/main/java/org/openmrs/scheduler/jobrunr/JobRunrSchedulerService.java
+index 8febd23fbb29..095ce2a60090 100644
+--- a/api/src/main/java/org/openmrs/scheduler/jobrunr/JobRunrSchedulerService.java
++++ b/api/src/main/java/org/openmrs/scheduler/jobrunr/JobRunrSchedulerService.java
+@@ -56,6 +56,7 @@
+ import org.openmrs.util.UuidUtil;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.orm.ObjectRetrievalFailureException;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+@@ -77,6 +78,8 @@ public class JobRunrSchedulerService extends BaseOpenmrsService implements Sched
+ 
+ 	private SchedulerDAO schedulerDAO;
+ 
++	private JobRunrServerLifecycle jobRunrServerLifecycle;
++
+ 	public JobRunrSchedulerService(StorageProvider storageProvider, JobRequestScheduler jobRequestScheduler,
+ 	    JobScheduler jobScheduler, SchedulerDAO schedulerDAO) {
+ 		this.jobRequestScheduler = jobRequestScheduler;
+@@ -85,8 +88,14 @@ public JobRunrSchedulerService(StorageProvider storageProvider, JobRequestSchedu
+ 		this.schedulerDAO = schedulerDAO;
+ 	}
+ 
++	@Autowired
++	public void setJobRunrServerLifecycle(JobRunrServerLifecycle jobRunrServerLifecycle) {
++		this.jobRunrServerLifecycle = jobRunrServerLifecycle;
++	}
++
+ 	@Override
+ 	public void onStartup() {
++		jobRunrServerLifecycle.openmrsStarted();
+ 		for (TaskDefinition taskDefinition : schedulerDAO.getTasks()) {
+ 			if (Boolean.TRUE.equals(taskDefinition.getStartOnStartup())) {
+ 				String scheduledBy = taskDefinition.getCreator() != null ? taskDefinition.getCreator().getSystemId()
+@@ -117,6 +126,12 @@ public void onStartup() {
+ 		}
+ 	}
+ 
++	@Override
++	public void onShutdown() {
++		// the webapp never closes its application context, so the lifecycle would not stop the server
++		jobRunrServerLifecycle.stop();
++	}
++
+ 	@Override
+ 	public String getStatus(Integer id) {
+ 		TaskDefinition task = getTask(id);
+diff --git a/api/src/main/java/org/openmrs/scheduler/jobrunr/JobRunrServerLifecycle.java b/api/src/main/java/org/openmrs/scheduler/jobrunr/JobRunrServerLifecycle.java
+new file mode 100644
+index 000000000000..48bfcca7aab0
+--- /dev/null
++++ b/api/src/main/java/org/openmrs/scheduler/jobrunr/JobRunrServerLifecycle.java
+@@ -0,0 +1,76 @@
++/**
++ * This Source Code Form is subject to the terms of the Mozilla Public License,
++ * v. 2.0. If a copy of the MPL was not distributed with this file, You can
++ * obtain one at http://mozilla.org/MPL/2.0/. OpenMRS is also distributed under
++ * the terms of the Healthcare Disclaimer located at http://openmrs.org/license.
++ *
++ * Copyright (C) OpenMRS Inc. OpenMRS is a registered trademark and the OpenMRS
++ * graphic logo is a trademark of OpenMRS Inc.
++ */
++package org.openmrs.scheduler.jobrunr;
++
++import org.jobrunr.server.BackgroundJobServer;
++import org.springframework.context.SmartLifecycle;
++
++/**
++ * Ties the JobRunr {@link BackgroundJobServer} to the lifecycle of the application context that
++ * created it, so jobs are only processed while that context is fully refreshed and not yet closing.
++ * <p>
++ * While OpenMRS starts up, the application context is refreshed before modules are started, and
++ * again once they are, so a job processed at the end of the first refresh fails on a module's task
++ * class that is not loaded yet. Startup code that refreshes contexts before starting modules calls
++ * {@link #deferStartUntilOpenmrsStarted()} first, and the server then starts only once
++ * {@link #openmrsStarted()} reports that OpenMRS has finished starting.
++ *
++ * @since 2.9.0
++ */
++public class JobRunrServerLifecycle implements SmartLifecycle {
++
++	private static volatile boolean startDeferred = false;
++
++	private final BackgroundJobServer backgroundJobServer;
++
++	private volatile boolean running;
++
++	public JobRunrServerLifecycle(BackgroundJobServer backgroundJobServer) {
++		this.backgroundJobServer = backgroundJobServer;
++	}
++
++	/**
++	 * Keeps background job servers from starting with their application context until
++	 * {@link #openmrsStarted()} is called.
++	 */
++	public static void deferStartUntilOpenmrsStarted() {
++		startDeferred = true;
++	}
++
++	/**
++	 * Starts the background job server if its start was deferred until OpenMRS has started.
++	 */
++	public synchronized void openmrsStarted() {
++		startDeferred = false;
++		if (!running) {
++			start();
++		}
++	}
++
++	@Override
++	public synchronized void start() {
++		if (startDeferred) {
++			return;
++		}
++		backgroundJobServer.start();
++		running = true;
++	}
++
++	@Override
++	public synchronized void stop() {
++		running = false;
++		backgroundJobServer.stop();
++	}
++
++	@Override
++	public boolean isRunning() {
++		return running;
++	}
++}
+diff --git a/api/src/test/java/org/openmrs/api/context/ContextTest.java b/api/src/test/java/org/openmrs/api/context/ContextTest.java
+index 2bcde06de834..b41f71352c7c 100644
+--- a/api/src/test/java/org/openmrs/api/context/ContextTest.java
++++ b/api/src/test/java/org/openmrs/api/context/ContextTest.java
+@@ -16,6 +16,7 @@
+ import org.hibernate.SessionFactory;
+ import org.junit.jupiter.api.AfterAll;
+ import org.junit.jupiter.api.Test;
++import org.mockito.InOrder;
+ import org.openmrs.GlobalProperty;
+ import org.openmrs.Location;
+ import org.openmrs.OpenmrsObject;
+@@ -29,8 +30,10 @@
+ import org.openmrs.api.cache.GlobalPropertyCacheTestUtil;
+ import org.openmrs.api.cache.RolePrivilegeCache;
+ import org.openmrs.api.cache.RolePrivilegeCacheTestUtil;
++import org.openmrs.api.db.ContextDAO;
+ import org.openmrs.api.handler.EncounterVisitHandler;
+ import org.openmrs.api.handler.ExistingOrNewVisitAssignmentHandler;
++import org.openmrs.scheduler.SchedulerService;
+ import org.openmrs.test.jupiter.BaseContextSensitiveTest;
+ import org.openmrs.util.LocaleUtility;
+ import org.openmrs.util.OpenmrsConstants;
+@@ -48,6 +51,8 @@
+ import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.inOrder;
++import static org.mockito.Mockito.mock;
+ 
+ /**
+  * TODO add methods for all context tests
+@@ -471,4 +476,27 @@ public void removeProxyPrivilege_shouldHandleNullArrayGracefully() {
+ 			authenticate();
+ 		}
+ 	}
++
++	/**
++	 * @see Context#shutdown()
++	 */
++	@Test
++	public void shutdown_shouldShutDownTheSchedulerBeforeTheDatabase() {
++		ContextDAO contextDAO = Context.getContextDAO();
++		SchedulerService schedulerService = Context.getSchedulerService();
++		ContextDAO mockContextDAO = mock(ContextDAO.class);
++		SchedulerService mockSchedulerService = mock(SchedulerService.class);
++		Context.setDAO(mockContextDAO);
++		Context.getServiceContext().setSchedulerService(mockSchedulerService);
++		try {
++			Context.shutdown();
++		} finally {
++			Context.getServiceContext().setSchedulerService(schedulerService);
++			Context.setDAO(contextDAO);
++		}
++
++		InOrder inOrder = inOrder(mockSchedulerService, mockContextDAO);
++		inOrder.verify(mockSchedulerService).onShutdown();
++		inOrder.verify(mockContextDAO).shutdown();
++	}
+ }
+diff --git a/api/src/test/java/org/openmrs/scheduler/jobrunr/JobRunrSchedulerServiceTest.java b/api/src/test/java/org/openmrs/scheduler/jobrunr/JobRunrSchedulerServiceTest.java
+new file mode 100644
+index 000000000000..78b85d2afec8
+--- /dev/null
++++ b/api/src/test/java/org/openmrs/scheduler/jobrunr/JobRunrSchedulerServiceTest.java
+@@ -0,0 +1,63 @@
++/**
++ * This Source Code Form is subject to the terms of the Mozilla Public License,
++ * v. 2.0. If a copy of the MPL was not distributed with this file, You can
++ * obtain one at http://mozilla.org/MPL/2.0/. OpenMRS is also distributed under
++ * the terms of the Healthcare Disclaimer located at http://openmrs.org/license.
++ *
++ * Copyright (C) OpenMRS Inc. OpenMRS is a registered trademark and the OpenMRS
++ * graphic logo is a trademark of OpenMRS Inc.
++ */
++package org.openmrs.scheduler.jobrunr;
++
++import org.jobrunr.scheduling.JobRequestScheduler;
++import org.jobrunr.scheduling.JobScheduler;
++import org.jobrunr.server.BackgroundJobServer;
++import org.jobrunr.storage.StorageProvider;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.openmrs.scheduler.db.SchedulerDAO;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++
++public class JobRunrSchedulerServiceTest {
++
++	private final BackgroundJobServer server = mock(BackgroundJobServer.class);
++
++	private final JobRunrServerLifecycle lifecycle = new JobRunrServerLifecycle(server);
++
++	private final JobRunrSchedulerService schedulerService = new JobRunrSchedulerService(mock(StorageProvider.class),
++	        mock(JobRequestScheduler.class), mock(JobScheduler.class), mock(SchedulerDAO.class));
++
++	@BeforeEach
++	public void setJobRunrServerLifecycle() {
++		schedulerService.setJobRunrServerLifecycle(lifecycle);
++	}
++
++	@AfterEach
++	public void clearDeferral() {
++		new JobRunrServerLifecycle(mock(BackgroundJobServer.class)).openmrsStarted();
++	}
++
++	@Test
++	public void onStartup_shouldStartAJobServerWhoseStartWasDeferred() {
++		JobRunrServerLifecycle.deferStartUntilOpenmrsStarted();
++		lifecycle.start();
++
++		schedulerService.onStartup();
++
++		verify(server).start();
++	}
++
++	@Test
++	public void onShutdown_shouldStopTheJobServer() {
++		lifecycle.start();
++
++		schedulerService.onShutdown();
++
++		verify(server).stop();
++		assertFalse(lifecycle.isRunning());
++	}
++}
+diff --git a/api/src/test/java/org/openmrs/scheduler/jobrunr/JobRunrServerLifecycleTest.java b/api/src/test/java/org/openmrs/scheduler/jobrunr/JobRunrServerLifecycleTest.java
+new file mode 100644
+index 000000000000..dea58741bc19
+--- /dev/null
++++ b/api/src/test/java/org/openmrs/scheduler/jobrunr/JobRunrServerLifecycleTest.java
+@@ -0,0 +1,86 @@
++/**
++ * This Source Code Form is subject to the terms of the Mozilla Public License,
++ * v. 2.0. If a copy of the MPL was not distributed with this file, You can
++ * obtain one at http://mozilla.org/MPL/2.0/. OpenMRS is also distributed under
++ * the terms of the Healthcare Disclaimer located at http://openmrs.org/license.
++ *
++ * Copyright (C) OpenMRS Inc. OpenMRS is a registered trademark and the OpenMRS
++ * graphic logo is a trademark of OpenMRS Inc.
++ */
++package org.openmrs.scheduler.jobrunr;
++
++import org.jobrunr.server.BackgroundJobServer;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++
++public class JobRunrServerLifecycleTest {
++
++	private final BackgroundJobServer server = mock(BackgroundJobServer.class);
++
++	private final JobRunrServerLifecycle lifecycle = new JobRunrServerLifecycle(server);
++
++	@AfterEach
++	public void clearDeferral() {
++		new JobRunrServerLifecycle(mock(BackgroundJobServer.class)).openmrsStarted();
++	}
++
++	@Test
++	public void start_shouldStartTheServerWhenNotDeferred() {
++		lifecycle.start();
++
++		verify(server).start();
++		assertTrue(lifecycle.isRunning());
++	}
++
++	@Test
++	public void start_shouldNotStartTheServerUntilOpenmrsHasStarted() {
++		JobRunrServerLifecycle.deferStartUntilOpenmrsStarted();
++
++		lifecycle.start();
++
++		verify(server, never()).start();
++		assertFalse(lifecycle.isRunning());
++
++		lifecycle.openmrsStarted();
++
++		verify(server).start();
++		assertTrue(lifecycle.isRunning());
++	}
++
++	@Test
++	public void openmrsStarted_shouldNotStartARunningServerAgain() {
++		lifecycle.start();
++
++		lifecycle.openmrsStarted();
++
++		verify(server, times(1)).start();
++	}
++
++	@Test
++	public void start_shouldStartServersOfLaterContextsOnceOpenmrsHasStarted() {
++		JobRunrServerLifecycle.deferStartUntilOpenmrsStarted();
++		lifecycle.openmrsStarted();
++		BackgroundJobServer refreshedServer = mock(BackgroundJobServer.class);
++
++		new JobRunrServerLifecycle(refreshedServer).start();
++
++		verify(refreshedServer).start();
++	}
++
++	@Test
++	public void stop_shouldStopTheServer() {
++		lifecycle.start();
++
++		lifecycle.stop();
++
++		verify(server).stop();
++		assertFalse(lifecycle.isRunning());
++	}
++}
+diff --git a/web/src/main/java/org/openmrs/web/Listener.java b/web/src/main/java/org/openmrs/web/Listener.java
+index c3a800a2bb9e..af7f69bf2c19 100644
+--- a/web/src/main/java/org/openmrs/web/Listener.java
++++ b/web/src/main/java/org/openmrs/web/Listener.java
+@@ -46,6 +46,7 @@
+ import org.openmrs.module.ModuleMustStartException;
+ import org.openmrs.module.web.OpenmrsJspServlet;
+ import org.openmrs.module.web.WebModuleUtil;
++import org.openmrs.scheduler.jobrunr.JobRunrServerLifecycle;
+ import org.openmrs.util.DatabaseUpdateException;
+ import org.openmrs.util.DatabaseUpdater;
+ import org.openmrs.util.InputRequiredException;
+@@ -203,6 +204,10 @@ public void contextInitialized(ServletContextEvent event) {
+ 			// validate the current JVM version
+ 			OpenmrsUtil.validateJavaVersion();
+ 
++			// the application context is refreshed before modules start, so hold off scheduled jobs
++			// until startOpenmrs has started them
++			JobRunrServerLifecycle.deferStartUntilOpenmrsStarted();
++
+ 			ServletContext servletContext = event.getServletContext();
+ 
+ 			// pulled from web.xml.

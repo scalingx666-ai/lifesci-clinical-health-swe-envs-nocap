@@ -1,0 +1,123 @@
+diff --git a/packages/server/src/email/email.test.ts b/packages/server/src/email/email.test.ts
+index 2601ed21a17..03e6b471119 100644
+--- a/packages/server/src/email/email.test.ts
++++ b/packages/server/src/email/email.test.ts
+@@ -297,6 +297,53 @@ describe('Email', () => {
+     expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(0);
+   });
+ 
++  test('Fetch URL attachment via safeFetch', async () => {
++    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('hello world'));
++    try {
++      await sendEmail(systemRepo, {
++        to: 'alice@example.com',
++        subject: 'Hello',
++        text: 'Hello Alice',
++        attachments: [{ filename: 'text1.txt', path: 'https://example.com/text1.txt' }],
++      });
++      expect(fetchSpy).toHaveBeenCalledWith(
++        'https://example.com/text1.txt',
++        expect.objectContaining({ dispatcher: expect.anything() })
++      );
++    } finally {
++      fetchSpy.mockRestore();
++    }
++
++    const inputArgs = mockSESv2Client.commandCalls(SendEmailCommand)[0].args[0].input;
++    const parsed = await simpleParser(Readable.from(inputArgs?.Content?.Raw?.Data ?? ''));
++    expect(parsed.attachments).toHaveLength(1);
++    expect(parsed.attachments[0].content.toString()).toBe('hello world');
++  });
++
++  test('Block metadata URL attachment', async () => {
++    await expect(
++      sendEmail(systemRepo, {
++        to: 'alice@example.com',
++        subject: 'Hello',
++        text: 'Hello Alice',
++        attachments: [{ filename: 'creds.json', path: 'https://169.254.170.2/v2/metadata' }],
++      })
++    ).rejects.toThrow('Failed to fetch attachment: Outbound request to unsafe hostname 169.254.170.2 is blocked');
++
++    expect(mockSESv2Client.send.callCount).toBe(0);
++  });
++
++  test('Block nodemailer URL access', async () => {
++    await expect(
++      sendEmail(systemRepo, {
++        to: 'alice@example.com',
++        subject: 'Hello',
++        text: 'Hello Alice',
++        attachments: [{ filename: 'creds.json', href: 'https://169.254.170.2/v2/metadata' }],
++      })
++    ).rejects.toThrow('Invalid email options: Url access rejected for https://169.254.170.2/v2/metadata');
++  });
++
+   test('Catch invalid options', async () => {
+     await expect(
+       sendEmail(systemRepo, {
+diff --git a/packages/server/src/email/email.ts b/packages/server/src/email/email.ts
+index 7c3aaf93d8b..d27b6413a6c 100644
+--- a/packages/server/src/email/email.ts
++++ b/packages/server/src/email/email.ts
+@@ -1,7 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+ import type { WithId } from '@medplum/core';
+-import { EMPTY, normalizeErrorString } from '@medplum/core';
++import { badRequest, EMPTY, normalizeErrorString, OperationOutcomeError } from '@medplum/core';
+ import type { Binary, Project } from '@medplum/fhirtypes';
+ import { createTransport } from 'nodemailer';
+ import type Mail from 'nodemailer/lib/mailer';
+@@ -12,6 +12,7 @@ import type { MedplumSmtpConfig } from '../config/types';
+ import type { Repository } from '../fhir/repo';
+ import { globalLogger } from '../logger';
+ import { getBinaryStorage } from '../storage/loader';
++import { safeFetch } from '../util/url';
+ import {
+   applyFromDisplayName,
+   getFromAddress,
+@@ -47,6 +48,7 @@ export async function sendEmail(repo: Repository, options: Mail.Options, project
+   // Disable file access
+   // "if set to true then fails with an error when a node tries to load content from a file"
+   options.disableFileAccess = true;
++  options.disableUrlAccess = true;
+ 
+   globalLogger.info('Sending email', { to: options.to, subject: options.subject, projectId: project?.id });
+ 
+@@ -100,6 +102,21 @@ async function processAttachment(repo: Repository, attachment: Mail.Attachment):
+     // And then delete the original path
+     delete attachment.path;
+   }
++
++  // Same pattern nodemailer uses to treat a path as a URL
++  if (/^https?:\/\//i.test(path)) {
++    // safeFetch blocks private, link-local, and metadata addresses, including on redirect
++    const response = await safeFetch(path, { signal: AbortSignal.timeout(30_000) }).catch((err: Error) => {
++      throw new OperationOutcomeError(
++        badRequest('Failed to fetch attachment: ' + normalizeErrorString(err.cause ?? err))
++      );
++    });
++    if (!response.ok) {
++      throw new OperationOutcomeError(badRequest(`Failed to fetch attachment: HTTP ${response.status}`));
++    }
++    attachment.content = Buffer.from(await response.arrayBuffer());
++    delete attachment.path;
++  }
+ }
+ 
+ /**
+diff --git a/packages/server/src/email/routes.test.ts b/packages/server/src/email/routes.test.ts
+index 063a71b6830..070550abba2 100644
+--- a/packages/server/src/email/routes.test.ts
++++ b/packages/server/src/email/routes.test.ts
+@@ -283,7 +283,8 @@ describe('Email API Routes', () => {
+       expect(options.from).toBe(config.supportEmail);
+       expect(options.sender).toBe(config.supportEmail);
+       expect(options.disableFileAccess).toBe(true);
+-      for (const key of ['envelope', 'raw', 'headers', 'dkim', 'auth', 'disableUrlAccess']) {
++      expect(options.disableUrlAccess).toBe(true);
++      for (const key of ['envelope', 'raw', 'headers', 'dkim', 'auth']) {
+         expect(options[key]).toBeUndefined();
+       }
+       expect(mockSESv2Client.send.callCount).toBe(0);

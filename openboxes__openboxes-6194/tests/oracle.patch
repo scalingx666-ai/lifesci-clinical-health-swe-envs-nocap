@@ -1,0 +1,525 @@
+diff --git a/grails-app/services/org/pih/warehouse/data/DataService.groovy b/grails-app/services/org/pih/warehouse/data/DataService.groovy
+index 182a6d09811..77c52e621d9 100755
+--- a/grails-app/services/org/pih/warehouse/data/DataService.groovy
++++ b/grails-app/services/org/pih/warehouse/data/DataService.groovy
+@@ -12,36 +12,17 @@ package org.pih.warehouse.data
+ import grails.gorm.transactions.Transactional
+ import groovy.sql.Sql
+ import org.apache.commons.lang.StringEscapeUtils
+-import org.apache.poi.hssf.usermodel.*
+-import org.apache.poi.ss.usermodel.*
+-import grails.plugins.csv.CSVWriter
+-import org.grails.plugins.excelimport.ExpectedPropertyType
+-import org.pih.warehouse.core.Location
+-import org.pih.warehouse.core.ProductPrice
+-import org.pih.warehouse.core.UnitOfMeasure
+-import org.pih.warehouse.core.UnitOfMeasureClass
+-import org.pih.warehouse.core.UnitOfMeasureType
++import org.apache.commons.lang.StringUtils
+ import org.pih.warehouse.importer.CSVUtils
+-import org.pih.warehouse.importer.ImportDataCommand
+-import org.pih.warehouse.importer.InventoryLevelExcelImporter
+-import org.pih.warehouse.core.UnitOfMeasure
+-import org.pih.warehouse.core.UnitOfMeasureClass
+-import org.pih.warehouse.core.Tag
+-import org.pih.warehouse.inventory.Inventory
+-import org.pih.warehouse.inventory.InventoryLevel
+-import org.pih.warehouse.inventory.InventoryStatus
+-import org.pih.warehouse.product.Category
+-import org.pih.warehouse.product.Product
+-import org.pih.warehouse.product.ProductPackage
+-import org.pih.warehouse.product.ProductType
+-import org.pih.warehouse.product.ProductTypeCode
+-
+-import java.text.SimpleDateFormat
++import org.springframework.transaction.annotation.Isolation
++
++import javax.sql.DataSource
++import java.sql.Connection
+ 
+ @Transactional
+ class DataService {
+ 
+-    def dataSource
++    DataSource dataSource
+ 
+     List executeQuery(String query) {
+         return new Sql(dataSource).rows(query)
+@@ -51,43 +32,116 @@ class DataService {
+         return new Sql(dataSource).rows(query, params)
+     }
+ 
+-    void executeStatement(String statement, Boolean logStatement = true) {
++    /**
++     * Executes a single SQL statement within its own transaction, optionally
++     * running it under a specific transaction isolation level (see
++     * withTransactionIsolation). Delegates to executeStatements() so both
++     * methods share one implementation of the transaction/isolation handling.
++     */
++    void executeStatement(String statement, Isolation isolation = null) {
++        executeStatements([statement], isolation)
++    }
++
++    /**
++     * Executes a list of SQL statements as a single atomic transaction. All
++     * statements commit together, or a failure anywhere rolls back the whole
++     * batch and rethrows to the caller (unlike the previous per-statement
++     * behavior, which silently swallowed failures; see OBS-1987/#6190).
++     *
++     * Optionally runs the whole batch under a specific transaction isolation
++     * level instead of the connection's default (REPEATABLE READ), e.g. to
++     * avoid the shared locks MariaDB/MySQL takes on source tables during a
++     * locking read like INSERT...SELECT. See OBPIH-3641 / OBS-1988 / #6189.
++     *
++     * Note: this only provides atomicity for pure DML sequences (DELETE,
++     * INSERT, UPDATE). DDL statements (DROP TABLE, CREATE TABLE) cause an
++     * implicit commit in MySQL/MariaDB regardless of this transaction wrapper.
++     * A sequence containing DDL needs a different pattern (build into a
++     * _tmp table, then RENAME TABLE to swap). See #6190.
++     *
++     * Pass disableForeignKeyChecks = true (e.g. to truncate tables referenced by
++     * foreign keys) instead of including SET FOREIGN_KEY_CHECKS statements in the
++     * list. FOREIGN_KEY_CHECKS is session-scoped and not undone by a rollback, so it
++     * has to be re-enabled in a finally block on the same connection; otherwise a
++     * failure would return the pooled connection with foreign key checks disabled.
++     *
++     * Statements are logged abbreviated at INFO and in full at DEBUG (and in full
++     * at ERROR on failure), since some (e.g. order summary, ETL) are very long.
++     */
++    void executeStatements(List<String> statementList, Isolation isolation = null, Boolean disableForeignKeyChecks = false) {
+         Sql sql = new Sql(dataSource)
+-        sql.withTransaction {
+-            try {
+-                def startTime = System.currentTimeMillis()
+-                log.info "Executing statement ${logStatement ? statement : ''}"
+-                sql.execute(statement)
+-                log.info "Updated ${sql.updateCount} rows in " +  (System.currentTimeMillis() - startTime) + " ms"
+-                sql.commit()
+-            } catch (Exception e) {
+-                sql.rollback()
+-                log.error("Rollback due to error while executing statements: " + e.message, e)
++        sql.cacheConnection { Connection connection ->
++            withForeignKeyChecksDisabled(sql, disableForeignKeyChecks) {
++                withTransactionIsolation(connection, isolation) {
++                    sql.withTransaction {
++                        statementList.each { String statement ->
++                            def startTime = System.currentTimeMillis()
++                            log.info "Executing statement: ${abbreviateStatement(statement)}"
++                            log.debug "Full statement: ${statement}"
++                            try {
++                                sql.execute(statement)
++                            } catch (Exception e) {
++                                log.error("Failed executing statement: ${statement}", e)
++                                throw e
++                            }
++                            log.info "Updated ${sql.updateCount} rows in " + (System.currentTimeMillis() - startTime) + " ms"
++                        }
++                    }
++                }
+             }
+         }
++        sql.close()
+     }
+ 
+-    void executeStatements(List statementList, Boolean logStatements = true) {
+-        statementList.each { String statement ->
+-            executeStatement(statement, logStatements)
+-        }
++    private static String abbreviateStatement(String statement) {
++        return StringUtils.abbreviate(statement.replaceAll(/\s+/, ' ').trim(), 100)
+     }
+ 
+-
+     /**
+-     * Should use the apache library to handle this.
+-     * @param str
+-     * @return
++     * Runs the given closure with foreign key checks disabled on the sql's cached
++     * connection, re-enabling them afterward regardless of success or failure.
++     * Must be called inside sql.cacheConnection so both SET statements run on the
++     * same connection as the closure.
+      */
+-    def getFloat(str) {
++    private void withForeignKeyChecksDisabled(Sql sql, Boolean disableForeignKeyChecks, Closure closure) {
++        if (!disableForeignKeyChecks) {
++            closure()
++            return
++        }
++        sql.execute("SET FOREIGN_KEY_CHECKS = 0")
+         try {
+-            return str.toFloat()
+-        } catch (NumberFormatException e) {
+-            log.error("Error converting string ${str} to float.")
++            closure()
++        } finally {
++            sql.execute("SET FOREIGN_KEY_CHECKS = 1")
++        }
++    }
+ 
+-            throw e
++    /**
++     * Runs the given closure with the connection's transaction isolation level temporarily
++     * set to transactionIsolation, restoring the previous level afterward regardless of success
++     * or failure. Pass null (or Isolation.DEFAULT) to run the closure unchanged, at
++     * whatever isolation level the connection already has.
++     *
++     * Used to run ETL/reporting queries (e.g. INSERT...SELECT) under READ COMMITTED
++     * instead of the default REPEATABLE READ, avoiding the shared locks MariaDB/MySQL
++     * takes on source table rows during a locking read. See OBPIH-3641 / OBS-1988.
++     */
++    private void withTransactionIsolation(Connection connection, Isolation transactionIsolation, Closure closure) {
++        if (!transactionIsolation || transactionIsolation == Isolation.DEFAULT) {
++            closure()
++            return
++        }
++        Integer previousTransactionIsolation = connection.getTransactionIsolation()
++        if (previousTransactionIsolation == transactionIsolation.value()) {
++            closure()
++            return
++        }
++        try {
++            connection.setTransactionIsolation(transactionIsolation.value())
++            closure()
++        } finally {
++            connection.setTransactionIsolation(previousTransactionIsolation)
+         }
+-        return 0.0
+     }
+ 
+     def transformObjects(List objects, List includeFields) {
+diff --git a/grails-app/services/org/pih/warehouse/inventory/InventoryService.groovy b/grails-app/services/org/pih/warehouse/inventory/InventoryService.groovy
+index f25c39aa202..6fb17e8ba92 100755
+--- a/grails-app/services/org/pih/warehouse/inventory/InventoryService.groovy
++++ b/grails-app/services/org/pih/warehouse/inventory/InventoryService.groovy
+@@ -2568,11 +2568,9 @@ class InventoryService implements ApplicationContextAware {
+             def sql = "select te from TransactionEntry as te left join fetch te.binLocation where te.transaction.inventory.id=:inventoryId and te.inventoryItem.product.id in (:productIds)"
+             log.debug "SQL: " + sql
+             def transactionEntries = TransactionEntry.executeQuery(sql, [inventoryId:inventory.id, productIds:productIds])
+-            log.debug "transactionEntries " + transactionEntries
+             def map = getQuantityByProductMap(transactionEntries)
+             map.keySet().each { result[it.id] = map[it] }
+         }
+-        log.debug "getQuantityForProducts " + result
+         result
+     }
+ 
+diff --git a/grails-app/services/org/pih/warehouse/order/OrderSummaryService.groovy b/grails-app/services/org/pih/warehouse/order/OrderSummaryService.groovy
+index 8d50776262a..8c8f956232a 100644
+--- a/grails-app/services/org/pih/warehouse/order/OrderSummaryService.groovy
++++ b/grails-app/services/org/pih/warehouse/order/OrderSummaryService.groovy
+@@ -414,7 +414,13 @@ class OrderSummaryService {
+         }
+ 
+         if (statements && checkIfOrderSummaryExists()) {
+-            dataService.executeStatements(statements, false)
++            try {
++                dataService.executeStatements(statements)
++            } catch (Exception e) {
++                // Don't fail the order/picklist save that triggered this refresh. The nightly
++                // RefreshOrderSummaryJob rebuilds the whole materialized view. See #6189.
++                log.error("Failed to refresh order summary for orders ${orderIds}", e)
++            }
+         }
+     }
+ 
+diff --git a/grails-app/services/org/pih/warehouse/report/ReportService.groovy b/grails-app/services/org/pih/warehouse/report/ReportService.groovy
+index e22642ebe08..3a50235bf5a 100644
+--- a/grails-app/services/org/pih/warehouse/report/ReportService.groovy
++++ b/grails-app/services/org/pih/warehouse/report/ReportService.groovy
+@@ -63,6 +63,7 @@ import org.pih.warehouse.reporting.InventoryShrinkageResult
+ import org.pih.warehouse.shipping.ShipmentService
+ import org.springframework.context.ApplicationContext
+ import org.springframework.context.ApplicationContextAware
++import org.springframework.transaction.annotation.Isolation
+ import org.xhtmlrenderer.pdf.ITextRenderer
+ import util.InventoryUtil
+ 
+@@ -383,30 +384,18 @@ class ReportService implements ApplicationContextAware {
+     }
+ 
+     def truncateFacts() {
+-        dataService.executeStatements(["SET FOREIGN_KEY_CHECKS = 0",
+-                                       "delete from transaction_fact",
+-                                       "delete from consumption_fact",
+-                                       "delete from stockout_fact",
+-                                       "alter table transaction_fact AUTO_INCREMENT = 1",
+-                                       "alter table consumption_fact AUTO_INCREMENT = 1",
+-                                       "alter table stockout_fact AUTO_INCREMENT = 1",
+-                                       "SET FOREIGN_KEY_CHECKS = 1"])
++        dataService.executeStatements(["truncate transaction_fact",
++                                       "truncate consumption_fact",
++                                       "truncate stockout_fact"], Isolation.READ_COMMITTED, true)
+     }
+ 
+     def truncateDimensions() {
+         dataService.executeStatements([
+-                "SET FOREIGN_KEY_CHECKS = 0",
+-                "delete from date_dimension",
+-                "delete from location_dimension",
+-                "delete from lot_dimension",
+-                "delete from product_dimension",
+-                "delete from transaction_type_dimension",
+-                "alter table date_dimension AUTO_INCREMENT = 1",
+-                "alter table location_dimension AUTO_INCREMENT = 1",
+-                "alter table lot_dimension AUTO_INCREMENT = 1",
+-                "alter table product_dimension AUTO_INCREMENT = 1",
+-                "alter table transaction_type_dimension AUTO_INCREMENT = 1",
+-                "SET FOREIGN_KEY_CHECKS = 1"])
++                "truncate date_dimension",
++                "truncate location_dimension",
++                "truncate lot_dimension",
++                "truncate product_dimension",
++                "truncate transaction_type_dimension"], Isolation.READ_COMMITTED, true)
+     }
+ 
+ 
+@@ -416,7 +405,7 @@ class ReportService implements ApplicationContextAware {
+             SELECT 0, transaction_type.transaction_code, substring_index(transaction_type.name, '|', 1), transaction_type.id
+             FROM transaction_type
+         """
+-        dataService.executeStatements([insertStatement])
++        dataService.executeStatements([insertStatement], Isolation.READ_COMMITTED)
+     }
+ 
+     void buildLotDimension() {
+@@ -426,7 +415,7 @@ class ReportService implements ApplicationContextAware {
+             FROM inventory_item
+             JOIN product ON product.id = inventory_item.product_id;
+         """
+-        dataService.executeStatements([insertStatement])
++        dataService.executeStatements([insertStatement], Isolation.READ_COMMITTED)
+     }
+ 
+     void buildProductDimension() {
+@@ -436,7 +425,7 @@ class ReportService implements ApplicationContextAware {
+             FROM product
+             JOIN category ON category.id = product.category_id
+         """
+-        dataService.executeStatements([insertStatement])
++        dataService.executeStatements([insertStatement], Isolation.READ_COMMITTED)
+     }
+ 
+     void buildLocationDimension() {
+@@ -447,7 +436,7 @@ class ReportService implements ApplicationContextAware {
+             JOIN location_type ON location_type.id = location.location_type_id
+             LEFT JOIN location_group ON location_group.id = location.location_group_id
+             LEFT JOIN location parent_location ON parent_location.id = location.parent_location_id;        """
+-        dataService.executeStatements([insertStatement])
++        dataService.executeStatements([insertStatement], Isolation.READ_COMMITTED)
+     }
+ 
+     void buildDateDimension() {
+@@ -485,7 +474,7 @@ class ReportService implements ApplicationContextAware {
+     }
+ 
+     def buildTransactionFact() {
+-        String deleteStatement = """delete from transaction_fact;"""
++        String deleteStatement = """truncate transaction_fact;"""
+         String insertStatement = """
+             insert into transaction_fact (version, 
+                 transaction_number, 
+@@ -521,12 +510,13 @@ class ReportService implements ApplicationContextAware {
+             where transaction.order_id is null 
+             or `order`.order_type_id not in ('PUTAWAY_ORDER') ;
+         """
+-        dataService.executeStatements([deleteStatement, insertStatement])
++        dataService.executeStatements([deleteStatement, insertStatement], Isolation.READ_COMMITTED)
++
+     }
+ 
+ 
+     def buildConsumptionFact() {
+-        String deleteStatement = """delete from consumption_fact;"""
++        String deleteStatement = """truncate consumption_fact;"""
+         String insertStatement = """
+             insert into consumption_fact (version, 
+                 transaction_number, 
+@@ -567,7 +557,7 @@ class ReportService implements ApplicationContextAware {
+             join date_dimension transaction_date_dimension on transaction_date_dimension.date = date(transaction.transaction_date)
+             WHERE transaction_type.transaction_code = 'DEBIT'
+         """
+-        dataService.executeStatements([deleteStatement, insertStatement])
++        dataService.executeStatements([deleteStatement, insertStatement], Isolation.READ_COMMITTED)
+     }
+ 
+ 
+@@ -599,7 +589,7 @@ class ReportService implements ApplicationContextAware {
+             );
+             """
+ 
+-        dataService.executeStatements([createTableStatement])
++        dataService.executeStatements([createTableStatement], Isolation.READ_COMMITTED)
+     }
+ 
+     void buildStockoutFact() {
+@@ -628,7 +618,7 @@ class ReportService implements ApplicationContextAware {
+             JOIN date_dimension ON date_dimension.id = stockout_fact.date_dimension_id
+             WHERE date_dimension.date = '${dateParam}';
+         """
+-        dataService.executeStatement(deleteStatement)
++        dataService.executeStatement(deleteStatement, Isolation.READ_COMMITTED)
+     }
+ 
+     void populateStockoutFact(Date date) {
+@@ -657,7 +647,7 @@ class ReportService implements ApplicationContextAware {
+             ) as stockout_tmp
+             on duplicate key update stockout_fact.quantity_on_hand = stockout_tmp.quantity_on_hand;
+         """
+-        dataService.executeStatement(insertStatement)
++        dataService.executeStatement(insertStatement, Isolation.READ_COMMITTED)
+     }
+ 
+     def refreshProductDemandData() {
+@@ -694,7 +684,7 @@ class ReportService implements ApplicationContextAware {
+                 "INSERT INTO product_demand_details SELECT * FROM product_demand_details_tmp;",
+                 "ALTER TABLE product_demand_details ADD INDEX (product_id, origin_id, destination_id, date_issued, date_requested)"
+         ]
+-        dataService.executeStatements(statements)
++        dataService.executeStatements(statements, Isolation.READ_COMMITTED)
+     }
+ 
+     List getOnOrderSummary(Location location) {
+diff --git a/src/integration-test/groovy/org/pih/warehouse/smoke/spec/DataServiceSpec.groovy b/src/integration-test/groovy/org/pih/warehouse/smoke/spec/DataServiceSpec.groovy
+new file mode 100644
+index 00000000000..c9662693029
+--- /dev/null
++++ b/src/integration-test/groovy/org/pih/warehouse/smoke/spec/DataServiceSpec.groovy
+@@ -0,0 +1,138 @@
++package org.pih.warehouse.smoke.spec
++
++import groovy.sql.Sql
++import org.springframework.beans.factory.annotation.Autowired
++import org.springframework.jdbc.datasource.SingleConnectionDataSource
++import org.springframework.transaction.annotation.Isolation
++
++import javax.sql.DataSource
++import java.sql.Connection
++import java.sql.SQLException
++
++import org.pih.warehouse.data.DataService
++import org.pih.warehouse.smoke.spec.base.SmokeSpec
++
++/**
++ * Tests DataService.executeStatements() against a real database.
++ *
++ * DataService is pointed at a single connection for each test so we can inspect the session state
++ * (foreign_key_checks, transaction isolation) of the exact connection it used. With the regular pool
++ * we'd have no way of knowing which connection a statement ran on. See #6189.
++ */
++class DataServiceSpec extends SmokeSpec {
++
++    @Autowired
++    DataService dataService
++
++    @Autowired
++    DataSource dataSource
++
++    DataSource originalDataSource
++    Connection connection
++    Sql sql
++
++    void setup() {
++        originalDataSource = dataService.dataSource
++        connection = dataSource.connection
++        dataService.dataSource = new SingleConnectionDataSource(connection, true)
++        sql = new Sql(connection)
++
++        sql.execute("DROP TABLE IF EXISTS data_service_spec_child")
++        sql.execute("DROP TABLE IF EXISTS data_service_spec_parent")
++        sql.execute("CREATE TABLE data_service_spec_parent (id INT PRIMARY KEY) ENGINE=InnoDB")
++        sql.execute("""
++            CREATE TABLE data_service_spec_child (
++                id INT PRIMARY KEY,
++                parent_id INT,
++                FOREIGN KEY (parent_id) REFERENCES data_service_spec_parent (id)
++            ) ENGINE=InnoDB
++        """)
++        sql.execute("INSERT INTO data_service_spec_parent (id) VALUES (1)")
++    }
++
++    void cleanup() {
++        sql.execute("SET FOREIGN_KEY_CHECKS = 1")
++        sql.execute("DROP TABLE IF EXISTS data_service_spec_child")
++        sql.execute("DROP TABLE IF EXISTS data_service_spec_parent")
++        dataService.dataSource = originalDataSource
++        connection.close()
++    }
++
++    private Integer getForeignKeyChecks() {
++        return sql.firstRow("SELECT @@foreign_key_checks AS value").value as Integer
++    }
++
++    private Integer countParents() {
++        return sql.firstRow("SELECT count(*) AS value FROM data_service_spec_parent").value as Integer
++    }
++
++    void "executeStatements should fail to truncate a referenced table when foreign key checks are enabled"() {
++        when:
++        dataService.executeStatements(["TRUNCATE data_service_spec_parent"])
++
++        then:
++        thrown(SQLException)
++        assert countParents() == 1
++    }
++
++    void "executeStatements should truncate a referenced table and re-enable foreign key checks"() {
++        when:
++        dataService.executeStatements(["TRUNCATE data_service_spec_parent"], Isolation.READ_COMMITTED, true)
++
++        then:
++        assert countParents() == 0
++        assert foreignKeyChecks == 1
++    }
++
++    void "executeStatements should re-enable foreign key checks on the same connection when a statement fails"() {
++        when:
++        dataService.executeStatements([
++                "TRUNCATE data_service_spec_parent",
++                "TRUNCATE data_service_spec_table_that_does_not_exist"], Isolation.READ_COMMITTED, true)
++
++        then:
++        thrown(SQLException)
++        assert foreignKeyChecks == 1
++    }
++
++    void "executeStatements should roll back the whole batch when a DML statement fails"() {
++        when:
++        dataService.executeStatements([
++                "INSERT INTO data_service_spec_parent (id) VALUES (2)",
++                "INSERT INTO data_service_spec_parent (id) VALUES (1)"])  // duplicate key
++
++        then:
++        thrown(SQLException)
++        assert countParents() == 1
++    }
++
++    void "executeStatements should restore the previous transaction isolation after success and failure"() {
++        given:
++        connection.transactionIsolation = Connection.TRANSACTION_REPEATABLE_READ
++
++        when:
++        dataService.executeStatements(["INSERT INTO data_service_spec_parent (id) VALUES (2)"], Isolation.READ_COMMITTED)
++
++        then:
++        assert connection.transactionIsolation == Connection.TRANSACTION_REPEATABLE_READ
++
++        when:
++        dataService.executeStatements(["INSERT INTO data_service_spec_parent (id) VALUES (1)"], Isolation.READ_COMMITTED)
++
++        then:
++        thrown(SQLException)
++        assert connection.transactionIsolation == Connection.TRANSACTION_REPEATABLE_READ
++    }
++
++    void "executeStatements should leave the transaction isolation alone when it already matches"() {
++        given:
++        connection.transactionIsolation = Connection.TRANSACTION_READ_COMMITTED
++
++        when:
++        dataService.executeStatements(["INSERT INTO data_service_spec_parent (id) VALUES (2)"], Isolation.READ_COMMITTED)
++
++        then:
++        assert connection.transactionIsolation == Connection.TRANSACTION_READ_COMMITTED
++        assert countParents() == 2
++    }
++}

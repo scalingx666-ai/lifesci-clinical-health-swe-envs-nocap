@@ -1,0 +1,586 @@
+diff --git a/api/src/main/java/org/openmrs/api/db/ContextDAO.java b/api/src/main/java/org/openmrs/api/db/ContextDAO.java
+index 092badcae70f..897de3aa53c7 100644
+--- a/api/src/main/java/org/openmrs/api/db/ContextDAO.java
++++ b/api/src/main/java/org/openmrs/api/db/ContextDAO.java
+@@ -101,6 +101,10 @@ public interface ContextDAO {
+ 
+ 	/**
+ 	 * Close session.
++	 * <p>
++	 * A call that would close a session while a Spring transaction is running on it is ignored with a
++	 * warning. The session was opened before that transaction began, so the close is unmatched, and
++	 * closing the session would break the transaction's cleanup.
+ 	 */
+ 	public void closeSession();
+ 
+diff --git a/api/src/main/java/org/openmrs/api/db/hibernate/HibernateContextDAO.java b/api/src/main/java/org/openmrs/api/db/hibernate/HibernateContextDAO.java
+index 8eb4386ce48e..78a6af6ea2f6 100644
+--- a/api/src/main/java/org/openmrs/api/db/hibernate/HibernateContextDAO.java
++++ b/api/src/main/java/org/openmrs/api/db/hibernate/HibernateContextDAO.java
+@@ -312,27 +312,23 @@ private int getUsersLoginAttempts(User user) {
+ 		return attempts;
+ 	}
+ 
+-	/**
+-	 * How many {@link #openSession()} calls on this thread joined a session that was already bound, and
+-	 * so must not close it. Nested calls are counted so that only the call that bound the session
+-	 * closes it.
+-	 */
+-	private final ThreadLocal<Integer> participationDepth = ThreadLocal.withInitial(() -> 0);
+-
+ 	/**
+ 	 * @see org.openmrs.api.context.Context#openSession()
+ 	 */
+ 	@Override
+ 	public void openSession() {
+ 		log.debug("HibernateContext: Opening Hibernate Session");
+-		if (TransactionSynchronizationManager.hasResource(sessionFactory)) {
++		Object value = TransactionSynchronizationManager.getResource(sessionFactory);
++		if (value instanceof ContextSessionHolder) {
+ 			log.debug("Participating in existing session ({})", sessionFactory.hashCode());
+-			participationDepth.set(participationDepth.get() + 1);
++			((ContextSessionHolder) value).openCount++;
++		} else if (value != null) {
++			log.debug("Participating in session bound by another owner ({})", sessionFactory.hashCode());
+ 		} else {
+ 			log.debug("Registering session with synchronization manager ({})", sessionFactory.hashCode());
+ 			Session session = sessionFactory.openSession();
+ 			session.setHibernateFlushMode(FlushMode.MANUAL);
+-			TransactionSynchronizationManager.bindResource(sessionFactory, new SessionHolder(session));
++			TransactionSynchronizationManager.bindResource(sessionFactory, new ContextSessionHolder(session));
+ 		}
+ 	}
+ 
+@@ -342,28 +338,29 @@ public void openSession() {
+ 	@Override
+ 	public void closeSession() {
+ 		log.debug("HibernateContext: closing Hibernate Session");
+-		if (participationDepth.get() == 0) {
+-			log.debug("Unbinding session from synchronization manager ({})", sessionFactory.hashCode());
++		Object value = TransactionSynchronizationManager.getResource(sessionFactory);
++		if (value instanceof ContextSessionHolder) {
++			ContextSessionHolder holder = (ContextSessionHolder) value;
++			if (holder.openCount == 1 && holder.isInSpringTransaction()) {
++				log.warn("Ignoring closeSession() without a matching openSession() inside a transaction",
++				    new IllegalStateException("Unmatched closeSession() call"));
++				return;
++			}
+ 
+-			if (TransactionSynchronizationManager.hasResource(sessionFactory)) {
+-				Object value = TransactionSynchronizationManager.unbindResource(sessionFactory);
+-				try {
+-					if (value instanceof SessionHolder) {
+-						Session session = ((SessionHolder) value).getSession();
+-						session.close();
+-					}
+-				} catch (RuntimeException e) {
+-					log.error("Unexpected exception on closing Hibernate Session", e);
+-				}
++			if (--holder.openCount > 0) {
++				log.debug("Participating in existing session, so not releasing session through synchronization manager");
++				return;
+ 			}
+-		} else {
+-			log.debug("Participating in existing session, so not releasing session through synchronization manager");
+-			int depth = participationDepth.get() - 1;
+-			if (depth == 0) {
+-				participationDepth.remove();
+-			} else {
+-				participationDepth.set(depth);
++
++			log.debug("Unbinding session from synchronization manager ({})", sessionFactory.hashCode());
++			TransactionSynchronizationManager.unbindResource(sessionFactory);
++			try {
++				holder.getSession().close();
++			} catch (RuntimeException e) {
++				log.error("Unexpected exception on closing Hibernate Session", e);
+ 			}
++		} else if (value != null) {
++			log.debug("Not closing a session this thread did not open ({})", sessionFactory.hashCode());
+ 		}
+ 	}
+ 
+@@ -675,4 +672,33 @@ private static Daemon.CallerKey daemonCallerKey() {
+ 		}
+ 		return daemonCallerKey;
+ 	}
++
++	/**
++	 * Marks a session bound by {@link #openSession()}, the only kind {@link #closeSession()} unbinds
++	 * and closes. Any other session bound to the thread belongs to whoever bound it, such as a Spring
++	 * transaction or {@code OpenSessionInViewFilter}, which releases it. Closing a transaction's
++	 * session here would leave the JDBC connection bound alongside it and break the next transaction on
++	 * the thread.
++	 * <p>
++	 * The holder counts the {@link #openSession()} calls it has not yet seen closed. The count lives on
++	 * the holder, rather than in a thread-local, so an unmatched open on some other session cannot keep
++	 * this one from closing. It needs no synchronization, as a bound resource is only reachable from
++	 * its own thread.
++	 */
++	private static final class ContextSessionHolder extends SessionHolder {
++
++		private int openCount = 1;
++
++		private ContextSessionHolder(Session session) {
++			super(session);
++		}
++
++		/**
++		 * Whether a Spring transaction manager is using this session. The flag is set when the transaction
++		 * begins and cleared only once its cleanup has finished, after the completion callbacks.
++		 */
++		private boolean isInSpringTransaction() {
++			return isTransactionActive();
++		}
++	}
+ }
+diff --git a/api/src/main/java/org/openmrs/event/outbox/tasks/OutboxTaskSchedulerInitializer.java b/api/src/main/java/org/openmrs/event/outbox/tasks/OutboxTaskSchedulerInitializer.java
+index 1bd6795717df..5611a7edd75e 100644
+--- a/api/src/main/java/org/openmrs/event/outbox/tasks/OutboxTaskSchedulerInitializer.java
++++ b/api/src/main/java/org/openmrs/event/outbox/tasks/OutboxTaskSchedulerInitializer.java
+@@ -37,10 +37,11 @@ public OutboxTaskSchedulerInitializer(SchedulerService schedulerService) {
+ 	}
+ 
+ 	public void schedule() {
++		boolean opened = !Context.isSessionOpen();
++		if (opened) {
++			Context.openSession();
++		}
+ 		try {
+-			if (!Context.isSessionOpen()) {
+-				Context.openSession();
+-			}
+ 			Context.addProxyPrivilege(PrivilegeConstants.MANAGE_SCHEDULER);
+ 
+ 			schedulerService.scheduleRecurrently(OUTBOX_POLLER_TASK_UUID, new OutboxPollingTaskData(),
+@@ -50,20 +51,27 @@ public void schedule() {
+ 			    OUTBOX_CLEANUP_TASK_NAME);
+ 		} finally {
+ 			Context.removeProxyPrivilege(PrivilegeConstants.MANAGE_SCHEDULER);
++			if (opened) {
++				Context.closeSession();
++			}
+ 		}
+ 	}
+ 
+ 	public void deleteScheduledTasks() {
++		boolean opened = !Context.isSessionOpen();
++		if (opened) {
++			Context.openSession();
++		}
+ 		try {
+-			if (!Context.isSessionOpen()) {
+-				Context.openSession();
+-			}
+ 			Context.addProxyPrivilege(PrivilegeConstants.MANAGE_SCHEDULER);
+ 
+ 			schedulerService.deleteRecurringTask(OUTBOX_POLLER_TASK_UUID);
+ 			schedulerService.deleteRecurringTask(OUTBOX_CLEANUP_TASK_UUID);
+ 		} finally {
+ 			Context.removeProxyPrivilege(PrivilegeConstants.MANAGE_SCHEDULER);
++			if (opened) {
++				Context.closeSession();
++			}
+ 		}
+ 	}
+ }
+diff --git a/api/src/test/java/org/openmrs/api/db/hibernate/HibernateContextDAOSessionTest.java b/api/src/test/java/org/openmrs/api/db/hibernate/HibernateContextDAOSessionTest.java
+new file mode 100644
+index 000000000000..9f9f8463851f
+--- /dev/null
++++ b/api/src/test/java/org/openmrs/api/db/hibernate/HibernateContextDAOSessionTest.java
+@@ -0,0 +1,125 @@
++/**
++ * This Source Code Form is subject to the terms of the Mozilla Public License,
++ * v. 2.0. If a copy of the MPL was not distributed with this file, You can
++ * obtain one at http://mozilla.org/MPL/2.0/. OpenMRS is also distributed under
++ * the terms of the Healthcare Disclaimer located at http://openmrs.org/license.
++ *
++ * Copyright (C) OpenMRS Inc. OpenMRS is a registered trademark and the OpenMRS
++ * graphic logo is a trademark of OpenMRS Inc.
++ */
++package org.openmrs.api.db.hibernate;
++
++import org.hibernate.Session;
++import org.hibernate.SessionFactory;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.openmrs.api.db.UserDAO;
++import org.openmrs.api.db.hibernate.search.session.SearchSessionFactory;
++import org.springframework.orm.jpa.hibernate.SessionHolder;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertSame;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * Tests which sessions {@link HibernateContextDAO#openSession()} and
++ * {@link HibernateContextDAO#closeSession()} bind and release, without a Spring context.
++ */
++public class HibernateContextDAOSessionTest {
++
++	private SessionFactory sessionFactory;
++
++	private HibernateContextDAO dao;
++
++	@BeforeEach
++	public void setUp() {
++		sessionFactory = mock(SessionFactory.class);
++		dao = new HibernateContextDAO(sessionFactory, mock(SearchSessionFactory.class), mock(UserDAO.class));
++	}
++
++	@AfterEach
++	public void tearDown() {
++		TransactionSynchronizationManager.unbindResourceIfPossible(sessionFactory);
++	}
++
++	@Test
++	public void closeSession_shouldCloseTheSessionOpenSessionBound() {
++		Session session = mock(Session.class);
++		when(sessionFactory.openSession()).thenReturn(session);
++
++		dao.openSession();
++		assertTrue(TransactionSynchronizationManager.hasResource(sessionFactory));
++		dao.closeSession();
++
++		assertFalse(TransactionSynchronizationManager.hasResource(sessionFactory));
++		verify(session).close();
++	}
++
++	@Test
++	public void closeSession_shouldCloseANestedSessionOnlyOnTheOutermostClose() {
++		Session session = mock(Session.class);
++		when(sessionFactory.openSession()).thenReturn(session);
++
++		dao.openSession();
++		dao.openSession();
++		dao.closeSession();
++
++		assertTrue(TransactionSynchronizationManager.hasResource(sessionFactory));
++		verify(session, never()).close();
++
++		dao.closeSession();
++
++		assertFalse(TransactionSynchronizationManager.hasResource(sessionFactory));
++		verify(session).close();
++	}
++
++	@Test
++	public void closeSession_shouldCloseItsSessionDespiteAnUnclosedJoinOfAnotherSession() {
++		// a join of a transaction's session that is never closed, as when the caller throws first
++		SessionHolder transactionHolder = new SessionHolder(mock(Session.class));
++		TransactionSynchronizationManager.bindResource(sessionFactory, transactionHolder);
++		dao.openSession();
++		TransactionSynchronizationManager.unbindResource(sessionFactory);
++
++		Session session = mock(Session.class);
++		when(sessionFactory.openSession()).thenReturn(session);
++		dao.openSession();
++		dao.closeSession();
++
++		assertFalse(TransactionSynchronizationManager.hasResource(sessionFactory));
++		verify(session).close();
++	}
++
++	@Test
++	public void closeSession_shouldNotCloseASessionThisThreadDidNotOpen() {
++		// as a Spring transaction or the web layer binds its session
++		Session session = mock(Session.class);
++		SessionHolder holder = new SessionHolder(session);
++		TransactionSynchronizationManager.bindResource(sessionFactory, holder);
++
++		dao.closeSession();
++
++		assertSame(holder, TransactionSynchronizationManager.getResource(sessionFactory));
++		verify(session, never()).close();
++	}
++
++	@Test
++	public void closeSession_shouldLeaveASessionItJoinedToItsOwner() {
++		Session session = mock(Session.class);
++		SessionHolder holder = new SessionHolder(session);
++		TransactionSynchronizationManager.bindResource(sessionFactory, holder);
++
++		dao.openSession();
++		dao.closeSession();
++
++		assertSame(holder, TransactionSynchronizationManager.getResource(sessionFactory));
++		verify(session, never()).close();
++		verify(sessionFactory, never()).openSession();
++	}
++}
+diff --git a/api/src/test/java/org/openmrs/api/db/hibernate/HibernateContextDAOTransactionTest.java b/api/src/test/java/org/openmrs/api/db/hibernate/HibernateContextDAOTransactionTest.java
+new file mode 100644
+index 000000000000..2c13cab2f6d2
+--- /dev/null
++++ b/api/src/test/java/org/openmrs/api/db/hibernate/HibernateContextDAOTransactionTest.java
+@@ -0,0 +1,121 @@
++/**
++ * This Source Code Form is subject to the terms of the Mozilla Public License,
++ * v. 2.0. If a copy of the MPL was not distributed with this file, You can
++ * obtain one at http://mozilla.org/MPL/2.0/. OpenMRS is also distributed under
++ * the terms of the Healthcare Disclaimer located at http://openmrs.org/license.
++ *
++ * Copyright (C) OpenMRS Inc. OpenMRS is a registered trademark and the OpenMRS
++ * graphic logo is a trademark of OpenMRS Inc.
++ */
++package org.openmrs.api.db.hibernate;
++
++import org.hibernate.SessionFactory;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.openmrs.api.context.Context;
++import org.openmrs.api.db.ContextDAO;
++import org.openmrs.test.SkipBaseSetup;
++import org.openmrs.test.jupiter.BaseContextSensitiveTest;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.orm.jpa.hibernate.SessionHolder;
++import org.springframework.transaction.PlatformTransactionManager;
++import org.springframework.transaction.annotation.Propagation;
++import org.springframework.transaction.annotation.Transactional;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
++import org.springframework.transaction.support.TransactionTemplate;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertSame;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * Tests how {@link HibernateContextDAO#closeSession()} behaves when a transaction runs on the
++ * session {@link HibernateContextDAO#openSession()} bound. The session must be bound before any
++ * transaction starts, so the tests cannot run in one.
++ */
++@SkipBaseSetup
++@Transactional(propagation = Propagation.NOT_SUPPORTED)
++public class HibernateContextDAOTransactionTest extends BaseContextSensitiveTest {
++
++	@Autowired
++	private ContextDAO contextDAO;
++
++	@Autowired
++	private SessionFactory sessionFactory;
++
++	@Autowired
++	private PlatformTransactionManager transactionManager;
++
++	private TransactionTemplate transaction;
++
++	@BeforeEach
++	public void releaseBaseSession() {
++		// release any session the base class opened, so each session a test opens is closed by one call
++		Context.closeSession();
++		assertNull(TransactionSynchronizationManager.getResource(sessionFactory));
++		transaction = new TransactionTemplate(transactionManager);
++	}
++
++	@Test
++	public void closeSession_shouldIgnoreAnUnmatchedCloseInsideATransactionOnItsSession() {
++		contextDAO.openSession();
++		SessionHolder holder = (SessionHolder) TransactionSynchronizationManager.getResource(sessionFactory);
++		try {
++			transaction.executeWithoutResult(status -> {
++				assertSame(holder.getSession(), sessionFactory.getCurrentSession());
++				contextDAO.closeSession();
++			});
++
++			assertSessionStillUsable(holder);
++		} finally {
++			contextDAO.closeSession();
++		}
++
++		assertNull(TransactionSynchronizationManager.getResource(sessionFactory));
++	}
++
++	@Test
++	public void closeSession_shouldIgnoreAnUnmatchedCloseInATransactionsCompletionCallback() {
++		contextDAO.openSession();
++		SessionHolder holder = (SessionHolder) TransactionSynchronizationManager.getResource(sessionFactory);
++		try {
++			transaction.executeWithoutResult(
++			    status -> TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
++
++				    @Override
++				    public void afterCompletion(int completionStatus) {
++					    contextDAO.closeSession();
++				    }
++			    }));
++
++			assertSessionStillUsable(holder);
++		} finally {
++			contextDAO.closeSession();
++		}
++
++		assertNull(TransactionSynchronizationManager.getResource(sessionFactory));
++	}
++
++	@Test
++	public void closeSession_shouldCloseItsSessionDespiteAHibernateTransactionLeftOpen() {
++		contextDAO.openSession();
++		SessionHolder holder = (SessionHolder) TransactionSynchronizationManager.getResource(sessionFactory);
++		holder.getSession().beginTransaction();
++
++		contextDAO.closeSession();
++
++		assertNull(TransactionSynchronizationManager.getResource(sessionFactory));
++		assertFalse(holder.getSession().isOpen());
++		transaction.executeWithoutResult(
++		    status -> sessionFactory.getCurrentSession().createNativeQuery("select 1", Integer.class).getSingleResult());
++	}
++
++	private void assertSessionStillUsable(SessionHolder holder) {
++		assertSame(holder, TransactionSynchronizationManager.getResource(sessionFactory));
++		assertTrue(holder.getSession().isOpen());
++		transaction.executeWithoutResult(
++		    status -> sessionFactory.getCurrentSession().createNativeQuery("select 1", Integer.class).getSingleResult());
++	}
++}
+diff --git a/api/src/test/java/org/openmrs/event/outbox/tasks/OutboxTaskSchedulerInitializerTest.java b/api/src/test/java/org/openmrs/event/outbox/tasks/OutboxTaskSchedulerInitializerTest.java
+new file mode 100644
+index 000000000000..43f5e91b544f
+--- /dev/null
++++ b/api/src/test/java/org/openmrs/event/outbox/tasks/OutboxTaskSchedulerInitializerTest.java
+@@ -0,0 +1,136 @@
++/**
++ * This Source Code Form is subject to the terms of the Mozilla Public License,
++ * v. 2.0. If a copy of the MPL was not distributed with this file, You can
++ * obtain one at http://mozilla.org/MPL/2.0/. OpenMRS is also distributed under
++ * the terms of the Healthcare Disclaimer located at http://openmrs.org/license.
++ *
++ * Copyright (C) OpenMRS Inc. OpenMRS is a registered trademark and the OpenMRS
++ * graphic logo is a trademark of OpenMRS Inc.
++ */
++package org.openmrs.event.outbox.tasks;
++
++import java.time.Duration;
++
++import org.hibernate.SessionFactory;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.openmrs.api.APIException;
++import org.openmrs.api.context.Context;
++import org.openmrs.scheduler.SchedulerService;
++import org.openmrs.scheduler.TaskData;
++import org.openmrs.test.SkipBaseSetup;
++import org.openmrs.test.jupiter.BaseContextSensitiveTest;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.transaction.annotation.Propagation;
++import org.springframework.transaction.annotation.Transactional;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertSame;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++
++/**
++ * Tests that {@link OutboxTaskSchedulerInitializer} closes the sessions it opens and leaves its
++ * caller's session alone. A session it leaves bound would be reused by every later transaction on
++ * the thread, so the tests cannot run in a transaction.
++ */
++@SkipBaseSetup
++@Transactional(propagation = Propagation.NOT_SUPPORTED)
++public class OutboxTaskSchedulerInitializerTest extends BaseContextSensitiveTest {
++
++	@Autowired
++	private SessionFactory sessionFactory;
++
++	private SchedulerService schedulerService;
++
++	private OutboxTaskSchedulerInitializer initializer;
++
++	@BeforeEach
++	public void setUp() {
++		// release any session the base class opened, so each test starts with none
++		Context.closeSession();
++		assertNull(TransactionSynchronizationManager.getResource(sessionFactory));
++
++		schedulerService = mock(SchedulerService.class);
++		initializer = new OutboxTaskSchedulerInitializer(schedulerService);
++	}
++
++	@Test
++	public void schedule_shouldCloseTheSessionItOpened() {
++		initializer.schedule();
++
++		verify(schedulerService).scheduleRecurrently(eq(OutboxTaskSchedulerInitializer.OUTBOX_POLLER_TASK_UUID),
++		    any(TaskData.class), any(Duration.class), anyString());
++		verify(schedulerService).scheduleRecurrently(eq(OutboxTaskSchedulerInitializer.OUTBOX_CLEANUP_TASK_UUID),
++		    any(TaskData.class), any(Duration.class), anyString());
++		assertNoSessionOpen();
++	}
++
++	@Test
++	public void schedule_shouldCloseTheSessionItOpenedWhenSchedulingFails() {
++		doThrow(new APIException("scheduling failed")).when(schedulerService).scheduleRecurrently(anyString(),
++		    any(TaskData.class), any(Duration.class), anyString());
++
++		assertThrows(APIException.class, () -> initializer.schedule());
++
++		assertNoSessionOpen();
++	}
++
++	@Test
++	public void schedule_shouldLeaveTheCallersSessionOpen() {
++		assertCallersSessionLeftOpen(() -> initializer.schedule());
++	}
++
++	@Test
++	public void deleteScheduledTasks_shouldCloseTheSessionItOpened() {
++		initializer.deleteScheduledTasks();
++
++		verify(schedulerService).deleteRecurringTask(OutboxTaskSchedulerInitializer.OUTBOX_POLLER_TASK_UUID);
++		verify(schedulerService).deleteRecurringTask(OutboxTaskSchedulerInitializer.OUTBOX_CLEANUP_TASK_UUID);
++		assertNoSessionOpen();
++	}
++
++	@Test
++	public void deleteScheduledTasks_shouldCloseTheSessionItOpenedWhenDeletionFails() {
++		doThrow(new APIException("deletion failed")).when(schedulerService).deleteRecurringTask(anyString());
++
++		assertThrows(APIException.class, () -> initializer.deleteScheduledTasks());
++
++		assertNoSessionOpen();
++	}
++
++	@Test
++	public void deleteScheduledTasks_shouldLeaveTheCallersSessionOpen() {
++		assertCallersSessionLeftOpen(() -> initializer.deleteScheduledTasks());
++	}
++
++	private void assertNoSessionOpen() {
++		assertFalse(Context.isSessionOpen());
++		assertNull(TransactionSynchronizationManager.getResource(sessionFactory));
++	}
++
++	private void assertCallersSessionLeftOpen(Runnable call) {
++		Context.openSession();
++		try {
++			Object holder = TransactionSynchronizationManager.getResource(sessionFactory);
++			assertNotNull(holder);
++
++			call.run();
++
++			assertTrue(Context.isSessionOpen());
++			assertSame(holder, TransactionSynchronizationManager.getResource(sessionFactory));
++		} finally {
++			Context.closeSession();
++		}
++		assertNoSessionOpen();
++	}
++}

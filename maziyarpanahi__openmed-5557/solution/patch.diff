@@ -1,0 +1,670 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 59fe9c8b73..ece80b3da8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,6 +17,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - Require OpenTelemetry API 1.45.2 or newer to reject oversized trace context
+   headers before parsing.
+ 
++### Security
++
++- **Breaking:** evaluation reports no longer fall back to signing keys
++  published in the source, which let anyone forge a signature that verifies.
++  `run_relation_suite`, `run_suite(suite="relations")` and
++  `run_federated_leakage_eval` need `signing_key` or
++  `OPENMED_RELATION_SCORECARD_KEY` / `OPENMED_FEDERATED_EVAL_KEY`. Without
++  one, they raise `ValueError` before any fixture or detector runs. Treat
++  reports signed with the old built-in keys as unsigned.
++- **Breaking (Android):** `DeidentifyEngine` no longer keys `HASH`
++  replacements with the published `openmed-android-deidentify-v1` salt.
++  Without `hashSalt`, each engine generates a random 32-byte key, so digests
++  repeat within one engine but differ between engines and app launches. Pass
++  a secret key to keep pseudonyms stable across runs.
++- **Breaking:** the public biomedical NER corpus loaders never run dataset
++  code from a repository. JNLPBA, Species-800 and BC2GM load Parquet files
++  pinned to a commit through the packaged `parquet` builder. BC5CDR and NCBI
++  Disease are published only as loading scripts, which `datasets` 4 and later
++  already refuse, so they need a local export. `BiomedicalNerSource` drops
++  `trust_remote_code` and gains `revision` and `data_dir`.
++
+ ## [3.3.0] - 2026-11-08
+ 
+ See the [3.3.0 release notes](docs/release/v3.3.0.md) and [3.2-to-3.3 migration guide](docs/migration/3.2-to-3.3.md).
+diff --git a/android/openmedkit/src/main/kotlin/com/openmed/openmedkit/deid/DeidentifyEngine.kt b/android/openmedkit/src/main/kotlin/com/openmed/openmedkit/deid/DeidentifyEngine.kt
+index 9d690081c5..ac6ae5018a 100644
+--- a/android/openmedkit/src/main/kotlin/com/openmed/openmedkit/deid/DeidentifyEngine.kt
++++ b/android/openmedkit/src/main/kotlin/com/openmed/openmedkit/deid/DeidentifyEngine.kt
+@@ -1,6 +1,7 @@
+ package com.openmed.openmedkit.deid
+ 
+ import java.nio.charset.StandardCharsets
++import java.security.SecureRandom
+ import java.util.Locale
+ import javax.crypto.Mac
+ import javax.crypto.spec.SecretKeySpec
+@@ -13,9 +14,18 @@ import kotlin.math.min
+  * The engine accepts original-text offsets and applies replacements from
+  * right to left, so each span is replaced at its original offsets even when
+  * earlier spans expand or shrink the output.
++ *
++ * [DeidentifyMethod.HASH] replacements are HMAC-SHA256 digests keyed by
++ * [hashSalt]. When no key is supplied, each engine generates a random 32-byte
++ * key, so digests repeat within one engine but differ between engines and app
++ * launches. Pass a secret key of at least 32 random bytes to keep pseudonyms
++ * stable across runs. Store it outside the app bundle and source control,
++ * because anyone holding it can test guesses against the digests.
++ *
++ * @param hashSalt Secret HMAC key for hash replacements. Must not be empty.
+  */
+ class DeidentifyEngine(
+-    hashSalt: ByteArray = DEFAULT_HASH_SALT.toByteArray(StandardCharsets.UTF_8),
++    hashSalt: ByteArray = generateHashKey(),
+ ) {
+     private val hashKey = hashSalt.copyOf()
+ 
+@@ -227,10 +237,14 @@ class DeidentifyEngine(
+     }
+ 
+     companion object {
+-        private const val DEFAULT_HASH_SALT = "openmed-android-deidentify-v1"
++        private const val GENERATED_HASH_KEY_BYTES = 32
+         private const val HMAC_SHA256 = "HmacSHA256"
+         private val HEX_CHARS = "0123456789abcdef".toCharArray()
+ 
++        private fun generateHashKey(): ByteArray {
++            return ByteArray(GENERATED_HASH_KEY_BYTES).also { SecureRandom().nextBytes(it) }
++        }
++
+         fun normalizeLabel(label: String): String {
+             val normalized = label.trim()
+                 .uppercase(Locale.US)
+diff --git a/android/openmedkit/src/test/kotlin/com/openmed/openmedkit/deid/DeidentifyEngineTest.kt b/android/openmedkit/src/test/kotlin/com/openmed/openmedkit/deid/DeidentifyEngineTest.kt
+index 64781f71e1..0206a337a7 100644
+--- a/android/openmedkit/src/test/kotlin/com/openmed/openmedkit/deid/DeidentifyEngineTest.kt
++++ b/android/openmedkit/src/test/kotlin/com/openmed/openmedkit/deid/DeidentifyEngineTest.kt
+@@ -8,6 +8,7 @@ import java.util.logging.LogRecord
+ import java.util.logging.Logger
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotEquals
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ 
+@@ -89,6 +90,33 @@ class DeidentifyEngineTest {
+         assertFalse(result.toString().contains("12345"))
+     }
+ 
++    @Test
++    fun defaultEnginesUseIndependentRandomHashKeys() {
++        val text = "MRN 12345 matched MRN 12345."
++        val spans = listOf(
++            spanOf(text, "12345", "medical_record_number"),
++            spanOf(text, "12345", "medical_record_number", fromIndex = text.lastIndexOf("12345")),
++        )
++
++        val first = DeidentifyEngine().deidentify(text, spans, DeidentifyMethod.HASH)
++        val second = DeidentifyEngine().deidentify(text, spans, DeidentifyMethod.HASH)
++
++        assertEquals(first.actions[0].replacement, first.actions[1].replacement)
++        assertTrue(first.actions[0].replacement.matches(Regex("hmac-sha256:[0-9a-f]{64}")))
++        assertNotEquals(first.actions[0].replacement, second.actions[0].replacement)
++    }
++
++    @Test
++    fun defaultHashKeyIsNotThePublishedLegacySalt() {
++        val text = "MRN 12345."
++        val spans = listOf(spanOf(text, "12345", "medical_record_number"))
++        val legacy = DeidentifyEngine("openmed-android-deidentify-v1".toByteArray())
++            .deidentify(text, spans, DeidentifyMethod.HASH)
++        val generated = DeidentifyEngine().deidentify(text, spans, DeidentifyMethod.HASH)
++
++        assertNotEquals(legacy.actions[0].replacement, generated.actions[0].replacement)
++    }
++
+     @Test
+     fun labelActionMapCanApplyMixedMethods() {
+         val text = "John called 555-1212 about MRN 12345."
+diff --git a/docs/eval-harness.md b/docs/eval-harness.md
+index 6eb50889b9..0d3620c9d0 100644
+--- a/docs/eval-harness.md
++++ b/docs/eval-harness.md
+@@ -343,6 +343,13 @@ than the span schema, run the relation gate, and return a signed
+ `RelationScorecard`. `run_relation_suite` exposes the same flow directly when a
+ caller needs to supply a signing key, key id, or baseline explicitly.
+ 
++OpenMed ships no built-in signing key. Pass `signing_key`, or set
++`OPENMED_RELATION_SCORECARD_KEY` (the only option through `run_suite`). Without
++either, the run raises `ValueError` before any fixture is scored. The federated
++leakage harness works the same way with `OPENMED_FEDERATED_EVAL_KEY`. Keep these
++keys out of source control, as anyone holding one can sign a scorecard that
++verifies.
++
+ The fixture file is JSONL with one schema-version `1` document per line. Every
+ row requires a globally unique `id`, source `text`, `metadata.synthetic=true`,
+ and non-empty `entities` and `relations` arrays. Entity rows require unique
+diff --git a/openmed/eval/datasets/biomedical_ner.py b/openmed/eval/datasets/biomedical_ner.py
+index ee2f4db0b6..348cc63861 100644
+--- a/openmed/eval/datasets/biomedical_ner.py
++++ b/openmed/eval/datasets/biomedical_ner.py
+@@ -3,6 +3,11 @@
+ The suite loads corpus rows from public Hugging Face/BigBIO sources on demand,
+ or from caller-supplied synthetic fixtures in tests. No benchmark corpus rows
+ are stored in the repository.
++
++Remote corpora are read only as Parquet files pinned to a commit, through the
++packaged ``parquet`` builder, so loading never runs dataset code published in a
++repository. Corpora that are published only as loading scripts must be passed
++as a local export.
+ """
+ 
+ from __future__ import annotations
+@@ -60,7 +65,21 @@ class BiomedicalNerSource:
+     label_mapping: Mapping[str, str]
+     loader_kind: str = "bigbio"
+     token_label: str = ""
+-    trust_remote_code: bool = True
++    revision: str | None = None
++    data_dir: str | None = None
++
++    def parquet_glob(self, split: str) -> str | None:
++        """Return the commit-pinned Parquet glob for *split*.
++
++        Returns ``None`` when the corpus has no pinned Parquet export.
++        """
++        if self.revision is None:
++            return None
++        data_dir = self.data_dir or self.config or self.corpus
++        return (
++            f"hf://datasets/{self.repository}@{self.revision}/"
++            f"{data_dir}/{split}/*.parquet"
++        )
+ 
+     @property
+     def source_url(self) -> str:
+@@ -151,6 +170,13 @@ def to_benchmark_fixtures(self) -> list[BenchmarkFixture]:
+         return [record.to_benchmark_fixture() for record in self.records]
+ 
+ 
++# Commits on each repository's ``refs/convert/parquet`` branch. BC5CDR and NCBI
++# Disease have no Parquet export (only loading scripts), so they stay unpinned
++# and must be loaded from a local export.
++_JNLPBA_PARQUET_REVISION = "c4d4db8684c996b6257b5f10f8a8f5c6e47b4cb4"
++_SPECIES_800_PARQUET_REVISION = "095d7c7223e891ad110a14c4a538faa3f4f5d903"
++_BLURB_PARQUET_REVISION = "2588833475f354bc8a5bfaa93e6688671cdd68a8"
++
+ BIOMEDICAL_NER_SOURCES: Mapping[str, BiomedicalNerSource] = {
+     BC5CDR: BiomedicalNerSource(
+         corpus=BC5CDR,
+@@ -179,6 +205,7 @@ def to_benchmark_fixtures(self) -> list[BenchmarkFixture]:
+         display_name="JNLPBA",
+         repository="bigbio/jnlpba",
+         config="jnlpba_bigbio_kb",
++        revision=_JNLPBA_PARQUET_REVISION,
+         label_mapping={
+             "cellline": OTHER,
+             "celltype": OTHER,
+@@ -199,6 +226,8 @@ def to_benchmark_fixtures(self) -> list[BenchmarkFixture]:
+         },
+         loader_kind="token_tags",
+         token_label="Species",
++        revision=_SPECIES_800_PARQUET_REVISION,
++        data_dir="species_800",
+     ),
+     BC2GM: BiomedicalNerSource(
+         corpus=BC2GM,
+@@ -212,7 +241,7 @@ def to_benchmark_fixtures(self) -> list[BenchmarkFixture]:
+         },
+         loader_kind="token_tags",
+         token_label="GENE",
+-        trust_remote_code=False,
++        revision=_BLURB_PARQUET_REVISION,
+     ),
+ }
+ 
+@@ -265,6 +294,7 @@ def biomedical_ner_suite_metadata(
+                 "display_name": source.display_name,
+                 "loader_kind": source.loader_kind,
+                 "repository": source.repository,
++                "revision": source.revision,
+                 "source_url": source.source_url,
+             }
+             for source in sources
+@@ -472,6 +502,13 @@ def _load_hf_rows(
+     split: str,
+     cache_dir: str | Path | None,
+ ) -> list[Mapping[str, Any]]:
++    parquet_glob = source.parquet_glob(split)
++    if parquet_glob is None:
++        raise RuntimeError(
++            f"{source.display_name} is published on Hugging Face only as a "
++            "loading script, and OpenMed does not run dataset code; export the "
++            "corpus locally and pass its path instead"
++        )
+     try:
+         from datasets import load_dataset
+     except ImportError as exc:
+@@ -481,21 +518,11 @@ def _load_hf_rows(
+             "local synthetic fixture path"
+         ) from exc
+ 
+-    kwargs: dict[str, Any] = {"split": split}
+-    if source.config is not None:
+-        kwargs["name"] = source.config
++    kwargs: dict[str, Any] = {"data_files": {split: parquet_glob}, "split": split}
+     if cache_dir is not None:
+         kwargs["cache_dir"] = str(Path(cache_dir).expanduser())
+-    if source.trust_remote_code:
+-        kwargs["trust_remote_code"] = True
+ 
+-    try:
+-        dataset = load_dataset(source.repository, **kwargs)
+-    except TypeError as exc:
+-        if "trust_remote_code" not in str(exc):
+-            raise
+-        kwargs.pop("trust_remote_code", None)
+-        dataset = load_dataset(source.repository, **kwargs)
++    dataset = load_dataset("parquet", **kwargs)
+ 
+     tag_names = _tag_names_from_dataset(dataset)
+     rows: list[Mapping[str, Any]] = []
+diff --git a/openmed/eval/harness.py b/openmed/eval/harness.py
+index 208189b16d..e47a771c44 100644
+--- a/openmed/eval/harness.py
++++ b/openmed/eval/harness.py
+@@ -63,8 +63,8 @@
+     "PipelineStageOutput | Mapping[str, Any] | Iterable[Any]",
+ ]
+ _SIGNATURE_ALGORITHM = "HMAC-SHA256"
+-_DEFAULT_FEDERATED_SIGNING_KEY = "openmed-federated-eval-local-key"
+-_DEFAULT_RELATION_SCORECARD_SIGNING_KEY = "openmed-relation-scorecard-local-key"
++_FEDERATED_EVAL_KEY_ENV = "OPENMED_FEDERATED_EVAL_KEY"
++_RELATION_SCORECARD_KEY_ENV = "OPENMED_RELATION_SCORECARD_KEY"
+ RELATION_SCORECARD_ARTIFACT = "openmed.eval.relation_scorecard"
+ RELATION_SCORECARD_SCHEMA_VERSION = 1
+ DUA_RELATION_PROMOTION_CORPORA = frozenset({"biored", "n2c2-2018", "n2c2-2022"})
+@@ -2117,8 +2117,19 @@ def run_relation_suite(
+     A failing gate is still serialized to requested output paths before
+     :class:`RelationGateFailure` is raised, so automation can archive the
+     signed failure evidence without treating the run as successful.
++
++    The scorecard is signed with ``signing_key`` or, when that is ``None``,
++    the ``OPENMED_RELATION_SCORECARD_KEY`` environment variable. There is no
++    built-in key: without either, a :class:`ValueError` is raised before any
++    fixture runs.
+     """
+ 
++    active_signing_key = _resolve_report_signing_key(
++        signing_key,
++        env_var=_RELATION_SCORECARD_KEY_ENV,
++        artifact="relation scorecard",
++    )
++
+     from openmed.core.baseline import (
+         BASELINE_PATH,
+         BaselineError,
+@@ -2211,14 +2222,6 @@ def run_relation_suite(
+         "relation_suite": relation_suite_metadata(),
+         "trap_summary": trap_summary,
+     }
+-    active_signing_key = (
+-        signing_key
+-        if signing_key is not None
+-        else os.environ.get(
+-            "OPENMED_RELATION_SCORECARD_KEY",
+-            _DEFAULT_RELATION_SCORECARD_SIGNING_KEY,
+-        )
+-    )
+     scorecard = RelationScorecard(
+         suite=report.suite,
+         model_name=report.model_name,
+@@ -2687,9 +2690,19 @@ def run_federated_leakage_eval(
+     fixture path and output path through environment variables, writes
+     predictions to that output JSON, and any stdout/stderr/side files are
+     treated as monitored egress. Gold spans are never passed to the child.
++
++    The report is signed with ``signing_key`` or, when that is ``None``, the
++    ``OPENMED_FEDERATED_EVAL_KEY`` environment variable. There is no built-in
++    key: without either, a :class:`ValueError` is raised before the detector
++    is started.
+     """
+     from openmed.eval.attacks.reid import probe_span_timing_side_channel
+ 
++    key = _resolve_report_signing_key(
++        signing_key,
++        env_var=_FEDERATED_EVAL_KEY_ENV,
++        artifact="federated leakage report",
++    )
+     _validate_unique_fixture_ids(fixtures)
+     spec = _coerce_federated_spec(detector)
+     script_path = Path(spec.script_path).expanduser().resolve()
+@@ -2752,10 +2765,6 @@ def run_federated_leakage_eval(
+             "detector_path_hash": _path_hash(script_path),
+         },
+     )
+-    key = signing_key or os.environ.get(
+-        "OPENMED_FEDERATED_EVAL_KEY",
+-        _DEFAULT_FEDERATED_SIGNING_KEY,
+-    )
+     return report.sign(key, key_id=key_id)
+ 
+ 
+@@ -4178,6 +4187,29 @@ def _canonical_json(data: Any) -> str:
+     )
+ 
+ 
++def _resolve_report_signing_key(
++    signing_key: bytes | str | None,
++    *,
++    env_var: str,
++    artifact: str,
++) -> bytes | str:
++    """Return the caller's signing key, falling back only to *env_var*.
++
++    OpenMed ships no default report key: a key published in the source would
++    let anyone produce a signature that verifies.
++    """
++    key: bytes | str | None = signing_key
++    if key is None:
++        key = os.environ.get(env_var) or None
++    if key is None:
++        raise ValueError(
++            f"{artifact} signing requires a key: pass signing_key or set "
++            f"{env_var}; OpenMed has no built-in signing key"
++        )
++    _key_bytes(key)
++    return key
++
++
+ def _key_bytes(key: bytes | str) -> bytes:
+     if isinstance(key, bytes):
+         if not key:
+diff --git a/tests/unit/eval/test_biomedical_ner_remote_sources.py b/tests/unit/eval/test_biomedical_ner_remote_sources.py
+new file mode 100644
+index 0000000000..93bbf3eea3
+--- /dev/null
++++ b/tests/unit/eval/test_biomedical_ner_remote_sources.py
+@@ -0,0 +1,120 @@
++"""Remote biomedical NER corpora load without running repository code."""
++
++from __future__ import annotations
++
++import re
++import sys
++import types
++from pathlib import Path
++from typing import Any
++
++import pytest
++
++from openmed.eval.datasets import (
++    BC2GM,
++    BC5CDR,
++    BIOMEDICAL_NER_CORPORA,
++    NCBI_DISEASE,
++    SPECIES_800,
++    biomedical_ner_suite_metadata,
++    load_biomedical_ner_corpus,
++)
++from openmed.eval.datasets.biomedical_ner import BIOMEDICAL_NER_SOURCES
++
++_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
++
++
++class _FakeClassLabel:
++    names = ["O", "B", "I"]
++
++
++class _FakeSequence:
++    feature = _FakeClassLabel()
++
++
++class _FakeDataset(list):
++    features = {"ner_tags": _FakeSequence()}
++
++
++def _install_fake_datasets(
++    monkeypatch: pytest.MonkeyPatch, rows: list[dict[str, Any]]
++) -> list[tuple[tuple[Any, ...], dict[str, Any]]]:
++    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
++
++    def load_dataset(*args: Any, **kwargs: Any) -> _FakeDataset:
++        calls.append((args, kwargs))
++        return _FakeDataset(rows)
++
++    module = types.ModuleType("datasets")
++    module.load_dataset = load_dataset  # type: ignore[attr-defined]
++    monkeypatch.setitem(sys.modules, "datasets", module)
++    return calls
++
++
++def test_remote_sources_never_request_dataset_code() -> None:
++    for corpus in BIOMEDICAL_NER_CORPORA:
++        source = BIOMEDICAL_NER_SOURCES[corpus]
++        assert not hasattr(source, "trust_remote_code")
++        if source.revision is not None:
++            assert _COMMIT_SHA.fullmatch(source.revision), corpus
++
++
++def test_pinned_source_loads_parquet_at_its_commit(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    rows = [
++        {"id": "s1", "tokens": ["BRCA1", "binds"], "ner_tags": [1, 0]},
++    ]
++    calls = _install_fake_datasets(monkeypatch, rows)
++    source = BIOMEDICAL_NER_SOURCES[BC2GM]
++
++    corpus = load_biomedical_ner_corpus(BC2GM, cache_dir=tmp_path)
++
++    assert len(calls) == 1
++    args, kwargs = calls[0]
++    assert args == ("parquet",)
++    assert kwargs == {
++        "cache_dir": str(tmp_path),
++        "data_files": {
++            "test": (
++                f"hf://datasets/bigbio/blurb@{source.revision}/bc2gm/test/*.parquet"
++            )
++        },
++        "split": "test",
++    }
++    assert "trust_remote_code" not in kwargs
++    assert [span.text for span in corpus.records[0].spans] == ["BRCA1"]
++
++
++def test_data_dir_overrides_the_config_name(monkeypatch: pytest.MonkeyPatch) -> None:
++    calls = _install_fake_datasets(monkeypatch, [])
++    source = BIOMEDICAL_NER_SOURCES[SPECIES_800]
++
++    load_biomedical_ner_corpus(SPECIES_800, split="validation")
++
++    ((_args, kwargs),) = calls
++    assert kwargs["data_files"] == {
++        "validation": (
++            f"hf://datasets/spyysalo/species_800@{source.revision}/"
++            "species_800/validation/*.parquet"
++        )
++    }
++
++
++@pytest.mark.parametrize("corpus", [BC5CDR, NCBI_DISEASE])
++def test_script_only_sources_require_a_local_export(
++    corpus: str, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    calls = _install_fake_datasets(monkeypatch, [])
++
++    with pytest.raises(RuntimeError, match="does not run dataset code"):
++        load_biomedical_ner_corpus(corpus)
++
++    assert calls == []
++
++
++def test_suite_metadata_records_the_pinned_revision() -> None:
++    sources = biomedical_ner_suite_metadata()["sources"]
++
++    assert sources[BC2GM]["revision"] == BIOMEDICAL_NER_SOURCES[BC2GM].revision
++    assert sources[BC5CDR]["revision"] is None
+diff --git a/tests/unit/eval/test_report_signing_keys.py b/tests/unit/eval/test_report_signing_keys.py
+new file mode 100644
+index 0000000000..9e8119d996
+--- /dev/null
++++ b/tests/unit/eval/test_report_signing_keys.py
+@@ -0,0 +1,158 @@
++"""Evaluation reports are signed only with caller-supplied keys."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from openmed.eval import harness
++from openmed.eval.harness import (
++    BenchmarkFixture,
++    run_federated_leakage_eval,
++    run_relation_suite,
++)
++from openmed.eval.metrics import EvalSpan
++
++RELATION_ENV = "OPENMED_RELATION_SCORECARD_KEY"
++FEDERATED_ENV = "OPENMED_FEDERATED_EVAL_KEY"
++
++
++def _gold_runner(fixture, _model, _device):
++    return fixture.gold_relations
++
++
++def _relation_suite(tmp_path: Path, **kwargs):
++    return run_relation_suite(
++        model_name="synthetic-relation-model",
++        output_json=tmp_path / "scorecard.json",
++        generated_at="2026-11-07T00:00:00Z",
++        ci_resamples=5,
++        ci_seed=3,
++        **kwargs,
++    )
++
++
++def _federated_fixture() -> BenchmarkFixture:
++    text = "Patient Jane Roe arrived for follow up."
++    start = text.index("Jane Roe")
++    return BenchmarkFixture(
++        fixture_id="synthetic-1",
++        text=text,
++        gold_spans=(
++            EvalSpan(start=start, end=start + len("Jane Roe"), label="PERSON"),
++        ),
++    )
++
++
++def _write_detector(tmp_path: Path) -> Path:
++    detector = tmp_path / "detector.py"
++    detector.write_text(
++        """
++import json
++import os
++from pathlib import Path
++
++Path(os.environ["OPENMED_DETECTOR_OUTPUT"]).write_text(json.dumps({"spans": []}))
++""".lstrip(),
++        encoding="utf-8",
++    )
++    return detector
++
++
++def _forbid_detector_runs(monkeypatch: pytest.MonkeyPatch) -> None:
++    def fail(*_args, **_kwargs):
++        raise AssertionError("the detector must not start without a signing key")
++
++    monkeypatch.setattr(harness, "_run_federated_fixture", fail)
++
++
++def test_relation_suite_without_a_key_fails_before_running(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.delenv(RELATION_ENV, raising=False)
++    calls: list[str] = []
++
++    def runner(fixture, _model, _device):
++        calls.append(fixture.fixture_id)
++        return fixture.gold_relations
++
++    with pytest.raises(ValueError, match=RELATION_ENV):
++        _relation_suite(tmp_path, runner=runner)
++
++    assert calls == []
++    assert not (tmp_path / "scorecard.json").exists()
++
++
++def test_relation_suite_rejects_an_empty_environment_key(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setenv(RELATION_ENV, "")
++
++    with pytest.raises(ValueError, match="no built-in signing key"):
++        _relation_suite(tmp_path, runner=_gold_runner)
++
++
++def test_relation_suite_signs_with_the_environment_key(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setenv(RELATION_ENV, "synthetic-env-relation-key")
++
++    scorecard = _relation_suite(tmp_path, runner=_gold_runner)
++
++    assert scorecard.verify("synthetic-env-relation-key")
++    assert not scorecard.verify("openmed-relation-scorecard-local-key")
++
++
++def test_relation_suite_prefers_the_explicit_key(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setenv(RELATION_ENV, "synthetic-env-relation-key")
++
++    scorecard = _relation_suite(
++        tmp_path, runner=_gold_runner, signing_key=b"synthetic-explicit-key"
++    )
++
++    assert scorecard.verify(b"synthetic-explicit-key")
++    assert not scorecard.verify("synthetic-env-relation-key")
++
++
++def test_federated_eval_without_a_key_fails_before_the_detector_starts(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.delenv(FEDERATED_ENV, raising=False)
++    _forbid_detector_runs(monkeypatch)
++
++    with pytest.raises(ValueError, match=FEDERATED_ENV):
++        run_federated_leakage_eval(
++            [_federated_fixture()], detector=_write_detector(tmp_path)
++        )
++
++
++def test_federated_eval_rejects_an_empty_explicit_key(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    _forbid_detector_runs(monkeypatch)
++
++    with pytest.raises(ValueError, match="non-empty"):
++        run_federated_leakage_eval(
++            [_federated_fixture()],
++            detector=_write_detector(tmp_path),
++            signing_key="",
++        )
++
++
++def test_federated_eval_signs_with_the_environment_key(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setenv(FEDERATED_ENV, "synthetic-env-federated-key")
++
++    report = run_federated_leakage_eval(
++        [_federated_fixture()],
++        detector=_write_detector(tmp_path),
++        generated_at="2026-11-07T00:00:00+00:00",
++    )
++
++    assert report.fixture_count == 1
++    assert report.verify("synthetic-env-federated-key")
++    assert not report.verify("openmed-federated-eval-local-key")

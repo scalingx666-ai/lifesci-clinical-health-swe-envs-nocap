@@ -1,0 +1,866 @@
+diff --git a/backend/app/config.py b/backend/app/config.py
+index ec932b4717..bb862a4dc3 100644
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -137,7 +137,8 @@ class Settings(BaseSettings):
+     linked_sync_pull_lease_seconds: int = Field(120, ge=30, le=3600)
+ 
+     # Whether to ingest per-second workout samples (speed, cadence, power, GPS, etc.) into
+-    # series_sample on workout webhook arrival. Significantly increases DB storage.
++    # series_sample on workout webhook arrival, and the route/samples of mobile SDK workouts.
++    # Significantly increases DB storage.
+     # Per-provider granularity will be added via ProviderSetting in a future release.
+     ingest_workout_samples: bool = False
+ 
+diff --git a/backend/app/constants/series_types/sdk/workout_samples.py b/backend/app/constants/series_types/sdk/workout_samples.py
+new file mode 100644
+index 0000000000..f505fdf16f
+--- /dev/null
++++ b/backend/app/constants/series_types/sdk/workout_samples.py
+@@ -0,0 +1,23 @@
++from app.schemas.enums import SeriesType
++
++# workouts[].samples[].type → SeriesType and the units it is stored in as sent (lowercase). A sample
++# with another unit is skipped rather than written into a series with the wrong scale. Samsung sends
++# these from ExerciseSession `log`; Health Connect and HealthKit send no workout samples yet.
++# Cadence is steps per minute for running and revolutions per minute for cycling, the same series.
++WORKOUT_SAMPLE_TYPES: dict[str, tuple[SeriesType, frozenset[str]]] = {
++    "heartRate": (SeriesType.heart_rate, frozenset({"bpm", "count/min"})),
++    "speed": (SeriesType.speed, frozenset({"m/s"})),
++    "cadence": (SeriesType.cadence, frozenset({"spm", "rpm"})),
++    "power": (SeriesType.power, frozenset({"w"})),
++}
++
++WORKOUT_SAMPLE_SERIES: frozenset[SeriesType] = frozenset(series for series, _ in WORKOUT_SAMPLE_TYPES.values())
++
++# workouts[].route[] key → SeriesType, same series the cloud providers write GPS tracks to.
++WORKOUT_ROUTE_FIELD_TO_SERIES_TYPE: dict[str, SeriesType] = {
++    "latitude": SeriesType.latitude,
++    "longitude": SeriesType.longitude,
++    "altitudeM": SeriesType.elevation,
++}
++
++WORKOUT_ROUTE_SERIES: frozenset[SeriesType] = frozenset(WORKOUT_ROUTE_FIELD_TO_SERIES_TYPE.values())
+diff --git a/backend/app/schemas/providers/mobile_sdk/sync_request.py b/backend/app/schemas/providers/mobile_sdk/sync_request.py
+index 2ceff2354f..98db7d92fa 100644
+--- a/backend/app/schemas/providers/mobile_sdk/sync_request.py
++++ b/backend/app/schemas/providers/mobile_sdk/sync_request.py
+@@ -7,7 +7,7 @@
+ from enum import StrEnum
+ from typing import Any
+ 
+-from pydantic import BaseModel, ConfigDict, Field
++from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator
+ 
+ from app.constants.series_types.sdk import SDKMetricType, SleepPhase, WorkoutStatisticType
+ from app.constants.workout_types import SDKWorkoutType
+@@ -105,6 +105,29 @@ class WorkoutStatistic(BaseModel):
+     value: float | int
+ 
+ 
++class WorkoutRoutePoint(BaseModel):
++    """One GPS location of a workout route. Other keys (accuracy, speed, course) are ignored."""
++
++    # NaN / Infinity fail validation, so the point is dropped instead of stored.
++    model_config = ConfigDict(allow_inf_nan=False)
++
++    timestamp: datetime | None = None
++    latitude: float | None = None
++    longitude: float | None = None
++    altitudeM: float | None = None
++
++
++class WorkoutSample(BaseModel):
++    """One per-sample measurement recorded during a workout (heart rate, speed, cadence, power)."""
++
++    model_config = ConfigDict(allow_inf_nan=False)
++
++    timestamp: datetime | None = None
++    type: str | None = None
++    value: float | None = None
++    unit: str | None = None
++
++
+ class Workout(BaseModel):
+     """Schema for workout/exercise session from HealthKit."""
+ 
+@@ -118,12 +141,27 @@ class Workout(BaseModel):
+     title: str | None = None
+     notes: str | None = None
+     values: list[WorkoutStatistic] | None = None
++    route: list[WorkoutRoutePoint] | None = None
++    samples: list[WorkoutSample] | None = None
++
++    @field_validator("route", "samples", mode="before")
++    @classmethod
++    def _drop_invalid_items(cls, items: Any, info: ValidationInfo) -> Any:
++        """A malformed route point or sample is dropped on its own instead of failing the workout."""
++        if not isinstance(items, list):
++            return items
++        model = WorkoutRoutePoint if info.field_name == "route" else WorkoutSample
++        valid = []
++        for item in items:
++            try:
++                valid.append(model.model_validate(item))
++            except ValidationError:
++                continue
++        return valid
+ 
+     # everything below is unused for now
+     segments: list[dict[str, Any]] | None = None
+     laps: list[dict[str, Any]] | None = None
+-    route: list[dict[str, Any]] | None = None
+-    samples: list[dict[str, Any]] | None = None
+     metadata: list[dict[str, Any]] | dict[str, Any] | None = None
+ 
+ 
+diff --git a/backend/app/services/providers/apple/coverage.py b/backend/app/services/providers/apple/coverage.py
+index 58412ccbb4..8eb4d801ca 100644
+--- a/backend/app/services/providers/apple/coverage.py
++++ b/backend/app/services/providers/apple/coverage.py
+@@ -1,4 +1,5 @@
+ from app.constants.series_types.sdk.metric_types import APPLE_METRIC_TYPE_TO_SERIES_TYPE
++from app.constants.series_types.sdk.workout_samples import WORKOUT_ROUTE_SERIES
+ from app.constants.series_types.sdk.workout_statistics import WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE
+ from app.schemas.enums import SeriesType
+ from app.schemas.enums.health_score_category import HealthScoreCategory
+@@ -8,6 +9,7 @@
+     {
+         *APPLE_METRIC_TYPE_TO_SERIES_TYPE.values(),
+         *WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE.values(),
++        *WORKOUT_ROUTE_SERIES,  # workouts[].route, gated by settings.ingest_workout_samples
+     }
+ )
+ 
+diff --git a/backend/app/services/providers/health_connect/coverage.py b/backend/app/services/providers/health_connect/coverage.py
+index 5c9f8d3275..0e2fa19ebf 100644
+--- a/backend/app/services/providers/health_connect/coverage.py
++++ b/backend/app/services/providers/health_connect/coverage.py
+@@ -1,4 +1,5 @@
+ from app.constants.series_types.sdk.metric_types import ANDROID_METRIC_TYPE_TO_SERIES_TYPE
++from app.constants.series_types.sdk.workout_samples import WORKOUT_ROUTE_SERIES
+ from app.constants.series_types.sdk.workout_statistics import WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE
+ from app.schemas.enums import SeriesType
+ from app.services.providers.apple.coverage import HEALTH_SCORES, MEAL_FIELDS, SLEEP_FIELDS
+@@ -9,6 +10,7 @@
+     {
+         *ANDROID_METRIC_TYPE_TO_SERIES_TYPE.values(),
+         *WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE.values(),
++        *WORKOUT_ROUTE_SERIES,  # workouts[].route, gated by settings.ingest_workout_samples
+     }
+ )
+ 
+diff --git a/backend/app/services/providers/samsung/coverage.py b/backend/app/services/providers/samsung/coverage.py
+index 54ac65aa65..697506bb08 100644
+--- a/backend/app/services/providers/samsung/coverage.py
++++ b/backend/app/services/providers/samsung/coverage.py
+@@ -1,4 +1,5 @@
+ from app.constants.series_types.sdk.metric_types import SAMSUNG_METRIC_TYPE_TO_SERIES_TYPE
++from app.constants.series_types.sdk.workout_samples import WORKOUT_ROUTE_SERIES, WORKOUT_SAMPLE_SERIES
+ from app.constants.series_types.sdk.workout_statistics import SAMSUNG_WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE
+ from app.schemas.enums import HealthScoreCategory, SeriesType
+ from app.services.providers.apple.coverage import MEAL_FIELDS, SLEEP_FIELDS
+@@ -10,6 +11,9 @@
+     {
+         *SAMSUNG_METRIC_TYPE_TO_SERIES_TYPE.values(),
+         *SAMSUNG_WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE.values(),
++        # ExerciseSession route and log, gated by settings.ingest_workout_samples
++        *WORKOUT_ROUTE_SERIES,
++        *WORKOUT_SAMPLE_SERIES,
+     }
+ )
+ 
+diff --git a/backend/app/services/sdk/import_service.py b/backend/app/services/sdk/import_service.py
+index 11e1459434..e91601ef91 100644
+--- a/backend/app/services/sdk/import_service.py
++++ b/backend/app/services/sdk/import_service.py
+@@ -5,13 +5,14 @@
+ from datetime import datetime
+ from decimal import Decimal
+ from logging import Logger, getLogger
+-from typing import Iterable, TypedDict
++from typing import Any, Iterable, TypedDict
+ from uuid import UUID, uuid4
+ 
+ import sentry_sdk
+ from packaging.version import InvalidVersion, Version
+ from pydantic import ValidationError
+ 
++from app.config import settings
+ from app.constants.entry_source import get_unified_sdk_entry_source
+ from app.constants.series_types.sdk import (
+     WorkoutStatisticType,
+@@ -20,6 +21,7 @@
+     get_series_type_from_metric_type,
+     get_series_type_from_workout_statistic_type,
+ )
++from app.constants.series_types.sdk.workout_samples import WORKOUT_ROUTE_FIELD_TO_SERIES_TYPE, WORKOUT_SAMPLE_TYPES
+ from app.constants.series_types.sdk.workout_statistics import WORKOUT_ENERGY_SERIES, WORKOUT_STATISTIC_STAT
+ from app.constants.series_types.workout_detail_stats import UNDECIDED_WORKOUT_SERIES
+ from app.constants.workout_types import get_unified_sdk_workout_type
+@@ -222,6 +224,25 @@ def _build_workout_bundles(
+                 workout_id,
+             )
+ 
++            if settings.ingest_workout_samples:
++                time_series_samples.extend(
++                    self._build_workout_route_and_samples(
++                        wjson,
++                        {
++                            "user_id": user_uuid,
++                            "source": original_source_name,
++                            "device_model": device_model,
++                            "software_version": software_version,
++                            "device_type": device_type,
++                            "device_id": device_id,
++                            "source_app_id": source_app_id,
++                            "device_manufacturer": device_manufacturer,
++                            "provider": provider,
++                            "zone_offset": wjson.zoneOffset,
++                        },
++                    )
++                )
++
+             if duration is None:
+                 duration = int((wjson.endDate - wjson.startDate).total_seconds())
+ 
+@@ -260,6 +281,61 @@ def _build_workout_bundles(
+ 
+             yield record, detail, time_series_samples
+ 
++    def _build_workout_route_and_samples(
++        self,
++        wjson: Workout,
++        source_fields: dict[str, Any],
++    ) -> list[TimeSeriesSampleCreate]:
++        """Per-point series from workouts[].route and workouts[].samples.
++
++        Rows share the workout's own data source (`source_fields`), so a re-push upserts
++        on (data_source, series_type, recorded_at) instead of duplicating.
++        Points without a timestamp and sample types with no series mapping are skipped.
++        """
++        result: list[TimeSeriesSampleCreate] = []
++
++        def add(recorded_at: datetime, series_type: SeriesType, value: float) -> None:
++            result.append(
++                TimeSeriesSampleCreate(
++                    id=uuid4(),
++                    **source_fields,
++                    recorded_at=recorded_at,
++                    value=Decimal(str(value)),
++                    series_type=series_type,
++                )
++            )
++
++        for point in wjson.route or []:
++            if point.timestamp is None:
++                continue
++            for field, series_type in WORKOUT_ROUTE_FIELD_TO_SERIES_TYPE.items():
++                value = getattr(point, field)
++                if value is not None:
++                    add(point.timestamp, series_type, value)
++
++        unknown_types: Counter[str] = Counter()
++        unexpected_units: Counter[str] = Counter()
++        for sample in wjson.samples or []:
++            if sample.timestamp is None or sample.value is None:
++                continue
++            sample_type = sample.type or ""
++            if sample_type not in WORKOUT_SAMPLE_TYPES:
++                unknown_types[sample_type] += 1
++                continue
++            series_type, units = WORKOUT_SAMPLE_TYPES[sample_type]
++            unit = (sample.unit or "").strip().lower()
++            if unit and unit not in units:
++                unexpected_units[f"{sample_type}:{unit}"] += 1
++                continue
++            add(sample.timestamp, series_type, sample.value)
++
++        if unknown_types or unexpected_units:
++            self.log.debug(
++                "Skipped workout samples with unsupported types or units",
++                extra={"workout_id": wjson.id, "types": dict(unknown_types), "units": dict(unexpected_units)},
++            )
++        return result
++
+     def _build_meal_bundles(
+         self,
+         correlation_records: list[MetricRecord],
+diff --git a/backend/config/.env.example b/backend/config/.env.example
+index 4be37a67f3..e3090fd51a 100644
+--- a/backend/config/.env.example
++++ b/backend/config/.env.example
+@@ -148,7 +148,7 @@ EXTENSION_EVENT_SWEEP_INTERVAL_SECONDS=60  # How often settled events are queued
+ # Will default to false in a future release.
+ HISTORICAL_SYNC_ON_CONNECT=true
+ # Ingest per-second workout samples (speed, cadence, power, GPS, elevation) into data_point_series
+-# on workout webhook arrival. Increases DB storage significantly — disabled by default.
++# on workout webhook arrival, plus mobile SDK workout routes and samples. Increases DB storage significantly — disabled by default.
+ INGEST_WORKOUT_SAMPLES=false
+ # Store raw FIT files in S3 when received via provider APIs.
+ # Independent of INGEST_WORKOUT_SAMPLES and RAW_PAYLOAD_STORAGE.
+diff --git a/backend/tests/integrations/test_sdk_import.py b/backend/tests/integrations/test_sdk_import.py
+index e7a227d74e..dcbebe39f7 100644
+--- a/backend/tests/integrations/test_sdk_import.py
++++ b/backend/tests/integrations/test_sdk_import.py
+@@ -17,6 +17,7 @@
+ from app.constants.series_types.sdk import get_series_type_from_metric_type
+ from app.models import DataSource, EventRecord, EventRecordAggregate, MealDetails, SeriesSample, WorkoutDetails
+ from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
++from app.schemas.enums.series_types import get_series_type_from_id
+ from app.schemas.model_crud.activities import EventRecordQueryParams
+ from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
+ from app.services.event_record_service import event_record_service
+@@ -1656,3 +1657,275 @@ def test_new_dietary_types_added_for_health_connect_resolve(self) -> None:
+         assert get_series_type_from_metric_type("DIETARY_ENERGY_FROM_FAT") == SeriesType.dietary_energy_from_fat
+         assert get_series_type_from_metric_type("DIETARY_UNSATURATED_FAT") == SeriesType.dietary_fat_unsaturated
+         assert get_series_type_from_metric_type("DIETARY_FOLIC_ACID") == SeriesType.dietary_folic_acid
++
++
++class TestSDKWorkoutRouteAndSamples:
++    """workouts[].route and workouts[].samples become per-point series when ingest_workout_samples is on."""
++
++    @pytest.fixture
++    def import_service(self) -> ImportService:
++        return ImportService(log=logging.getLogger("test"))
++
++    @pytest.fixture(autouse=True)
++    def ingest_workout_samples(self) -> Any:
++        with patch("app.services.sdk.import_service.settings", ingest_workout_samples=True) as mock_settings:
++            yield mock_settings
++
++    @staticmethod
++    def _apple_payload() -> dict[str, Any]:
++        """iOS SDK shape: route only, no samples."""
++        return {
++            **SDK_ENVELOPE,
++            "data": {
++                "workouts": [
++                    {
++                        "id": "ROUTE-0000-1111-2222-333344445555",
++                        "type": "running",
++                        "startDate": "2025-05-01T06:00:00Z",
++                        "endDate": "2025-05-01T06:30:00Z",
++                        "zoneOffset": "+02:00",
++                        "source": {
++                            "name": "Apple Watch",
++                            "bundleIdentifier": "com.apple.health",
++                            "deviceManufacturer": "Apple Inc.",
++                            "deviceModel": "Watch",
++                            "productType": "Watch7,5",
++                        },
++                        "values": [{"type": "duration", "unit": "s", "value": 1800}],
++                        "route": [
++                            {
++                                "timestamp": "2025-05-01T06:00:01Z",
++                                "latitude": 52.229676,
++                                "longitude": 21.012229,
++                                "altitudeM": 101.5,
++                                "horizontalAccuracyM": 3.5,
++                                "verticalAccuracyM": 2.0,
++                                "speedMps": 2.9,
++                                "courseDeg": 90.0,
++                            },
++                            {
++                                "timestamp": "2025-05-01T06:00:02Z",
++                                "latitude": 52.229701,
++                                "longitude": 21.012301,
++                                "altitudeM": 101.7,
++                                "horizontalAccuracyM": 4.0,
++                                "verticalAccuracyM": 2.0,
++                            },
++                        ],
++                        "samples": None,
++                    }
++                ],
++            },
++        }
++
++    @staticmethod
++    def _samsung_payload() -> dict[str, Any]:
++        """Samsung SDK shape: ExerciseSession route + log samples."""
++        ts = "2026-02-24T06:01:00Z"
++        return {
++            "provider": "samsung",
++            "sdkVersion": "0.9.0",
++            "syncTimestamp": "2026-02-24T10:00:00Z",
++            "data": {
++                "workouts": [
++                    {
++                        "id": "wrk-001-s0",
++                        "parentId": "wrk-001",
++                        "type": "RUNNING",
++                        "startDate": "2026-02-24T06:00:00Z",
++                        "endDate": "2026-02-24T06:45:00Z",
++                        "zoneOffset": "+01:00",
++                        "source": {
++                            "appId": "com.sec.android.app.shealth",
++                            "deviceId": "R9ZW30ABC12",
++                            "deviceName": "Galaxy Watch7",
++                            "deviceManufacturer": "Samsung",
++                            "deviceModel": "SM-R960",
++                            "deviceType": "watch",
++                        },
++                        "values": [{"type": "duration", "value": 2700000, "unit": "ms"}],
++                        "route": [
++                            {
++                                "timestamp": ts,
++                                "latitude": 52.229676,
++                                "longitude": 21.012229,
++                                "altitudeM": 142.0,
++                                "horizontalAccuracyM": 3.5,
++                                "verticalAccuracyM": None,
++                            }
++                        ],
++                        "samples": [
++                            {"timestamp": ts, "type": "heartRate", "value": 110.0, "unit": "bpm"},
++                            {"timestamp": ts, "type": "cadence", "value": 155.0, "unit": "spm"},
++                            {"timestamp": ts, "type": "speed", "value": 1.8, "unit": "m/s"},
++                            {"timestamp": ts, "type": "power", "value": 240.0, "unit": "W"},
++                        ],
++                    }
++                ],
++            },
++        }
++
++    @staticmethod
++    def _series(db: Session, user_id: UUID) -> dict[SeriesType, list[SeriesSample]]:
++        rows = (
++            db.query(SeriesSample)
++            .join(DataSource)
++            .filter(DataSource.user_id == user_id)
++            .order_by(SeriesSample.recorded_at)
++            .all()
++        )
++        result: dict[SeriesType, list[SeriesSample]] = {}
++        for row in rows:
++            result.setdefault(get_series_type_from_id(row.series_type_definition_id), []).append(row)
++        return result
++
++    def test_ios_route_stored_as_latitude_longitude_elevation(self, db: Session, import_service: ImportService) -> None:
++        user = UserFactory()
++
++        result = import_service.load_data(db, self._apple_payload(), str(user.id))
++
++        series = self._series(db, user.id)
++        assert set(series) == {SeriesType.latitude, SeriesType.longitude, SeriesType.elevation}
++        assert all(len(rows) == 2 for rows in series.values())
++        assert result["records_saved"] == 6
++        # Tolerance instead of equality: the value column precision is widened separately.
++        assert abs(float(series[SeriesType.latitude][0].value) - 52.229676) < 0.001
++        assert abs(float(series[SeriesType.longitude][0].value) - 21.012229) < 0.001
++        assert series[SeriesType.elevation][1].value == Decimal("101.7")
++        assert series[SeriesType.latitude][0].zone_offset == "+02:00"
++
++    def test_route_and_samples_share_the_workout_data_source(self, db: Session, import_service: ImportService) -> None:
++        user = UserFactory()
++
++        import_service.load_data(db, self._samsung_payload(), str(user.id))
++
++        workout = db.query(EventRecord).filter(EventRecord.category == "workout").one()
++        series = self._series(db, user.id)
++        assert {row.data_source_id for rows in series.values() for row in rows} == {workout.data_source_id}
++
++    def test_samsung_samples_and_route_stored(self, db: Session, import_service: ImportService) -> None:
++        user = UserFactory()
++
++        import_service.load_data(db, self._samsung_payload(), str(user.id))
++
++        series = self._series(db, user.id)
++        values = {st: rows[0].value for st, rows in series.items()}
++        assert values[SeriesType.heart_rate] == Decimal("110")
++        assert values[SeriesType.cadence] == Decimal("155")
++        assert values[SeriesType.speed] == Decimal("1.8")
++        assert values[SeriesType.power] == Decimal("240")
++        assert values[SeriesType.elevation] == Decimal("142")
++        assert {SeriesType.latitude, SeriesType.longitude} <= set(series)
++
++    def test_repush_upserts_instead_of_duplicating(self, db: Session, import_service: ImportService) -> None:
++        user = UserFactory()
++        payload = self._samsung_payload()
++
++        first = import_service.load_data(db, payload, str(user.id))
++        payload["data"]["workouts"][0]["samples"][0]["value"] = 112.0
++        second = import_service.load_data(db, payload, str(user.id))
++
++        series = self._series(db, user.id)
++        assert all(len(rows) == 1 for rows in series.values())
++        assert series[SeriesType.heart_rate][0].value == Decimal("112")
++        assert first["records_inserted"] == 7
++        assert second["records_inserted"] == 0
++        assert second["records_updated"] == 7
++
++    def test_standalone_heart_rate_at_the_same_timestamp_is_one_row(
++        self, db: Session, import_service: ImportService
++    ) -> None:
++        """A heart rate record from the same device and second as a workout sample upserts into one row."""
++        user = UserFactory()
++        payload = self._samsung_payload()
++        workout = payload["data"]["workouts"][0]
++        payload["data"]["records"] = [
++            {
++                "id": "hr-1",
++                "type": "HEART_RATE",
++                "startDate": "2026-02-24T06:01:00Z",
++                "endDate": "2026-02-24T06:01:00Z",
++                "source": workout["source"],
++                "value": 111.0,
++                "unit": "bpm",
++            }
++        ]
++
++        import_service.load_data(db, payload, str(user.id))
++
++        assert len(self._series(db, user.id)[SeriesType.heart_rate]) == 1
++
++    def test_unknown_sample_type_and_missing_timestamp_are_skipped(
++        self, db: Session, import_service: ImportService, caplog: pytest.LogCaptureFixture
++    ) -> None:
++        user = UserFactory()
++        payload = self._samsung_payload()
++        workout = payload["data"]["workouts"][0]
++        workout["route"] = [{"timestamp": None, "latitude": 1.0, "longitude": 2.0}]
++        workout["samples"] = [
++            {"timestamp": "2026-02-24T06:01:00Z", "type": "strideLength", "value": 1.1, "unit": "m"},
++            {"timestamp": None, "type": "heartRate", "value": 120.0, "unit": "bpm"},
++            {"timestamp": "2026-02-24T06:02:00Z", "type": "heartRate", "value": 121.0, "unit": "bpm"},
++        ]
++
++        with caplog.at_level(logging.DEBUG, logger="test"):
++            result = import_service.load_data(db, payload, str(user.id))
++
++        assert result["workouts_saved"] == 1
++        assert result["dropped"] == []
++        assert {st: len(rows) for st, rows in self._series(db, user.id).items()} == {SeriesType.heart_rate: 1}
++        assert "Skipped workout samples with unsupported types or units" in caplog.text
++
++    def test_sample_with_unexpected_unit_is_skipped(self, db: Session, import_service: ImportService) -> None:
++        """A km/h speed would land in the m/s series at the wrong scale, so it's not stored."""
++        user = UserFactory()
++        payload = self._samsung_payload()
++        workout = payload["data"]["workouts"][0]
++        workout["route"] = None
++        workout["samples"] = [
++            {"timestamp": "2026-02-24T06:01:00Z", "type": "speed", "value": 6.5, "unit": "km/h"},
++            {"timestamp": "2026-02-24T06:02:00Z", "type": "speed", "value": 1.8, "unit": "M/S"},
++            {"timestamp": "2026-02-24T06:03:00Z", "type": "cadence", "value": 85.0, "unit": "rpm"},
++            {"timestamp": "2026-02-24T06:04:00Z", "type": "power", "value": 210.0, "unit": None},
++        ]
++
++        import_service.load_data(db, payload, str(user.id))
++
++        series = self._series(db, user.id)
++        assert [row.value for row in series[SeriesType.speed]] == [Decimal("1.8")]
++        assert len(series[SeriesType.cadence]) == 1
++        assert len(series[SeriesType.power]) == 1
++
++    def test_malformed_route_point_or_sample_keeps_the_workout(
++        self, db: Session, import_service: ImportService
++    ) -> None:
++        user = UserFactory()
++        payload = self._samsung_payload()
++        workout = payload["data"]["workouts"][0]
++        workout["route"] += [
++            {"timestamp": "2026-02-24T06:02:00Z", "latitude": "north", "longitude": 21.0},
++            {"timestamp": "2026-02-24T06:03:00Z", "latitude": float("nan"), "longitude": 21.0},
++        ]
++        workout["samples"] += [
++            {"timestamp": "not a date", "type": "heartRate", "value": 120.0},
++            {"timestamp": "2026-02-24T06:03:00Z", "type": "heartRate", "value": float("inf"), "unit": "bpm"},
++        ]
++
++        result = import_service.load_data(db, payload, str(user.id))
++
++        assert result["workouts_saved"] == 1
++        assert result["dropped"] == []
++        series = self._series(db, user.id)
++        assert len(series[SeriesType.latitude]) == 1
++        assert len(series[SeriesType.heart_rate]) == 1
++
++    def test_nothing_stored_when_ingest_workout_samples_is_off(
++        self, db: Session, import_service: ImportService, ingest_workout_samples: Any
++    ) -> None:
++        ingest_workout_samples.ingest_workout_samples = False
++        user = UserFactory()
++
++        result = import_service.load_data(db, self._samsung_payload(), str(user.id))
++
++        assert result["workouts_saved"] == 1
++        assert self._series(db, user.id) == {}
+diff --git a/backend/tests/providers/test_provider_coverage.py b/backend/tests/providers/test_provider_coverage.py
+index 5a866b78a8..c9428c3112 100644
+--- a/backend/tests/providers/test_provider_coverage.py
++++ b/backend/tests/providers/test_provider_coverage.py
+@@ -23,6 +23,7 @@
+     APPLE_METRIC_TYPE_TO_SERIES_TYPE,
+     SAMSUNG_METRIC_TYPE_TO_SERIES_TYPE,
+ )
++from app.constants.series_types.sdk.workout_samples import WORKOUT_ROUTE_SERIES, WORKOUT_SAMPLE_SERIES
+ from app.constants.series_types.sdk.workout_statistics import (
+     SAMSUNG_WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE,
+     WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE,
+@@ -172,14 +173,23 @@ def test_workout_energy_comes_from_coverage(provider: str) -> None:
+     "health_connect": WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE,
+ }
+ 
++# workouts[].route goes to every SDK; only Samsung sends workouts[].samples.
++_SDK_WORKOUT_SERIES = {
++    "apple": WORKOUT_ROUTE_SERIES,
++    "samsung": WORKOUT_ROUTE_SERIES | WORKOUT_SAMPLE_SERIES,
++    "health_connect": WORKOUT_ROUTE_SERIES,
++}
++
+ 
+ @pytest.mark.parametrize("provider", sorted(SDK_PROVIDERS))
+ def test_sdk_timeseries_match_maps(provider: str) -> None:
+     cov = _load_coverage(provider)
+-    expected = frozenset(_SDK_METRIC_MAP[provider].values()) | frozenset(_SDK_WORKOUT_STATISTIC_MAP[provider].values())
+-    assert _timeseries(cov) == expected, (
+-        f"{provider}: TIMESERIES must equal the union of the provider-specific SDK metric + workout-statistic maps"
++    expected = (
++        frozenset(_SDK_METRIC_MAP[provider].values())
++        | frozenset(_SDK_WORKOUT_STATISTIC_MAP[provider].values())
++        | _SDK_WORKOUT_SERIES[provider]
+     )
++    assert _timeseries(cov) == expected, f"{provider}: TIMESERIES must equal the union of its SDK maps"
+ 
+ 
+ @pytest.mark.parametrize("provider", _providers_with_coverage())
+diff --git a/docs/openapi.json b/docs/openapi.json
+index 8076f3f3cc..91e0910235 100644
+--- a/docs/openapi.json
++++ b/docs/openapi.json
+@@ -7830,11 +7830,59 @@
+                               ],
+                               "title": "Values"
+                             },
+-                            "segments": {
++                            "route": {
+                               "anyOf": [
+                                 {
+                                   "items": {
+-                                    "additionalProperties": true,
++                                    "description": "One GPS location of a workout route. Other keys (accuracy, speed, course) are ignored.",
++                                    "properties": {
++                                      "timestamp": {
++                                        "anyOf": [
++                                          {
++                                            "format": "date-time",
++                                            "type": "string"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Timestamp"
++                                      },
++                                      "latitude": {
++                                        "anyOf": [
++                                          {
++                                            "type": "number"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Latitude"
++                                      },
++                                      "longitude": {
++                                        "anyOf": [
++                                          {
++                                            "type": "number"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Longitude"
++                                      },
++                                      "altitudeM": {
++                                        "anyOf": [
++                                          {
++                                            "type": "number"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Altitudem"
++                                      }
++                                    },
++                                    "title": "WorkoutRoutePoint",
+                                     "type": "object"
+                                   },
+                                   "type": "array"
+@@ -7843,13 +7891,61 @@
+                                   "type": "null"
+                                 }
+                               ],
+-                              "title": "Segments"
++                              "title": "Route"
+                             },
+-                            "laps": {
++                            "samples": {
+                               "anyOf": [
+                                 {
+                                   "items": {
+-                                    "additionalProperties": true,
++                                    "description": "One per-sample measurement recorded during a workout (heart rate, speed, cadence, power).",
++                                    "properties": {
++                                      "timestamp": {
++                                        "anyOf": [
++                                          {
++                                            "format": "date-time",
++                                            "type": "string"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Timestamp"
++                                      },
++                                      "type": {
++                                        "anyOf": [
++                                          {
++                                            "type": "string"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Type"
++                                      },
++                                      "value": {
++                                        "anyOf": [
++                                          {
++                                            "type": "number"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Value"
++                                      },
++                                      "unit": {
++                                        "anyOf": [
++                                          {
++                                            "type": "string"
++                                          },
++                                          {
++                                            "type": "null"
++                                          }
++                                        ],
++                                        "title": "Unit"
++                                      }
++                                    },
++                                    "title": "WorkoutSample",
+                                     "type": "object"
+                                   },
+                                   "type": "array"
+@@ -7858,9 +7954,9 @@
+                                   "type": "null"
+                                 }
+                               ],
+-                              "title": "Laps"
++                              "title": "Samples"
+                             },
+-                            "route": {
++                            "segments": {
+                               "anyOf": [
+                                 {
+                                   "items": {
+@@ -7873,9 +7969,9 @@
+                                   "type": "null"
+                                 }
+                               ],
+-                              "title": "Route"
++                              "title": "Segments"
+                             },
+-                            "samples": {
++                            "laps": {
+                               "anyOf": [
+                                 {
+                                   "items": {
+@@ -7888,7 +7984,7 @@
+                                   "type": "null"
+                                 }
+                               ],
+-                              "title": "Samples"
++                              "title": "Laps"
+                             },
+                             "metadata": {
+                               "anyOf": [
+diff --git a/docs/providers/coverage.mdx b/docs/providers/coverage.mdx
+index 6523793b93..0bc3e8bda3 100644
+--- a/docs/providers/coverage.mdx
++++ b/docs/providers/coverage.mdx
+@@ -194,18 +194,18 @@ Legend:
+ <tr className="ow-cov-cat"><td className="ow-cov-sticky">Activity - Generic</td><td colSpan={14}></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>cadence</code> <span className="ow-cov-unit">rpm</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>estimated_<wbr />workout_<wbr />effort_<wbr />score</code> <span className="ow-cov-unit">score</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+-<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>power</code> <span className="ow-cov-unit">watts</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+-<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>speed</code> <span className="ow-cov-unit">m_per_s</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
++<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>power</code> <span className="ow-cov-unit">watts</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
++<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>speed</code> <span className="ow-cov-unit">m_per_s</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>workout_<wbr />effort_<wbr />score</code> <span className="ow-cov-unit">score</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr className="ow-cov-cat"><td className="ow-cov-sticky">Environmental</td><td colSpan={14}></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>air_<wbr />temperature</code> <span className="ow-cov-unit">celsius</span></th><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+-<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>elevation</code> <span className="ow-cov-unit">meters</span></th><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
++<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>elevation</code> <span className="ow-cov-unit">meters</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>environmental_<wbr />audio_<wbr />exposure</code> <span className="ow-cov-unit">dB</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>environmental_<wbr />sound_<wbr />reduction</code> <span className="ow-cov-unit">dB</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>headphone_<wbr />audio_<wbr />exposure</code> <span className="ow-cov-unit">dB</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>inhaler_<wbr />usage</code> <span className="ow-cov-unit">count</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+-<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>latitude</code> <span className="ow-cov-unit">degrees</span></th><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+-<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>longitude</code> <span className="ow-cov-unit">degrees</span></th><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
++<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>latitude</code> <span className="ow-cov-unit">degrees</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
++<tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>longitude</code> <span className="ow-cov-unit">degrees</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>time_<wbr />in_<wbr />daylight</code> <span className="ow-cov-unit">minutes</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>uv_<wbr />exposure</code> <span className="ow-cov-unit">count</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+ <tr><th scope="row" className="ow-cov-sticky ow-cov-metric"><code>water_<wbr />temperature</code> <span className="ow-cov-unit">celsius</span></th><td className="y"><span className="ow-cov-sr">Supported</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td><td className="n"><span className="ow-cov-sr">Not available</span></td></tr>
+@@ -585,8 +585,8 @@ Legend: ✅ supported, ❌ not available.
+ |------|------|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
+ | `cadence` | rpm | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+ | `estimated_workout_effort_score` | score | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+-| `power` | watts | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+-| `speed` | m_per_s | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
++| `power` | watts | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
++| `speed` | m_per_s | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+ | `workout_effort_score` | score | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ 
+ **Environmental**
+@@ -594,13 +594,13 @@ Legend: ✅ supported, ❌ not available.
+ | Metric | Unit | Apple | Fitbit | Garmin | Google Health | Health Connect | Oura | Polar | Samsung | Sensorbio | Strava | Suunto | Ultrahuman | Whoop | Withings |
+ |------|------|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
+ | `air_temperature` | celsius | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+-| `elevation` | meters | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
++| `elevation` | meters | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `environmental_audio_exposure` | dB | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `environmental_sound_reduction` | dB | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `headphone_audio_exposure` | dB | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `inhaler_usage` | count | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+-| `latitude` | degrees | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+-| `longitude` | degrees | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
++| `latitude` | degrees | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
++| `longitude` | degrees | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `time_in_daylight` | minutes | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `uv_exposure` | count | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `water_temperature` | celsius | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+@@ -777,6 +777,7 @@ Key differences and limitations to be aware of when working with each provider:
+   - Some walking metrics require iPhone in pocket during activity
+   - HRV is measured as SDNN, typically during sleep or rest periods
+   - Since 0.11.0, Apple Watch sleeping wrist temperature is stored as `skin_temperature`. Apple Health XML imports made on earlier versions kept it in `body_temperature`, and no migration moves those rows
++  - Workout GPS routes (iOS SDK with route export) are stored as `latitude`, `longitude` and `elevation` `/timeseries` data when `ingest_workout_samples` is enabled
+ </Accordion>
+ 
+ <Accordion title="Garmin">
+@@ -905,7 +906,8 @@ Key differences and limitations to be aware of when working with each provider:
+   - Blood glucose arrives in mmol/L; values are stored as received until unit conversion ships
+   - Health Connect basal metabolic rate is a kcal/day rate stored into the kcal `basal_energy` series
+   - All Health Connect distance is stored as `distance_walking_running` regardless of activity type
+-  - No health scores; GPS routes and in-workout sample streams are accepted by the SDK payload but not yet processed
++  - No health scores
++  - Workout GPS routes are stored as `latitude`, `longitude` and `elevation` `/timeseries` data when `ingest_workout_samples` is enabled. Samsung Health also sends in-workout heart rate, speed, cadence and power samples, stored the same way
+ </Accordion>
+ 
+ <Accordion title="Google Health (cloud OAuth)">

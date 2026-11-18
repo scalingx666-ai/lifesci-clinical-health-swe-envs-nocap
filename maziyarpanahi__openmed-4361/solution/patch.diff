@@ -1,0 +1,4802 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 512692acbb..5c79d5a0d9 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Add configurable morphology-aware clinical label projection with exact code-point, grapheme and byte offsets, and explicit ambiguity review.
++
++- Add an offline translation guard for protected terminology, numeric values, placeholders and span maps, with explicit surface-check limits.
++
+ - Add explicitly marked augmentation-only synthetic notes for six national-ID-only or user-model language routes, with validator-backed identifiers and value-free failure diagnostics.
+ 
+ - Add deterministic rare-case synthetic privacy stress records with configurable attribute tiers, value-free risk labels, and linkage-attack truth.
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index e1b71a0357..5dff4520b0 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -381,6 +381,7 @@ classification:
+     - structured/schema-guided-extraction.md
+     - medical-tokenizer.md
+     - indic-normalization.md
++    - languages/morphology-projection.md
+     - configuration.md
+     - configuration/precedence-audit.md
+     - profiles.md
+@@ -548,6 +549,7 @@ classification:
+     - languages/clinical-transliteration.md
+     - languages/abbreviation-mining.md
+     - languages/code-switch-projection.md
++    - languages/translation-guard.md
+     - runtimes/browser-extension.md
+     - india-health-id-deidentification.md
+     - security/policy-as-data.md
+diff --git a/docs/languages/morphology-projection.md b/docs/languages/morphology-projection.md
+new file mode 100644
+index 0000000000..cd5540a3d1
+--- /dev/null
++++ b/docs/languages/morphology-projection.md
+@@ -0,0 +1,115 @@
++# Morphology-aware label projection
++
++Labels projected from a high-resource language often land on a target word
++whose surface was changed by case endings, clitics, agglutinative suffix
++chains, noun-class prefixes or stem alternations. Finnish `diabetes` appears
++as `Diabeteksen`, Turkish `kalp` as `kalbinde`, Swahili `ugonjwa` as
++`magonjwa`, and Tamil `மருந்து` as `மருந்தை`. Plain string matching misses
++these words, picks the wrong occurrence, or emits a span that cuts through an
++affix or a grapheme cluster.
++
++`openmed.training.languages.morphology_projection.project_labels` matches each
++projected base form (lemma) against the target text through a caller-supplied
++`MorphologyProfile`. It emits a training label only when exactly one
++grapheme-safe span remains, and routes everything else to review with a
++controlled reason code.
++
++```python
++from openmed.training.languages.morphology_projection import (
++    LabelProjection,
++    MorphologyProfile,
++    project_labels,
++)
++
++profile = MorphologyProfile.from_dict(
++    {
++        "language": "fi",
++        "affixes": [
++            {"surface": "n", "position": "suffix", "kind": "inflection"},
++            {"surface": "ssa", "position": "suffix", "kind": "inflection"},
++            {"surface": "kin", "position": "suffix", "kind": "clitic"},
++        ],
++        "alternations": [{"lemma_edge": "s", "stem_edge": "kse"}],
++    }
++)
++text = "Diabeteksen hoito jatkuu."
++result = project_labels(text, [LabelProjection("DISEASE", "diabetes")], profile)
++decision = result.decisions[0]
++assert text[decision.start : decision.end] == "Diabeteksen"
++```
++
++## Profiles
++
++A profile is configuration, not linguistic authority. List only the
++inflectional affixes and clitics that a native reviewer approved for label
++projection; derivational affixes (for example Turkish privative `-siz`,
++"without") change meaning and must stay out so the projection is flagged.
++
++| Field | Meaning |
++| --- | --- |
++| `language` | BCP 47 tag, validated offline. |
++| `affixes` | `surface`, `position` (`prefix` or `suffix`) and `kind` (`inflection` or `clitic`). Clitics are always outermost. |
++| `alternations` | `lemma_edge` rewritten to `stem_edge` at the `suffix` or `prefix` edge, such as Turkish `p` to `b` or Swahili prefix `u` to nothing. An alternation applies only when an affix was removed on that side. |
++| `lexicalized_forms` | Whole words that an affix boundary may never split, such as Amharic `በሽታ` ("disease"), whose first syllable looks like the clitic `በ`. |
++| `casing` | `unicode` full case folding, `turkic` dotted and dotless I folding, or `auto` (Turkic for `tr` and `az`). |
++| `max_affixes` | Affixes removed per token, `0` to `8` (default `4`). |
++| `min_stem_graphemes` | Graphemes that must remain after removing affixes (default `2`). |
++
++Rules are deduplicated and sorted, so `profile.digest` is a stable SHA-256 of
++the canonical configuration and can be recorded as provenance.
++
++## Span policies
++
++| Policy | Label covers |
++| --- | --- |
++| `token` | Whole matched tokens, affixes and clitics included. |
++| `host` (default) | Tokens without outer clitics; inflection stays. |
++| `stem` | Only the material left after removing every affix. |
++
++Multi-word lemmas such as Amharic `ስኳር በሽታ` must match consecutive tokens
++with the same spacing. Shared tokenization keeps apostrophe-separated Turkish
++suffixes out of the label, so `EKG'de` labels `EKG`.
++
++## Decisions and review reasons
++
++| Status | Reason | Meaning |
++| --- | --- | --- |
++| `projected` | `exact_match`, `affix_match`, `alternation_match` | One unambiguous, grapheme-safe span. |
++| `needs_review` | `multiple_matches` | Several locations match, such as Swahili `Mgonjwa` and `magonjwa` for `ugonjwa`. Pass the aligner's `window` to narrow them. |
++| `needs_review` | `ambiguous_segmentation` | One location yields different spans under the chosen policy. |
++| `needs_review` | `grapheme_bisection` | A label edge would cut a grapheme cluster or a case-folding expansion, such as the Tamil stem of `மருந்தை` under the `stem` policy. |
++| `needs_review` | `unanalyzed_affix` | The lemma occurs only inside a token with unconfigured material, such as a compound or derivation. |
++| `needs_review` | `overlapping_projection` | Projected spans overlap with a different extent or label. Identical duplicates stay projected. |
++| `unmatched` | `no_match` | No candidate in the text or window. |
++
++Review decisions list candidate code-point spans that never bisect a grapheme
++cluster. Export only `result.projected` as training labels.
++
++## Offsets
++
++Projected labels follow the cross-runtime
++[offset contract](https://github.com/maziyarpanahi/openmed/blob/master/openmed/core/decoding/OFFSET_CONTRACT.md):
++`start` and `end` are half-open Unicode code-point offsets into the exact,
++unnormalized source. Each decision also carries `grapheme_start` and
++`grapheme_end` (extended-grapheme indices) and `byte_start` and `byte_end`
++(UTF-8 byte offsets) for the same span. Matching runs on NFC-normalized,
++case-folded text, and every boundary maps back through the shared offset
++maps, so decomposed accents and multi-byte scripts keep exact offsets.
++
++## Privacy and limits
++
++Projection is deterministic, local and stdlib-only. It runs no models, makes
++no network calls and never logs. `LabelProjection` hides its lemma from
++`repr`; decisions and `result.to_dict()` carry offsets, label and reason
++codes, counts and the profile digest only, never source text or lemmas.
++Validation errors never echo input values.
++
++The helper does not translate, align or certify labels, and it is not a
++clinical decision aid. A batch accepts at most 10,000 projections; lemmas are
++limited to 256 code points and 16 tokens. Configure each profile with a
++native reviewer and keep review decisions out of training data until they are
++resolved.
++
++```sh
++.venv/bin/python -m pytest tests/unit/training/languages/test_morphology_projection.py -q
++```
+diff --git a/docs/languages/translation-guard.md b/docs/languages/translation-guard.md
+new file mode 100644
+index 0000000000..273e6fb4b5
+--- /dev/null
++++ b/docs/languages/translation-guard.md
+@@ -0,0 +1,160 @@
++# Clinical translation guard
++
++Back-translation augmentation can return fluent text that quietly changes a
++dose, drops a negation, flips laterality, expands an abbreviation, or rewrites a
++de-identification placeholder. `openmed.training.languages.translation_guard`
++wraps a translator you supply, protects those facts during translation, checks
++the protected surfaces and configured cue counts afterwards, and rejects detected
++changes with reason codes.
++
++The guard does not translate anything itself. It calls your local translator
++once per translation leg and never opens a network connection. Frozen items
++are replaced with opaque placeholders before the call, so the translator never
++sees identifiers, doses, PHI placeholders, or annotated spans. Results keep the
++translated text for your training pipeline. Reports carry counts, reason codes,
++labels, and offsets only. Translator exception messages are discarded because
++they can quote input text.
++
++## Wrap a local translator
++
++Pass an object with `translate(text, source_lang, target_lang)` or a plain
++callable with the same arguments. The example uses the offline dictionary
++backend from the translation augmentation module.
++
++```python
++from openmed.training.languages.translation_guard import (
++    TranslationGuard,
++    TranslationGuardConfig,
++)
++from openmed.training.synthetic.translation_augment import DictionaryTranslator
++
++translator = DictionaryTranslator(
++    lexicon={
++        ("en", "es"): (("denies", "niega"), ("no", "sin"), ("fever", "fiebre")),
++        ("es", "en"): (("niega", "denies"), ("sin", "no"), ("fiebre", "fever")),
++    }
++)
++guard = TranslationGuard(
++    translator,
++    config=TranslationGuardConfig(glossary={("en", "es"): {"metformin": "metformina"}}),
++)
++
++text = "Patient [NAME] denies chest pain. Takes metformin 500 mg BID. No fever."
++spans = [{"start": 40, "end": 49, "label": "DRUG"}]
++result = guard.round_trip(text, source_language="en", pivot_language="es", spans=spans)
++
++if result.accepted:
++    augmented_text, augmented_spans = result.text, result.spans
++else:
++    print(result.to_report()["reasons"])
++```
++
++`translate()` runs one leg, `round_trip()` runs source to pivot to source, and
++`guard_examples()` (or `guard_round_trip_examples()`) gates a batch of
++span-annotated examples. A rejected result has `text=None` and no spans.
++
++## What is protected
++
++Protected items are detected in priority order. An item never overlaps an
++earlier one.
++
++| Kind | Examples | Source |
++| --- | --- | --- |
++| `annotated_span` | caller spans, always protected | your NER labels |
++| `phi_placeholder` | `[NAME]`, `<<OPENMED_PHI_...>>`, `{{DATE}}`, `***` | OpenMed mask and proxy placeholder shapes |
++| `clinical_term` | `protected_terms` and glossary terms | your configuration |
++| `measurement` | `500 mg`, `128/82 mmHg`, `37.5 °C`, `7.2%` | `openmed.clinical.units` and the unit aliases in `openmed.clinical.lexicons` |
++| `identifier` | `MRN-0042817`, `HbA1c`, `q8h`, `COVID-19` | mixed letter-digit tokens |
++| `number` | `3`, `2024-03-01`, `120/80` | digit groups and ranges |
++| `abbreviation` | `BID`, `BP`, `b/p`, `bid`, `temp` | upper-case tokens, the `clinical_norm` abbreviation keys, and sig frequencies from `medication_sig` |
++
++Glossary entries are terminology constraints. A term or annotated span that
++matches a glossary entry for the `(source, target)` pair is restored as the
++target term, for example `metformin` as `metformina` in the pivot text. On the
++way back every item is restored as its original source surface, so the
++back-translated example keeps those protected surfaces. Other detected invariant
++items are restored verbatim.
++
++Disable detected kinds with `protected_kinds` when you want the translator to
++localize them. Digits that are not protected are still verified.
++
++For scripts written without spaces (Chinese and Japanese), detection treats
++only ASCII letters and digits as word characters. The measurement `37.5°C`
++in `体温37.5°C` and an identifier such as `MRN-77` are found inside running
++text, and localized unit aliases such as `毫米汞柱` count as measurement units.
++
++## What is verified
++
++| Check | When | Reason code |
++| --- | --- | --- |
++| Each placeholder appears exactly once | every leg | `protected_item_dropped`, `protected_item_duplicated`, `unknown_placeholder` |
++| No split or re-cased placeholder fragments remain | every leg | `placeholder_residue` |
++| Digits outside protected items survive as a multiset | every leg | `number_changed` |
++| Negation cue counts match across languages | forward leg and one-way translation | `negation_changed` |
++| Negation, uncertainty, hypothetical, and historical cue counts match | same-language output and end of a round trip | `*_changed` for each axis |
++| Severity, laterality, and position modifiers match | English same-language output and English round trips | `severity_changed`, `laterality_changed`, `position_changed` |
++| Projected spans point at their text | every accepted leg | `span_integrity_failed` |
++
++Assertion cues come from the shared ConText language packs
++(`openmed.clinical.lexicons.context_cues`). Pseudo-negation phrases such as
++`no increase` are matched first so their inner `no` never counts as a negation.
++Cues inside protected items are ignored on both sides. Set
++`cross_lingual_assertion_axes` to add axes to the cross-language check, or to
++`()` when a pivot language pack is too sparse to compare.
++
++When a language has no cue pack, the check cannot run. For a one-way
++translation, `fail_on_unverifiable=True` (the default) rejects it with
++`assertion_unverifiable`. In a round trip, a pivot language without a pack only
++adds a warning, because the end-to-end check runs in the source language. The
++modifier lexicon is English only, so other source languages carry a
++`modifier_unverifiable` warning. For cross-language laterality or anatomy,
++protect the terms through annotated spans or the glossary.
++
++Other reason codes are `translator_error` (exception or non-string output),
++`empty_translation`, `placeholder_collision` (the source already contains the
++placeholder shape, so the translator is not called), `invalid_input` and
++`same_language` (batch only).
++
++## Span map
++
++Every result has a span map of protected item offsets. A round trip records
++`source`, `pivot`, and `back` offsets for each item. Accepted batch examples
++keep the map in `to_training_item()` under
++`metadata.translation_guard.span_map`, next to the projected `gold_spans`.
++Projected spans carry `projected_from_start` and `projected_from_end`, the same
++fields that `openmed.training.synthetic.offset_projection` writes.
++
++## Gate a batch
++
++```python
++from openmed.training.languages.translation_guard import guard_round_trip_examples
++
++batch = guard_round_trip_examples(
++    examples,  # mappings with text, language, id, and gold_spans
++    translator=translator,
++    pivot_language="es",
++)
++rows = [example.to_training_item() for example in batch.accepted]
++report = batch.report.to_dict()  # counts, codes, offsets; no text or ids
++```
++
++The report lists one decision per input position with its reason codes,
++warnings, protected counts, and span map. `report.fingerprint` is a SHA-256
++reference of the canonical JSON, so two runs with the same deterministic
++translator produce the same fingerprint.
++
++## Limits
++
++The checks compare surface forms. They catch dropped, duplicated, or altered
++protected items and changed cue counts. Moving a negation or modifier from one
++fact to another can preserve those counts, so this check does not establish
++which fact each cue modifies. They do not prove that a translation
++is clinically equivalent, and an accepted example can still read badly. The
++guard is training-data tooling, not a compliance certification, and it must not
++drive clinical decisions.
++
++Run the offline tests with:
++
++```bash
++.venv/bin/python -m pytest tests/unit/training/languages/test_translation_guard.py -q
++```
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 3caff363ed..2fbd7225de 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -322,6 +322,7 @@ nav:
+       - Schema-Guided JSON Extraction: structured/schema-guided-extraction.md
+       - Medical Tokenizer: medical-tokenizer.md
+       - Indic Unicode Normalization: indic-normalization.md
++      - Morphology-aware Label Projection: languages/morphology-projection.md
+       - Configuration & Validation: configuration.md
+       - Configuration Precedence Audit: configuration/precedence-audit.md
+       - Configuration Profiles: profiles.md
+@@ -490,6 +491,7 @@ nav:
+       - Clinical Transliteration Provenance: languages/clinical-transliteration.md
+       - Local Abbreviation Mining: languages/abbreviation-mining.md
+       - Code-switch Span Projection: languages/code-switch-projection.md
++      - Clinical Translation Guard: languages/translation-guard.md
+       - Browser Extension PHI Guard: runtimes/browser-extension.md
+       - India Health-ID De-identification: india-health-id-deidentification.md
+       - Privacy Policy as Data: security/policy-as-data.md
+diff --git a/openmed/training/languages/morphology_projection.py b/openmed/training/languages/morphology_projection.py
+new file mode 100644
+index 0000000000..5e754f81d5
+--- /dev/null
++++ b/openmed/training/languages/morphology_projection.py
+@@ -0,0 +1,1255 @@
++"""Project clinical labels through configurable morphology with exact offsets.
++
++Cross-lingual pipelines often project an annotation from a high-resource
++language onto a target-language word whose surface was changed by case
++endings, clitics, agglutinative suffix chains, noun-class prefixes or stem
++alternations. Plain string matching then misses the word, picks the wrong
++occurrence, or emits a span that cuts through an affix or a grapheme cluster.
++
++:func:`project_labels` matches each projected base form (lemma) against the
++target text through a caller-supplied :class:`MorphologyProfile`. Every
++emitted label is a half-open Unicode code-point span into the exact,
++unnormalized source text (see ``openmed/core/decoding/OFFSET_CONTRACT.md``)
++together with the matching extended-grapheme and UTF-8 byte coordinates.
++Projections that cannot be resolved to exactly one grapheme-safe span are
++routed to review with a controlled reason code instead of being emitted as
++training labels.
++
++Tokenization, grapheme segmentation and Unicode normalization reuse the shared
++offset-preserving helpers in :mod:`openmed.processing.tokenization`,
++:mod:`openmed.core.decoding.spans` and :mod:`openmed.core.text_normalize`.
++The module is deterministic, runs no models, makes no network calls and never
++logs. Decisions and reports carry offsets, controlled codes, counts and a
++profile digest only; they never carry source text or lemmas.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++from collections.abc import Callable, Iterable, Mapping, Sequence
++from dataclasses import dataclass, field, replace
++from typing import Any, Final
++
++from openmed.core.decoding.spans import (
++    grapheme_break_checker,
++    iter_grapheme_cluster_spans,
++    snap_span_to_grapheme_boundaries,
++)
++from openmed.core.locale_tag import normalize_locale_tag
++from openmed.core.text_normalize import normalize_unicode_with_offsets
++from openmed.processing.tokenization import SpanToken, indic_word_tokenize
++
++SPAN_POLICIES: Final[tuple[str, ...]] = ("token", "host", "stem")
++AFFIX_POSITIONS: Final[tuple[str, ...]] = ("prefix", "suffix")
++AFFIX_KINDS: Final[tuple[str, ...]] = ("inflection", "clitic")
++CASING_MODES: Final[tuple[str, ...]] = ("auto", "unicode", "turkic")
++PROJECTION_STATUSES: Final[tuple[str, ...]] = (
++    "projected",
++    "needs_review",
++    "unmatched",
++)
++PROJECTED_REASONS: Final[tuple[str, ...]] = (
++    "exact_match",
++    "affix_match",
++    "alternation_match",
++)
++REVIEW_REASONS: Final[tuple[str, ...]] = (
++    "ambiguous_segmentation",
++    "multiple_matches",
++    "grapheme_bisection",
++    "unanalyzed_affix",
++    "overlapping_projection",
++)
++UNMATCHED_REASONS: Final[tuple[str, ...]] = ("no_match",)
++
++MAX_PROJECTIONS: Final[int] = 10_000
++MAX_LEMMA_LENGTH: Final[int] = 256
++MAX_LEMMA_TOKENS: Final[int] = 16
++MAX_AFFIX_RULES: Final[int] = 512
++MAX_AFFIX_LENGTH: Final[int] = 32
++MAX_ALTERNATIONS: Final[int] = 64
++MAX_LEXICALIZED_FORMS: Final[int] = 10_000
++MAX_AFFIXES_PER_TOKEN: Final[int] = 8
++MAX_ANALYZED_TOKEN_LENGTH: Final[int] = 256
++MAX_REVIEW_CANDIDATES: Final[int] = 32
++
++_LABEL: Final = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
++_TURKIC_LANGUAGES: Final = frozenset({"az", "tr"})
++_JOINERS: Final = frozenset({"\u200c", "\u200d"})
++_PROFILE_FIELDS: Final = frozenset(
++    {
++        "language",
++        "affixes",
++        "alternations",
++        "lexicalized_forms",
++        "casing",
++        "max_affixes",
++        "min_stem_graphemes",
++    }
++)
++_STATUS_REASONS: Final[Mapping[str, tuple[str, ...]]] = {
++    "projected": PROJECTED_REASONS,
++    "needs_review": REVIEW_REASONS,
++    "unmatched": UNMATCHED_REASONS,
++}
++_EXACT, _AFFIX, _ALTERNATION = range(3)
++
++
++def _is_int(value: object) -> bool:
++    return isinstance(value, int) and not isinstance(value, bool)
++
++
++def _validate_surface(value: object, *, allow_empty: bool = False) -> str:
++    """Validate configured affix or lemma-edge material without echoing it."""
++    if not isinstance(value, str):
++        raise TypeError("morphology surfaces must be strings")
++    if not allow_empty and not value:
++        raise ValueError("morphology surfaces must not be empty")
++    if len(value) > MAX_AFFIX_LENGTH:
++        raise ValueError("morphology surface exceeds the length limit")
++    for char in value:
++        # Zero-width (non-)joiners are legitimate inside Indic affixes.
++        if char.isspace() or (not char.isprintable() and char not in _JOINERS):
++            raise ValueError(
++                "morphology surfaces must not contain whitespace or controls"
++            )
++    return value
++
++
++def _string_tuple(values: object, *, what: str) -> tuple[Any, ...]:
++    if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
++        raise TypeError(f"{what} must be a sequence")
++    return tuple(values)
++
++
++@dataclass(frozen=True)
++class AffixRule:
++    """One configurable prefix or suffix surface.
++
++    Attributes:
++        surface: Affix surface in the target script. Matching happens after
++            the profile's NFC and case folding, so either case may be given.
++        position: ``"prefix"`` or ``"suffix"``.
++        kind: ``"inflection"`` for case, number, possessive or noun-class
++            material that belongs to the word, or ``"clitic"`` for attached
++            function words such as conjunctions, prepositions or focus
++            particles. Clitics are always outermost and the ``"host"`` span
++            policy excludes them from the label.
++    """
++
++    surface: str
++    position: str = "suffix"
++    kind: str = "inflection"
++
++    def __post_init__(self) -> None:
++        _validate_surface(self.surface)
++        if not isinstance(self.position, str) or self.position not in AFFIX_POSITIONS:
++            raise ValueError("affix position must be 'prefix' or 'suffix'")
++        if not isinstance(self.kind, str) or self.kind not in AFFIX_KINDS:
++            raise ValueError("affix kind must be 'inflection' or 'clitic'")
++
++    def to_dict(self) -> dict[str, str]:
++        """Serialize the rule as configuration data."""
++        return {"surface": self.surface, "position": self.position, "kind": self.kind}
++
++
++@dataclass(frozen=True)
++class StemAlternation:
++    """Rewrite lemma-edge material into the stem form used before an affix.
++
++    Examples are Finnish ``diabetes`` -> ``diabetekse-`` (``"s"`` to
++    ``"kse"``), Turkish ``kalp`` -> ``kalb-`` (``"p"`` to ``"b"``), Tamil
++    ``மருந்து`` -> ``மருந்த-`` (drop the final vowel sign) and Swahili
++    ``ugonjwa`` -> ``-gonjwa`` after a plural class prefix (``"u"`` to ``""``
++    at the prefix edge). An alternation only applies when at least one affix
++    was removed on the same side, so a bare alternated stem never matches.
++
++    Attributes:
++        lemma_edge: Material at the lemma edge that is replaced.
++        stem_edge: Replacement material; may be empty.
++        position: ``"suffix"`` for the word end or ``"prefix"`` for its start.
++    """
++
++    lemma_edge: str
++    stem_edge: str
++    position: str = "suffix"
++
++    def __post_init__(self) -> None:
++        _validate_surface(self.lemma_edge, allow_empty=True)
++        _validate_surface(self.stem_edge, allow_empty=True)
++        if self.lemma_edge == self.stem_edge:
++            raise ValueError("a stem alternation must change the lemma edge")
++        if not isinstance(self.position, str) or self.position not in AFFIX_POSITIONS:
++            raise ValueError("alternation position must be 'prefix' or 'suffix'")
++
++    def to_dict(self) -> dict[str, str]:
++        """Serialize the alternation as configuration data."""
++        return {
++            "lemma_edge": self.lemma_edge,
++            "stem_edge": self.stem_edge,
++            "position": self.position,
++        }
++
++
++@dataclass(frozen=True)
++class MorphologyProfile:
++    """Caller-configured morphology for one target language.
++
++    Profiles are configuration, not linguistic authority: they should list
++    only inflectional affixes and clitics that a native reviewer has approved
++    for label projection. Rules are canonicalized (deduplicated and sorted),
++    so equivalent profiles share one :attr:`digest`.
++
++    Attributes:
++        language: BCP 47 language tag, normalized on construction.
++        affixes: Prefix and suffix rules.
++        alternations: Lemma-to-stem edge rewrites.
++        lexicalized_forms: Whole words that must never be split by an affix
++            boundary, for example a noun that starts with the same letters as
++            a prepositional clitic.
++        casing: ``"unicode"`` full case folding, ``"turkic"`` dotted and
++            dotless I folding, or ``"auto"`` to pick ``"turkic"`` for Turkish
++            and Azerbaijani and ``"unicode"`` otherwise.
++        max_affixes: Maximum affixes removed from one token, in ``0..8``.
++        min_stem_graphemes: Minimum graphemes left after removing affixes.
++    """
++
++    language: str
++    affixes: tuple[AffixRule, ...] = ()
++    alternations: tuple[StemAlternation, ...] = ()
++    lexicalized_forms: tuple[str, ...] = ()
++    casing: str = "auto"
++    max_affixes: int = 4
++    min_stem_graphemes: int = 2
++
++    def __post_init__(self) -> None:
++        language = normalize_locale_tag(self.language)
++        affixes = _string_tuple(self.affixes, what="affixes")
++        alternations = _string_tuple(self.alternations, what="alternations")
++        lexicalized = _string_tuple(self.lexicalized_forms, what="lexicalized_forms")
++        if not all(isinstance(rule, AffixRule) for rule in affixes):
++            raise TypeError("affixes must contain AffixRule values")
++        if not all(isinstance(rule, StemAlternation) for rule in alternations):
++            raise TypeError("alternations must contain StemAlternation values")
++        if len(affixes) > MAX_AFFIX_RULES or len(alternations) > MAX_ALTERNATIONS:
++            raise ValueError("morphology profile exceeds its rule limit")
++        if len(lexicalized) > MAX_LEXICALIZED_FORMS:
++            raise ValueError("morphology profile exceeds its lexicalized-form limit")
++        for form in lexicalized:
++            if not isinstance(form, str):
++                raise TypeError("lexicalized forms must be strings")
++            if (
++                not form
++                or len(form) > MAX_LEMMA_LENGTH
++                or any(char.isspace() for char in form)
++            ):
++                raise ValueError("lexicalized forms must be single non-empty words")
++        if not isinstance(self.casing, str) or self.casing not in CASING_MODES:
++            raise ValueError("casing must be 'auto', 'unicode' or 'turkic'")
++        if not _is_int(self.max_affixes) or not (
++            0 <= self.max_affixes <= MAX_AFFIXES_PER_TOKEN
++        ):
++            raise ValueError("max_affixes must be an integer between 0 and 8")
++        if not _is_int(self.min_stem_graphemes) or not (
++            1 <= self.min_stem_graphemes <= 16
++        ):
++            raise ValueError("min_stem_graphemes must be an integer between 1 and 16")
++        casing = self.casing
++        if casing == "auto":
++            primary = language.split("-", 1)[0]
++            casing = "turkic" if primary in _TURKIC_LANGUAGES else "unicode"
++        object.__setattr__(self, "language", language)
++        object.__setattr__(self, "casing", casing)
++        object.__setattr__(
++            self,
++            "affixes",
++            tuple(
++                sorted(set(affixes), key=lambda rule: tuple(rule.to_dict().values()))
++            ),
++        )
++        object.__setattr__(
++            self,
++            "alternations",
++            tuple(
++                sorted(
++                    set(alternations), key=lambda rule: tuple(rule.to_dict().values())
++                )
++            ),
++        )
++        object.__setattr__(self, "lexicalized_forms", tuple(sorted(set(lexicalized))))
++
++    @classmethod
++    def from_dict(cls, data: Mapping[str, Any]) -> MorphologyProfile:
++        """Build a profile from JSON- or YAML-style configuration data.
++
++        Args:
++            data: Mapping with ``language`` and optional ``affixes`` (mappings
++                with ``surface``, ``position`` and ``kind``), ``alternations``
++                (mappings with ``lemma_edge``, ``stem_edge`` and ``position``),
++                ``lexicalized_forms``, ``casing``, ``max_affixes`` and
++                ``min_stem_graphemes``.
++
++        Returns:
++            A validated, canonical profile.
++
++        Raises:
++            TypeError: If the configuration has the wrong shape.
++            ValueError: If a field is unknown or a value is invalid.
++        """
++        if not isinstance(data, Mapping):
++            raise TypeError("morphology profile configuration must be a mapping")
++        if not all(isinstance(key, str) for key in data):
++            raise TypeError("morphology profile keys must be strings")
++        if set(data) - _PROFILE_FIELDS:
++            raise ValueError("unknown morphology profile field")
++        if "language" not in data:
++            raise ValueError("morphology profile requires a language")
++        affixes = _string_tuple(data.get("affixes", ()), what="affixes")
++        alternations = _string_tuple(data.get("alternations", ()), what="alternations")
++        if not all(isinstance(item, Mapping) for item in (*affixes, *alternations)):
++            raise TypeError("affix and alternation entries must be mappings")
++        try:
++            affix_rules = tuple(AffixRule(**item) for item in affixes)
++            alternation_rules = tuple(StemAlternation(**item) for item in alternations)
++        except TypeError:
++            raise ValueError("invalid affix or alternation fields") from None
++        return cls(
++            language=data["language"],
++            affixes=affix_rules,
++            alternations=alternation_rules,
++            lexicalized_forms=_string_tuple(
++                data.get("lexicalized_forms", ()), what="lexicalized_forms"
++            ),
++            casing=data.get("casing", "auto"),
++            max_affixes=data.get("max_affixes", 4),
++            min_stem_graphemes=data.get("min_stem_graphemes", 2),
++        )
++
++    def to_dict(self) -> dict[str, Any]:
++        """Serialize the canonical profile configuration."""
++        return {
++            "language": self.language,
++            "affixes": [rule.to_dict() for rule in self.affixes],
++            "alternations": [rule.to_dict() for rule in self.alternations],
++            "lexicalized_forms": list(self.lexicalized_forms),
++            "casing": self.casing,
++            "max_affixes": self.max_affixes,
++            "min_stem_graphemes": self.min_stem_graphemes,
++        }
++
++    @property
++    def digest(self) -> str:
++        """Return a stable SHA-256 digest of the canonical configuration."""
++        payload = json.dumps(
++            self.to_dict(), ensure_ascii=True, separators=(",", ":"), sort_keys=True
++        )
++        return hashlib.sha256(payload.encode("ascii")).hexdigest()
++
++
++@dataclass(frozen=True)
++class LabelProjection:
++    """One label projected from a high-resource annotation.
++
++    Attributes:
++        label: Controlled label code such as ``"DISEASE"``.
++        lemma: Target-language base form of the projected mention, for
++            example from a bilingual lexicon or an aligned translation. It may
++            contain several words. It is excluded from ``repr`` and from every
++            decision and report.
++        window: Optional ``(start, end)`` code-point window from an aligner.
++            Only matches with at least one token inside the window count.
++    """
++
++    label: str
++    lemma: str = field(repr=False)
++    window: tuple[int, int] | None = None
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.label, str) or not _LABEL.fullmatch(self.label):
++            raise ValueError("label must be a controlled upper-case code")
++        if not isinstance(self.lemma, str):
++            raise TypeError("lemma must be a string")
++        if not self.lemma.strip() or len(self.lemma) > MAX_LEMMA_LENGTH:
++            raise ValueError("lemma must be non-empty and within the length limit")
++        if not 1 <= len(indic_word_tokenize(self.lemma)) <= MAX_LEMMA_TOKENS:
++            raise ValueError("lemma exceeds the token limit")
++        if self.window is not None:
++            window = self.window
++            if (
++                not isinstance(window, (tuple, list))
++                or len(window) != 2
++                or not all(_is_int(value) for value in window)
++                or not 0 <= window[0] < window[1]
++            ):
++                raise ValueError("window must be a non-empty (start, end) pair")
++            object.__setattr__(self, "window", (window[0], window[1]))
++
++
++@dataclass(frozen=True)
++class ProjectionDecision:
++    """Metadata-only outcome for one :class:`LabelProjection`.
++
++    Offsets are present only for ``"projected"`` decisions. ``start`` and
++    ``end`` are code-point offsets into the exact source text; the grapheme
++    and byte fields describe the same span as extended-grapheme indices and
++    UTF-8 byte offsets. Review decisions list grapheme-safe candidate
++    code-point spans for a reviewer instead of a label span.
++
++    Attributes:
++        index: Position of the projection in the input sequence.
++        label: Controlled label code.
++        status: ``"projected"``, ``"needs_review"`` or ``"unmatched"``.
++        reason: Controlled reason code for the status.
++        start: Inclusive code-point offset of a projected label.
++        end: Exclusive code-point offset of a projected label.
++        grapheme_start: Index of the first grapheme cluster in the label.
++        grapheme_end: Index one past the last grapheme cluster in the label.
++        byte_start: Inclusive UTF-8 byte offset of a projected label.
++        byte_end: Exclusive UTF-8 byte offset of a projected label.
++        affix_count: Affixes removed to reach the lemma.
++        candidate_spans: Sorted code-point spans to review, at most 32.
++        candidate_count: Number of distinct candidates before truncation.
++    """
++
++    index: int
++    label: str
++    status: str
++    reason: str
++    start: int | None = None
++    end: int | None = None
++    grapheme_start: int | None = None
++    grapheme_end: int | None = None
++    byte_start: int | None = None
++    byte_end: int | None = None
++    affix_count: int = 0
++    candidate_spans: tuple[tuple[int, int], ...] = ()
++    candidate_count: int = 0
++
++    def __post_init__(self) -> None:
++        if not _is_int(self.index) or self.index < 0:
++            raise ValueError("decision index must be a non-negative integer")
++        if not isinstance(self.label, str) or not _LABEL.fullmatch(self.label):
++            raise ValueError("decision label must be a controlled code")
++        if not isinstance(self.status, str) or not isinstance(self.reason, str):
++            raise ValueError("invalid projection disposition")
++        if self.reason not in _STATUS_REASONS.get(self.status, ()):
++            raise ValueError("invalid projection disposition")
++        offsets = (
++            self.start,
++            self.end,
++            self.grapheme_start,
++            self.grapheme_end,
++            self.byte_start,
++            self.byte_end,
++        )
++        spans = self.candidate_spans
++        if not isinstance(spans, tuple) or len(spans) > MAX_REVIEW_CANDIDATES:
++            raise ValueError("invalid review candidate spans")
++        for span in spans:
++            if (
++                not isinstance(span, tuple)
++                or len(span) != 2
++                or not all(_is_int(value) for value in span)
++                or not 0 <= span[0] < span[1]
++            ):
++                raise ValueError("invalid review candidate spans")
++        if (
++            not _is_int(self.affix_count)
++            or not _is_int(self.candidate_count)
++            or self.affix_count < 0
++            or self.candidate_count < len(spans)
++        ):
++            raise ValueError("invalid projection counts")
++        if self.status == "projected":
++            if (
++                not all(_is_int(value) for value in offsets)
++                or not 0 <= self.start < self.end
++                or not 0 <= self.grapheme_start < self.grapheme_end
++                or not 0 <= self.byte_start < self.byte_end
++                or spans
++            ):
++                raise ValueError("inconsistent projected label coordinates")
++        elif any(value is not None for value in offsets) or (
++            (self.status == "needs_review") != bool(spans)
++        ):
++            raise ValueError("inconsistent review or unmatched metadata")
++
++    def to_dict(self) -> dict[str, Any]:
++        """Serialize controlled codes, offsets and counts only."""
++        return {
++            "index": self.index,
++            "label": self.label,
++            "status": self.status,
++            "reason": self.reason,
++            "start": self.start,
++            "end": self.end,
++            "grapheme_start": self.grapheme_start,
++            "grapheme_end": self.grapheme_end,
++            "byte_start": self.byte_start,
++            "byte_end": self.byte_end,
++            "affix_count": self.affix_count,
++            "candidate_spans": [list(span) for span in self.candidate_spans],
++            "candidate_count": self.candidate_count,
++        }
++
++
++@dataclass(frozen=True)
++class MorphologyProjectionResult:
++    """Deterministic, metadata-only result of :func:`project_labels`.
++
++    Attributes:
++        language: Normalized profile language tag.
++        span_policy: Span policy used for every decision.
++        profile_digest: SHA-256 digest of the canonical profile.
++        decisions: One decision per input projection, in input order.
++    """
++
++    language: str
++    span_policy: str
++    profile_digest: str
++    decisions: tuple[ProjectionDecision, ...]
++
++    @property
++    def projected(self) -> tuple[ProjectionDecision, ...]:
++        """Return decisions that are safe to export as training labels."""
++        return tuple(item for item in self.decisions if item.status == "projected")
++
++    @property
++    def review_queue(self) -> tuple[ProjectionDecision, ...]:
++        """Return decisions that a reviewer must resolve before export."""
++        return tuple(item for item in self.decisions if item.status == "needs_review")
++
++    def reason_counts(self) -> dict[str, int]:
++        """Return decision counts keyed by reason code, sorted by code."""
++        counts: dict[str, int] = {}
++        for item in self.decisions:
++            counts[item.reason] = counts.get(item.reason, 0) + 1
++        return dict(sorted(counts.items()))
++
++    def to_dict(self) -> dict[str, Any]:
++        """Serialize codes, offsets, counts and the profile digest only."""
++        statuses = {status: 0 for status in PROJECTION_STATUSES}
++        for item in self.decisions:
++            statuses[item.status] += 1
++        return {
++            "language": self.language,
++            "span_policy": self.span_policy,
++            "profile_digest": self.profile_digest,
++            "status_counts": statuses,
++            "reason_counts": self.reason_counts(),
++            "decisions": [item.to_dict() for item in self.decisions],
++        }
++
++
++@dataclass(frozen=True)
++class _Fold:
++    """Folded token text with an absolute source span per folded code point."""
++
++    text: str
++    origins: tuple[tuple[int, int], ...]
++
++
++@dataclass(frozen=True)
++class _Analysis:
++    """Stem and clitic-host boundaries inside one folded token."""
++
++    lo: int
++    hi: int
++    host_lo: int
++    host_hi: int
++    prefixes: int
++    suffixes: int
++
++
++@dataclass(frozen=True)
++class _CompiledProfile:
++    prefixes: tuple[tuple[str, bool], ...]
++    suffixes: tuple[tuple[str, bool], ...]
++    alternations: tuple[tuple[str, str, str], ...]
++    lexicalized: Mapping[int, frozenset[str]]
++    turkic: bool
++    max_affixes: int
++    min_stem_graphemes: int
++
++
++@dataclass(frozen=True)
++class _LemmaToken:
++    fold: str
++    variants: tuple[tuple[str, str | None], ...]
++    gap_before: bool
++
++
++@dataclass(frozen=True)
++class _Draft:
++    index: int
++    label: str
++    status: str
++    reason: str
++    span: tuple[int, int] | None = None
++    affix_count: int = 0
++    candidates: tuple[tuple[int, int], ...] = ()
++    candidate_count: int = 0
++
++
++_Hit = tuple[_Analysis, int]
++
++
++def _fold_char(char: str, *, turkic: bool) -> str:
++    if turkic:
++        if char == "I":
++            return "\u0131"  # dotless i
++        if char == "\u0130":  # dotted capital I
++            return "i"
++    return char.casefold()
++
++
++def _fold(text: str, start: int, end: int, *, turkic: bool) -> _Fold:
++    """NFC-normalize and case-fold ``text[start:end]`` with source origins."""
++    normalized, offset_map = normalize_unicode_with_offsets(text[start:end], "NFC")
++    parts: list[str] = []
++    origins: list[tuple[int, int]] = []
++    for char, (source_start, source_end) in zip(
++        normalized, offset_map.source_spans, strict=True
++    ):
++        folded = _fold_char(char, turkic=turkic)
++        parts.append(folded)
++        origins.extend([(start + source_start, start + source_end)] * len(folded))
++    return _Fold("".join(parts), tuple(origins))
++
++
++def _fold_text(value: str, *, turkic: bool) -> str:
++    return _fold(value, 0, len(value), turkic=turkic).text
++
++
++def _compile(profile: MorphologyProfile) -> _CompiledProfile:
++    turkic = profile.casing == "turkic"
++
++    def side(position: str) -> tuple[tuple[str, bool], ...]:
++        rules = {
++            (_fold_text(rule.surface, turkic=turkic), rule.kind == "clitic")
++            for rule in profile.affixes
++            if rule.position == position
++        }
++        return tuple(sorted(rules))
++
++    # Single-code-point forms cannot be split, so they never block a cut.
++    buckets: dict[int, set[str]] = {}
++    for form in profile.lexicalized_forms:
++        folded = _fold_text(form, turkic=turkic)
++        if len(folded) > 1:
++            buckets.setdefault(len(folded), set()).add(folded)
++
++    return _CompiledProfile(
++        prefixes=side("prefix"),
++        suffixes=side("suffix"),
++        alternations=tuple(
++            sorted(
++                {
++                    (
++                        _fold_text(rule.lemma_edge, turkic=turkic),
++                        _fold_text(rule.stem_edge, turkic=turkic),
++                        rule.position,
++                    )
++                    for rule in profile.alternations
++                }
++            )
++        ),
++        lexicalized={
++            length: frozenset(forms) for length, forms in sorted(buckets.items())
++        },
++        turkic=turkic,
++        max_affixes=profile.max_affixes,
++        min_stem_graphemes=profile.min_stem_graphemes,
++    )
++
++
++def _cut_guard(
++    fold: str, lexicalized: Mapping[int, frozenset[str]]
++) -> Callable[[int], bool]:
++    """Return a memoized predicate: does ``cut`` split a lexicalized form?
++
++    Only proposed affix cuts are checked, against forms bucketed by length, so
++    a large lexicon does not cost a full scan of every token.
++    """
++    memo: dict[int, bool] = {}
++
++    def splits(cut: int) -> bool:
++        if cut not in memo:
++            memo[cut] = any(
++                fold[start : start + length] in forms
++                for length, forms in lexicalized.items()
++                for start in range(
++                    max(0, cut - length + 1), min(cut, len(fold) - length + 1)
++                )
++            )
++        return memo[cut]
++
++    return splits
++
++
++def _side_states(
++    fold: str,
++    rules: Sequence[tuple[str, bool]],
++    *,
++    suffix: bool,
++    limit: int,
++    forbidden: Callable[[int], bool],
++) -> tuple[tuple[int, int, int], ...]:
++    """Enumerate ``(boundary, host_boundary, count)`` affix-stripping states.
++
++    Clitics may only be removed while every removed affix so far is a clitic,
++    which keeps clitics outermost; the host boundary stops at the last clitic.
++    """
++    origin = len(fold) if suffix else 0
++    initial = (origin, origin, True, 0)
++    seen = {initial}
++    pending = [initial]
++    while pending:
++        boundary, host, clitic_phase, count = pending.pop()
++        if count >= limit:
++            continue
++        for surface, is_clitic in rules:
++            if is_clitic and not clitic_phase:
++                continue
++            if suffix:
++                if not fold.endswith(surface, 0, boundary):
++                    continue
++                cut = boundary - len(surface)
++            else:
++                if not fold.startswith(surface, boundary):
++                    continue
++                cut = boundary + len(surface)
++            if forbidden(cut):
++                continue
++            state = (cut, cut if is_clitic else host, is_clitic, count + 1)
++            if state not in seen:
++                seen.add(state)
++                pending.append(state)
++    return tuple(sorted({(boundary, host, count) for boundary, host, _, count in seen}))
++
++
++def _grapheme_count(value: str) -> int:
++    return sum(1 for _ in iter_grapheme_cluster_spans(value))
++
++
++def _token_analyses(fold: str, compiled: _CompiledProfile) -> tuple[_Analysis, ...]:
++    """Return every bounded affix analysis of one folded token."""
++    exact = _Analysis(0, len(fold), 0, len(fold), 0, 0)
++    if (
++        compiled.max_affixes == 0
++        or not (compiled.prefixes or compiled.suffixes)
++        or len(fold) > MAX_ANALYZED_TOKEN_LENGTH
++    ):
++        return (exact,)
++    forbidden = _cut_guard(fold, compiled.lexicalized)
++    prefix_states = _side_states(
++        fold,
++        compiled.prefixes,
++        suffix=False,
++        limit=compiled.max_affixes,
++        forbidden=forbidden,
++    )
++    suffix_states = _side_states(
++        fold,
++        compiled.suffixes,
++        suffix=True,
++        limit=compiled.max_affixes,
++        forbidden=forbidden,
++    )
++    analyses = []
++    for lo, host_lo, prefix_count in prefix_states:
++        for hi, host_hi, suffix_count in suffix_states:
++            if lo >= hi or prefix_count + suffix_count > compiled.max_affixes:
++                continue
++            if prefix_count + suffix_count and (
++                _grapheme_count(fold[lo:hi]) < compiled.min_stem_graphemes
++            ):
++                continue
++            analyses.append(
++                _Analysis(lo, hi, host_lo, host_hi, prefix_count, suffix_count)
++            )
++    return tuple(analyses)
++
++
++def _build_index(
++    folds: Sequence[_Fold], compiled: _CompiledProfile
++) -> dict[str, list[tuple[int, _Analysis]]]:
++    index: dict[str, list[tuple[int, _Analysis]]] = {}
++    cache: dict[str, tuple[_Analysis, ...]] = {}
++    for token_index, fold in enumerate(folds):
++        analyses = cache.get(fold.text)
++        if analyses is None:
++            analyses = _token_analyses(fold.text, compiled)
++            cache[fold.text] = analyses
++        for analysis in analyses:
++            stem = fold.text[analysis.lo : analysis.hi]
++            index.setdefault(stem, []).append((token_index, analysis))
++    return index
++
++
++def _lemma_tokens(lemma: str, compiled: _CompiledProfile) -> tuple[_LemmaToken, ...]:
++    tokens: list[_LemmaToken] = []
++    previous_end: int | None = None
++    for token in indic_word_tokenize(lemma):
++        folded = _fold_text(token.text, turkic=compiled.turkic)
++        variants: list[tuple[str, str | None]] = [(folded, None)]
++        for lemma_edge, stem_edge, position in compiled.alternations:
++            if len(folded) <= len(lemma_edge):
++                continue
++            if position == "suffix" and folded.endswith(lemma_edge):
++                kept = folded[: len(folded) - len(lemma_edge)]
++                variants.append((kept + stem_edge, "suffix"))
++            elif position == "prefix" and folded.startswith(lemma_edge):
++                variants.append((stem_edge + folded[len(lemma_edge) :], "prefix"))
++        tokens.append(
++            _LemmaToken(
++                fold=folded,
++                variants=tuple(
++                    sorted(set(variants), key=lambda item: (item[0], item[1] or ""))
++                ),
++                gap_before=previous_end is not None and token.start > previous_end,
++            )
++        )
++        previous_end = token.end
++    return tuple(tokens)
++
++
++def _token_hits(
++    lemma_token: _LemmaToken,
++    index: Mapping[str, Sequence[tuple[int, _Analysis]]],
++) -> dict[int, list[_Hit]]:
++    hits: dict[int, list[_Hit]] = {}
++    for form, side in lemma_token.variants:
++        for token_index, analysis in index.get(form, ()):
++            if side == "suffix" and not analysis.suffixes:
++                continue
++            if side == "prefix" and not analysis.prefixes:
++                continue
++            if side is not None:
++                rank = _ALTERNATION
++            elif analysis.prefixes or analysis.suffixes:
++                rank = _AFFIX
++            else:
++                rank = _EXACT
++            hits.setdefault(token_index, []).append((analysis, rank))
++    return hits
++
++
++def _boundary_start(fold: _Fold, boundary: int, token: SpanToken) -> tuple[int, bool]:
++    if boundary <= 0:
++        return token.start, True
++    if boundary >= len(fold.origins):
++        return token.end, True
++    exact = fold.origins[boundary - 1][1] <= fold.origins[boundary][0]
++    return fold.origins[boundary][0], exact
++
++
++def _boundary_end(fold: _Fold, boundary: int, token: SpanToken) -> tuple[int, bool]:
++    if boundary >= len(fold.origins):
++        return token.end, True
++    if boundary <= 0:
++        return token.start, True
++    exact = fold.origins[boundary - 1][1] <= fold.origins[boundary][0]
++    return fold.origins[boundary - 1][1], exact
++
++
++def _span_edge(
++    fold: _Fold, token: SpanToken, analysis: _Analysis, policy: str, *, end: bool
++) -> tuple[int, bool]:
++    if policy == "token":
++        return (token.end if end else token.start), True
++    if end:
++        boundary = analysis.host_hi if policy == "host" else analysis.hi
++        return _boundary_end(fold, boundary, token)
++    boundary = analysis.host_lo if policy == "host" else analysis.lo
++    return _boundary_start(fold, boundary, token)
++
++
++def _gaps_match(
++    text: str, tokens: Sequence[SpanToken], first: int, lemma: Sequence[_LemmaToken]
++) -> bool:
++    for offset in range(1, len(lemma)):
++        gap = text[tokens[first + offset - 1].end : tokens[first + offset].start]
++        if bool(gap) != lemma[offset].gap_before:
++            return False
++    return True
++
++
++def _touches_window(
++    tokens: Sequence[SpanToken], first: int, count: int, window: tuple[int, int] | None
++) -> bool:
++    if window is None:
++        return True
++    return any(
++        token.start < window[1] and token.end > window[0]
++        for token in tokens[first : first + count]
++    )
++
++
++def _location_spans(
++    *,
++    first: int,
++    lemma: Sequence[_LemmaToken],
++    hits: Sequence[Mapping[int, list[_Hit]]],
++    tokens: Sequence[SpanToken],
++    folds: Sequence[_Fold],
++    policy: str,
++    has_break: Callable[[int], bool],
++) -> dict[tuple[int, int], tuple[bool, int, int]]:
++    """Map each label span at one location to ``(aligned, rank, affixes)``."""
++    last = first + len(lemma) - 1
++    middle_rank = 0
++    middle_affixes = 0
++    for offset in range(1, len(lemma) - 1):
++        best = min(
++            (rank, analysis.prefixes + analysis.suffixes)
++            for analysis, rank in hits[offset][first + offset]
++        )
++        middle_rank = max(middle_rank, best[0])
++        middle_affixes += best[1]
++    if len(lemma) == 1:
++        pairs = [(hit, hit) for hit in hits[0][first]]
++    else:
++        pairs = [(head, tail) for head in hits[0][first] for tail in hits[-1][last]]
++    spans: dict[tuple[int, int], tuple[bool, int, int]] = {}
++    for (head, head_rank), (tail, tail_rank) in pairs:
++        start, start_exact = _span_edge(
++            folds[first], tokens[first], head, policy, end=False
++        )
++        end, end_exact = _span_edge(folds[last], tokens[last], tail, policy, end=True)
++        if start >= end:
++            continue
++        aligned = start_exact and end_exact and has_break(start) and has_break(end)
++        rank = max(head_rank, tail_rank, middle_rank)
++        affixes = head.prefixes + head.suffixes + middle_affixes
++        if len(lemma) > 1:
++            affixes += tail.prefixes + tail.suffixes
++        previous = spans.get((start, end))
++        if previous is None:
++            spans[(start, end)] = (aligned, rank, affixes)
++        else:
++            spans[(start, end)] = (
++                previous[0] and aligned,
++                *min(previous[1:], (rank, affixes)),
++            )
++    return spans
++
++
++def _review(
++    index: int,
++    label: str,
++    reason: str,
++    spans: Iterable[tuple[int, int]],
++    *,
++    text: str,
++    has_break: Callable[[int], bool],
++) -> _Draft:
++    # Only spans that bisect a cluster pay for the shared outward snap.
++    candidates = sorted(
++        {
++            (start, end)
++            if has_break(start) and has_break(end)
++            else snap_span_to_grapheme_boundaries(start, end, text)
++            for start, end in spans
++        }
++    )
++    return _Draft(
++        index=index,
++        label=label,
++        status="needs_review",
++        reason=reason,
++        candidates=tuple(candidates[:MAX_REVIEW_CANDIDATES]),
++        candidate_count=len(candidates),
++    )
++
++
++def _decide(
++    index: int,
++    projection: LabelProjection,
++    lemma: Sequence[_LemmaToken],
++    *,
++    text: str,
++    tokens: Sequence[SpanToken],
++    folds: Sequence[_Fold],
++    term_index: Mapping[str, Sequence[tuple[int, _Analysis]]],
++    policy: str,
++    has_break: Callable[[int], bool],
++) -> _Draft:
++    hits = [_token_hits(token, term_index) for token in lemma]
++    count = len(lemma)
++    locations: dict[int, dict[tuple[int, int], tuple[bool, int, int]]] = {}
++    for first in sorted(hits[0]):
++        if first + count > len(tokens):
++            continue
++        if not all(first + offset in hits[offset] for offset in range(count)):
++            continue
++        if not _gaps_match(text, tokens, first, lemma) or not _touches_window(
++            tokens, first, count, projection.window
++        ):
++            continue
++        spans = _location_spans(
++            first=first,
++            lemma=lemma,
++            hits=hits,
++            tokens=tokens,
++            folds=folds,
++            policy=policy,
++            has_break=has_break,
++        )
++        if spans:
++            locations[first] = spans
++
++    label = projection.label
++    review = {"text": text, "has_break": has_break}
++    if not locations:
++        partial = []
++        for first in range(len(tokens) - count + 1):
++            if not _touches_window(tokens, first, count, projection.window):
++                continue
++            if not _gaps_match(text, tokens, first, lemma):
++                continue
++            contained = [
++                any(form in folds[first + offset].text for form, _ in token.variants)
++                for offset, token in enumerate(lemma)
++            ]
++            full = [first + offset in hits[offset] for offset in range(count)]
++            if all(c or f for c, f in zip(contained, full, strict=True)):
++                partial.append((tokens[first].start, tokens[first + count - 1].end))
++        if partial:
++            return _review(index, label, "unanalyzed_affix", partial, **review)
++        return _Draft(index=index, label=label, status="unmatched", reason="no_match")
++
++    if len(locations) > 1:
++        every_span = [span for spans in locations.values() for span in spans]
++        return _review(index, label, "multiple_matches", every_span, **review)
++    (spans,) = locations.values()
++    if len(spans) > 1:
++        return _review(index, label, "ambiguous_segmentation", spans, **review)
++    ((span, (aligned, rank, affixes)),) = spans.items()
++    if not aligned:
++        return _review(index, label, "grapheme_bisection", [span], **review)
++    return _Draft(
++        index=index,
++        label=label,
++        status="projected",
++        reason=PROJECTED_REASONS[rank],
++        span=span,
++        affix_count=affixes,
++    )
++
++
++def _flag_overlaps(
++    drafts: Sequence[_Draft], *, text: str, has_break: Callable[[int], bool]
++) -> list[_Draft]:
++    """Route overlapping projected spans with different extents or labels.
++
++    Identical duplicates (same span and label) stay projected; nested,
++    crossing or relabelled spans would corrupt flat token-classification
++    labels, so every participant goes to review.
++    """
++    projected = sorted(
++        (draft for draft in drafts if draft.span is not None),
++        key=lambda draft: (draft.span[0], draft.span[1], draft.index),
++    )
++    conflicted: set[int] = set()
++    active: list[_Draft] = []
++    for draft in projected:
++        active = [other for other in active if other.span[1] > draft.span[0]]
++        for other in active:
++            if other.span != draft.span or other.label != draft.label:
++                conflicted.update((other.index, draft.index))
++        active.append(draft)
++    return [
++        _review(
++            draft.index,
++            draft.label,
++            "overlapping_projection",
++            [draft.span],
++            text=text,
++            has_break=has_break,
++        )
++        if draft.index in conflicted
++        else draft
++        for draft in drafts
++    ]
++
++
++def _coordinate_maps(
++    text: str, offsets: Iterable[int]
++) -> tuple[dict[int, int], dict[int, int]]:
++    """Return UTF-8 byte and grapheme indices for grapheme-boundary offsets."""
++    targets = sorted(set(offsets))
++    byte_map: dict[int, int] = {}
++    position = 0
++    byte_count = 0
++    for offset in targets:
++        byte_count += len(text[position:offset].encode("utf-8"))
++        position = offset
++        byte_map[offset] = byte_count
++    grapheme_map: dict[int, int] = {}
++    pointer = 0
++    while pointer < len(targets) and targets[pointer] == 0:
++        grapheme_map[0] = 0
++        pointer += 1
++    for cluster_count, (_, cluster_end) in enumerate(
++        iter_grapheme_cluster_spans(text), start=1
++    ):
++        if pointer == len(targets):
++            break
++        while pointer < len(targets) and targets[pointer] <= cluster_end:
++            if targets[pointer] == cluster_end:
++                grapheme_map[cluster_end] = cluster_count
++            pointer += 1
++    return byte_map, grapheme_map
++
++
++def project_labels(
++    text: str,
++    projections: Sequence[LabelProjection],
++    profile: MorphologyProfile,
++    *,
++    span_policy: str = "host",
++) -> MorphologyProjectionResult:
++    """Project labels through a morphology profile with exact source offsets.
++
++    Each projection lemma is tokenized and folded like the target text (NFC,
++    then profile case folding). A text token matches a lemma word when
++    removing at most ``max_affixes`` configured affixes leaves the lemma word
++    or one of its alternated stems. Multi-word lemmas must match consecutive
++    tokens with the same spacing. The label span depends on ``span_policy``:
++
++    * ``"token"`` labels whole matched tokens, affixes and clitics included.
++    * ``"host"`` (default) excludes outer clitics but keeps inflection.
++    * ``"stem"`` labels only the material left after removing every affix.
++
++    A projection is emitted only when exactly one location and one
++    grapheme-safe span remain. Otherwise it is routed to review:
++    ``multiple_matches`` (several locations), ``ambiguous_segmentation``
++    (several spans at one location), ``grapheme_bisection`` (a label edge
++    would cut a grapheme cluster or a case-folding expansion),
++    ``unanalyzed_affix`` (the lemma only occurs inside a token with
++    unconfigured material, such as a compound) or ``overlapping_projection``
++    (projected spans overlap with a different extent or label). Projections
++    with no candidate at all are ``unmatched``.
++
++    Args:
++        text: Exact, unnormalized target-language source text.
++        projections: Labels to project, at most 10,000.
++        profile: Target-language morphology configuration.
++        span_policy: ``"token"``, ``"host"`` or ``"stem"``.
++
++    Returns:
++        One metadata-only decision per projection, in input order.
++
++    Raises:
++        TypeError: If an argument has the wrong type.
++        ValueError: If a window falls outside the text, the batch is too
++            large, or the span policy is unknown.
++        openmed.core.errors.InputError: If ``text`` exceeds the shared
++            tokenizer's validated input budget.
++    """
++    if not isinstance(text, str):
++        raise TypeError("text must be a string")
++    if not isinstance(profile, MorphologyProfile):
++        raise TypeError("profile must be a MorphologyProfile")
++    if not isinstance(span_policy, str) or span_policy not in SPAN_POLICIES:
++        raise ValueError("span_policy must be 'token', 'host' or 'stem'")
++    if isinstance(projections, (str, bytes)) or not isinstance(projections, Sequence):
++        raise TypeError("projections must be a sequence of LabelProjection values")
++    if len(projections) > MAX_PROJECTIONS:
++        raise ValueError("provide at most 10000 label projections")
++    for projection in projections:
++        if not isinstance(projection, LabelProjection):
++            raise TypeError("projections must be a sequence of LabelProjection values")
++        if projection.window is not None and projection.window[1] > len(text):
++            raise ValueError("projection window must lie inside the text")
++
++    compiled = _compile(profile)
++    tokens = tuple(indic_word_tokenize(text))
++    folds = tuple(
++        _fold(text, token.start, token.end, turkic=compiled.turkic) for token in tokens
++    )
++    term_index = _build_index(folds, compiled)
++    has_break = grapheme_break_checker(text)
++    lemma_cache: dict[str, tuple[_LemmaToken, ...]] = {}
++    drafts = []
++    for index, projection in enumerate(projections):
++        lemma = lemma_cache.get(projection.lemma)
++        if lemma is None:
++            lemma = _lemma_tokens(projection.lemma, compiled)
++            lemma_cache[projection.lemma] = lemma
++        drafts.append(
++            _decide(
++                index,
++                projection,
++                lemma,
++                text=text,
++                tokens=tokens,
++                folds=folds,
++                term_index=term_index,
++                policy=span_policy,
++                has_break=has_break,
++            )
++        )
++    drafts = _flag_overlaps(drafts, text=text, has_break=has_break)
++    byte_map, grapheme_map = _coordinate_maps(
++        text,
++        (edge for draft in drafts if draft.span is not None for edge in draft.span),
++    )
++    decisions = []
++    for draft in drafts:
++        if draft.span is None:
++            decisions.append(
++                ProjectionDecision(
++                    index=draft.index,
++                    label=draft.label,
++                    status=draft.status,
++                    reason=draft.reason,
++                    candidate_spans=draft.candidates,
++                    candidate_count=draft.candidate_count,
++                )
++            )
++            continue
++        start, end = draft.span
++        decisions.append(
++            ProjectionDecision(
++                index=draft.index,
++                label=draft.label,
++                status=draft.status,
++                reason=draft.reason,
++                start=start,
++                end=end,
++                grapheme_start=grapheme_map[start],
++                grapheme_end=grapheme_map[end],
++                byte_start=byte_map[start],
++                byte_end=byte_map[end],
++                affix_count=draft.affix_count,
++            )
++        )
++    return MorphologyProjectionResult(
++        language=profile.language,
++        span_policy=span_policy,
++        profile_digest=profile.digest,
++        decisions=tuple(decisions),
++    )
++
++
++__all__ = [
++    "AFFIX_KINDS",
++    "AFFIX_POSITIONS",
++    "CASING_MODES",
++    "PROJECTED_REASONS",
++    "PROJECTION_STATUSES",
++    "REVIEW_REASONS",
++    "SPAN_POLICIES",
++    "UNMATCHED_REASONS",
++    "AffixRule",
++    "LabelProjection",
++    "MorphologyProfile",
++    "MorphologyProjectionResult",
++    "ProjectionDecision",
++    "StemAlternation",
++    "project_labels",
++]
+diff --git a/openmed/training/languages/translation_guard.py b/openmed/training/languages/translation_guard.py
+new file mode 100644
+index 0000000000..bb6194239d
+--- /dev/null
++++ b/openmed/training/languages/translation_guard.py
+@@ -0,0 +1,1844 @@
++"""Clinical terminology guard for local translation round trips.
++
++Back-translation augmentation can return fluent text that silently changes a
++dose, drops a negation, flips laterality, expands an abbreviation, or rewrites
++a de-identification placeholder. This module wraps a caller-supplied local
++translator and makes those changes detectable before an example reaches a
++training set:
++
++* Invariant items (annotated spans, PHI placeholders, glossary and protected
++  terms, doses and measurements, identifiers, numbers, and abbreviations) are
++  replaced with opaque placeholders before translation, so the translator never
++  sees them, and are restored afterwards. A missing, duplicated, unknown, or
++  altered placeholder rejects the translation.
++* Translatable assertion cues (negation, uncertainty, hypothetical, historical)
++  are verified by per-axis cue counts from the shared ConText language packs.
++  English round trips also verify severity, laterality, and position modifiers.
++* Digits outside protected items must survive as a multiset.
++
++The guard never translates text itself and never opens a network connection; it
++only calls the injected translator. Results keep the translated text for the
++caller, but reports carry counts, reason codes, labels, and offsets only.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import unicodedata
++from collections import Counter
++from collections.abc import Callable, Iterable, Mapping, Sequence
++from dataclasses import dataclass, field
++from enum import Enum
++from functools import lru_cache
++from typing import Any, Final, Protocol
++
++from openmed.clinical.lexicons import (
++    ClinicalCueLexicon,
++    available_clinical_cue_languages,
++    canonical_unit_alias,
++    get_clinical_cue_lexicon,
++    get_clinical_norm_lexicon,
++    normalize_language,
++)
++from openmed.clinical.medication_sig import normalize_frequency
++from openmed.clinical.severity_laterality import extract_severity_laterality
++from openmed.clinical.units import parse_unit
++from openmed.training.synthetic.offset_projection import (
++    SpanAnnotation,
++    SpanProjectionError,
++    normalize_span_annotations,
++    validate_span_integrity,
++)
++
++TRANSLATION_GUARD_SCHEMA_VERSION: Final = 1
++DEFAULT_PLACEHOLDER_TEMPLATE: Final = "__OMP{index}__"
++GUARDED_SYNTHETIC_SOURCE: Final = "guarded_backtranslation"
++TRANSLATION_GUARD_ADVISORY: Final = (
++    "Translation guard checks are deterministic surface checks for training-data "
++    "augmentation. They do not certify translation quality or clinical "
++    "equivalence and must not drive autonomous clinical decisions."
++)
++ASSERTION_AXES: Final[tuple[str, ...]] = (
++    "negation",
++    "uncertainty",
++    "hypothetical",
++    "historical",
++)
++DEFAULT_CROSS_LINGUAL_ASSERTION_AXES: Final[tuple[str, ...]] = ("negation",)
++MODIFIER_KINDS: Final[tuple[str, ...]] = ("laterality", "severity", "position")
++
++# Severity/laterality/position cues ship as an English lexicon only.
++_MODIFIER_LANGUAGES: Final = frozenset({"en"})
++
++
++class TranslationGuardError(ValueError):
++    """Raised for invalid guard configuration or input.
++
++    Messages name the failing field or offsets only and never echo text.
++    """
++
++
++class ProtectedKind(str, Enum):
++    """Category of an item frozen behind a placeholder during translation."""
++
++    ANNOTATED_SPAN = "annotated_span"
++    PHI_PLACEHOLDER = "phi_placeholder"
++    CLINICAL_TERM = "clinical_term"
++    MEASUREMENT = "measurement"
++    IDENTIFIER = "identifier"
++    NUMBER = "number"
++    ABBREVIATION = "abbreviation"
++
++
++DEFAULT_PROTECTED_KINDS: Final[frozenset[ProtectedKind]] = frozenset(ProtectedKind)
++
++
++class TranslationGuardReason(str, Enum):
++    """Stable reason codes for rejected or flagged translations."""
++
++    INVALID_INPUT = "invalid_input"
++    SAME_LANGUAGE = "same_language"
++    PLACEHOLDER_COLLISION = "placeholder_collision"
++    TRANSLATOR_ERROR = "translator_error"
++    EMPTY_TRANSLATION = "empty_translation"
++    PROTECTED_ITEM_DROPPED = "protected_item_dropped"
++    PROTECTED_ITEM_DUPLICATED = "protected_item_duplicated"
++    UNKNOWN_PLACEHOLDER = "unknown_placeholder"
++    PLACEHOLDER_RESIDUE = "placeholder_residue"
++    NUMBER_CHANGED = "number_changed"
++    NEGATION_CHANGED = "negation_changed"
++    UNCERTAINTY_CHANGED = "uncertainty_changed"
++    HYPOTHETICAL_CHANGED = "hypothetical_changed"
++    HISTORICAL_CHANGED = "historical_changed"
++    LATERALITY_CHANGED = "laterality_changed"
++    SEVERITY_CHANGED = "severity_changed"
++    POSITION_CHANGED = "position_changed"
++    ASSERTION_UNVERIFIABLE = "assertion_unverifiable"
++    MODIFIER_UNVERIFIABLE = "modifier_unverifiable"
++    SPAN_INTEGRITY_FAILED = "span_integrity_failed"
++
++
++_REASON_ORDER: Final = {
++    reason: rank for rank, reason in enumerate(TranslationGuardReason)
++}
++_AXIS_REASONS: Final[Mapping[str, TranslationGuardReason]] = {
++    "negation": TranslationGuardReason.NEGATION_CHANGED,
++    "uncertainty": TranslationGuardReason.UNCERTAINTY_CHANGED,
++    "hypothetical": TranslationGuardReason.HYPOTHETICAL_CHANGED,
++    "historical": TranslationGuardReason.HISTORICAL_CHANGED,
++}
++_MODIFIER_REASONS: Final[Mapping[str, TranslationGuardReason]] = {
++    "laterality": TranslationGuardReason.LATERALITY_CHANGED,
++    "severity": TranslationGuardReason.SEVERITY_CHANGED,
++    "position": TranslationGuardReason.POSITION_CHANGED,
++}
++
++
++class LocalTranslator(Protocol):
++    """Local translation backend contract accepted by the guard."""
++
++    def translate(self, text: str, source_lang: str, target_lang: str) -> str:
++        """Translate ``text`` from ``source_lang`` to ``target_lang``."""
++
++
++TranslateFn = Callable[[str, str, str], str]
++
++
++@dataclass(frozen=True)
++class TranslationGuardConfig:
++    """Protection and verification policy for guarded translation.
++
++    Attributes:
++        placeholder_template: Placeholder shape with exactly one ``{index}``
++            field, a non-empty prefix and suffix, and no whitespace.
++        protected_kinds: Detected item kinds to freeze. Caller-annotated spans
++            are always protected.
++        protected_terms: Clinical terms frozen verbatim, matched
++            case-insensitively on token boundaries.
++        glossary: Terminology constraints keyed by ``(source, target)``
++            language pair. A matching term or annotated span is frozen and
++            restored as the glossary target term.
++        assertion_axes: Cue axes compared when source and output share a
++            language, including the end of a round trip.
++        cross_lingual_assertion_axes: Cue axes compared across languages.
++        verify_modifiers: Compare severity, laterality, and position cues on
++            English round trips.
++        verify_numbers: Require digits outside protected items to survive.
++        fail_on_unverifiable: Reject when a required assertion check has no
++            language pack instead of only flagging it.
++    """
++
++    placeholder_template: str = DEFAULT_PLACEHOLDER_TEMPLATE
++    protected_kinds: frozenset[ProtectedKind] = DEFAULT_PROTECTED_KINDS
++    protected_terms: tuple[str, ...] = ()
++    glossary: Mapping[tuple[str, str], Mapping[str, str]] = field(default_factory=dict)
++    assertion_axes: tuple[str, ...] = ASSERTION_AXES
++    cross_lingual_assertion_axes: tuple[str, ...] = DEFAULT_CROSS_LINGUAL_ASSERTION_AXES
++    verify_modifiers: bool = True
++    verify_numbers: bool = True
++    fail_on_unverifiable: bool = True
++
++    def __post_init__(self) -> None:
++        _placeholder_codec(_validated_template(self.placeholder_template))
++        try:
++            kinds = frozenset(ProtectedKind(kind) for kind in self.protected_kinds)
++        except (TypeError, ValueError):
++            raise TranslationGuardError("protected_kinds has an unknown kind") from None
++        object.__setattr__(self, "protected_kinds", kinds)
++        if isinstance(self.protected_terms, str):
++            raise TranslationGuardError("protected_terms must be a sequence of terms")
++        object.__setattr__(
++            self,
++            "protected_terms",
++            tuple(
++                dict.fromkeys(_validated_term(term) for term in self.protected_terms)
++            ),
++        )
++        object.__setattr__(self, "glossary", _normalized_glossary(self.glossary))
++        object.__setattr__(
++            self, "assertion_axes", _validated_axes(self.assertion_axes, "assertion")
++        )
++        object.__setattr__(
++            self,
++            "cross_lingual_assertion_axes",
++            _validated_axes(self.cross_lingual_assertion_axes, "cross_lingual"),
++        )
++
++    def glossary_for(
++        self, source_language: str, target_language: str
++    ) -> dict[str, str]:
++        """Return the case-folded glossary for one language pair.
++
++        Args:
++            source_language: Language of the text being protected.
++            target_language: Language the glossary terms are restored in.
++
++        Returns:
++            A mapping from case-folded source term to target term.
++        """
++
++        key = (normalize_language(source_language), normalize_language(target_language))
++        return dict(self.glossary.get(key, {}))
++
++
++@dataclass(frozen=True)
++class ProtectedItem:
++    """One invariant item frozen behind a placeholder.
++
++    ``surface`` and ``replacement`` hold raw text for restoration and are
++    excluded from ``repr`` and from :meth:`to_dict`.
++    """
++
++    index: int
++    kind: ProtectedKind
++    start: int
++    end: int
++    label: str | None = None
++    surface: str = field(default="", repr=False)
++    replacement: str = field(default="", repr=False)
++    metadata: Mapping[str, Any] = field(default_factory=dict, repr=False)
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return an offsets-only record."""
++
++        return {
++            "end": self.end,
++            "index": self.index,
++            "kind": self.kind.value,
++            "label": self.label,
++            "mapped": self.replacement != self.surface,
++            "start": self.start,
++        }
++
++
++@dataclass(frozen=True)
++class ProtectedText:
++    """Text with every protected item replaced by its placeholder."""
++
++    language: str
++    items: tuple[ProtectedItem, ...]
++    masked_text: str = field(repr=False)
++
++    def kind_counts(self) -> dict[str, int]:
++        """Return protected item counts keyed by kind value."""
++
++        return _kind_counts(self.items)
++
++
++@dataclass(frozen=True)
++class SpanMapEntry:
++    """Offsets of one protected item before and after a translation leg."""
++
++    index: int
++    kind: ProtectedKind
++    label: str | None
++    source_start: int
++    source_end: int
++    target_start: int
++    target_end: int
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return a JSON-ready offsets record."""
++
++        return {
++            "index": self.index,
++            "kind": self.kind.value,
++            "label": self.label,
++            "source": [self.source_start, self.source_end],
++            "target": [self.target_start, self.target_end],
++        }
++
++
++@dataclass(frozen=True)
++class RoundTripSpanMapEntry:
++    """Offsets of one protected item across source, pivot, and back text."""
++
++    index: int
++    kind: ProtectedKind
++    label: str | None
++    source_start: int
++    source_end: int
++    pivot_start: int
++    pivot_end: int
++    back_start: int
++    back_end: int
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return a JSON-ready offsets record."""
++
++        return {
++            "back": [self.back_start, self.back_end],
++            "index": self.index,
++            "kind": self.kind.value,
++            "label": self.label,
++            "pivot": [self.pivot_start, self.pivot_end],
++            "source": [self.source_start, self.source_end],
++        }
++
++
++@dataclass(frozen=True)
++class GuardedTranslation:
++    """Outcome of one guarded translation leg.
++
++    ``text`` and ``spans`` are populated only when the translation is
++    accepted, so a rejected translation fails closed.
++    """
++
++    source_language: str
++    target_language: str
++    reasons: tuple[TranslationGuardReason, ...]
++    warnings: tuple[TranslationGuardReason, ...]
++    items: tuple[ProtectedItem, ...]
++    span_map: tuple[SpanMapEntry, ...] = ()
++    problem_indices: tuple[int, ...] = ()
++    spans: tuple[SpanAnnotation, ...] = field(default=(), repr=False)
++    text: str | None = field(default=None, repr=False)
++
++    @property
++    def accepted(self) -> bool:
++        """Whether every protection and verification check passed."""
++
++        return not self.reasons
++
++    @property
++    def protected_counts(self) -> dict[str, int]:
++        """Protected item counts keyed by kind value."""
++
++        return _kind_counts(self.items)
++
++    def to_report(self) -> dict[str, Any]:
++        """Return a counts, codes, and offsets report without raw text."""
++
++        return {
++            "accepted": self.accepted,
++            "advisory": TRANSLATION_GUARD_ADVISORY,
++            "problem_indices": list(self.problem_indices),
++            "protected_counts": self.protected_counts,
++            "protected_items": [item.to_dict() for item in self.items],
++            "reasons": _codes(self.reasons),
++            "schema_version": TRANSLATION_GUARD_SCHEMA_VERSION,
++            "source_language": self.source_language,
++            "span_map": [entry.to_dict() for entry in self.span_map],
++            "target_language": self.target_language,
++            "warnings": _codes(self.warnings),
++        }
++
++
++@dataclass(frozen=True)
++class GuardedRoundTrip:
++    """Outcome of a guarded source to pivot to source round trip.
++
++    ``text`` and ``spans`` describe the back-translated source-language text
++    and are populated only when the full round trip is accepted.
++    """
++
++    source_language: str
++    pivot_language: str
++    reasons: tuple[TranslationGuardReason, ...]
++    warnings: tuple[TranslationGuardReason, ...]
++    forward: GuardedTranslation
++    backward: GuardedTranslation | None = None
++    round_trip_reasons: tuple[TranslationGuardReason, ...] = ()
++    span_map: tuple[RoundTripSpanMapEntry, ...] = ()
++    spans: tuple[SpanAnnotation, ...] = field(default=(), repr=False)
++    text: str | None = field(default=None, repr=False)
++
++    @property
++    def accepted(self) -> bool:
++        """Whether both legs and the end-to-end checks passed."""
++
++        return not self.reasons
++
++    @property
++    def pivot_text(self) -> str | None:
++        """Accepted pivot-language text, or ``None`` when the round trip failed."""
++
++        return self.forward.text if self.accepted else None
++
++    @property
++    def protected_counts(self) -> dict[str, int]:
++        """Protected item counts keyed by kind value."""
++
++        return self.forward.protected_counts
++
++    def to_report(self) -> dict[str, Any]:
++        """Return a counts, codes, and offsets report without raw text."""
++
++        backward = self.backward
++        return {
++            "accepted": self.accepted,
++            "advisory": TRANSLATION_GUARD_ADVISORY,
++            "pivot_language": self.pivot_language,
++            "protected_counts": self.protected_counts,
++            "protected_items": [item.to_dict() for item in self.forward.items],
++            "reasons": _codes(self.reasons),
++            "schema_version": TRANSLATION_GUARD_SCHEMA_VERSION,
++            "source_language": self.source_language,
++            "span_map": [entry.to_dict() for entry in self.span_map],
++            "stages": {
++                "backward": None if backward is None else _stage_report(backward),
++                "forward": _stage_report(self.forward),
++                "round_trip": {"reasons": _codes(self.round_trip_reasons)},
++            },
++            "warnings": _codes(self.warnings),
++        }
++
++
++@dataclass(frozen=True)
++class GuardedExample:
++    """An accepted back-translated training example with its span map."""
++
++    index: int
++    example_id: str
++    language: str
++    pivot_language: str
++    span_map: tuple[RoundTripSpanMapEntry, ...]
++    text: str = field(repr=False)
++    spans: tuple[SpanAnnotation, ...] = field(repr=False)
++    pivot_text: str = field(repr=False)
++    pivot_spans: tuple[SpanAnnotation, ...] = field(repr=False)
++
++    @property
++    def transform(self) -> str:
++        """Transform label recorded in training metadata."""
++
++        return (
++            f"backtranslation:{self.language}->{self.pivot_language}->{self.language}"
++        )
++
++    def to_training_item(self) -> dict[str, Any]:
++        """Return a JSONL-ready span example that keeps the guard span map."""
++
++        spans = [span.to_dict() for span in self.spans]
++        return {
++            "gold_spans": spans,
++            "id": f"{self.example_id}-guarded-bt-{self.pivot_language}",
++            "is_synthetic": True,
++            "labels": spans,
++            "language": self.language,
++            "metadata": {
++                "augmentation_only": True,
++                "synthetic": True,
++                "synthetic_source": GUARDED_SYNTHETIC_SOURCE,
++                "transform": self.transform,
++                "translation_guard": {
++                    "pivot_language": self.pivot_language,
++                    "schema_version": TRANSLATION_GUARD_SCHEMA_VERSION,
++                    "span_map": [entry.to_dict() for entry in self.span_map],
++                },
++            },
++            "source_id": self.example_id,
++            "synthetic_source": GUARDED_SYNTHETIC_SOURCE,
++            "text": self.text,
++        }
++
++
++@dataclass(frozen=True)
++class ExampleDecision:
++    """Report row for one example; it carries no example text or identifier."""
++
++    index: int
++    accepted: bool
++    reasons: tuple[TranslationGuardReason, ...]
++    warnings: tuple[TranslationGuardReason, ...]
++    protected_counts: Mapping[str, int]
++    span_map: tuple[RoundTripSpanMapEntry, ...] = ()
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return a JSON-ready decision record."""
++
++        return {
++            "accepted": self.accepted,
++            "index": self.index,
++            "protected_counts": dict(sorted(self.protected_counts.items())),
++            "reasons": _codes(self.reasons),
++            "span_map": [entry.to_dict() for entry in self.span_map],
++            "warnings": _codes(self.warnings),
++        }
++
++
++@dataclass(frozen=True)
++class TranslationGuardReport:
++    """Aggregate counts, reason codes, and offsets for a guarded batch."""
++
++    pivot_language: str
++    total: int
++    accepted: int
++    rejected: int
++    reason_counts: Mapping[str, int]
++    warning_counts: Mapping[str, int]
++    protected_counts: Mapping[str, int]
++    decisions: tuple[ExampleDecision, ...]
++    schema_version: int = TRANSLATION_GUARD_SCHEMA_VERSION
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return a JSON-ready report without raw text or example identifiers."""
++
++        return {
++            "accepted": self.accepted,
++            "advisory": TRANSLATION_GUARD_ADVISORY,
++            "decisions": [decision.to_dict() for decision in self.decisions],
++            "pivot_language": self.pivot_language,
++            "protected_counts": dict(sorted(self.protected_counts.items())),
++            "reason_counts": dict(sorted(self.reason_counts.items())),
++            "rejected": self.rejected,
++            "schema_version": self.schema_version,
++            "total": self.total,
++            "warning_counts": dict(sorted(self.warning_counts.items())),
++        }
++
++    def to_json(self) -> str:
++        """Return canonical sorted-key JSON for the report."""
++
++        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
++
++    @property
++    def fingerprint(self) -> str:
++        """SHA-256 reference of the canonical report JSON."""
++
++        digest = hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
++        return f"sha256:{digest}"
++
++
++@dataclass(frozen=True)
++class TranslationGuardBatch:
++    """Accepted examples plus the aggregate report for a guarded batch."""
++
++    accepted: tuple[GuardedExample, ...]
++    report: TranslationGuardReport
++
++
++class TranslationGuard:
++    """Protect and verify clinical facts around an injected local translator.
++
++    The guard calls ``translator`` exactly once per translation leg with
++    placeholder-masked text. It never translates text itself, never contacts a
++    service, and never logs. Frozen surfaces are not passed to the translator.
++
++    Args:
++        translator: A local backend exposing
++            ``translate(text, source_lang, target_lang)`` or a callable with the
++            same arguments.
++        config: Optional protection and verification policy.
++
++    Raises:
++        TypeError: If ``translator`` is neither callable nor a translator.
++    """
++
++    def __init__(
++        self,
++        translator: LocalTranslator | TranslateFn,
++        *,
++        config: TranslationGuardConfig | None = None,
++    ) -> None:
++        self._translate_fn = _resolve_translator(translator)
++        self.config = config or TranslationGuardConfig()
++
++    def protect(
++        self,
++        text: str,
++        *,
++        language: str,
++        target_language: str | None = None,
++        spans: Iterable[Any] = (),
++    ) -> ProtectedText:
++        """Detect protected items and mask them with placeholders.
++
++        Args:
++            text: Source text.
++            language: Language of ``text``.
++            target_language: Language glossary terms are restored in; defaults
++                to ``language``.
++            spans: Caller-annotated spans (mappings or ``SpanAnnotation``) that
++                must survive translation. They must not overlap.
++
++        Returns:
++            The masked text and protected items ordered by offset.
++
++        Raises:
++            TranslationGuardError: If the text or spans are invalid.
++        """
++
++        _require_text(text)
++        source = normalize_language(language)
++        target = normalize_language(target_language) if target_language else source
++        annotated = _normalized_input_spans(text, spans)
++        candidates = _detect_candidates(text, source, target, annotated, self.config)
++        items = tuple(
++            ProtectedItem(
++                index=index,
++                kind=candidate.kind,
++                start=candidate.start,
++                end=candidate.end,
++                label=candidate.label,
++                surface=text[candidate.start : candidate.end],
++                replacement=candidate.replacement,
++                metadata=candidate.metadata,
++            )
++            for index, candidate in enumerate(candidates)
++        )
++        codec = _placeholder_codec(self.config.placeholder_template)
++        return ProtectedText(
++            language=source,
++            items=items,
++            masked_text=_mask(text, items, codec),
++        )
++
++    def translate(
++        self,
++        text: str,
++        *,
++        source_language: str,
++        target_language: str,
++        spans: Iterable[Any] = (),
++    ) -> GuardedTranslation:
++        """Translate once with protection and verification.
++
++        Args:
++            text: Source text.
++            source_language: Language of ``text``.
++            target_language: Output language.
++            spans: Caller-annotated spans to protect and project.
++
++        Returns:
++            A guarded translation; ``text`` is ``None`` when rejected.
++
++        Raises:
++            TranslationGuardError: If the text or spans are invalid.
++        """
++
++        source = normalize_language(source_language)
++        target = normalize_language(target_language)
++        protected = self.protect(
++            text, language=source, target_language=target, spans=spans
++        )
++        same_language = source == target
++        result = self._run_leg(
++            text,
++            protected.items,
++            source_language=source,
++            target_language=target,
++            assertion_axes=(
++                self.config.assertion_axes
++                if same_language
++                else self.config.cross_lingual_assertion_axes
++            ),
++            unverifiable_rejects=self.config.fail_on_unverifiable,
++        )
++        if not result.accepted or not self.config.verify_modifiers:
++            return result
++        source_regions = _regions((item.start, item.end) for item in protected.items)
++        if same_language:
++            changed = _modifier_changes(
++                text,
++                source_regions,
++                result.text or "",
++                _regions((e.target_start, e.target_end) for e in result.span_map),
++                source,
++            )
++            return _rejected_leg(result, changed) if changed else result
++        if source in _MODIFIER_LANGUAGES and _modifier_counts(text, source_regions):
++            return _with_warnings(
++                result, (TranslationGuardReason.MODIFIER_UNVERIFIABLE,)
++            )
++        return result
++
++    def round_trip(
++        self,
++        text: str,
++        *,
++        source_language: str,
++        pivot_language: str,
++        spans: Iterable[Any] = (),
++    ) -> GuardedRoundTrip:
++        """Translate to a pivot language and back, verifying both legs.
++
++        Protected items are restored as glossary terms (or verbatim) in the
++        pivot text, then re-protected at their pivot offsets and restored as
++        their original source surfaces in the back translation.
++
++        Args:
++            text: Source text.
++            source_language: Language of ``text``.
++            pivot_language: Intermediate language; must differ from the source.
++            spans: Caller-annotated spans to protect and project.
++
++        Returns:
++            A guarded round trip; ``text`` is ``None`` when rejected.
++
++        Raises:
++            TranslationGuardError: If the input is invalid or both languages
++                are the same.
++        """
++
++        source = normalize_language(source_language)
++        pivot = normalize_language(pivot_language)
++        if source == pivot:
++            raise TranslationGuardError(
++                "pivot_language must differ from source_language"
++            )
++        protected = self.protect(
++            text, language=source, target_language=pivot, spans=spans
++        )
++        forward = self._run_leg(
++            text,
++            protected.items,
++            source_language=source,
++            target_language=pivot,
++            assertion_axes=self.config.cross_lingual_assertion_axes,
++            unverifiable_rejects=False,
++        )
++        if not forward.accepted or forward.text is None:
++            return GuardedRoundTrip(
++                source_language=source,
++                pivot_language=pivot,
++                reasons=forward.reasons,
++                warnings=forward.warnings,
++                forward=forward,
++            )
++
++        pivot_positions = {entry.index: entry for entry in forward.span_map}
++        back_items = tuple(
++            ProtectedItem(
++                index=item.index,
++                kind=item.kind,
++                start=pivot_positions[item.index].target_start,
++                end=pivot_positions[item.index].target_end,
++                label=item.label,
++                surface=item.replacement,
++                replacement=item.surface,
++                metadata=item.metadata,
++            )
++            for item in protected.items
++        )
++        backward = self._run_leg(
++            forward.text,
++            back_items,
++            source_language=pivot,
++            target_language=source,
++            assertion_axes=(),
++            unverifiable_rejects=False,
++        )
++        warnings = _ordered((*forward.warnings, *backward.warnings))
++        if not backward.accepted or backward.text is None:
++            return GuardedRoundTrip(
++                source_language=source,
++                pivot_language=pivot,
++                reasons=backward.reasons,
++                warnings=warnings,
++                forward=forward,
++                backward=backward,
++            )
++
++        back_positions = {entry.index: entry for entry in backward.span_map}
++        span_map = tuple(
++            RoundTripSpanMapEntry(
++                index=item.index,
++                kind=item.kind,
++                label=item.label,
++                source_start=item.start,
++                source_end=item.end,
++                pivot_start=pivot_positions[item.index].target_start,
++                pivot_end=pivot_positions[item.index].target_end,
++                back_start=back_positions[item.index].target_start,
++                back_end=back_positions[item.index].target_end,
++            )
++            for item in protected.items
++        )
++        source_regions = _regions((e.source_start, e.source_end) for e in span_map)
++        back_regions = _regions((e.back_start, e.back_end) for e in span_map)
++        end_reasons: list[TranslationGuardReason] = []
++        end_warnings: list[TranslationGuardReason] = []
++        self._check_assertions(
++            text,
++            source_regions,
++            backward.text,
++            back_regions,
++            source_language=source,
++            target_language=source,
++            axes=self.config.assertion_axes,
++            unverifiable_rejects=self.config.fail_on_unverifiable,
++            reasons=end_reasons,
++            warnings=end_warnings,
++        )
++        if self.config.verify_modifiers:
++            changed = _modifier_changes(
++                text, source_regions, backward.text, back_regions, source
++            )
++            if changed is None:
++                end_warnings.append(TranslationGuardReason.MODIFIER_UNVERIFIABLE)
++            else:
++                end_reasons.extend(changed)
++
++        spans_out: tuple[SpanAnnotation, ...] = ()
++        if not end_reasons:
++            try:
++                spans_out = _project_round_trip_spans(
++                    backward.text, protected.items, back_positions
++                )
++            except SpanProjectionError:
++                end_reasons.append(TranslationGuardReason.SPAN_INTEGRITY_FAILED)
++
++        round_trip_reasons = _ordered(end_reasons)
++        all_warnings = _ordered((*warnings, *end_warnings))
++        if round_trip_reasons:
++            return GuardedRoundTrip(
++                source_language=source,
++                pivot_language=pivot,
++                reasons=round_trip_reasons,
++                warnings=all_warnings,
++                forward=forward,
++                backward=backward,
++                round_trip_reasons=round_trip_reasons,
++                span_map=span_map,
++            )
++        return GuardedRoundTrip(
++            source_language=source,
++            pivot_language=pivot,
++            reasons=(),
++            warnings=all_warnings,
++            forward=forward,
++            backward=backward,
++            span_map=span_map,
++            spans=spans_out,
++            text=backward.text,
++        )
++
++    def guard_examples(
++        self,
++        examples: Iterable[Mapping[str, Any]],
++        *,
++        pivot_language: str,
++        default_language: str = "en",
++    ) -> TranslationGuardBatch:
++        """Round-trip span examples and reject any whose facts changed.
++
++        Each example is a mapping with ``text``, an optional ``language`` (or
++        ``lang``), an optional ``id``, and spans under ``gold_spans``,
++        ``labels``, ``entities``, or ``spans``. Invalid examples are rejected
++        with ``invalid_input`` instead of raising.
++
++        Args:
++            examples: Span-annotated examples.
++            pivot_language: Intermediate language for the round trip.
++            default_language: Language assumed when an example has none.
++
++        Returns:
++            Accepted examples and an aggregate report keyed by input position.
++        """
++
++        pivot = normalize_language(pivot_language)
++        accepted: list[GuardedExample] = []
++        decisions: list[ExampleDecision] = []
++        for index, raw_example in enumerate(examples):
++            try:
++                example_id, text, language, spans = _example_fields(
++                    raw_example, index=index, default_language=default_language
++                )
++                if language == pivot:
++                    decisions.append(
++                        _decision(index, (TranslationGuardReason.SAME_LANGUAGE,))
++                    )
++                    continue
++                result = self.round_trip(
++                    text,
++                    source_language=language,
++                    pivot_language=pivot,
++                    spans=spans,
++                )
++            except TranslationGuardError:
++                decisions.append(
++                    _decision(index, (TranslationGuardReason.INVALID_INPUT,))
++                )
++                continue
++
++            decisions.append(
++                ExampleDecision(
++                    index=index,
++                    accepted=result.accepted,
++                    reasons=result.reasons,
++                    warnings=result.warnings,
++                    protected_counts=result.protected_counts,
++                    span_map=result.span_map,
++                )
++            )
++            if result.accepted and result.text is not None:
++                accepted.append(
++                    GuardedExample(
++                        index=index,
++                        example_id=example_id,
++                        language=language,
++                        pivot_language=pivot,
++                        span_map=result.span_map,
++                        text=result.text,
++                        spans=result.spans,
++                        pivot_text=result.forward.text or "",
++                        pivot_spans=result.forward.spans,
++                    )
++                )
++        return TranslationGuardBatch(
++            accepted=tuple(accepted),
++            report=_build_report(pivot, decisions),
++        )
++
++    def _run_leg(
++        self,
++        text: str,
++        items: tuple[ProtectedItem, ...],
++        *,
++        source_language: str,
++        target_language: str,
++        assertion_axes: tuple[str, ...],
++        unverifiable_rejects: bool,
++    ) -> GuardedTranslation:
++        codec = _placeholder_codec(self.config.placeholder_template)
++        source_regions = _regions((item.start, item.end) for item in items)
++
++        def rejected(
++            reasons: Iterable[TranslationGuardReason],
++            problems: Iterable[int] = (),
++        ) -> GuardedTranslation:
++            return GuardedTranslation(
++                source_language=source_language,
++                target_language=target_language,
++                reasons=_ordered(reasons),
++                warnings=(),
++                items=items,
++                problem_indices=tuple(sorted(set(problems))),
++            )
++
++        if codec.loose.search(_blank(text, source_regions)):
++            return rejected((TranslationGuardReason.PLACEHOLDER_COLLISION,))
++        try:
++            output = self._translate_fn(
++                _mask(text, items, codec), source_language, target_language
++            )
++        except Exception:
++            # Backend failures become a reason code; the exception message may
++            # quote input text, so it is deliberately discarded.
++            return rejected((TranslationGuardReason.TRANSLATOR_ERROR,))
++        if not isinstance(output, str):
++            return rejected((TranslationGuardReason.TRANSLATOR_ERROR,))
++        output = output.strip()
++        if not output:
++            return rejected((TranslationGuardReason.EMPTY_TRANSLATION,))
++
++        restored, positions, restore_reasons, problems = _restore(output, items, codec)
++        if restore_reasons or restored is None:
++            return rejected(restore_reasons, problems)
++
++        target_regions = _regions(positions.values())
++        reasons: list[TranslationGuardReason] = []
++        warnings: list[TranslationGuardReason] = []
++        if codec.loose.search(_blank(restored, target_regions)):
++            reasons.append(TranslationGuardReason.PLACEHOLDER_RESIDUE)
++        if self.config.verify_numbers and _digit_runs(
++            text, source_regions
++        ) != _digit_runs(restored, target_regions):
++            reasons.append(TranslationGuardReason.NUMBER_CHANGED)
++        self._check_assertions(
++            text,
++            source_regions,
++            restored,
++            target_regions,
++            source_language=source_language,
++            target_language=target_language,
++            axes=assertion_axes,
++            unverifiable_rejects=unverifiable_rejects,
++            reasons=reasons,
++            warnings=warnings,
++        )
++
++        span_map = tuple(
++            SpanMapEntry(
++                index=item.index,
++                kind=item.kind,
++                label=item.label,
++                source_start=item.start,
++                source_end=item.end,
++                target_start=positions[item.index][0],
++                target_end=positions[item.index][1],
++            )
++            for item in items
++        )
++        spans: tuple[SpanAnnotation, ...] = ()
++        if not reasons:
++            try:
++                spans = _project_leg_spans(restored, items, positions)
++            except SpanProjectionError:
++                reasons.append(TranslationGuardReason.SPAN_INTEGRITY_FAILED)
++        if reasons:
++            return GuardedTranslation(
++                source_language=source_language,
++                target_language=target_language,
++                reasons=_ordered(reasons),
++                warnings=_ordered(warnings),
++                items=items,
++                span_map=span_map,
++            )
++        return GuardedTranslation(
++            source_language=source_language,
++            target_language=target_language,
++            reasons=(),
++            warnings=_ordered(warnings),
++            items=items,
++            span_map=span_map,
++            spans=spans,
++            text=restored,
++        )
++
++    def _check_assertions(
++        self,
++        source_text: str,
++        source_regions: tuple[tuple[int, int], ...],
++        target_text: str,
++        target_regions: tuple[tuple[int, int], ...],
++        *,
++        source_language: str,
++        target_language: str,
++        axes: tuple[str, ...],
++        unverifiable_rejects: bool,
++        reasons: list[TranslationGuardReason],
++        warnings: list[TranslationGuardReason],
++    ) -> None:
++        if not axes:
++            return
++        before = _assertion_counts(source_text, source_language, source_regions, axes)
++        after = _assertion_counts(target_text, target_language, target_regions, axes)
++        if before is None or after is None:
++            bucket = reasons if unverifiable_rejects else warnings
++            bucket.append(TranslationGuardReason.ASSERTION_UNVERIFIABLE)
++            return
++        for axis in axes:
++            if before[axis] != after[axis]:
++                reasons.append(_AXIS_REASONS[axis])
++
++
++def guard_round_trip_examples(
++    examples: Iterable[Mapping[str, Any]],
++    *,
++    translator: LocalTranslator | TranslateFn,
++    pivot_language: str,
++    config: TranslationGuardConfig | None = None,
++    default_language: str = "en",
++) -> TranslationGuardBatch:
++    """Round-trip span examples through a local translator and gate them.
++
++    Args:
++        examples: Span-annotated examples (see
++            :meth:`TranslationGuard.guard_examples`).
++        translator: Caller-supplied local translator or callable.
++        pivot_language: Intermediate language for the round trip.
++        config: Optional protection and verification policy.
++        default_language: Language assumed when an example has none.
++
++    Returns:
++        Accepted examples and a counts, codes, and offsets report.
++    """
++
++    return TranslationGuard(translator, config=config).guard_examples(
++        examples, pivot_language=pivot_language, default_language=default_language
++    )
++
++
++# ---------------------------------------------------------------------------
++# Placeholders
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class _PlaceholderCodec:
++    prefix: str
++    suffix: str
++    strict: re.Pattern[str]
++    loose: re.Pattern[str]
++
++    def render(self, index: int) -> str:
++        return f"{self.prefix}{index}{self.suffix}"
++
++
++def _validated_template(template: object) -> str:
++    if not isinstance(template, str) or template.count("{index}") != 1:
++        raise TranslationGuardError(
++            "placeholder_template must contain '{index}' exactly once"
++        )
++    prefix, suffix = template.split("{index}")
++    if (
++        not prefix
++        or not suffix
++        or prefix[-1].isdigit()
++        or suffix[0].isdigit()
++        or any(char.isspace() for char in template)
++    ):
++        raise TranslationGuardError(
++            "placeholder_template needs a non-digit prefix and suffix without spaces"
++        )
++    return template
++
++
++@lru_cache(maxsize=16)
++def _placeholder_codec(template: str) -> _PlaceholderCodec:
++    prefix, suffix = template.split("{index}")
++    strict = re.compile(re.escape(prefix) + r"([0-9]+)" + re.escape(suffix))
++    core = re.sub(r"[\W_]+", "", prefix) or re.sub(r"[\W_]+", "", suffix)
++    if len(core) >= 2:
++        # A translator that splits or re-cases the token ("OMP 3") leaves residue.
++        loose = re.compile(re.escape(core) + r"[\W_]*\d", re.IGNORECASE)
++    else:
++        fragments = sorted({prefix, suffix}, key=len, reverse=True)
++        loose = re.compile("|".join(re.escape(fragment) for fragment in fragments))
++    return _PlaceholderCodec(prefix=prefix, suffix=suffix, strict=strict, loose=loose)
++
++
++def _mask(text: str, items: Sequence[ProtectedItem], codec: _PlaceholderCodec) -> str:
++    parts: list[str] = []
++    cursor = 0
++    for item in sorted(items, key=lambda value: value.start):
++        parts.append(text[cursor : item.start])
++        parts.append(codec.render(item.index))
++        cursor = item.end
++    parts.append(text[cursor:])
++    return "".join(parts)
++
++
++def _restore(
++    output: str,
++    items: Sequence[ProtectedItem],
++    codec: _PlaceholderCodec,
++) -> tuple[
++    str | None,
++    dict[int, tuple[int, int]],
++    tuple[TranslationGuardReason, ...],
++    tuple[int, ...],
++]:
++    by_index = {item.index: item for item in items}
++    canonical_indices = {str(index): index for index in by_index}
++    matches = list(codec.strict.finditer(output))
++    counts: Counter[int] = Counter()
++    unknown = False
++    for match in matches:
++        raw_index = match.group(1)
++        index = canonical_indices.get(raw_index)
++        if index is None:
++            unknown = True
++            continue
++        counts[index] += 1
++    dropped = sorted(index for index in by_index if counts[index] == 0)
++    duplicated = sorted(index for index, count in counts.items() if count > 1)
++    reasons: list[TranslationGuardReason] = []
++    if dropped:
++        reasons.append(TranslationGuardReason.PROTECTED_ITEM_DROPPED)
++    if duplicated:
++        reasons.append(TranslationGuardReason.PROTECTED_ITEM_DUPLICATED)
++    if unknown:
++        reasons.append(TranslationGuardReason.UNKNOWN_PLACEHOLDER)
++    if reasons:
++        return None, {}, _ordered(reasons), tuple(dropped + duplicated)
++
++    parts: list[str] = []
++    positions: dict[int, tuple[int, int]] = {}
++    cursor = 0
++    length = 0
++    for match in matches:
++        segment = output[cursor : match.start()]
++        parts.append(segment)
++        length += len(segment)
++        item = by_index[int(match.group(1))]
++        positions[item.index] = (length, length + len(item.replacement))
++        parts.append(item.replacement)
++        length += len(item.replacement)
++        cursor = match.end()
++    parts.append(output[cursor:])
++    return "".join(parts), positions, (), ()
++
++
++# ---------------------------------------------------------------------------
++# Detection
++# ---------------------------------------------------------------------------
++
++_PHI_PLACEHOLDER_RE: Final = re.compile(
++    r"<<[A-Za-z0-9_:-]{1,96}>>"
++    r"|\[\[?[A-Za-z][A-Za-z0-9_-]{0,63}\]?\]"
++    r"|\{\{[A-Za-z][A-Za-z0-9_-]{0,63}\}\}"
++    r"|<[A-Z][A-Z0-9_-]{0,63}>"
++    r"|\*{3,}"
++)
++_NUMBER_CORE: Final = r"\d+(?:[.,]\d+)*"
++# Ranges, ratios, dates, and products such as 5-10, 120/80, 2024-03-01, 2 x 5.
++_NUMBER_BODY: Final = (
++    _NUMBER_CORE
++    + r"(?:[ \t]?(?:/|:|-|\N{EN DASH}|x|\N{MULTIPLICATION SIGN})[ \t]?"
++    + _NUMBER_CORE
++    + r")*"
++)
++_UNIT_TOKEN_RE: Final = re.compile(
++    r"[ \t\N{NO-BREAK SPACE}]?(?P<unit>%|\N{DEGREE SIGN}[ \t]?[CFcf](?!\w)"
++    r"|[^\W\d_][\w/^*]*(?:[ \t][Hh]g)?)"
++)
++_IDENTIFIER_SEGMENT_RE: Final = re.compile(r"[./#-]+")
++_DIGIT_RE: Final = re.compile(r"\d+")
++
++
++@dataclass(frozen=True)
++class _ScriptPatterns:
++    bounded: bool
++    number: re.Pattern[str]
++    identifier: re.Pattern[str]
++    all_caps: re.Pattern[str]
++    short_token: re.Pattern[str]
++
++
++_BOUNDED_PATTERNS: Final = _ScriptPatterns(
++    bounded=True,
++    number=re.compile(r"(?<!\w)" + _NUMBER_BODY),
++    identifier=re.compile(r"(?<![\w#])[^\W_][\w.#/-]*[^\W_]"),
++    all_caps=re.compile(r"(?<!\w)[A-Z]{2,8}(?!\w)"),
++    short_token=re.compile(r"(?<![\w/])[A-Za-z][A-Za-z0-9/]{1,4}(?![\w/])"),
++)
++# Scripts written without spaces (Chinese, Japanese) put Latin codes and digits
++# directly next to letters, so boundaries only consider ASCII word characters.
++_UNBOUNDED_PATTERNS: Final = _ScriptPatterns(
++    bounded=False,
++    number=re.compile(r"(?<![\dA-Za-z_])" + _NUMBER_BODY),
++    identifier=re.compile(r"(?<![A-Za-z0-9_#])[A-Za-z0-9][A-Za-z0-9.#/_-]*[A-Za-z0-9]"),
++    all_caps=re.compile(r"(?<![A-Za-z0-9_])[A-Z]{2,8}(?![A-Za-z0-9_])"),
++    short_token=re.compile(
++        r"(?<![A-Za-z0-9_/])[A-Za-z][A-Za-z0-9/]{1,4}(?![A-Za-z0-9_/])"
++    ),
++)
++_MAX_UNBOUNDED_UNIT_LENGTH: Final = 8
++
++
++@dataclass(frozen=True)
++class _Candidate:
++    start: int
++    end: int
++    kind: ProtectedKind
++    label: str | None
++    replacement: str
++    metadata: Mapping[str, Any]
++
++
++def _detect_candidates(
++    text: str,
++    language: str,
++    target_language: str,
++    annotated: Sequence[SpanAnnotation],
++    config: TranslationGuardConfig,
++) -> list[_Candidate]:
++    claimed = bytearray(len(text))
++    found: list[_Candidate] = []
++    glossary = config.glossary_for(language, target_language)
++
++    def claim(
++        start: int,
++        end: int,
++        kind: ProtectedKind,
++        *,
++        label: str | None = None,
++        replacement: str | None = None,
++        metadata: Mapping[str, Any] | None = None,
++    ) -> None:
++        if start >= end or any(claimed[start:end]):
++            return
++        claimed[start:end] = b"\x01" * (end - start)
++        found.append(
++            _Candidate(
++                start=start,
++                end=end,
++                kind=kind,
++                label=label,
++                replacement=text[start:end] if replacement is None else replacement,
++                metadata=dict(metadata or {}),
++            )
++        )
++
++    for span in annotated:
++        claim(
++            span.start,
++            span.end,
++            ProtectedKind.ANNOTATED_SPAN,
++            label=span.label,
++            replacement=glossary.get(_term_key(span.text), span.text),
++            metadata=span.metadata,
++        )
++
++    kinds = config.protected_kinds
++    patterns = (
++        _BOUNDED_PATTERNS if _uses_token_boundaries(language) else _UNBOUNDED_PATTERNS
++    )
++    if ProtectedKind.PHI_PLACEHOLDER in kinds:
++        for match in _PHI_PLACEHOLDER_RE.finditer(text):
++            claim(match.start(), match.end(), ProtectedKind.PHI_PLACEHOLDER)
++    if ProtectedKind.CLINICAL_TERM in kinds:
++        for start, end, replacement in _term_matches(
++            text, patterns.bounded, glossary, config.protected_terms
++        ):
++            claim(start, end, ProtectedKind.CLINICAL_TERM, replacement=replacement)
++    if ProtectedKind.MEASUREMENT in kinds:
++        for start, end in _measurement_matches(text, language, patterns):
++            claim(start, end, ProtectedKind.MEASUREMENT)
++    if ProtectedKind.IDENTIFIER in kinds:
++        for match in patterns.identifier.finditer(text):
++            if _looks_like_identifier(match.group(0)):
++                claim(match.start(), match.end(), ProtectedKind.IDENTIFIER)
++    if ProtectedKind.NUMBER in kinds:
++        for match in patterns.number.finditer(text):
++            claim(match.start(), match.end(), ProtectedKind.NUMBER)
++    if ProtectedKind.ABBREVIATION in kinds:
++        for match in patterns.all_caps.finditer(text):
++            claim(match.start(), match.end(), ProtectedKind.ABBREVIATION)
++        compact = _compact_abbreviations(language)
++        for match in patterns.short_token.finditer(text):
++            key = match.group(0).casefold()
++            if key in compact or _is_sig_abbreviation(key):
++                claim(match.start(), match.end(), ProtectedKind.ABBREVIATION)
++    return sorted(found, key=lambda candidate: candidate.start)
++
++
++def _term_matches(
++    text: str,
++    boundaries: bool,
++    glossary: Mapping[str, str],
++    protected_terms: Sequence[str],
++) -> list[tuple[int, int, str | None]]:
++    terms: dict[str, str | None] = {_term_key(term): None for term in protected_terms}
++    terms.update(glossary)
++    matches: list[tuple[int, int, str | None]] = []
++    for term in sorted(terms, key=lambda value: (-len(value), value)):
++        for match in _term_pattern(term, boundaries).finditer(text):
++            matches.append((match.start(), match.end(), terms[term]))
++    return matches
++
++
++@lru_cache(maxsize=512)
++def _term_pattern(term: str, boundaries: bool) -> re.Pattern[str]:
++    body = r"\s+".join(re.escape(part) for part in term.split())
++    prefix = r"(?<!\w)" if boundaries and _is_word_char(term[0]) else ""
++    suffix = r"(?!\w)" if boundaries and _is_word_char(term[-1]) else ""
++    return re.compile(prefix + body + suffix, re.IGNORECASE)
++
++
++def _measurement_matches(
++    text: str,
++    language: str,
++    patterns: _ScriptPatterns,
++) -> list[tuple[int, int]]:
++    matches: list[tuple[int, int]] = []
++    for number in patterns.number.finditer(text):
++        unit = _UNIT_TOKEN_RE.match(text, number.end())
++        if unit is None:
++            continue
++        unit_start = unit.start("unit")
++        for candidate in _unit_candidates(unit.group("unit"), patterns.bounded):
++            end = unit_start + len(candidate)
++            if patterns.bounded and end < len(text) and _is_word_char(text[end]):
++                continue
++            if _is_unit(candidate, language):
++                matches.append((number.start(), end))
++                break
++    return matches
++
++
++def _unit_candidates(token: str, bounded: bool) -> tuple[str, ...]:
++    if not bounded:
++        # Unspaced scripts run a unit straight into the next word, so try each
++        # prefix from longest to shortest.
++        longest = min(len(token), _MAX_UNBOUNDED_UNIT_LENGTH)
++        return tuple(token[:size] for size in range(longest, 0, -1))
++    candidates = [token]
++    cut = token
++    while "/" in cut:
++        cut = cut.rsplit("/", 1)[0]
++        if cut:
++            candidates.append(cut)
++    leading = re.match(r"[^\W\d_]+", token)
++    if leading is not None:
++        candidates.append(leading.group(0))
++    return tuple(dict.fromkeys(candidates))
++
++
++@lru_cache(maxsize=1024)
++def _is_unit(candidate: str, language: str) -> bool:
++    if canonical_unit_alias(candidate, language=language) is not None:
++        return True
++    return parse_unit(candidate, language=language).get("status") == "ok"
++
++
++def _looks_like_identifier(token: str) -> bool:
++    """Return whether a token is a Latin-alphanumeric code such as MRN-0042817.
++
++    A token qualifies when it mixes ASCII letters and digits within one
++    segment (``HbA1c``, ``q8h``, ``E11.9``) or carries an upper-case letter
++    next to a digit segment (``MRN-0042817``, ``COVID-19``). Lower-case
++    phrases such as ``5-year-old`` stay translatable.
++    """
++
++    if not any(char.isdigit() for char in token):
++        return False
++    if not any(_is_ascii_letter(char) for char in token):
++        return False
++    for segment in _IDENTIFIER_SEGMENT_RE.split(token):
++        if any(char.isdigit() for char in segment) and any(
++            _is_ascii_letter(char) for char in segment
++        ):
++            return True
++    return any(_is_ascii_letter(char) and char.isupper() for char in token)
++
++
++def _is_ascii_letter(char: str) -> bool:
++    return char.isascii() and char.isalpha()
++
++
++def _compact_abbreviations(language: str) -> frozenset[str]:
++    lexicon = get_clinical_norm_lexicon(language)
++    return frozenset(
++        key
++        for key in lexicon.abbreviation_expansions
++        if key.isascii() and " " not in key and 2 <= len(key) <= 5
++    )
++
++
++@lru_cache(maxsize=1024)
++def _is_sig_abbreviation(token: str) -> bool:
++    if not token.isalpha() or len(token) > 4:
++        return False
++    frequency = normalize_frequency(token)
++    return bool(frequency.get("recognized")) and frequency.get("cue") == token
++
++
++def _uses_token_boundaries(language: str) -> bool:
++    code = normalize_language(language)
++    if code not in available_clinical_cue_languages():
++        return True
++    return get_clinical_cue_lexicon(code).token_boundaries
++
++
++# ---------------------------------------------------------------------------
++# Verification
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class _CuePack:
++    pattern: re.Pattern[str] | None
++    axes_by_cue: Mapping[str, frozenset[str]]
++
++
++@lru_cache(maxsize=32)
++def _compiled_cue_pack(lexicon: ClinicalCueLexicon) -> _CuePack:
++    axes_by_cue: dict[str, set[str]] = {}
++    # Pseudo-negation phrases are matched so their inner "no"/"not" never
++    # counts as a negation, but they only count on axes they also belong to.
++    for axis in (*ASSERTION_AXES, "pseudo_negation"):
++        for cue in getattr(lexicon, axis):
++            key = _cue_key(cue)
++            if key:
++                axes_by_cue.setdefault(key, set()).add(axis)
++    if not axes_by_cue:
++        return _CuePack(pattern=None, axes_by_cue={})
++    alternation = "|".join(
++        r"\s+".join(re.escape(part) for part in cue.split())
++        for cue in sorted(axes_by_cue, key=lambda value: (-len(value), value))
++    )
++    if lexicon.token_boundaries:
++        pattern = re.compile(rf"(?<!\w)(?:{alternation})(?!\w)", re.IGNORECASE)
++    else:
++        pattern = re.compile(rf"(?:{alternation})", re.IGNORECASE)
++    return _CuePack(
++        pattern=pattern,
++        axes_by_cue={cue: frozenset(axes) for cue, axes in axes_by_cue.items()},
++    )
++
++
++def _assertion_counts(
++    text: str,
++    language: str,
++    regions: tuple[tuple[int, int], ...],
++    axes: tuple[str, ...],
++) -> dict[str, int] | None:
++    code = normalize_language(language)
++    if code not in available_clinical_cue_languages():
++        return None
++    pack = _compiled_cue_pack(get_clinical_cue_lexicon(code))
++    counts = {axis: 0 for axis in axes}
++    if pack.pattern is None:
++        return counts
++    for match in pack.pattern.finditer(_blank(text, regions)):
++        for axis in pack.axes_by_cue.get(_cue_key(match.group(0)), ()):
++            if axis in counts:
++                counts[axis] += 1
++    return counts
++
++
++def _modifier_counts(
++    text: str, regions: tuple[tuple[int, int], ...]
++) -> Counter[tuple[str, str]]:
++    blanked = _blank(text, regions)
++    if not blanked.strip():
++        return Counter()
++    hits = extract_severity_laterality(
++        [{"start": 0, "end": len(blanked), "label": "text"}],
++        blanked,
++        max_distance=len(blanked),
++    )
++    return Counter((str(hit["kind"]), str(hit["normalized"])) for hit in hits)
++
++
++def _modifier_changes(
++    source_text: str,
++    source_regions: tuple[tuple[int, int], ...],
++    target_text: str,
++    target_regions: tuple[tuple[int, int], ...],
++    language: str,
++) -> tuple[TranslationGuardReason, ...] | None:
++    if normalize_language(language) not in _MODIFIER_LANGUAGES:
++        return None
++    before = _modifier_counts(source_text, source_regions)
++    after = _modifier_counts(target_text, target_regions)
++    changed: list[TranslationGuardReason] = []
++    for kind in MODIFIER_KINDS:
++        left = {key: count for key, count in before.items() if key[0] == kind}
++        right = {key: count for key, count in after.items() if key[0] == kind}
++        if left != right:
++            changed.append(_MODIFIER_REASONS[kind])
++    return tuple(changed)
++
++
++def _digit_runs(text: str, regions: tuple[tuple[int, int], ...]) -> Counter[str]:
++    return Counter(
++        "".join(str(unicodedata.decimal(char)) for char in match.group(0))
++        for match in _DIGIT_RE.finditer(_blank(text, regions))
++    )
++
++
++def _project_leg_spans(
++    text: str,
++    items: Sequence[ProtectedItem],
++    positions: Mapping[int, tuple[int, int]],
++) -> tuple[SpanAnnotation, ...]:
++    spans = tuple(
++        SpanAnnotation(
++            start=positions[item.index][0],
++            end=positions[item.index][1],
++            label=item.label or "",
++            text=item.replacement,
++            metadata={
++                **dict(item.metadata),
++                "projected_from_end": item.end,
++                "projected_from_start": item.start,
++            },
++        )
++        for item in items
++        if item.kind is ProtectedKind.ANNOTATED_SPAN
++    )
++    validate_span_integrity(text, spans)
++    return tuple(sorted(spans, key=lambda span: (span.start, span.end, span.label)))
++
++
++def _project_round_trip_spans(
++    text: str,
++    items: Sequence[ProtectedItem],
++    back_positions: Mapping[int, SpanMapEntry],
++) -> tuple[SpanAnnotation, ...]:
++    spans = tuple(
++        SpanAnnotation(
++            start=back_positions[item.index].target_start,
++            end=back_positions[item.index].target_end,
++            label=item.label or "",
++            text=item.surface,
++            metadata={
++                **dict(item.metadata),
++                "projected_from_end": item.end,
++                "projected_from_start": item.start,
++            },
++        )
++        for item in items
++        if item.kind is ProtectedKind.ANNOTATED_SPAN
++    )
++    validate_span_integrity(text, spans)
++    return tuple(sorted(spans, key=lambda span: (span.start, span.end, span.label)))
++
++
++# ---------------------------------------------------------------------------
++# Small helpers
++# ---------------------------------------------------------------------------
++
++
++def _resolve_translator(translator: object) -> TranslateFn:
++    translate = getattr(translator, "translate", None)
++    if callable(translate):
++        return translate
++    if callable(translator):
++        return translator  # type: ignore[return-value]
++    raise TypeError(
++        "translator must be callable or expose translate(text, source, target)"
++    )
++
++
++def _require_text(text: object) -> None:
++    if not isinstance(text, str) or not text.strip():
++        raise TranslationGuardError("text must be a non-empty string")
++
++
++def _normalized_input_spans(
++    text: str, spans: Iterable[Any]
++) -> tuple[SpanAnnotation, ...]:
++    try:
++        annotated = normalize_span_annotations(list(spans), source_text=text)
++        validate_span_integrity(text, annotated)
++    except (SpanProjectionError, TypeError, AttributeError):
++        raise TranslationGuardError(
++            "annotated spans must be in range, match the text, and not overlap"
++        ) from None
++    return annotated
++
++
++def _example_fields(
++    raw_example: object,
++    *,
++    index: int,
++    default_language: str,
++) -> tuple[str, str, str, tuple[SpanAnnotation, ...]]:
++    if not isinstance(raw_example, Mapping):
++        raise TranslationGuardError("example must be a mapping")
++    text = raw_example.get("text")
++    if not isinstance(text, str) or not text.strip():
++        raise TranslationGuardError("example text must be a non-empty string")
++    language = normalize_language(
++        raw_example.get("language") or raw_example.get("lang") or default_language
++    )
++    try:
++        spans = normalize_span_annotations(raw_example, source_text=text)
++    except (SpanProjectionError, TypeError, AttributeError):
++        raise TranslationGuardError("example spans are invalid") from None
++    example_id = str(
++        raw_example.get("id") or raw_example.get("fixture_id") or f"example-{index}"
++    )
++    return example_id, text, language, spans
++
++
++def _validated_term(term: object) -> str:
++    if not isinstance(term, str) or not term.strip():
++        raise TranslationGuardError("protected terms must be non-empty strings")
++    return term.strip()
++
++
++def _normalized_glossary(
++    glossary: Mapping[tuple[str, str], Mapping[str, str]],
++) -> dict[tuple[str, str], dict[str, str]]:
++    if not isinstance(glossary, Mapping):
++        raise TranslationGuardError("glossary must be a mapping")
++    normalized: dict[tuple[str, str], dict[str, str]] = {}
++    for pair, entries in glossary.items():
++        if (
++            not isinstance(pair, tuple)
++            or len(pair) != 2
++            or not all(isinstance(code, str) and code.strip() for code in pair)
++        ):
++            raise TranslationGuardError(
++                "glossary keys must be (source_language, target_language) pairs"
++            )
++        if not isinstance(entries, Mapping):
++            raise TranslationGuardError("glossary entries must be mappings")
++        key = (normalize_language(pair[0]), normalize_language(pair[1]))
++        bucket = normalized.setdefault(key, {})
++        for term, target in entries.items():
++            if not isinstance(target, str) or not target.strip():
++                raise TranslationGuardError(
++                    "glossary targets must be non-empty strings"
++                )
++            bucket[_term_key(_validated_term(term))] = target.strip()
++    return normalized
++
++
++def _validated_axes(axes: Iterable[str], name: str) -> tuple[str, ...]:
++    values = tuple(dict.fromkeys(axes))
++    if any(axis not in ASSERTION_AXES for axis in values):
++        raise TranslationGuardError(f"{name} axes must be drawn from {ASSERTION_AXES}")
++    return values
++
++
++def _term_key(term: str) -> str:
++    return " ".join(unicodedata.normalize("NFKC", term).casefold().split())
++
++
++def _cue_key(cue: str) -> str:
++    return " ".join(unicodedata.normalize("NFKC", cue).casefold().split())
++
++
++def _is_word_char(char: str) -> bool:
++    return char.isalnum() or char == "_"
++
++
++def _regions(pairs: Iterable[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
++    return tuple(sorted((int(start), int(end)) for start, end in pairs))
++
++
++def _blank(text: str, regions: Iterable[tuple[int, int]]) -> str:
++    chars = list(text)
++    for start, end in regions:
++        chars[start:end] = " " * (end - start)
++    return "".join(chars)
++
++
++def _ordered(
++    reasons: Iterable[TranslationGuardReason],
++) -> tuple[TranslationGuardReason, ...]:
++    return tuple(sorted(set(reasons), key=_REASON_ORDER.__getitem__))
++
++
++def _codes(reasons: Iterable[TranslationGuardReason]) -> list[str]:
++    return [reason.value for reason in reasons]
++
++
++def _kind_counts(items: Iterable[ProtectedItem]) -> dict[str, int]:
++    return dict(sorted(Counter(item.kind.value for item in items).items()))
++
++
++def _stage_report(result: GuardedTranslation) -> dict[str, Any]:
++    return {
++        "accepted": result.accepted,
++        "problem_indices": list(result.problem_indices),
++        "reasons": _codes(result.reasons),
++        "warnings": _codes(result.warnings),
++    }
++
++
++def _rejected_leg(
++    result: GuardedTranslation,
++    reasons: Iterable[TranslationGuardReason],
++) -> GuardedTranslation:
++    return GuardedTranslation(
++        source_language=result.source_language,
++        target_language=result.target_language,
++        reasons=_ordered((*result.reasons, *reasons)),
++        warnings=result.warnings,
++        items=result.items,
++        span_map=result.span_map,
++        problem_indices=result.problem_indices,
++    )
++
++
++def _with_warnings(
++    result: GuardedTranslation,
++    warnings: Iterable[TranslationGuardReason],
++) -> GuardedTranslation:
++    return GuardedTranslation(
++        source_language=result.source_language,
++        target_language=result.target_language,
++        reasons=result.reasons,
++        warnings=_ordered((*result.warnings, *warnings)),
++        items=result.items,
++        span_map=result.span_map,
++        problem_indices=result.problem_indices,
++        spans=result.spans,
++        text=result.text,
++    )
++
++
++def _decision(
++    index: int, reasons: tuple[TranslationGuardReason, ...]
++) -> ExampleDecision:
++    return ExampleDecision(
++        index=index,
++        accepted=False,
++        reasons=reasons,
++        warnings=(),
++        protected_counts={},
++    )
++
++
++def _build_report(
++    pivot_language: str, decisions: Sequence[ExampleDecision]
++) -> TranslationGuardReport:
++    reason_counts: Counter[str] = Counter()
++    warning_counts: Counter[str] = Counter()
++    protected_counts: Counter[str] = Counter()
++    for decision in decisions:
++        reason_counts.update(reason.value for reason in decision.reasons)
++        warning_counts.update(reason.value for reason in decision.warnings)
++        protected_counts.update(decision.protected_counts)
++    accepted = sum(1 for decision in decisions if decision.accepted)
++    return TranslationGuardReport(
++        pivot_language=pivot_language,
++        total=len(decisions),
++        accepted=accepted,
++        rejected=len(decisions) - accepted,
++        reason_counts=dict(sorted(reason_counts.items())),
++        warning_counts=dict(sorted(warning_counts.items())),
++        protected_counts=dict(sorted(protected_counts.items())),
++        decisions=tuple(decisions),
++    )
++
++
++__all__ = [
++    "ASSERTION_AXES",
++    "DEFAULT_CROSS_LINGUAL_ASSERTION_AXES",
++    "DEFAULT_PLACEHOLDER_TEMPLATE",
++    "DEFAULT_PROTECTED_KINDS",
++    "GUARDED_SYNTHETIC_SOURCE",
++    "MODIFIER_KINDS",
++    "TRANSLATION_GUARD_ADVISORY",
++    "TRANSLATION_GUARD_SCHEMA_VERSION",
++    "ExampleDecision",
++    "GuardedExample",
++    "GuardedRoundTrip",
++    "GuardedTranslation",
++    "LocalTranslator",
++    "ProtectedItem",
++    "ProtectedKind",
++    "ProtectedText",
++    "RoundTripSpanMapEntry",
++    "SpanMapEntry",
++    "TranslateFn",
++    "TranslationGuard",
++    "TranslationGuardBatch",
++    "TranslationGuardConfig",
++    "TranslationGuardError",
++    "TranslationGuardReason",
++    "TranslationGuardReport",
++    "guard_round_trip_examples",
++]
+diff --git a/tests/unit/training/languages/test_morphology_projection.py b/tests/unit/training/languages/test_morphology_projection.py
+new file mode 100644
+index 0000000000..e0fdc3ec9e
+--- /dev/null
++++ b/tests/unit/training/languages/test_morphology_projection.py
+@@ -0,0 +1,594 @@
++"""Span-integrity, ambiguity and negative-control gates for label projection.
++
++Every text, lemma and profile below is synthetic. The profiles are deliberately
++small illustrations of each language's morphology, not linguistic references.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++import socket
++import unicodedata
++
++import pytest
++
++from openmed.core.decoding.spans import (
++    grapheme_break_checker,
++    iter_grapheme_cluster_spans,
++)
++from openmed.training.languages.morphology_projection import (
++    PROJECTED_REASONS,
++    PROJECTION_STATUSES,
++    REVIEW_REASONS,
++    SPAN_POLICIES,
++    UNMATCHED_REASONS,
++    AffixRule,
++    LabelProjection,
++    MorphologyProfile,
++    ProjectionDecision,
++    StemAlternation,
++    project_labels,
++)
++
++
++def _nfd(value: str) -> str:
++    return unicodedata.normalize("NFD", value)
++
++
++def _affixes(*surfaces: str, position: str = "suffix", kind: str = "inflection"):
++    return [
++        {"surface": surface, "position": position, "kind": kind} for surface in surfaces
++    ]
++
++
++def _window(text: str, surface: str) -> tuple[int, int]:
++    start = text.index(surface)
++    return start, start + len(surface)
++
++
++PROFILES = {
++    "fi": {
++        "language": "fi",
++        "affixes": _affixes("n", "en", "ssa", "ssä", "sta", "stä", "ta", "tä")
++        + _affixes("kin", "kaan", "kään", "han", "hän", kind="clitic"),
++        "alternations": [
++            {"lemma_edge": "s", "stem_edge": "kse"},
++            {"lemma_edge": "nen", "stem_edge": "se"},
++        ],
++    },
++    "tr": {
++        "language": "tr",
++        "affixes": _affixes(
++            *("da", "de", "ta", "te", "dan", "den", "in", "ın", "un", "ün"),
++            *("nın", "nin", "ı", "i", "u", "ü", "a", "e", "lar", "ler"),
++        ),
++        "alternations": [
++            {"lemma_edge": lemma_edge, "stem_edge": stem_edge}
++            for lemma_edge, stem_edge in (("p", "b"), ("ç", "c"), ("k", "ğ"))
++        ],
++    },
++    "hu": {
++        "language": "hu",
++        "affixes": _affixes("ben", "ban", "ból", "ből", "t", "ot", "et", "at"),
++        "alternations": [
++            {"lemma_edge": "e", "stem_edge": "é"},
++            {"lemma_edge": "a", "stem_edge": "á"},
++        ],
++    },
++    "sw": {
++        "language": "sw",
++        "affixes": _affixes("m", "wa", "ma", "ki", "vi", position="prefix")
++        + _affixes("ni"),
++        "alternations": [{"lemma_edge": "u", "stem_edge": "", "position": "prefix"}],
++    },
++    "am": {
++        "language": "am",
++        "affixes": _affixes("በ", "ለ", "ከ", "የ", position="prefix", kind="clitic")
++        + _affixes("ው", "ን"),
++        "lexicalized_forms": ["በሽታ"],
++    },
++    "ta": {
++        "language": "ta",
++        "affixes": _affixes("க்கு", "யில்", "ை"),
++        "alternations": [{"lemma_edge": "ு", "stem_edge": ""}],
++    },
++}
++
++TEXTS = {
++    "fi": (
++        "Potilaalla on diabetes. Diabeteksen hoito jatkuu, eikä munuaisessa "
++        "näkynyt muutoksia. Verensokeri mitattiin, ja diabeteskin kirjattiin."
++    ),
++    "tr": (
++        "İnsülin dozu artırıldı. Hastanın kalbinde üfürüm duyuldu ve EKG'de "
++        "ritim düzensizdi. İlacı kesildi."
++    ),
++    # Decomposed accents exercise NFC matching against NFD source offsets.
++    "hu": _nfd("A betegségben szenvedő páciens vesében cisztát láttak."),
++    "sw": "Mgonjwa ana magonjwa ya moyo na maumivu kifuani.",
++    "am": "ታካሚው በስኳር በሽታ ይሰቃያል። በሽታው በመድኃኒት ቁጥጥር ስር ነው።",
++    "ta": "நோயாளிக்கு நீரிழிவுக்கு மருந்தை மருத்துவமனையில் கொடுத்தனர்.",
++}
++
++# (language, label, lemma, window surface, policy, status, reason, surface)
++# fmt: off
++CASES = [
++    ("fi", "DISEASE", "diabetes", "Diabeteksen", "host", "projected",
++     "alternation_match", "Diabeteksen"),
++    ("fi", "DISEASE", "diabetes", "Diabeteksen", "stem", "projected",
++     "alternation_match", "Diabetekse"),
++    ("fi", "ANATOMY", "munuainen", None, "host", "projected",
++     "alternation_match", "munuaisessa"),
++    ("fi", "DISEASE", "diabetes", "diabeteskin", "host", "projected",
++     "affix_match", "diabetes"),
++    ("fi", "DISEASE", "diabetes", "diabeteskin", "token", "projected",
++     "affix_match", "diabeteskin"),
++    ("fi", "DISEASE", "diabetes", None, "host", "needs_review",
++     "multiple_matches", None),
++    ("fi", "LAB", "sokeri", None, "host", "needs_review", "unanalyzed_affix", None),
++    ("fi", "DISEASE", "astma", None, "host", "unmatched", "no_match", None),
++    ("tr", "MEDICATION", "insülin", None, "host", "projected", "exact_match",
++     "İnsülin"),
++    ("tr", "ANATOMY", "kalp", None, "host", "projected", "alternation_match",
++     "kalbinde"),
++    ("tr", "ANATOMY", "kalp", None, "stem", "projected", "alternation_match",
++     "kalb"),
++    ("tr", "MEDICATION", "ilaç", None, "host", "projected", "alternation_match",
++     "İlacı"),
++    ("tr", "TEST", "EKG", None, "host", "projected", "exact_match", "EKG"),
++    ("tr", "ROLE", "hasta", None, "host", "projected", "affix_match", "Hastanın"),
++    # Privative "-siz" is unconfigured: "düzensiz" (irregular) is not "düzen".
++    ("tr", "FINDING", "düzen", None, "host", "needs_review", "unanalyzed_affix",
++     None),
++    ("hu", "DISEASE", "betegség", None, "host", "projected", "affix_match",
++     _nfd("betegségben")),
++    ("hu", "DISEASE", "betegség", None, "stem", "projected", "affix_match",
++     _nfd("betegség")),
++    ("hu", "ANATOMY", "vese", None, "host", "projected", "alternation_match",
++     _nfd("vesében")),
++    ("hu", "FINDING", "ciszta", None, "stem", "projected", "alternation_match",
++     _nfd("cisztá")),
++    ("hu", "DISEASE", "beteg", None, "host", "needs_review", "unanalyzed_affix",
++     None),
++    ("sw", "DISEASE", "ugonjwa", None, "host", "needs_review",
++     "multiple_matches", None),
++    ("sw", "DISEASE", "ugonjwa", "magonjwa", "host", "projected",
++     "alternation_match", "magonjwa"),
++    ("sw", "DISEASE", "ugonjwa", "magonjwa", "stem", "projected",
++     "alternation_match", "gonjwa"),
++    ("sw", "ANATOMY", "kifua", None, "host", "projected", "affix_match",
++     "kifuani"),
++    ("sw", "ANATOMY", "moyo", None, "host", "projected", "exact_match", "moyo"),
++    ("am", "DISEASE", "ስኳር በሽታ", None, "host", "projected", "affix_match",
++     "ስኳር በሽታ"),
++    ("am", "DISEASE", "ስኳር በሽታ", None, "token", "projected", "affix_match",
++     "በስኳር በሽታ"),
++    ("am", "DISEASE", "በሽታ", None, "host", "needs_review", "multiple_matches",
++     None),
++    ("am", "DISEASE", "በሽታ", "በሽታው", "host", "projected", "affix_match",
++     "በሽታው"),
++    ("am", "DISEASE", "በሽታ", "በሽታው", "stem", "projected", "affix_match", "በሽታ"),
++    ("am", "MEDICATION", "መድኃኒት", None, "host", "projected", "affix_match",
++     "መድኃኒት"),
++    ("am", "SYMPTOM", "ሽታ", "በሽታው", "host", "needs_review", "unanalyzed_affix",
++     None),
++    ("ta", "DISEASE", "நீரிழிவு", None, "stem", "projected", "affix_match",
++     "நீரிழிவு"),
++    ("ta", "MEDICATION", "மருந்து", None, "host", "projected",
++     "alternation_match", "மருந்தை"),
++    ("ta", "MEDICATION", "மருந்து", None, "stem", "needs_review",
++     "grapheme_bisection", None),
++    ("ta", "FACILITY", "மருத்துவமனை", None, "host", "projected", "affix_match",
++     "மருத்துவமனையில்"),
++]
++# fmt: on
++
++
++def _profile(language: str, **overrides) -> MorphologyProfile:
++    return MorphologyProfile.from_dict({**PROFILES[language], **overrides})
++
++
++def _projection(language: str, label: str, lemma: str, window: str | None):
++    text = TEXTS[language]
++    return LabelProjection(
++        label, lemma, _window(text, window) if window is not None else None
++    )
++
++
++def _language_projections(language: str) -> list[LabelProjection]:
++    return [_projection(*case[:4]) for case in CASES if case[0] == language]
++
++
++@pytest.mark.parametrize(
++    "case",
++    CASES,
++    ids=[f"{case[0]}-{case[1]}-{case[4]}-{n}" for n, case in enumerate(CASES)],
++)
++def test_fixture_projection_decisions(case) -> None:
++    language, label, lemma, window, policy, status, reason, surface = case
++    text = TEXTS[language]
++    result = project_labels(
++        text,
++        [_projection(language, label, lemma, window)],
++        _profile(language),
++        span_policy=policy,
++    )
++    (decision,) = result.decisions
++    assert (decision.status, decision.reason) == (status, reason)
++    if surface is None:
++        assert decision.start is None and decision.end is None
++    else:
++        assert text[decision.start : decision.end] == surface
++
++
++def test_fixtures_cover_several_morphologically_rich_languages_with_controls():
++    languages = {case[0] for case in CASES}
++    assert languages == {"fi", "tr", "hu", "sw", "am", "ta"}
++    for language in languages:
++        statuses = {case[5] for case in CASES if case[0] == language}
++        assert "projected" in statuses
++        assert statuses - {"projected"}, f"{language} lacks a negative control"
++
++
++@pytest.mark.parametrize("policy", SPAN_POLICIES)
++@pytest.mark.parametrize("language", sorted(TEXTS))
++def test_projected_spans_round_trip_grapheme_and_byte_offsets(language, policy):
++    text = TEXTS[language]
++    encoded = text.encode("utf-8")
++    clusters = list(iter_grapheme_cluster_spans(text))
++    has_break = grapheme_break_checker(text)
++    result = project_labels(
++        text, _language_projections(language), _profile(language), span_policy=policy
++    )
++    assert result.projected
++    for decision in result.projected:
++        start, end = decision.start, decision.end
++        assert has_break(start) and has_break(end)
++        assert (
++            encoded[decision.byte_start : decision.byte_end].decode("utf-8")
++            == (text[start:end])
++        )
++        assert len(encoded[: decision.byte_start].decode("utf-8")) == start
++        assert clusters[decision.grapheme_start][0] == start
++        assert clusters[decision.grapheme_end - 1][1] == end
++    for decision in result.review_queue:
++        for candidate_start, candidate_end in decision.candidate_spans:
++            assert has_break(candidate_start) and has_break(candidate_end)
++
++
++def test_turkic_dotted_capital_i_keeps_exact_byte_offsets():
++    text = TEXTS["tr"]
++    projection = [LabelProjection("MEDICATION", "insülin")]
++    (decision,) = project_labels(text, projection, _profile("tr")).decisions
++    assert (decision.start, decision.end) == (0, 7)
++    assert (decision.byte_start, decision.byte_end) == (0, 9)
++    assert (decision.grapheme_start, decision.grapheme_end) == (0, 7)
++
++    # Negative control: Unicode default folding turns the capital into "i̇".
++    unicode_profile = _profile("tr", casing="unicode")
++    (control,) = project_labels(text, projection, unicode_profile).decisions
++    assert (control.status, control.reason) == ("unmatched", "no_match")
++
++
++def test_decomposed_accents_map_back_to_every_source_code_point():
++    text = TEXTS["hu"]
++    result = project_labels(
++        text,
++        [LabelProjection("DISEASE", "betegség")],
++        _profile("hu"),
++        span_policy="stem",
++    )
++    (decision,) = result.decisions
++    assert decision.end - decision.start == 9
++    assert decision.grapheme_end - decision.grapheme_start == 8
++    assert decision.byte_end - decision.byte_start == len(_nfd("betegség").encode())
++
++
++def test_amharic_byte_offsets_cover_three_byte_ethiopic_syllables():
++    text = TEXTS["am"]
++    result = project_labels(
++        text, [LabelProjection("MEDICATION", "መድኃኒት")], _profile("am")
++    )
++    (decision,) = result.decisions
++    assert text[decision.start : decision.end] == "መድኃኒት"
++    assert decision.byte_end - decision.byte_start == 3 * len("መድኃኒት")
++    assert decision.byte_start == len(text[: decision.start].encode("utf-8"))
++
++
++def test_tamil_fused_vowel_sign_stem_is_reviewed_not_split():
++    text = TEXTS["ta"]
++    projection = [LabelProjection("MEDICATION", "மருந்து")]
++    (review,) = project_labels(
++        text, projection, _profile("ta"), span_policy="stem"
++    ).decisions
++    assert review.reason == "grapheme_bisection"
++    assert review.candidate_spans == (_window(text, "மருந்தை"),)
++    (projected,) = project_labels(text, projection, _profile("ta")).decisions
++    assert text[projected.start : projected.end] == "மருந்தை"
++
++
++def test_case_folding_expansion_never_yields_a_partial_character_label():
++    profile = MorphologyProfile(
++        language="de", affixes=(AffixRule("s"),), min_stem_graphemes=3
++    )
++    text = "Das Maß stimmt."
++    projection = [LabelProjection("MEASURE", "mas")]
++    (decision,) = project_labels(
++        text, projection, profile, span_policy="stem"
++    ).decisions
++    assert decision.reason == "grapheme_bisection"
++    assert decision.candidate_spans == (_window(text, "Maß"),)
++
++
++def test_segmentation_ambiguity_is_reviewed_only_when_policy_depends_on_it():
++    ambiguous = _profile(
++        "fi",
++        alternations=[
++            *PROFILES["fi"]["alternations"],
++            {"lemma_edge": "s", "stem_edge": "ks"},
++        ],
++    )
++    text = TEXTS["fi"]
++    projection = [_projection("fi", "DISEASE", "diabetes", "Diabeteksen")]
++    (stem,) = project_labels(text, projection, ambiguous, span_policy="stem").decisions
++    assert stem.reason == "ambiguous_segmentation"
++    assert [text[start:end] for start, end in stem.candidate_spans] == [
++        "Diabeteks",
++        "Diabetekse",
++    ]
++    (host,) = project_labels(text, projection, ambiguous).decisions
++    assert host.status == "projected"
++    assert text[host.start : host.end] == "Diabeteksen"
++
++
++def test_lexicalized_form_blocks_clitic_split_that_would_mislabel_a_noun():
++    text = TEXTS["am"]
++    projection = [_projection("am", "SYMPTOM", "ሽታ", "በሽታው")]
++    unguarded = _profile("am", lexicalized_forms=[])
++    (hazard,) = project_labels(text, projection, unguarded).decisions
++    assert hazard.status == "projected"  # the silent mislabel the guard prevents
++    (guarded,) = project_labels(text, projection, _profile("am")).decisions
++    assert (guarded.status, guarded.reason) == ("needs_review", "unanalyzed_affix")
++
++
++def test_noun_class_swap_is_flagged_instead_of_labelled_twice():
++    text = TEXTS["sw"]
++    (decision,) = project_labels(
++        text, [LabelProjection("DISEASE", "ugonjwa")], _profile("sw")
++    ).decisions
++    assert decision.reason == "multiple_matches"
++    assert [text[start:end] for start, end in decision.candidate_spans] == [
++        "Mgonjwa",
++        "magonjwa",
++    ]
++
++
++def test_overlapping_or_conflicting_projections_are_routed_to_review():
++    text = TEXTS["am"]
++    first_disease = _window(text, "በሽታ")
++    nested = project_labels(
++        text,
++        [
++            LabelProjection("DISEASE", "ስኳር በሽታ"),
++            LabelProjection("DISEASE", "በሽታ", first_disease),
++        ],
++        _profile("am"),
++    )
++    assert {item.reason for item in nested.decisions} == {"overlapping_projection"}
++
++    window = _window(TEXTS["fi"], "Diabeteksen")
++    conflicting = project_labels(
++        TEXTS["fi"],
++        [
++            LabelProjection("DISEASE", "diabetes", window),
++            LabelProjection("CONDITION", "diabetes", window),
++        ],
++        _profile("fi"),
++    )
++    assert {item.reason for item in conflicting.decisions} == {"overlapping_projection"}
++
++    duplicates = project_labels(
++        TEXTS["fi"],
++        [LabelProjection("DISEASE", "diabetes", window)] * 2,
++        _profile("fi"),
++    )
++    assert all(item.status == "projected" for item in duplicates.decisions)
++
++
++def test_multiword_lemmas_require_the_same_spacing():
++    text = "COVID-19'a bağlı ve COVID - 19 notu."
++    result = project_labels(
++        text, [LabelProjection("DISEASE", "COVID-19")], _profile("tr")
++    )
++    (decision,) = result.decisions
++    assert decision.reason == "exact_match"
++    assert text[decision.start : decision.end] == "COVID-19"
++
++
++def test_affix_budget_and_minimum_stem_are_fail_closed():
++    text = TEXTS["tr"]
++    projection = [LabelProjection("ANATOMY", "kalp")]
++    (bounded,) = project_labels(
++        text, projection, _profile("tr", max_affixes=1)
++    ).decisions
++    assert (bounded.status, bounded.reason) == ("needs_review", "unanalyzed_affix")
++
++    short = [LabelProjection("FINDING", "ta")]
++    lenient = MorphologyProfile("fi", affixes=(AffixRule("ssa"),))
++    strict = MorphologyProfile("fi", affixes=(AffixRule("ssa"),), min_stem_graphemes=3)
++    assert project_labels("tassa", short, lenient).decisions[0].status == "projected"
++    assert project_labels("tassa", short, strict).decisions[0].status != "projected"
++
++
++def test_decisions_are_deterministic_and_independent_of_input_order():
++    text = TEXTS["am"]
++    projections = _language_projections("am")
++    first = project_labels(text, projections, _profile("am"))
++    assert first == project_labels(text, projections, _profile("am"))
++    reversed_result = project_labels(text, projections[::-1], _profile("am"))
++    count = len(projections)
++    for decision in reversed_result.decisions:
++        original = first.decisions[count - 1 - decision.index]
++        assert decision.to_dict() | {"index": original.index} == original.to_dict()
++
++
++def test_projection_runs_without_network(monkeypatch):
++    def blocked(*_args, **_kwargs):
++        raise AssertionError("network access attempted")
++
++    monkeypatch.setattr(socket, "socket", blocked)
++    monkeypatch.setattr(socket, "create_connection", blocked)
++    monkeypatch.setattr(socket, "getaddrinfo", blocked)
++    for language in TEXTS:
++        result = project_labels(
++            TEXTS[language], _language_projections(language), _profile(language)
++        )
++        assert result.decisions
++
++
++def test_reports_contain_only_controlled_metadata():
++    allowed = {
++        *PROJECTION_STATUSES,
++        *PROJECTED_REASONS,
++        *REVIEW_REASONS,
++        *UNMATCHED_REASONS,
++        *SPAN_POLICIES,
++        *TEXTS,
++        *(case[1] for case in CASES),
++    }
++    digest = re.compile(r"[0-9a-f]{64}\Z")
++
++    def strings(value):
++        if isinstance(value, str):
++            yield value
++        elif isinstance(value, dict):
++            for key, item in value.items():
++                yield key
++                yield from strings(item)
++        elif isinstance(value, list):
++            for item in value:
++                yield from strings(item)
++
++    for language in TEXTS:
++        projections = _language_projections(language)
++        result = project_labels(TEXTS[language], projections, _profile(language))
++        report = result.to_dict()
++        json.dumps(report)
++        keys = set(report) | set(report["decisions"][0])
++        for value in strings(report):
++            assert value in allowed or value in keys or digest.fullmatch(value)
++        rendered = repr(result) + repr(projections)
++        for projection in projections:
++            assert projection.lemma not in rendered
++
++
++@pytest.mark.parametrize(
++    "build",
++    [
++        lambda: LabelProjection("Jane Roe", "diabetes"),
++        lambda: LabelProjection("DISEASE", "Jane Roe " * 40),
++        lambda: AffixRule("Jane Roe"),
++        lambda: MorphologyProfile.from_dict({"language": "fi", "Jane Roe": 1}),
++        lambda: MorphologyProfile("Jane Roe"),
++        lambda: project_labels(
++            "Jane Roe", [LabelProjection("DISEASE", "roe", (0, 99))], _profile("fi")
++        ),
++    ],
++)
++def test_errors_never_echo_input_values(build):
++    with pytest.raises((TypeError, ValueError)) as error:
++        build()
++    assert "Jane" not in str(error.value) and "Roe" not in str(error.value)
++
++
++def test_profile_round_trip_and_canonical_digest():
++    profile = _profile("fi")
++    assert MorphologyProfile.from_dict(profile.to_dict()) == profile
++    reordered = dict(PROFILES["fi"], affixes=PROFILES["fi"]["affixes"][::-1])
++    assert MorphologyProfile.from_dict(reordered).digest == profile.digest
++    assert re.fullmatch(r"[0-9a-f]{64}", profile.digest)
++    assert _profile("fi", max_affixes=3).digest != profile.digest
++    assert _profile("tr").casing == "turkic"
++    assert _profile("fi").casing == "unicode"
++    result = project_labels(TEXTS["fi"], [], profile)
++    assert result.to_dict()["profile_digest"] == profile.digest
++
++
++@pytest.mark.parametrize(
++    ("build", "error"),
++    [
++        (lambda: MorphologyProfile("fi", affixes="ssa"), TypeError),
++        (lambda: MorphologyProfile("fi", max_affixes=9), ValueError),
++        (lambda: MorphologyProfile("fi", max_affixes=True), ValueError),
++        (lambda: MorphologyProfile("fi", min_stem_graphemes=0), ValueError),
++        (lambda: MorphologyProfile("fi", casing="upper"), ValueError),
++        (lambda: MorphologyProfile("fi", lexicalized_forms=("two words",)), ValueError),
++        (lambda: StemAlternation("s", "s"), ValueError),
++        (lambda: AffixRule("ssa", position="infix"), ValueError),
++        (lambda: AffixRule("ssa", kind="derivation"), ValueError),
++        (lambda: AffixRule("\x00"), ValueError),
++        (lambda: MorphologyProfile.from_dict({"affixes": []}), ValueError),
++        (
++            lambda: MorphologyProfile.from_dict(
++                {"language": "fi", "affixes": [{"surface": "n", "extra": 1}]}
++            ),
++            ValueError,
++        ),
++        (lambda: LabelProjection("DISEASE", "diabetes", (4, 4)), ValueError),
++        (lambda: LabelProjection("DISEASE", "diabetes", (True, 4)), ValueError),
++    ],
++)
++def test_invalid_configuration_fails_closed(build, error):
++    with pytest.raises(error):
++        build()
++
++
++def test_invalid_call_arguments_fail_closed():
++    profile = _profile("fi")
++    projection = [LabelProjection("DISEASE", "diabetes")]
++    with pytest.raises(ValueError):
++        project_labels(TEXTS["fi"], projection, profile, span_policy="lemma")
++    with pytest.raises(TypeError):
++        project_labels(TEXTS["fi"].encode(), projection, profile)
++    with pytest.raises(TypeError):
++        project_labels(TEXTS["fi"], ["diabetes"], profile)
++    with pytest.raises(TypeError):
++        project_labels(TEXTS["fi"], projection, PROFILES["fi"])
++
++
++def test_window_accepts_json_style_pairs_and_empty_inputs_are_safe():
++    assert LabelProjection("DISEASE", "diabetes", [1, 3]).window == (1, 3)
++    assert project_labels("", [], _profile("fi")).decisions == ()
++    (decision,) = project_labels(
++        "   ", [LabelProjection("DISEASE", "diabetes")], _profile("fi")
++    ).decisions
++    assert (decision.status, decision.reason) == ("unmatched", "no_match")
++
++
++def test_result_views_and_counts():
++    result = project_labels(TEXTS["sw"], _language_projections("sw"), _profile("sw"))
++    assert len(result.projected) + len(result.review_queue) == len(result.decisions)
++    assert sum(result.reason_counts().values()) == len(result.decisions)
++    assert result.to_dict()["status_counts"] == {
++        "projected": len(result.projected),
++        "needs_review": len(result.review_queue),
++        "unmatched": 0,
++    }
++
++
++@pytest.mark.parametrize(
++    "fields",
++    [
++        {"status": "projected", "reason": "no_match"},
++        {"status": "projected", "reason": "exact_match"},
++        {"status": "needs_review", "reason": "multiple_matches"},
++        {"status": "unmatched", "reason": "no_match", "start": 0},
++        {"status": "unmatched", "reason": "no_match", "candidate_spans": ((0, 1),)},
++        {"status": "accepted", "reason": "exact_match"},
++        {"status": ["projected"], "reason": "exact_match"},
++    ],
++)
++def test_decision_constructor_rejects_inconsistent_metadata(fields):
++    with pytest.raises(ValueError):
++        ProjectionDecision(index=0, label="DISEASE", **fields)
+diff --git a/tests/unit/training/languages/test_translation_guard.py b/tests/unit/training/languages/test_translation_guard.py
+new file mode 100644
+index 0000000000..5529c12cdd
+--- /dev/null
++++ b/tests/unit/training/languages/test_translation_guard.py
+@@ -0,0 +1,743 @@
++"""Tests for the clinical terminology guard around local translation."""
++
++from __future__ import annotations
++
++import json
++import socket
++from collections.abc import Callable
++
++import pytest
++
++from openmed.training.languages.translation_guard import (
++    ProtectedKind,
++    TranslationGuard,
++    TranslationGuardConfig,
++    TranslationGuardError,
++    TranslationGuardReason,
++    guard_round_trip_examples,
++)
++from openmed.training.synthetic.offset_projection import validate_span_integrity
++from openmed.training.synthetic.translation_augment import DictionaryTranslator
++
++Reason = TranslationGuardReason
++
++# Synthetic note: no real patient, identifier, or clinical record.
++NOTE = (
++    "Patient [NAME] (MRN-0042817) denies chest pain. Takes metformin 500 mg BID. "
++    "BP 128/82 mmHg, temp 37.5 °C. No fever. Left knee swelling, HbA1c 7.2%. "
++    "History of asthma."
++)
++SENSITIVE_VALUES = (
++    "[NAME]",
++    "MRN-0042817",
++    "metformin",
++    "500 mg",
++    "chest pain",
++    "128/82",
++    "37.5",
++    "HbA1c",
++    "asthma",
++)
++LEXICON = {
++    ("en", "es"): (
++        ("patient", "paciente"),
++        ("denies", "niega"),
++        ("takes", "toma"),
++        ("no", "sin"),
++        ("fever", "fiebre"),
++        ("cough", "tos"),
++        ("left", "izquierda"),
++        ("knee", "rodilla"),
++        ("swelling", "hinchazón"),
++        ("history of", "antecedentes de"),
++        ("asthma", "asma"),
++    ),
++    ("es", "en"): (
++        ("paciente", "patient"),
++        ("niega", "denies"),
++        ("toma", "takes"),
++        ("sin", "no"),
++        ("fiebre", "fever"),
++        ("tos", "cough"),
++        ("izquierda", "left"),
++        ("rodilla", "knee"),
++        ("hinchazón", "swelling"),
++        ("antecedentes de", "history of"),
++        ("asma", "asthma"),
++    ),
++    ("en", "te"): (
++        ("patient", "రోగి"),
++        ("fever", "జ్వరం"),
++        ("knee", "మోకాలు"),
++    ),
++    ("te", "en"): (
++        ("రోగి", "patient"),
++        ("జ్వరం", "fever"),
++        ("మోకాలు", "knee"),
++    ),
++}
++GLOSSARY = {("en", "es"): {"metformin": "metformina"}}
++
++
++def _span(text: str, surface: str, label: str) -> dict[str, object]:
++    start = text.index(surface)
++    return {"start": start, "end": start + len(surface), "label": label}
++
++
++def _note_spans() -> list[dict[str, object]]:
++    return [
++        _span(NOTE, "chest pain", "PROBLEM"),
++        _span(NOTE, "metformin", "DRUG"),
++        _span(NOTE, "asthma", "PROBLEM"),
++    ]
++
++
++class RecordingTranslator:
++    """Deterministic local lexicon translator that records what it receives."""
++
++    def __init__(
++        self,
++        rewrite: Callable[[str, str, str], str] | None = None,
++    ) -> None:
++        self.calls: list[tuple[str, str, str]] = []
++        self._backend = DictionaryTranslator(lexicon=LEXICON)
++        self._rewrite = rewrite
++
++    def translate(self, text: str, source_lang: str, target_lang: str) -> str:
++        self.calls.append((text, source_lang, target_lang))
++        translated = self._backend.translate(text, source_lang, target_lang)
++        if self._rewrite is None:
++            return translated
++        return self._rewrite(translated, source_lang, target_lang)
++
++
++def _guard(
++    rewrite: Callable[[str, str, str], str] | None = None,
++    **config: object,
++) -> tuple[TranslationGuard, RecordingTranslator]:
++    translator = RecordingTranslator(rewrite)
++    options = {"glossary": GLOSSARY, **config}
++    return TranslationGuard(
++        translator, config=TranslationGuardConfig(**options)
++    ), translator
++
++
++def _leaks(payload: str) -> list[str]:
++    return [value for value in SENSITIVE_VALUES if value in payload]
++
++
++def test_protect_freezes_each_invariant_kind() -> None:
++    guard, _ = _guard()
++
++    protected = guard.protect(
++        NOTE, language="en", target_language="es", spans=_note_spans()
++    )
++
++    kinds = {item.kind for item in protected.items}
++    assert kinds == {
++        ProtectedKind.ANNOTATED_SPAN,
++        ProtectedKind.PHI_PLACEHOLDER,
++        ProtectedKind.IDENTIFIER,
++        ProtectedKind.MEASUREMENT,
++        ProtectedKind.ABBREVIATION,
++    }
++    surfaces = {item.surface: item.kind for item in protected.items}
++    assert surfaces["[NAME]"] is ProtectedKind.PHI_PLACEHOLDER
++    assert surfaces["MRN-0042817"] is ProtectedKind.IDENTIFIER
++    assert surfaces["500 mg"] is ProtectedKind.MEASUREMENT
++    assert surfaces["128/82 mmHg"] is ProtectedKind.MEASUREMENT
++    assert surfaces["37.5 °C"] is ProtectedKind.MEASUREMENT
++    assert surfaces["7.2%"] is ProtectedKind.MEASUREMENT
++    assert surfaces["BID"] is ProtectedKind.ABBREVIATION
++    assert surfaces["BP"] is ProtectedKind.ABBREVIATION
++    assert surfaces["HbA1c"] is ProtectedKind.IDENTIFIER
++    metformin = next(item for item in protected.items if item.surface == "metformin")
++    assert metformin.replacement == "metformina"
++    assert [item.index for item in protected.items] == list(range(len(protected.items)))
++    assert [item.start for item in protected.items] == sorted(
++        item.start for item in protected.items
++    )
++    assert not _leaks(protected.masked_text)
++    assert "denies" in protected.masked_text
++    assert "No fever" in protected.masked_text
++
++
++def test_translator_never_receives_protected_surfaces() -> None:
++    guard, translator = _guard()
++
++    result = guard.round_trip(
++        NOTE, source_language="en", pivot_language="es", spans=_note_spans()
++    )
++
++    assert result.accepted
++    assert [call[1:] for call in translator.calls] == [("en", "es"), ("es", "en")]
++    for text, _, _ in translator.calls:
++        assert not _leaks(text)
++        assert "metformina" not in text
++
++
++def test_round_trip_accepts_and_preserves_span_map() -> None:
++    guard, _ = _guard()
++
++    result = guard.round_trip(
++        NOTE, source_language="en", pivot_language="es", spans=_note_spans()
++    )
++
++    assert result.accepted, result.reasons
++    assert result.reasons == ()
++    assert result.pivot_text is not None and result.text is not None
++    assert "niega" in result.pivot_text and "sin fiebre" in result.pivot_text
++    assert "metformina" in result.pivot_text
++    items = {item.index: item for item in result.forward.items}
++    assert len(result.span_map) == len(items)
++    for entry in result.span_map:
++        item = items[entry.index]
++        assert NOTE[entry.source_start : entry.source_end] == item.surface
++        pivot_surface = result.pivot_text[entry.pivot_start : entry.pivot_end]
++        assert pivot_surface == item.replacement
++        assert result.text[entry.back_start : entry.back_end] == item.surface
++
++    validate_span_integrity(result.text, result.spans)
++    assert [(span.label, span.text) for span in result.spans] == [
++        ("PROBLEM", "chest pain"),
++        ("DRUG", "metformin"),
++        ("PROBLEM", "asthma"),
++    ]
++    drug = result.spans[1]
++    assert drug.metadata["projected_from_start"] == NOTE.index("metformin")
++    pivot_drug = next(span for span in result.forward.spans if span.label == "DRUG")
++    assert pivot_drug.text == "metformina"
++    validate_span_integrity(result.pivot_text, result.forward.spans)
++
++
++def test_one_way_translation_applies_glossary_and_flags_modifiers() -> None:
++    guard, _ = _guard()
++
++    result = guard.translate(
++        NOTE, source_language="en", target_language="es", spans=_note_spans()
++    )
++
++    assert result.accepted
++    assert result.text is not None
++    assert Reason.MODIFIER_UNVERIFIABLE in result.warnings
++    drug = next(span for span in result.spans if span.label == "DRUG")
++    assert result.text[drug.start : drug.end] == "metformina"
++    assert drug.metadata["projected_from_end"] == NOTE.index("metformin") + 9
++    report = result.to_report()
++    assert report["accepted"] is True
++    assert report["warnings"] == ["modifier_unverifiable"]
++    assert not _leaks(json.dumps(report, ensure_ascii=False))
++
++
++def _drop_placeholder(text: str, *_: str) -> str:
++    return text.replace("__OMP4__", "", 1)
++
++
++def _duplicate_placeholder(text: str, *_: str) -> str:
++    return text + " __OMP4__"
++
++
++def _alter_placeholder(text: str, *_: str) -> str:
++    return text.replace("__OMP4__", "__OMP 4__", 1)
++
++
++def _zero_padded_placeholder(text: str, *_: str) -> str:
++    return text.replace("__OMP4__", "__OMP04__", 1)
++
++
++def _unknown_placeholder(text: str, *_: str) -> str:
++    return text + " __OMP99__"
++
++
++def _placeholder_residue(text: str, *_: str) -> str:
++    return text + " omp-4"
++
++
++def _inject_number(text: str, *_: str) -> str:
++    return text + " x2"
++
++
++def _drop_negation(text: str, source: str, target: str) -> str:
++    if (source, target) == ("en", "es"):
++        return text.replace("niega", "reporta", 1)
++    return text
++
++
++def _flip_laterality_back(text: str, source: str, target: str) -> str:
++    if (source, target) == ("es", "en"):
++        return text.replace("left", "right", 1)
++    return text
++
++
++def _drop_history_back(text: str, source: str, target: str) -> str:
++    if (source, target) == ("es", "en"):
++        return text.replace("history of", "with", 1)
++    return text
++
++
++def _empty(*_: str) -> str:
++    return "   "
++
++
++@pytest.mark.parametrize(
++    ("rewrite", "expected", "stage"),
++    [
++        (_drop_placeholder, {Reason.PROTECTED_ITEM_DROPPED}, "forward"),
++        (_duplicate_placeholder, {Reason.PROTECTED_ITEM_DUPLICATED}, "forward"),
++        (_alter_placeholder, {Reason.PROTECTED_ITEM_DROPPED}, "forward"),
++        (
++            _zero_padded_placeholder,
++            {Reason.PROTECTED_ITEM_DROPPED, Reason.UNKNOWN_PLACEHOLDER},
++            "forward",
++        ),
++        (_unknown_placeholder, {Reason.UNKNOWN_PLACEHOLDER}, "forward"),
++        (
++            lambda text, *_: text + " __OMP" + "9" * 5000 + "__",
++            {Reason.UNKNOWN_PLACEHOLDER},
++            "forward",
++        ),
++        (
++            _placeholder_residue,
++            {Reason.PLACEHOLDER_RESIDUE, Reason.NUMBER_CHANGED},
++            "forward",
++        ),
++        (_inject_number, {Reason.NUMBER_CHANGED}, "forward"),
++        (_drop_negation, {Reason.NEGATION_CHANGED}, "forward"),
++        (_flip_laterality_back, {Reason.LATERALITY_CHANGED}, "round_trip"),
++        (_drop_history_back, {Reason.HISTORICAL_CHANGED}, "round_trip"),
++        (_empty, {Reason.EMPTY_TRANSLATION}, "forward"),
++    ],
++)
++def test_negative_control_translators_are_rejected(
++    rewrite: Callable[..., str],
++    expected: set[TranslationGuardReason],
++    stage: str,
++) -> None:
++    guard, _ = _guard(rewrite)
++
++    result = guard.round_trip(
++        NOTE, source_language="en", pivot_language="es", spans=_note_spans()
++    )
++
++    assert not result.accepted
++    assert set(result.reasons) == expected
++    assert result.text is None
++    assert result.pivot_text is None
++    assert result.spans == ()
++    report = result.to_report()
++    assert set(report["stages"][stage]["reasons"]) == {r.value for r in expected}
++    assert not _leaks(json.dumps(report, ensure_ascii=False))
++
++
++def test_dropped_placeholder_reports_the_item_offsets_only() -> None:
++    guard, _ = _guard(_drop_placeholder)
++
++    result = guard.translate(
++        NOTE, source_language="en", target_language="es", spans=_note_spans()
++    )
++
++    assert result.reasons == (Reason.PROTECTED_ITEM_DROPPED,)
++    assert result.problem_indices == (4,)
++    item = result.to_report()["protected_items"][4]
++    assert item == {
++        "end": NOTE.index("500 mg") + len("500 mg"),
++        "index": 4,
++        "kind": "measurement",
++        "label": None,
++        "mapped": False,
++        "start": NOTE.index("500 mg"),
++    }
++
++
++def test_translator_errors_fail_closed_without_echoing_the_message() -> None:
++    def failing(text: str, source: str, target: str) -> str:
++        raise RuntimeError(f"backend crashed on {NOTE}")
++
++    guard = TranslationGuard(failing)
++
++    result = guard.round_trip(NOTE, source_language="en", pivot_language="es")
++
++    assert result.reasons == (Reason.TRANSLATOR_ERROR,)
++    payload = json.dumps(result.to_report(), ensure_ascii=False) + repr(result)
++    assert "backend crashed" not in payload
++    assert not _leaks(payload)
++
++
++def test_non_string_translator_output_is_rejected() -> None:
++    guard = TranslationGuard(lambda text, source, target: None)
++
++    result = guard.translate("No fever.", source_language="en", target_language="es")
++
++    assert result.reasons == (Reason.TRANSLATOR_ERROR,)
++
++
++def test_placeholder_collision_rejects_before_calling_the_translator() -> None:
++    guard, translator = _guard()
++
++    result = guard.translate(
++        "No fever. Ref __OMP3__ pending.",
++        source_language="en",
++        target_language="es",
++    )
++
++    assert result.reasons == (Reason.PLACEHOLDER_COLLISION,)
++    assert translator.calls == []
++
++
++def test_round_trip_through_pivot_without_cue_pack_is_verified_at_the_end() -> None:
++    guard, _ = _guard()
++
++    result = guard.round_trip(
++        "Patient denies fever. Left knee pain.",
++        source_language="en",
++        pivot_language="te",
++    )
++
++    assert result.accepted
++    assert result.warnings == (Reason.ASSERTION_UNVERIFIABLE,)
++    assert result.forward.warnings == (Reason.ASSERTION_UNVERIFIABLE,)
++    assert result.text == "patient denies fever. Left knee pain."
++
++
++def test_one_way_translation_without_cue_pack_fails_closed_by_default() -> None:
++    strict, _ = _guard()
++    lenient, _ = _guard(fail_on_unverifiable=False)
++
++    rejected = strict.translate(
++        "Patient denies fever.", source_language="en", target_language="te"
++    )
++    flagged = lenient.translate(
++        "Patient denies fever.", source_language="en", target_language="te"
++    )
++
++    assert rejected.reasons == (Reason.ASSERTION_UNVERIFIABLE,)
++    assert rejected.text is None
++    assert flagged.accepted
++    assert flagged.warnings == (Reason.ASSERTION_UNVERIFIABLE,)
++
++
++def test_same_language_paraphrase_checks_assertion_axes() -> None:
++    def paraphrase(text: str, source: str, target: str) -> str:
++        return text.replace("not ruled out", "ruled out")
++
++    guard = TranslationGuard(paraphrase)
++
++    result = guard.translate(
++        "Pneumonia not ruled out.", source_language="en", target_language="en"
++    )
++
++    assert set(result.reasons) == {
++        Reason.NEGATION_CHANGED,
++        Reason.UNCERTAINTY_CHANGED,
++    }
++
++
++def test_pseudo_negation_is_not_counted_as_negation() -> None:
++    def paraphrase(text: str, source: str, target: str) -> str:
++        return text.replace("No increase", "No interval increase")
++
++    guard = TranslationGuard(paraphrase)
++
++    result = guard.translate(
++        "No increase in swelling.", source_language="en", target_language="en"
++    )
++
++    assert result.accepted
++
++
++def test_unprotected_digits_are_still_verified() -> None:
++    def alter_digits(text: str, source: str, target: str) -> str:
++        return text.replace("128", "182")
++
++    kinds = {ProtectedKind.ANNOTATED_SPAN, ProtectedKind.ABBREVIATION}
++    guard = TranslationGuard(
++        alter_digits, config=TranslationGuardConfig(protected_kinds=kinds)
++    )
++
++    protected = guard.protect("BP 128/82 today.", language="en")
++    result = guard.translate(
++        "BP 128/82 today.", source_language="en", target_language="es"
++    )
++
++    assert "128/82" in protected.masked_text
++    assert result.reasons == (Reason.NUMBER_CHANGED,)
++
++
++def test_protected_terms_and_lexicon_abbreviations_are_frozen() -> None:
++    guard = TranslationGuard(
++        lambda text, source, target: text,
++        config=TranslationGuardConfig(protected_terms=("chest pain",)),
++    )
++
++    protected = guard.protect(
++        "Chest pain resolved; b/p stable, aspirin bid and the cough.", language="en"
++    )
++
++    by_surface = {item.surface: item.kind for item in protected.items}
++    assert by_surface == {
++        "Chest pain": ProtectedKind.CLINICAL_TERM,
++        "b/p": ProtectedKind.ABBREVIATION,
++        "bid": ProtectedKind.ABBREVIATION,
++    }
++
++
++@pytest.mark.parametrize(
++    ("language", "text", "expected"),
++    [
++        (
++            "en",
++            "5-year-old with 2 x 5 mg q8h prn, see 2024-03-01.",
++            {
++                "5": ProtectedKind.NUMBER,
++                "2 x 5 mg": ProtectedKind.MEASUREMENT,
++                "q8h": ProtectedKind.IDENTIFIER,
++                "prn": ProtectedKind.ABBREVIATION,
++                "2024-03-01": ProtectedKind.NUMBER,
++            },
++        ),
++        (
++            "es",
++            "Paciente sin fiebre, TA 120/80 mmHg, fc 88.",
++            {
++                "TA": ProtectedKind.ABBREVIATION,
++                "120/80 mmHg": ProtectedKind.MEASUREMENT,
++                "fc": ProtectedKind.ABBREVIATION,
++                "88": ProtectedKind.NUMBER,
++            },
++        ),
++        (
++            "zh",
++            "患者否认发热，体温37.5°C，血压120/80毫米汞柱，MRN-77。",
++            {
++                "37.5°C": ProtectedKind.MEASUREMENT,
++                "120/80毫米汞柱": ProtectedKind.MEASUREMENT,
++                "MRN-77": ProtectedKind.IDENTIFIER,
++            },
++        ),
++        (
++            "hi",
++            "रोगी को बुखार नहीं है, तापमान ३७.५ C, MRN-77।",
++            {
++                "३७.५ C": ProtectedKind.MEASUREMENT,
++                "MRN-77": ProtectedKind.IDENTIFIER,
++            },
++        ),
++    ],
++)
++def test_multilingual_detection_protects_ids_doses_and_numbers(
++    language: str,
++    text: str,
++    expected: dict[str, ProtectedKind],
++) -> None:
++    guard = TranslationGuard(lambda value, source, target: value)
++
++    protected = guard.protect(text, language=language)
++
++    assert {item.surface: item.kind for item in protected.items} == expected
++
++
++_ZH_EN_PAIRS = (
++    ("患者", "patient "),
++    ("否认", "denies "),
++    ("发热", "fever"),
++    ("，", ", "),
++    ("体温", "temperature "),
++    ("。", "."),
++)
++
++
++def _zh_en_translator(text: str, source: str, target: str) -> str:
++    for chinese, english in _ZH_EN_PAIRS:
++        if (source, target) == ("zh", "en"):
++            text = text.replace(chinese, english)
++        else:
++            text = text.replace(english, chinese)
++    return text
++
++
++def test_unspaced_script_round_trip_restores_codes_and_units() -> None:
++    text = "患者否认发热，体温37.5°C，MRN-77。"
++    guard = TranslationGuard(_zh_en_translator)
++
++    result = guard.round_trip(text, source_language="zh", pivot_language="en")
++
++    assert result.accepted, result.reasons
++    assert result.pivot_text == "patient denies fever, temperature 37.5°C, MRN-77."
++    assert result.text == text
++    assert result.warnings == (Reason.MODIFIER_UNVERIFIABLE,)
++
++
++def test_invalid_spans_raise_without_echoing_text() -> None:
++    guard, translator = _guard()
++    overlapping = [
++        {"start": 0, "end": 12, "label": "A"},
++        {"start": 5, "end": 15, "label": "B"},
++    ]
++
++    with pytest.raises(TranslationGuardError) as error:
++        guard.translate(
++            NOTE, source_language="en", target_language="es", spans=overlapping
++        )
++
++    assert not _leaks(str(error.value))
++    assert "Patient" not in str(error.value)
++    assert translator.calls == []
++
++
++def test_round_trip_requires_a_distinct_pivot_language() -> None:
++    guard, _ = _guard()
++
++    with pytest.raises(TranslationGuardError):
++        guard.round_trip(NOTE, source_language="en", pivot_language="EN-us")
++
++
++def _rewrite_chills_example(text: str, source: str, target: str) -> str:
++    if "chills" in text.casefold():
++        return text.replace("__OMP0__", "", 1)
++    return text
++
++
++def test_batch_gate_rejects_changed_examples_with_reason_codes() -> None:
++    translator = RecordingTranslator(_rewrite_chills_example)
++    chills = "Chills since 3 days, takes metformin 500 mg."
++    examples = [
++        {"id": "seed-ok", "text": NOTE, "language": "en", "gold_spans": _note_spans()},
++        {
++            "id": "seed-chills",
++            "text": chills,
++            "language": "en",
++            "gold_spans": [_span(chills, "metformin", "DRUG")],
++        },
++        {
++            "id": "seed-bad-span",
++            "text": "No fever.",
++            "gold_spans": [{"start": 0, "end": 40, "label": "PROBLEM"}],
++        },
++        {"id": "seed-spanish", "text": "Sin fiebre.", "language": "es"},
++        "not-a-mapping",
++    ]
++
++    batch = guard_round_trip_examples(
++        examples,
++        translator=translator,
++        pivot_language="es",
++        config=TranslationGuardConfig(glossary=GLOSSARY),
++    )
++
++    report = batch.report
++    assert (report.total, report.accepted, report.rejected) == (5, 1, 4)
++    assert report.reason_counts == {
++        "invalid_input": 2,
++        "protected_item_dropped": 1,
++        "same_language": 1,
++    }
++    assert [d.reasons for d in report.decisions] == [
++        (),
++        (Reason.PROTECTED_ITEM_DROPPED,),
++        (Reason.INVALID_INPUT,),
++        (Reason.SAME_LANGUAGE,),
++        (Reason.INVALID_INPUT,),
++    ]
++    assert report.protected_counts["annotated_span"] == 4
++
++    [example] = batch.accepted
++    assert example.index == 0 and example.example_id == "seed-ok"
++    item = example.to_training_item()
++    assert item["source_id"] == "seed-ok"
++    assert item["metadata"]["transform"] == "backtranslation:en->es->en"
++    span_map = item["metadata"]["translation_guard"]["span_map"]
++    assert len(span_map) == len(example.span_map)
++    for span in item["gold_spans"]:
++        assert item["text"][span["start"] : span["end"]] == span["text"]
++    assert "metformina" in example.pivot_text
++
++    payload = report.to_json()
++    assert not _leaks(payload)
++    assert "seed-ok" not in payload and "Chills" not in payload
++    assert json.loads(payload)["decisions"][1]["reasons"] == ["protected_item_dropped"]
++
++
++def test_reports_are_deterministic() -> None:
++    def run() -> tuple[str, str]:
++        translator = RecordingTranslator()
++        batch = guard_round_trip_examples(
++            [{"text": NOTE, "gold_spans": _note_spans()}],
++            translator=translator,
++            pivot_language="es",
++            config=TranslationGuardConfig(glossary=GLOSSARY),
++        )
++        return batch.report.fingerprint, batch.accepted[0].text
++
++    first = run()
++    second = run()
++
++    assert first == second
++    assert first[0].startswith("sha256:")
++
++
++def test_result_reprs_exclude_raw_text() -> None:
++    guard, _ = _guard()
++
++    result = guard.round_trip(
++        NOTE, source_language="en", pivot_language="es", spans=_note_spans()
++    )
++    protected = guard.protect(NOTE, language="en", spans=_note_spans())
++
++    assert result.accepted
++    assert not _leaks(repr(result))
++    assert not _leaks(repr(protected))
++
++
++def test_guard_runs_without_network(monkeypatch: pytest.MonkeyPatch) -> None:
++    def fail_socket(*_args: object, **_kwargs: object) -> None:
++        raise AssertionError("translation guard opened a socket")
++
++    monkeypatch.setattr(socket, "socket", fail_socket)
++    monkeypatch.setattr(socket, "create_connection", fail_socket)
++    guard, _ = _guard()
++
++    result = guard.round_trip(
++        NOTE, source_language="en", pivot_language="es", spans=_note_spans()
++    )
++
++    assert result.accepted
++
++
++@pytest.mark.parametrize(
++    "options",
++    [
++        {"placeholder_template": "__OMP__"},
++        {"placeholder_template": "{index}__"},
++        {"placeholder_template": "__OMP{index}{index}__"},
++        {"placeholder_template": "__OMP {index}__"},
++        {"placeholder_template": "__OMP1{index}__"},
++        {"assertion_axes": ("negation", "recent")},
++        {"cross_lingual_assertion_axes": ("laterality",)},
++        {"protected_kinds": {"dose"}},
++        {"protected_terms": ("  ",)},
++        {"protected_terms": "chest pain"},
++        {"glossary": {"en": {"metformin": "metformina"}}},
++        {"glossary": {("en", "es"): {"metformin": ""}}},
++    ],
++)
++def test_invalid_configuration_is_rejected(options: dict[str, object]) -> None:
++    with pytest.raises(TranslationGuardError):
++        TranslationGuardConfig(**options)
++
++
++def test_custom_placeholder_template_round_trips() -> None:
++    translator = RecordingTranslator()
++    guard = TranslationGuard(
++        translator,
++        config=TranslationGuardConfig(placeholder_template="<x{index}/>"),
++    )
++
++    result = guard.round_trip(NOTE, source_language="en", pivot_language="es")
++
++    assert result.accepted
++    assert "<x0/>" in translator.calls[0][0]
++
++
++def test_translator_must_be_callable() -> None:
++    with pytest.raises(TypeError):
++        TranslationGuard(object())  # type: ignore[arg-type]

@@ -1,0 +1,660 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_2_0/8823-citus-contained-chained-search.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_2_0/8823-citus-contained-chained-search.yaml
+new file mode 100644
+index 000000000000..97fc35f14b32
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_2_0/8823-citus-contained-chained-search.yaml
+@@ -0,0 +1,10 @@
++---
++type: fix
++issue: 8823
++jira: SMILE-12494
++title: "Previously, chained searches such as `ServiceRequest?subject:Patient.identifier=system|value` failed on
++  Azure Database for PostgreSQL elastic clusters (Citus) when database partition mode and contained resource indexing
++  were both enabled. The combined configuration led the generated SQL to look up the referenced resource through a
++  join that crossed partitions, which Citus cannot run. On PostgreSQL, the referenced resource is now looked up
++  separately from the partition being searched. Citus can run this query on any number of worker nodes, with or
++  without repartition joins enabled. This problem is fixed."
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/QueryStack.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/QueryStack.java
+index a1784eda7994..af7931f53840 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/QueryStack.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/QueryStack.java
+@@ -1624,20 +1624,49 @@ public Condition createPredicateReferenceForEmbeddedChainedSearchResource(
+ 					builder = mySqlBuilder;
+ 				}
+ 
++				// When true, each reference target is matched through an uncorrelated
++				// (PARTITION_ID, RES_ID) IN (SELECT ...) subquery instead of a join on the link's target columns.
++				// For example, subject:Patient.identifier=sys|MRN becomes:
++				//   EXISTS (SELECT ... FROM HFJ_RES_LINK s0 WHERE ...
++				//     AND (s0.TARGET_RES_PARTITION_ID, s0.TARGET_RESOURCE_ID) IN
++				//       (SELECT s0.PARTITION_ID, s0.RES_ID FROM HFJ_SPIDX_TOKEN s0 WHERE s0.HASH_SYS_AND_VALUE = ?))
++				// See SearchQueryBuilder#isUseSubqueriesForChainedReferenceTargets() for why and on which databases.
++				boolean useSubqueriesForTargets =
++						wantChainedAndNormal && builder.isUseSubqueriesForChainedReferenceTargets();
++				// The builder that receives the predicates for the link being processed. It starts as the child
++				// builder for this chain, and moves into a new subquery for each target when useSubqueriesForTargets
++				// is true. The child builder itself is still the one added to childBuilders or the union below.
++				SearchQueryBuilder currentLinkBuilder = builder;
+ 				DbColumn[] previousJoinColumn = null;
+ 
+ 				// Create a reference link predicates to the subselect for every link but the last one
+ 				for (String nextLink : nextReferenceLink) {
++					// From the second link on, the previous link's target columns are restricted to a new subquery,
++					// and this link's HFJ_RES_LINK becomes that subquery's root table instead of being joined.
++					// Clearing previousJoinColumn tells addReferencePredicateBuilder() to start a new root.
++					if (useSubqueriesForTargets && previousJoinColumn != null) {
++						currentLinkBuilder = newSubqueryForReferenceTarget(currentLinkBuilder, previousJoinColumn);
++						previousJoinColumn = null;
++					}
++
+ 					// We don't want to call createPredicateReference() here, because the whole point is to avoid the
+ 					// recursion.
+ 					// TODO: Are we missing any important business logic from that method? All tests are passing.
+ 					ResourceLinkPredicateBuilder resourceLinkPredicateBuilder =
+-							builder.addReferencePredicateBuilder(this, previousJoinColumn);
+-					builder.addPredicate(
++							currentLinkBuilder.addReferencePredicateBuilder(this, previousJoinColumn);
++					currentLinkBuilder.addPredicate(
+ 							resourceLinkPredicateBuilder.createPredicateSourcePaths(Lists.newArrayList(nextLink)));
+ 					previousJoinColumn = resourceLinkPredicateBuilder.getJoinColumnsForTarget();
+ 				}
+ 
++				// The last link's target is restricted the same way: the leaf index table (HFJ_SPIDX_TOKEN for
++				// identifier) becomes the root of its own subquery, and createIndexPredicate() below adds its
++				// predicates there with no join columns.
++				if (useSubqueriesForTargets && previousJoinColumn != null) {
++					currentLinkBuilder = newSubqueryForReferenceTarget(currentLinkBuilder, previousJoinColumn);
++					previousJoinColumn = null;
++				}
++
+ 				Condition containedCondition = createIndexPredicate(
+ 						previousJoinColumn,
+ 						leafNodeDefinition.getLeafTarget(),
+@@ -1648,10 +1677,10 @@ public Condition createPredicateReferenceForEmbeddedChainedSearchResource(
+ 						theOperation,
+ 						leafNodeDefinition.getQualifiers(),
+ 						theRequestPartitionId,
+-						builder);
++						currentLinkBuilder);
+ 
+ 				if (wantChainedAndNormal) {
+-					builder.addPredicate(containedCondition);
++					currentLinkBuilder.addPredicate(containedCondition);
+ 					if (usePartitionIdInJoins) {
+ 						childBuilders.add(builder);
+ 					} else {
+@@ -1690,6 +1719,21 @@ public Condition createPredicateReferenceForEmbeddedChainedSearchResource(
+ 		return retVal;
+ 	}
+ 
++	/**
++	 * Restricts the given reference target columns to the rows of a new subquery.
++	 *
++	 * @return the builder for that subquery, whose first predicate builder supplies its selected columns
++	 * @see SearchQueryBuilder#isUseSubqueriesForChainedReferenceTargets()
++	 */
++	private static SearchQueryBuilder newSubqueryForReferenceTarget(
++			SearchQueryBuilder theParentBuilder, DbColumn[] theTargetJoinColumns) {
++		SearchQueryBuilder retVal = theParentBuilder.newNestedChildSqlBuilder();
++		theParentBuilder.addPredicate(theParentBuilder
++				.getTuplePredicateBuilder()
++				.toUncorrelatedInSubquery(PartitionableJoinColumns.from(theTargetJoinColumns), retVal));
++		return retVal;
++	}
++
+ 	/**
+ 	 * Multiple OR values on the same uplifted leaf are represented as multiple leaf instances.
+ 	 * Merge those values so that predicate builders can emit a single indexed OR (or IN) path
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/sql/SearchQueryBuilder.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/sql/SearchQueryBuilder.java
+index ecd22597119a..3efebac64a28 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/sql/SearchQueryBuilder.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/sql/SearchQueryBuilder.java
+@@ -75,6 +75,8 @@
+ import jakarta.annotation.Nonnull;
+ import jakarta.annotation.Nullable;
+ import org.hibernate.dialect.Dialect;
++import org.hibernate.dialect.MySQLDialect;
++import org.hibernate.dialect.PostgreSQLDialect;
+ import org.hibernate.dialect.SQLServerDialect;
+ import org.hibernate.dialect.pagination.AbstractLimitHandler;
+ import org.hibernate.query.TypedParameterValue;
+@@ -133,8 +135,6 @@ public class SearchQueryBuilder {
+ 	private ResourceTablePredicateBuilder myResourceTableRoot;
+ 	private boolean myHaveAtLeastOnePredicate;
+ 	private BaseJoiningPredicateBuilder myFirstPredicateBuilder;
+-	private boolean dialectIsMsSql;
+-	private boolean dialectIsMySql;
+ 	private boolean myNeedResourceTableRoot;
+ 	private int myNextNearnessColumnId = 0;
+ 	private DbColumn mySelectedResourceIdColumn;
+@@ -168,7 +168,7 @@ public SearchQueryBuilder(
+ 				new ArrayList<>(),
+ 				thePartitionSettings.isPartitioningEnabled(),
+ 				theSelectResourceType,
+-				DEFAULT_ALIAS_PREFIX);
++				new DbSpec(DEFAULT_ALIAS_PREFIX));
+ 	}
+ 
+ 	/**
+@@ -188,7 +188,7 @@ private SearchQueryBuilder(
+ 			ArrayList<Object> theBindVariableValues,
+ 			boolean theSelectPartitionId,
+ 			boolean theSelectResourceType,
+-			String theAliasPrefix) {
++			DbSpec theSpec) {
+ 		myFhirContext = theFhirContext;
+ 		myStorageSettings = theStorageSettings;
+ 		myPartitionSettings = thePartitionSettings;
+@@ -198,14 +198,7 @@ private SearchQueryBuilder(
+ 		myCountQuery = theCountQuery;
+ 		myDialect = theDialect;
+ 		myDialectProvider = theDialectProvider;
+-		if (myDialect instanceof org.hibernate.dialect.MySQLDialect) {
+-			dialectIsMySql = true;
+-		}
+-		if (myDialect instanceof org.hibernate.dialect.SQLServerDialect) {
+-			dialectIsMsSql = true;
+-		}
+-
+-		mySpec = new DbSpec(theAliasPrefix);
++		mySpec = theSpec;
+ 		mySchema = mySpec.addDefaultSchema();
+ 		mySelect = new SelectQuery();
+ 
+@@ -582,6 +575,77 @@ public boolean isIncludePartitionIdInJoins() {
+ 		return mySelectPartitionId && myPartitionSettings.isDatabasePartitionMode();
+ 	}
+ 
++	/**
++	 * Should a chained search reach each reference target through an uncorrelated subquery instead of
++	 * a join?
++	 * <p>
++	 * This only applies when contained resource indexing is enabled. A chained search such as
++	 * {@code ServiceRequest?subject:Patient.identifier=sys|MRN} must then match the identifier indexed
++	 * on the ServiceRequest itself (a contained Patient) or on a referenced Patient. In database
++	 * partition mode, the two cases are combined with an {@code OR}, each matching the outer query on
++	 * {@code PARTITION_ID} and {@code RES_ID}.
++	 * <p>
++	 * Other databases match each case with an {@code EXISTS} correlated to the outer query, and reach
++	 * the referenced Patient with a join:
++	 * <pre>
++	 * EXISTS (SELECT ... FROM HFJ_RES_LINK s0
++	 *   INNER JOIN HFJ_SPIDX_TOKEN s1
++	 *     ON s0.TARGET_RES_PARTITION_ID = s1.PARTITION_ID AND s0.TARGET_RESOURCE_ID = s1.RES_ID
++	 *   WHERE ... AND s0.PARTITION_ID = t0.PARTITION_ID AND s0.SRC_RESOURCE_ID = t0.RES_ID)
++	 * </pre>
++	 * Citus distributes every table on {@code PARTITION_ID}. The join above uses
++	 * {@code TARGET_RES_PARTITION_ID} instead, and the target row may sit on another worker. Citus can
++	 * repartition such a join in a top-level query, but not inside a correlated subquery, and fails with
++	 * "complex joins are only supported when all distributed tables are co-located and joined on their
++	 * distribution columns". Enabling {@code citus.enable_repartition_joins} does not help.
++	 * <p>
++	 * With uncorrelated subqueries, the referenced-Patient case becomes:
++	 * <pre>
++	 * (t0.PARTITION_ID, t0.RES_ID) IN (SELECT s0.PARTITION_ID, s0.SRC_RESOURCE_ID FROM HFJ_RES_LINK s0
++	 *   WHERE ... AND (s0.TARGET_RES_PARTITION_ID, s0.TARGET_RESOURCE_ID) IN
++	 *     (SELECT s1.PARTITION_ID, s1.RES_ID FROM HFJ_SPIDX_TOKEN s1 WHERE s1.HASH_SYS_AND_VALUE = ?))
++	 * </pre>
++	 * The contained case uses the same outer tuple {@code IN}. No subquery depends on the outer row.
++	 * Citus runs each subquery once on its own and then uses its rows in the enclosing query, which
++	 * works with or without repartition joins. A correlated {@code EXISTS} around the link subquery
++	 * would instead make each worker re-scan the target rows for every row of {@code t0}. A longer chain
++	 * nests one subquery per link.
++	 * <p>
++	 * Only Postgres dialects use this form, in database partition mode only:
++	 * <ul>
++	 * <li>MSSQL rejects tuple {@code IN} syntax.</li>
++	 * <li>Without database partition mode, the two cases are combined with a {@code UNION ALL} on
++	 * {@code RES_ID} and no correlated subquery is generated.</li>
++	 * <li>Other databases keep the join and their existing query plans.</li>
++	 * </ul>
++	 */
++	public boolean isUseSubqueriesForChainedReferenceTargets() {
++		return isPostgres() && isIncludePartitionIdInJoins();
++	}
++
++	private boolean isPostgres() {
++		return myDialect instanceof PostgreSQLDialect;
++	}
++
++	/**
++	 * MariaDB is included: its Hibernate dialect extends {@link MySQLDialect}.
++	 */
++	private boolean isMySql() {
++		return myDialect instanceof MySQLDialect;
++	}
++
++	private boolean isMsSql() {
++		return myDialect instanceof SQLServerDialect;
++	}
++
++	/**
++	 * Can an {@code ORDER BY} use {@code NULLS FIRST} and {@code NULLS LAST}? MariaDB, MySQL and MSSQL
++	 * reject that syntax.
++	 */
++	private boolean supportsNullsFirstSyntax() {
++		return !isMySql() && !isMsSql();
++	}
++
+ 	public void addJoin(DbTable theFromTable, DbTable theToTable, DbColumn[] theFromColumn, DbColumn[] theToColumn) {
+ 		addJoin(theFromTable, theToTable, theFromColumn, theToColumn, SelectQuery.JoinType.INNER);
+ 	}
+@@ -1128,7 +1192,46 @@ public SearchQueryBuilder newChildSqlBuilder(boolean theSelectPartitionId) {
+ 				myBindVariableValues,
+ 				theSelectPartitionId,
+ 				false,
+-				theSelectPartitionId ? CHILD_ALIAS_PREFIX : DEFAULT_ALIAS_PREFIX);
++				new DbSpec(theSelectPartitionId ? CHILD_ALIAS_PREFIX : DEFAULT_ALIAS_PREFIX));
++	}
++
++	/**
++	 * Creates a child builder for a subquery nested inside this builder's query. Its table aliases continue this
++	 * builder's sequence (s0, then s1, ...) instead of restarting, so the nested subquery never reuses an alias of
++	 * the query enclosing it.
++	 */
++	public SearchQueryBuilder newNestedChildSqlBuilder() {
++		return new SearchQueryBuilder(
++				myFhirContext,
++				myStorageSettings,
++				myPartitionSettings,
++				myRequestPartitionId,
++				myResourceType,
++				mySqlBuilderFactory,
++				myBindVariableSubstitutionBase,
++				myDialect,
++				myDialectProvider,
++				false,
++				myBindVariableValues,
++				true,
++				false,
++				new SharedAliasDbSpec(mySpec));
++	}
++
++	/**
++	 * A {@link DbSpec} that takes its table aliases from another spec's sequence.
++	 */
++	private static class SharedAliasDbSpec extends DbSpec {
++		private final DbSpec myAliasSource;
++
++		SharedAliasDbSpec(DbSpec theAliasSource) {
++			myAliasSource = theAliasSource;
++		}
++
++		@Override
++		public String getNextAlias() {
++			return myAliasSource.getNextAlias();
++		}
+ 	}
+ 
+ 	public SelectQuery getSelect() {
+@@ -1206,8 +1309,7 @@ public void addSortString(
+ 			boolean theTheAscending,
+ 			OrderObject.NullOrder theNullOrder,
+ 			boolean theUseAggregate) {
+-		if ((dialectIsMySql || dialectIsMsSql)) {
+-			// MariaDB, MySQL and MSSQL do not support "NULLS FIRST" and "NULLS LAST" syntax.
++		if (!supportsNullsFirstSyntax()) {
+ 			String direction = theTheAscending ? " ASC" : " DESC";
+ 			String sortColumnName =
+ 					theTheColumnValueNormalized.getTable().getAlias() + "." + theTheColumnValueNormalized.getName();
+@@ -1250,8 +1352,7 @@ public void addSortNumeric(
+ 			boolean theAscending,
+ 			OrderObject.NullOrder theNullOrder,
+ 			boolean theUseAggregate) {
+-		if ((dialectIsMySql || dialectIsMsSql)) {
+-			// MariaDB, MySQL and MSSQL do not support "NULLS FIRST" and "NULLS LAST" syntax.
++		if (!supportsNullsFirstSyntax()) {
+ 			// Null values are always treated as less than non-null values.
+ 			// As such special handling is required here.
+ 			String direction;
+@@ -1278,8 +1379,7 @@ public void addSortDate(
+ 			boolean theTheAscending,
+ 			OrderObject.NullOrder theNullOrder,
+ 			boolean theUseAggregate) {
+-		if ((dialectIsMySql || dialectIsMsSql)) {
+-			// MariaDB, MySQL and MSSQL do not support "NULLS FIRST" and "NULLS LAST" syntax.
++		if (!supportsNullsFirstSyntax()) {
+ 			String direction = theTheAscending ? " ASC" : " DESC";
+ 			String sortColumnName =
+ 					theTheColumnValueNormalized.getTable().getAlias() + "." + theTheColumnValueNormalized.getName();
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/sql/TuplePredicateBuilder.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/sql/TuplePredicateBuilder.java
+index c54103a70f5e..6f0654d6b11b 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/sql/TuplePredicateBuilder.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/sql/TuplePredicateBuilder.java
+@@ -81,10 +81,18 @@ public Condition toNotInSubquery(
+ 	}
+ 
+ 	/**
+-	 * Creates an OR'd EXISTS condition from multiple child subqueries with correlated predicates
+-	 * on PARTITION_ID and RES_ID.
++	 * Creates an OR'd condition matching the outer query's rows against multiple child subqueries, each
++	 * selecting PARTITION_ID and a resource ID.
+ 	 * <p>
+-	 * Produces: {@code EXISTS (SELECT ... WHERE correlated) OR EXISTS (...)}
++	 * When {@link SearchQueryBuilder#isUseSubqueriesForChainedReferenceTargets()} is true (PostgreSQL in database
++	 * partition mode), each child is an uncorrelated tuple IN:
++	 * {@code (t0.PARTITION_ID, t0.RES_ID) IN (SELECT ...) OR (t0.PARTITION_ID, t0.RES_ID) IN (...)}.
++	 * The subqueries don't depend on the outer row, which lets the database evaluate each one once per search
++	 * rather than once per outer row. On Citus, a correlated EXISTS whose subquery holds a reference target
++	 * subquery makes each worker re-scan the target rows for every row it filters.
++	 * <p>
++	 * Otherwise, each child is an EXISTS correlated on PARTITION_ID and RES_ID:
++	 * {@code EXISTS (SELECT ... WHERE correlated) OR EXISTS (...)}.
+ 	 *
+ 	 * @param theChildBuilders the child SQL builders (one per subquery, must use "s" alias prefix)
+ 	 * @param theOuterJoinColumns the outer query's join columns (must be partitioned)
+@@ -94,13 +102,38 @@ public Condition toInSubquery(
+ 		Validate.isTrue(
+ 				theOuterJoinColumns.isPartitioned(),
+ 				"toInSubquery requires partitioned join columns with both PARTITION_ID and RES_ID");
+-		ComboCondition orExists = ComboCondition.or();
++		boolean uncorrelated = mySearchQueryBuilder.isUseSubqueriesForChainedReferenceTargets();
++		ComboCondition retVal = ComboCondition.or();
+ 		for (SearchQueryBuilder childBuilder : theChildBuilders) {
+ 			BaseJoiningPredicateBuilder childRoot = childBuilder.getOrCreateFirstPredicateBuilder();
+-			addCorrelationPredicates(childBuilder, childRoot, theOuterJoinColumns);
+-			orExists.addCondition(UnaryCondition.exists(new Subquery(childBuilder.getSelect())));
++			if (uncorrelated) {
++				retVal.addCondition(toUncorrelatedInSubquery(theOuterJoinColumns, childBuilder));
++			} else {
++				addCorrelationPredicates(childBuilder, childRoot, theOuterJoinColumns);
++				retVal.addCondition(UnaryCondition.exists(new Subquery(childBuilder.getSelect())));
++			}
+ 		}
+-		return orExists;
++		return retVal;
++	}
++
++	/**
++	 * Creates an uncorrelated tuple IN condition.
++	 * <p>
++	 * Produces: {@code (PARTITION_ID, RES_ID) IN (SELECT PARTITION_ID, RES_ID FROM ...)}
++	 * <p>
++	 * MSSQL doesn't support this syntax, so callers must not use it on that database.
++	 *
++	 * @param theJoinColumns the columns compared to the subquery's selected columns (must be partitioned)
++	 * @param theSubQueryBuilder the child SQL builder
++	 */
++	public Condition toUncorrelatedInSubquery(
++			PartitionableJoinColumns theJoinColumns, SearchQueryBuilder theSubQueryBuilder) {
++		Validate.isTrue(
++				theJoinColumns.isPartitioned(),
++				"toUncorrelatedInSubquery requires partitioned join columns with both PARTITION_ID and RES_ID");
++		return new InCondition(
++				new ColumnTupleObject(theJoinColumns.getPartitionIdColumn(), theJoinColumns.getResourceIdColumn()),
++				new Subquery(theSubQueryBuilder.getSelect()));
+ 	}
+ 
+ 	private static void addCorrelationPredicates(
+diff --git a/hapi-fhir-jpaserver-test-r5/src/test/java/ca/uhn/fhir/jpa/dao/r5/database/DatabasePartitionModeWithPostgresIT.java b/hapi-fhir-jpaserver-test-r5/src/test/java/ca/uhn/fhir/jpa/dao/r5/database/DatabasePartitionModeWithPostgresIT.java
+index d984d9c24602..088b8a5e0822 100644
+--- a/hapi-fhir-jpaserver-test-r5/src/test/java/ca/uhn/fhir/jpa/dao/r5/database/DatabasePartitionModeWithPostgresIT.java
++++ b/hapi-fhir-jpaserver-test-r5/src/test/java/ca/uhn/fhir/jpa/dao/r5/database/DatabasePartitionModeWithPostgresIT.java
+@@ -1,9 +1,95 @@
+ package ca.uhn.fhir.jpa.dao.r5.database;
+ 
++import org.hl7.fhir.instance.model.api.IIdType;
++import org.hl7.fhir.r5.model.Bundle;
++import org.junit.jupiter.api.Test;
+ import org.springframework.test.context.ContextConfiguration;
+ 
++import static org.assertj.core.api.Assertions.assertThat;
++
+ @ContextConfiguration(classes = {
+ 	EmbeddedDatabaseConfigurations.Postgres.class
+ })
+ public class DatabasePartitionModeWithPostgresIT extends BaseDatabasePartitionModeIT {
++
++	/**
++	 * Distributed Postgres variants reject a correlated subquery containing a join on
++	 * TARGET_RES_PARTITION_ID, which only a real multi-node cluster detects.
++	 */
++	@Test
++	void testChainedSearch_whenContainedResourceIndexingEnabled_usesUncorrelatedSubqueryForReferenceTarget() {
++		boolean previousIndexContained = myStorageSettings.isIndexOnContainedResources();
++		// With this setting off, the chain only follows the reference to the Patient. With it on, the Patient
++		// may also be contained in the ServiceRequest, where its identifier is indexed on the ServiceRequest
++		// itself. The search must cover both cases, which generates WHERE clause:
++		// EXISTS (token row on the ServiceRequest) OR EXISTS (link row to a Patient with that token)
++		myStorageSettings.setIndexOnContainedResources(true);
++		try {
++			IIdType patientId = createPatient(withIdentifier("http://acme.org/mrn", "PT12494"));
++			createResource("ServiceRequest", withSubject(patientId));
++			myCaptureQueriesListener.clear();
++
++			myServer.getFhirClient()
++				.search()
++				.byUrl("ServiceRequest?subject:Patient.identifier=http://acme.org/mrn|PT12494")
++				.returnBundle(Bundle.class)
++				.execute();
++
++			String searchSql = myCaptureQueriesListener.getSelectQueries().stream()
++				.map(query -> query.getSql(false, false))
++				.filter(sql -> sql.contains("HFJ_RES_LINK"))
++				.findFirst()
++				.orElseThrow();
++			assertThat(searchSql)
++				// The link EXISTS is correlated to the outer query. An INNER JOIN inside it would compare
++				// TARGET_RES_PARTITION_ID to HFJ_SPIDX_TOKEN.PARTITION_ID, and Citus rejects that because
++				// TARGET_RES_PARTITION_ID isn't the column HFJ_RES_LINK is distributed on. The IN subquery
++				// is neither correlated nor joined to the link table, which lets Citus plan/execute it independently.
++				.contains("(s0.TARGET_RES_PARTITION_ID,s0.TARGET_RESOURCE_ID) IN (SELECT s1.PARTITION_ID,s1.RES_ID FROM HFJ_SPIDX_TOKEN s1")
++				.doesNotContain("INNER JOIN HFJ_SPIDX_TOKEN");
++		} finally {
++			myStorageSettings.setIndexOnContainedResources(previousIndexContained);
++		}
++	}
++
++	/**
++	 * Each branch of the chain (the contained Patient and the referenced Patient) is matched with an uncorrelated
++	 * tuple IN on the searched resource's key rather than an EXISTS correlated to it. The branch subquery no longer
++	 * depends on the row being filtered: PostgreSQL evaluates it once per search, and Citus runs it as a semi-join
++	 * within each worker instead of re-scanning the target rows for every resource it filters.
++	 */
++	@Test
++	void testChainedSearch_whenContainedResourceIndexingEnabled_matchesEachBranchWithUncorrelatedSubquery() {
++		boolean previousIndexContained = myStorageSettings.isIndexOnContainedResources();
++		myStorageSettings.setIndexOnContainedResources(true);
++		try {
++			IIdType patientId = createPatient(withIdentifier("http://acme.org/mrn", "PT12494"));
++			IIdType serviceRequestId = createResource("ServiceRequest", withSubject(patientId));
++			myCaptureQueriesListener.clear();
++
++			Bundle result = myServer.getFhirClient()
++				.search()
++				.byUrl("ServiceRequest?subject:Patient.identifier=http://acme.org/mrn|PT12494")
++				.returnBundle(Bundle.class)
++				.execute();
++
++			assertThat(result.getEntry())
++				.extracting(entry -> entry.getResource().getIdElement().getIdPart())
++				.containsExactly(serviceRequestId.getIdPart());
++			String searchSql = myCaptureQueriesListener.getSelectQueries().stream()
++				.map(query -> query.getSql(false, false))
++				.filter(sql -> sql.contains("HFJ_RES_LINK"))
++				.findFirst()
++				.orElseThrow();
++			assertThat(searchSql)
++				// contained Patient: the identifier is indexed on the ServiceRequest itself
++				.contains("(t0.PARTITION_ID,t0.RES_ID) IN (SELECT s0.PARTITION_ID,s0.RES_ID FROM HFJ_SPIDX_TOKEN s0")
++				// referenced Patient: the ServiceRequest's link to a Patient with that identifier
++				.contains("(t0.PARTITION_ID,t0.RES_ID) IN (SELECT s0.PARTITION_ID,s0.SRC_RESOURCE_ID FROM HFJ_RES_LINK s0")
++				.doesNotContain("EXISTS")
++				.doesNotContain("= t0.");
++		} finally {
++			myStorageSettings.setIndexOnContainedResources(previousIndexContained);
++		}
++	}
+ }
+diff --git a/hapi-fhir-jpaserver-test-r5/src/test/java/ca/uhn/fhir/jpa/dao/r5/database/TuplePredicateSearchTest.java b/hapi-fhir-jpaserver-test-r5/src/test/java/ca/uhn/fhir/jpa/dao/r5/database/TuplePredicateSearchTest.java
+index 0081ea8513e1..f4fc4ca5f1d6 100644
+--- a/hapi-fhir-jpaserver-test-r5/src/test/java/ca/uhn/fhir/jpa/dao/r5/database/TuplePredicateSearchTest.java
++++ b/hapi-fhir-jpaserver-test-r5/src/test/java/ca/uhn/fhir/jpa/dao/r5/database/TuplePredicateSearchTest.java
+@@ -6,11 +6,10 @@
+ import ca.uhn.fhir.test.utilities.server.RestfulServerExtension;
+ import org.hl7.fhir.instance.model.api.IIdType;
+ import org.hl7.fhir.r5.model.Bundle;
+-import org.hl7.fhir.r5.model.DateTimeType;
+-import org.hl7.fhir.r5.model.DateType;
+ import org.hl7.fhir.r5.model.IdType;
+ import org.hl7.fhir.r5.model.Parameters;
+-import org.hl7.fhir.r5.model.Questionnaire;
++import org.hl7.fhir.r5.model.Patient;
++import org.hl7.fhir.r5.model.ServiceRequest;
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.params.ParameterizedTest;
+ import org.junit.jupiter.params.provider.CsvSource;
+@@ -20,7 +19,6 @@
+ import java.util.List;
+ 
+ import static ca.uhn.fhir.jpa.model.util.JpaConstants.OPERATION_EVERYTHING;
+-import static org.apache.commons.lang3.StringUtils.leftPad;
+ import static org.assertj.core.api.Assertions.assertThat;
+ 
+ /**
+@@ -153,6 +151,62 @@ default void testEverythingOperation() {
+ 			obsId.toUnqualifiedVersionless().getValue());
+ 	}
+ 
++	@Test
++	default void testChainedIdentifierSearch_whenSubjectIsReferencedAndContained_findsBothResources() {
++		Context ctx = getTuplePredicateSearchTestContext();
++		boolean previousIndexContained = ctx.storageSettings().isIndexOnContainedResources();
++		ctx.storageSettings().setIndexOnContainedResources(true);
++		try {
++			String mrn = "PT12494";
++			IIdType patientId = createPatient(withIdentifier("http://acme.org/mrn", mrn));
++			IIdType referencingId = createResource("ServiceRequest", withSubject(patientId));
++
++			Patient containedPatient = new Patient();
++			containedPatient.setId("pat");
++			containedPatient.addIdentifier().setSystem("http://acme.org/mrn").setValue(mrn);
++			ServiceRequest containing = new ServiceRequest();
++			containing.getContained().add(containedPatient);
++			containing.getSubject().setReference("#pat");
++			IIdType containingId = doCreateResource(containing);
++
++			Bundle results = ctx.server().getFhirClient()
++				.search()
++				.byUrl("ServiceRequest?subject:Patient.identifier=http://acme.org/mrn|PT12494")
++				.returnBundle(Bundle.class)
++				.execute();
++
++			List<String> ids = SearchTestUtil.toUnqualifiedVersionlessIdValues(results);
++			assertThat(ids).containsExactlyInAnyOrder(
++				referencingId.toUnqualifiedVersionless().getValue(),
++				containingId.toUnqualifiedVersionless().getValue());
++		} finally {
++			ctx.storageSettings().setIndexOnContainedResources(previousIndexContained);
++		}
++	}
++
++	@Test
++	default void testTwoLinkChainSearch_whenContainedResourceIndexingEnabled_findsMatchingResource() {
++		Context ctx = getTuplePredicateSearchTestContext();
++		boolean previousIndexContained = ctx.storageSettings().isIndexOnContainedResources();
++		ctx.storageSettings().setIndexOnContainedResources(true);
++		try {
++			IIdType orgId = createOrganization(withName("ORG12494"));
++			IIdType patientId = createPatient(withOrganization(orgId));
++			IIdType serviceRequestId = createResource("ServiceRequest", withSubject(patientId));
++
++			Bundle results = ctx.server().getFhirClient()
++				.search()
++				.byUrl("ServiceRequest?subject:Patient.organization.name=ORG12494")
++				.returnBundle(Bundle.class)
++				.execute();
++
++			List<String> ids = SearchTestUtil.toUnqualifiedVersionlessIdValues(results);
++			assertThat(ids).containsExactly(serviceRequestId.toUnqualifiedVersionless().getValue());
++		} finally {
++			ctx.storageSettings().setIndexOnContainedResources(previousIndexContained);
++		}
++	}
++
+ 	@Test
+ 	default void testChainedReferenceSearch() {
+ 		Context ctx = getTuplePredicateSearchTestContext();
+diff --git a/hapi-fhir-jpaserver-test-utilities/src/test/java/ca/uhn/fhir/jpa/search/builder/sql/TuplePredicateBuilderTest.java b/hapi-fhir-jpaserver-test-utilities/src/test/java/ca/uhn/fhir/jpa/search/builder/sql/TuplePredicateBuilderTest.java
+index 3e94a6b1d223..d2a3e447f6f6 100644
+--- a/hapi-fhir-jpaserver-test-utilities/src/test/java/ca/uhn/fhir/jpa/search/builder/sql/TuplePredicateBuilderTest.java
++++ b/hapi-fhir-jpaserver-test-utilities/src/test/java/ca/uhn/fhir/jpa/search/builder/sql/TuplePredicateBuilderTest.java
+@@ -15,6 +15,7 @@
+ import org.hibernate.dialect.PostgreSQLDialect;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.extension.ExtendWith;
++import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.params.ParameterizedTest;
+ import org.junit.jupiter.params.provider.MethodSource;
+ import org.springframework.beans.factory.annotation.Autowired;
+@@ -57,6 +58,13 @@ static Stream<Dialect> allDialects() {
+ 		);
+ 	}
+ 
++	/**
++	 * Dialects that don't match chain branches with uncorrelated subqueries (everything but PostgreSQL).
++	 */
++	static Stream<Dialect> nonPostgresDialects() {
++		return allDialects().filter(dialect -> !(dialect instanceof PostgreSQLDialect));
++	}
++
+ 	@ParameterizedTest
+ 	@MethodSource("allDialects")
+ 	void toNotInSubquery_singleColumn_producesNotIn(Dialect theDialect) {
+@@ -97,8 +105,46 @@ void toNotInSubquery_multiColumn_producesNotExistsWithCorrelation(Dialect theDia
+ 				+ ")))");
+ 	}
+ 
++	@Test
++	void toInSubquery_singleChildBuilderOnPostgres_producesUncorrelatedTupleIn() {
++		SearchQueryBuilder outerBuilder = createBuilder(new PostgreSQLDialect());
++		BaseJoiningPredicateBuilder outerRoot = outerBuilder.getOrCreateFirstPredicateBuilder();
++		PartitionableJoinColumns multiColumn = PartitionableJoinColumns.from(outerRoot.getJoinColumns());
++
++		SearchQueryBuilder childBuilder = outerBuilder.newChildSqlBuilder(true);
++
++		Condition result = outerBuilder.getTuplePredicateBuilder().toInSubquery(List.of(childBuilder), multiColumn);
++
++		assertThat(normalizePlaceholders(result.toString())).isEqualTo(
++			"((t0.PARTITION_ID,t0.RES_ID) IN ("
++			+ "SELECT s0.PARTITION_ID,s0.RES_ID FROM HFJ_RESOURCE s0"
++			+ " WHERE ((s0.RES_TYPE = ?) AND (s0.RES_DELETED_AT IS NULL))"
++			+ ") )");
++	}
++
++	@Test
++	void toInSubquery_multipleChildBuildersOnPostgres_producesOrOfUncorrelatedTupleIn() {
++		SearchQueryBuilder outerBuilder = createBuilder(new PostgreSQLDialect());
++		BaseJoiningPredicateBuilder outerRoot = outerBuilder.getOrCreateFirstPredicateBuilder();
++		PartitionableJoinColumns multiColumn = PartitionableJoinColumns.from(outerRoot.getJoinColumns());
++
++		SearchQueryBuilder childBuilder1 = outerBuilder.newChildSqlBuilder(true);
++		SearchQueryBuilder childBuilder2 = outerBuilder.newChildSqlBuilder(true);
++
++		Condition result = outerBuilder.getTuplePredicateBuilder().toInSubquery(List.of(childBuilder1, childBuilder2), multiColumn);
++
++		assertThat(normalizePlaceholders(result.toString())).isEqualTo(
++			"(((t0.PARTITION_ID,t0.RES_ID) IN ("
++			+ "SELECT s0.PARTITION_ID,s0.RES_ID FROM HFJ_RESOURCE s0"
++			+ " WHERE ((s0.RES_TYPE = ?) AND (s0.RES_DELETED_AT IS NULL))"
++			+ ") ) OR ((t0.PARTITION_ID,t0.RES_ID) IN ("
++			+ "SELECT s0.PARTITION_ID,s0.RES_ID FROM HFJ_RESOURCE s0"
++			+ " WHERE ((s0.RES_TYPE = ?) AND (s0.RES_DELETED_AT IS NULL))"
++			+ ") ))");
++	}
++
+ 	@ParameterizedTest
+-	@MethodSource("allDialects")
++	@MethodSource("nonPostgresDialects")
+ 	void toInSubquery_singleChildBuilder_producesExistsWithCorrelation(Dialect theDialect) {
+ 		SearchQueryBuilder outerBuilder = createBuilder(theDialect);
+ 		BaseJoiningPredicateBuilder outerRoot = outerBuilder.getOrCreateFirstPredicateBuilder();
+@@ -118,7 +164,7 @@ void toInSubquery_singleChildBuilder_producesExistsWithCorrelation(Dialect theDi
+ 	}
+ 
+ 	@ParameterizedTest
+-	@MethodSource("allDialects")
++	@MethodSource("nonPostgresDialects")
+ 	void toInSubquery_multipleChildBuilders_producesOrExistsWithCorrelation(Dialect theDialect) {
+ 		SearchQueryBuilder outerBuilder = createBuilder(theDialect);
+ 		BaseJoiningPredicateBuilder outerRoot = outerBuilder.getOrCreateFirstPredicateBuilder();

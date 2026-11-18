@@ -1,0 +1,1387 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 15129dcb10..438760b364 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Withhold bounded provisional speech until context is finalized and local PHI screening resolves identifiers, preserving known redactions across context changes and discarding pending text on overflow or deadline expiry (#2815).
++
+ - Carry verified local images and bounded video clips through decision requests and the loopback System One bridge; strip metadata before dispatch and keep media out of audit logs (#4261).
+ 
+ - Add an experimental CPU ONNX streaming speech adapter for pinned local character-CTC exports, with bounded timed hypotheses and content-free reports (#3842).
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index db12459368..5c176a3db9 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -489,6 +489,7 @@ classification:
+     - multimodal/fused-evidence-graphs.md
+     - multimodal/audio-windows.md
+     - multimodal/streaming/offline-asr-contract.md
++    - multimodal/streaming/phi-withholding-buffer.md
+     - multimodal/wav-preflight.md
+     - multimodal/wav-metadata.md
+     - multimodal/asr-audio-profiles.md
+diff --git a/docs/multimodal/streaming/phi-withholding-buffer.md b/docs/multimodal/streaming/phi-withholding-buffer.md
+new file mode 100644
+index 0000000000..d1a7ab9549
+--- /dev/null
++++ b/docs/multimodal/streaming/phi-withholding-buffer.md
+@@ -0,0 +1,150 @@
++# Speech PHI withholding
++
++`openmed.multimodal.streaming.privacy.WithholdingBuffer` holds provisional speech
++in bounded local memory. It releases an ordered prefix only after the pending
++context is finalized and an injected local detector resolves its identifiers.
++Known identifier spans are replaced with the fixed `[REDACTED]` marker. Nothing
++chooses a remote detector or sends audio or transcript text to a service.
++
++This is a release gate, not an ASR engine, detector qualification, compliance
++certification or clinical decision system. The caller must qualify the detector
++for direct-identifier recall, critical leakage and the languages it processes.
++An incorrect detector decision can still miss PHI. Treat released text as
++protected candidate output, with the applicable review and disclosure controls.
++
++## Revision and context rules
++
++`append` starts a provisional segment with an opaque 32-character hexadecimal
++reference, protected text and optional `TranscriptToken` coordinates. `edit`
++delegates insert/delete/replace operations to the existing `RevisionLedger`
++while applying the same operation to its protected text. Replacement token
++coordinates are fragment-local and their references must be fresh. Stale edits
++fail without changing text. `finalize` seals the existing ledger; finalization
++alone never releases a segment, and finalized evidence cannot be silently edited.
++
++`release_ready()` constructs a fresh `PhiScreenRequest` covering **all pending
++segments**. It fingerprints the session, policy, detector artifact, end-of-stream
++state, exact revisions and protected text digests. The detector must return one
++ordered decision for every segment, with the matching request fingerprint and
++revision. Missing, stale, out-of-range or failed responses hold all text.
++
++All pending context must be finalized before screening can authorize release.
++An unresolved or critically unresolved identifier anywhere in that context
++withholds the entire candidate prefix. Decisions are never inferred from a
++confidence score, a timeout, missing detector output or an empty exception.
++
++The policy keeps the last `trailing_segments` segments as lookahead context
++(one by default). Every valid response contributes known redaction spans for
++each finalized segment. Those spans remain mandatory when previous context
++leaves the buffer: later detector omissions cannot expose a previously located
++identifier. Overlapping spans merge before rendering. This bounded lookahead
++does not prove that arbitrarily distant future speech cannot change meaning;
++choose and qualify the context policy for the capture workflow.
++
++`finish()` marks end of input and removes the lookahead hold. It does not invent
++finalization or a safe decision. Unresolved content stays held until a valid
++response, expiry or explicit close; provisional segments can still be revised
++and finalized while ending, but new segments cannot be appended. A completely
++drained ending buffer becomes closed.
++
++## Detector contract
++
++Implement `LocalPhiScreener` with a `PhiScreenDeclaration` and `screen(request)`.
++The declaration binds a lowercase SHA-256 covering the exact detector/model
++and privacy policy, and rejects `requires_network=True`. No model or network
++client is initialized by the buffer. The detector remains caller-owned.
++
++A `SegmentPhiDecision` has a closed `PhiResolution`:
++
++| Resolution | Meaning |
++| --- | --- |
++| `RESOLVED` | Complete coverage for this revision and context; every detected identifier has complete source redaction spans. An empty span list explicitly asserts that no identifier needs redaction. |
++| `UNRESOLVED` | Context or privacy classification remains incomplete; withhold. |
++| `CRITICAL_UNRESOLVED` | A critical identifier or fragment remains unresolved; withhold. |
++
++Use half-open Unicode code-point offsets in `PhiRedactionSpan`. Cross-segment
++identifiers require complete spans in every affected segment. Do not return
++`RESOLVED` for an incomplete name, identifier or uncertain boundary. The runtime
++checks shape, bounds, identity and revision binding; it cannot verify detector
++recall from those declarations. Adapters are trusted local code, must disable
++logging and telemetry, and must not retain protected request objects after use.
++
++## Bounds, latency and cleanup
++
++The default policy permits 16 pending segments, 32,768 held characters, 4,096
++operations and a 5,000 ms maximum age from first insertion. Revisions do not
++restart that clock. Overflow or deadline expiry closes the buffer as
++`ABSTAINED`, discards every pending protected segment and releases nothing.
++Previously returned outputs cannot be recalled and remain caller-owned.
++
++Every mutation and release checks a trusted monotonic clock. Screening and
++redaction time count toward the deadline; a final check runs before committing
++the prepared release. A failing or backwards clock also discards pending text.
++Inject a fake clock for deterministic tests, without performance thresholds.
++
++There is no background scheduler. Call `tick()` while capture is idle to enforce
++retention deadlines, and always use the context manager or `close()`. A blocked
++detector cannot be forcibly interrupted by this synchronous buffer, but its late
++result cannot release expired text. The buffer performs no disk writes, keeps
++no history of released text, and drops pending references on close. This is not
++cryptographic zeroization of Python strings or copies held by the caller.
++
++## Results and diagnostics
++
++Released segments contain protected text, a content-free lineage export,
++request/output digests and `RedactionMapping` source-to-output intervals.
++Replacement markers change output lengths: use these mappings to connect
++released offsets to original finalized transcript coordinates. Do not reuse
++original offsets directly against redacted text.
++
++`ReleasedSpeechSegment.to_dict()` and `buffer.to_json()` omit text and exception
++payloads. Reports contain closed codes, counts, offsets, opaque references and
++digests. Object representations also omit protected text. Do not use generic
++dataclass serialization or capture traceback locals; fingerprints remain
++sensitive linkage metadata and need access controls.
++
++## Runnable fixed-detector example
++
++This synthetic detector recognizes only one fixture marker. It exercises the
++buffer, not real PHI recognition. Replace it with a qualified local detector.
++
++```python
++from openmed.multimodal.streaming.privacy import (
++    PhiRedactionSpan, PhiResolution, PhiScreenDeclaration, PhiScreenResult,
++    SegmentPhiDecision, WithholdingBuffer,
++)
++
++
++class FixtureDetector:
++    declaration = PhiScreenDeclaration(artifact_digest="a" * 64)
++
++    def screen(self, request):
++        decisions = []
++        for segment in request.segments:
++            marker = "SYNTHETIC-ID"
++            start = segment.text.find(marker)
++            decisions.append(SegmentPhiDecision(
++                segment_ref=segment.segment_ref, revision=segment.revision,
++                resolution=PhiResolution.RESOLVED,
++                redactions=(PhiRedactionSpan(start, start + len(marker)),)
++                if start >= 0 else (),
++            ))
++        return PhiScreenResult(
++            request_digest=request.request_digest, decisions=tuple(decisions),
++        )
++
++
++with WithholdingBuffer("0" * 32, FixtureDetector()) as held:
++    held.append("1" * 32, "SYNTHETIC-ID has no allergy")
++    assert held.release_ready() == ()
++    held.finalize("1" * 32, expected_revision=0)
++    assert held.release_ready() == ()  # Retain trailing context until input ends.
++    result = held.finish()[0]
++    assert result.text == "[REDACTED] has no allergy"
++```
++
++Run the offline controls with:
++
++```sh
++.venv/bin/python -m pytest tests/unit/multimodal/streaming/privacy/test_withholding_buffer.py -q
++```
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 655df1720d..8a3566b6c6 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -429,6 +429,7 @@ nav:
+       - Fused Image-Text Evidence: multimodal/fused-evidence-graphs.md
+       - Streaming Audio Windows: multimodal/audio-windows.md
+       - Offline Streaming ASR Providers: multimodal/streaming/offline-asr-contract.md
++      - Speech PHI Withholding: multimodal/streaming/phi-withholding-buffer.md
+       - WAV Metadata Preflight: multimodal/wav-preflight.md
+       - WAV Metadata and RF64: multimodal/wav-metadata.md
+       - ASR Audio Profiles: multimodal/asr-audio-profiles.md
+diff --git a/openmed/multimodal/streaming/privacy/__init__.py b/openmed/multimodal/streaming/privacy/__init__.py
+new file mode 100644
+index 0000000000..24e890c08f
+--- /dev/null
++++ b/openmed/multimodal/streaming/privacy/__init__.py
+@@ -0,0 +1,39 @@
++"""Local privacy admission for provisional speech."""
++
++from .withholding_buffer import (
++    WITHHOLDING_SCHEMA_VERSION,
++    BufferState,
++    HoldReason,
++    LocalPhiScreener,
++    PhiRedactionSpan,
++    PhiResolution,
++    PhiScreenDeclaration,
++    PhiScreenRequest,
++    PhiScreenResult,
++    ProtectedSpeechSegment,
++    RedactionMapping,
++    ReleasedSpeechSegment,
++    SegmentPhiDecision,
++    WithholdingBuffer,
++    WithholdingError,
++    WithholdingPolicy,
++)
++
++__all__ = [
++    "WITHHOLDING_SCHEMA_VERSION",
++    "BufferState",
++    "HoldReason",
++    "LocalPhiScreener",
++    "PhiRedactionSpan",
++    "PhiResolution",
++    "PhiScreenDeclaration",
++    "PhiScreenRequest",
++    "PhiScreenResult",
++    "ProtectedSpeechSegment",
++    "RedactionMapping",
++    "ReleasedSpeechSegment",
++    "SegmentPhiDecision",
++    "WithholdingBuffer",
++    "WithholdingError",
++    "WithholdingPolicy",
++]
+diff --git a/openmed/multimodal/streaming/privacy/withholding_buffer.py b/openmed/multimodal/streaming/privacy/withholding_buffer.py
+new file mode 100644
+index 0000000000..7efd736cb5
+--- /dev/null
++++ b/openmed/multimodal/streaming/privacy/withholding_buffer.py
+@@ -0,0 +1,715 @@
++"""Bounded revision-aware PHI holdback for locally screened speech segments."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++import re
++import time
++from collections.abc import Callable
++from dataclasses import asdict, dataclass, field
++from enum import Enum
++from typing import Any, Protocol, cast
++
++from ..transcript.revision_ledger import RevisionKind, RevisionLedger, TranscriptToken
++
++WITHHOLDING_SCHEMA_VERSION = "openmed.speech.withholding.v1"
++_REF = re.compile(r"[0-9a-f]{32}\Z")
++_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
++_REDACTION = "[REDACTED]"
++
++
++class WithholdingError(ValueError):
++    """A fixed-message caller-contract failure, without transcript values."""
++
++
++class BufferState(str, Enum):
++    """Closed and abstained buffers never accept or release further text."""
++
++    OPEN = "open"
++    ENDING = "ending"
++    CLOSED = "closed"
++    ABSTAINED = "abstained"
++
++
++class HoldReason(str, Enum):
++    """Controlled reasons for withholding or discarding protected speech."""
++
++    PROVISIONAL = "provisional"
++    TRAILING_CONTEXT = "trailing_context"
++    UNRESOLVED_PHI = "unresolved_phi"
++    CRITICAL_IDENTIFIER = "critical_identifier"
++    SCREEN_FAILED = "screen_failed"
++    BUFFER_LIMIT = "buffer_limit"
++    LATENCY_LIMIT = "latency_limit"
++    CLOCK_INVALID = "clock_invalid"
++    OPERATION_LIMIT = "operation_limit"
++    CLOSED = "closed"
++
++
++class PhiResolution(str, Enum):
++    """RESOLVED means every detected identifier has a complete redaction span."""
++
++    RESOLVED = "resolved"
++    UNRESOLVED = "unresolved"
++    CRITICAL_UNRESOLVED = "critical_unresolved"
++
++
++def _require(condition: bool) -> None:
++    if not condition:
++        raise WithholdingError("invalid speech withholding contract")
++
++
++def _integer(value: object, maximum: int, minimum: int = 0) -> None:
++    _require(type(value) is int and minimum <= value <= maximum)
++
++
++def _ref(value: object) -> None:
++    _require(type(value) is str and _REF.fullmatch(value) is not None)
++
++
++def _text(value: object, maximum: int) -> None:
++    _require(type(value) is str and len(value) <= maximum)
++    valid = True
++    try:
++        cast(str, value).encode("utf-8")
++    except UnicodeError:
++        valid = False
++    _require(valid)
++
++
++def _digest(value: object) -> str:
++    return hashlib.sha256(
++        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
++    ).hexdigest()
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class WithholdingPolicy:
++    """Explicit ceilings and the amount of trailing context retained.
++
++    Args:
++        max_segments: Maximum simultaneously buffered segments, at most 64.
++        max_chars: Maximum protected characters held, at most 65,536.
++        max_latency_ms: Maximum age since first insertion, including revisions
++            and screening time. Expiry discards pending text without release.
++        trailing_segments: Segments kept as context until further input or end.
++        max_operations: Bound edits, evaluations and total segment identities.
++    """
++
++    max_segments: int = 16
++    max_chars: int = 32_768
++    max_latency_ms: int = 5000
++    trailing_segments: int = 1
++    max_operations: int = 4096
++
++    def __post_init__(self) -> None:
++        _integer(self.max_segments, 64, 1)
++        _integer(self.max_chars, 65_536, 1)
++        _integer(self.max_latency_ms, 60_000, 1)
++        _integer(self.trailing_segments, self.max_segments - 1)
++        _integer(self.max_operations, 16_384, 1)
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class PhiScreenDeclaration:
++    """Pinned local screening policy/model identity, without free-form names."""
++
++    artifact_digest: str
++    requires_network: bool = False
++
++    def __post_init__(self) -> None:
++        _require(
++            type(self.artifact_digest) is str
++            and _DIGEST.fullmatch(self.artifact_digest) is not None
++            and self.requires_network is False
++        )
++
++
++@dataclass(frozen=True, slots=True)
++class ProtectedSpeechSegment:
++    """One current revision for the trusted local screener; never serialize text."""
++
++    segment_ref: str
++    revision: int
++    finalized: bool
++    text: str = field(repr=False)
++
++
++@dataclass(frozen=True, slots=True)
++class PhiScreenRequest:
++    """Full bounded pending context and its exact revision/content fingerprint."""
++
++    request_digest: str
++    segments: tuple[ProtectedSpeechSegment, ...] = field(repr=False)
++
++
++@dataclass(frozen=True, slots=True)
++class PhiRedactionSpan:
++    """Complete half-open Unicode code-point interval of a detected identifier."""
++
++    start: int
++    end: int
++
++    def __post_init__(self) -> None:
++        _integer(self.start, 65_536)
++        _integer(self.end, 65_536)
++        _require(self.start < self.end)
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class SegmentPhiDecision:
++    """Decision for one exact segment revision under the full request context."""
++
++    segment_ref: str
++    revision: int
++    resolution: PhiResolution
++    redactions: tuple[PhiRedactionSpan, ...] = ()
++
++    def __post_init__(self) -> None:
++        _ref(self.segment_ref)
++        _integer(self.revision, 4096)
++        _require(type(self.resolution) is PhiResolution)
++        _require(type(self.redactions) is tuple and len(self.redactions) <= 4096)
++        _require(all(type(span) is PhiRedactionSpan for span in self.redactions))
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class PhiScreenResult:
++    """A response bound to the exact context; omission never implies safety."""
++
++    request_digest: str
++    decisions: tuple[SegmentPhiDecision, ...]
++
++
++class LocalPhiScreener(Protocol):
++    """Trusted local detector resolving identifiers across all pending context.
++
++    A RESOLVED decision asserts complete coverage, including direct identifiers
++    and cross-segment fragments. Return UNRESOLVED or CRITICAL_UNRESOLVED when
++    context is insufficient; confidence alone must not authorize release.
++    The runtime enforces bounds and bindings, not detector recall. Qualify the
++    detector separately and disable logs, telemetry and remote fallback.
++    """
++
++    @property
++    def declaration(self) -> PhiScreenDeclaration:
++        """Return the local policy/model fingerprint without reading speech."""
++        ...
++
++    def screen(self, request: PhiScreenRequest) -> PhiScreenResult:
++        """Inspect protected context in memory and return bounded decisions."""
++        ...
++
++
++@dataclass(frozen=True, slots=True)
++class RedactionMapping:
++    """Map released character intervals back to original finalized lineage."""
++
++    source_start: int
++    source_end: int
++    output_start: int
++    output_end: int
++    redacted: bool
++
++
++@dataclass(frozen=True, slots=True)
++class ReleasedSpeechSegment:
++    """Final screened text and source-coordinate mappings; text remains protected."""
++
++    segment_ref: str
++    revision: int
++    request_digest: str
++    output_digest: str
++    mappings: tuple[RedactionMapping, ...]
++    lineage_json: str = field(repr=False)
++    text: str = field(repr=False)
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return offsets and provenance without the released text."""
++        return {
++            "segment_ref": self.segment_ref,
++            "revision": self.revision,
++            "request_digest": self.request_digest,
++            "output_digest": self.output_digest,
++            "mappings": [asdict(mapping) for mapping in self.mappings],
++        }
++
++
++@dataclass(slots=True)
++class _Pending:
++    ledger: RevisionLedger
++    text: str = field(repr=False)
++    inserted_ms: int
++    redactions: tuple[PhiRedactionSpan, ...] = ()
++
++
++class WithholdingBuffer:
++    """Own bounded trailing text and its existing revision ledger until release.
++
++    Args:
++        session_ref: Opaque session identity, never a patient-derived identifier.
++        screener: Injected local PHI detector with a pinned declaration.
++        policy: Retention, trailing-context and operation ceilings.
++        clock: Monotonic seconds. Inject a fake clock for deterministic replay.
++
++    Serialize calls. There is no background scheduler: call ``tick`` while input
++    is idle and always ``close`` on exit. Every mutation and release checks age,
++    including after screening. Text is never released after its latency budget.
++    Caller-held released outputs are not retained or erased by this buffer.
++    """
++
++    def __init__(
++        self,
++        session_ref: str,
++        screener: LocalPhiScreener,
++        *,
++        policy: WithholdingPolicy | None = None,
++        clock: Callable[[], float] = time.monotonic,
++    ) -> None:
++        _ref(session_ref)
++        self._policy = policy if policy is not None else WithholdingPolicy()
++        _require(type(self._policy) is WithholdingPolicy and callable(clock))
++        declaration = None
++        try:
++            declaration = screener.declaration
++            if type(declaration) is PhiScreenDeclaration:
++                declaration.__post_init__()
++        except Exception:
++            declaration = None
++        _require(type(declaration) is PhiScreenDeclaration)
++        assert declaration is not None
++        self._declaration = declaration
++        self._session_ref, self._screener, self._clock = session_ref, screener, clock
++        self._state = BufferState.OPEN
++        self._reason: HoldReason | None = None
++        self._pending: dict[str, _Pending] = {}
++        self._seen: set[str] = set()
++        self._operations = self._released = self._discarded = 0
++        self._busy = False
++        self._origin: float | None = None
++        self._last_clock: float | None = None
++        self._now = 0
++        self._observe_time()
++
++    def __enter__(self) -> WithholdingBuffer:
++        _require(self._state is BufferState.OPEN)
++        return self
++
++    def __exit__(self, *_: object) -> None:
++        self.close()
++
++    @property
++    def state(self) -> BufferState:
++        """Current lifecycle state; failures discard all pending protected text."""
++        return self._state
++
++    @property
++    def reason(self) -> HoldReason | None:
++        """Controlled current hold or terminal failure reason."""
++        return self._reason
++
++    def _fail(self, reason: HoldReason) -> None:
++        self._discarded += len(self._pending)
++        self._pending.clear()
++        self._state, self._reason = BufferState.ABSTAINED, reason
++
++    def _observe_time(self) -> bool:
++        current = None
++        try:
++            current = self._clock()
++        except Exception:
++            pass
++        if (
++            current is None
++            or type(current) not in (int, float)
++            or (type(current) is int and current.bit_length() > 64)
++            or not math.isfinite(current)
++            or (self._last_clock is not None and current < self._last_clock)
++        ):
++            self._fail(HoldReason.CLOCK_INVALID)
++            return False
++        if self._origin is None:
++            self._origin = float(current)
++        self._last_clock = float(current)
++        elapsed = (current - self._origin) * 1000
++        if not math.isfinite(elapsed) or not self._now <= elapsed <= 86_400_000:
++            self._fail(HoldReason.CLOCK_INVALID)
++            return False
++        self._now = math.floor(elapsed)
++        if any(
++            self._now - pending.inserted_ms > self._policy.max_latency_ms
++            for pending in self._pending.values()
++        ):
++            self._fail(HoldReason.LATENCY_LIMIT)
++            return False
++        return True
++
++    def _admit(self) -> bool:
++        _require(not self._busy)
++        _require(self._state in (BufferState.OPEN, BufferState.ENDING))
++        if not self._observe_time():
++            return False
++        if self._operations >= self._policy.max_operations:
++            self._fail(HoldReason.OPERATION_LIMIT)
++            return False
++        self._operations += 1
++        return True
++
++    def _capacity(self, length: int, *, replacing: int = 0, added: int = 0) -> bool:
++        chars = sum(len(item.text) for item in self._pending.values())
++        if (
++            len(self._pending) + added > self._policy.max_segments
++            or chars - replacing + length > self._policy.max_chars
++        ):
++            self._fail(HoldReason.BUFFER_LIMIT)
++            return False
++        return True
++
++    def append(
++        self, segment_ref: str, text: str, tokens: tuple[TranscriptToken, ...] = ()
++    ) -> bool:
++        """Insert a new provisional segment; overflow fails closed for the buffer."""
++        _ref(segment_ref)
++        _text(text, 65_536)
++        _require(self._state is BufferState.OPEN and segment_ref not in self._seen)
++        if not self._admit():
++            return False
++        ledger = RevisionLedger(self._session_ref, segment_ref, len(text), tokens)
++        if not self._capacity(len(text), added=1):
++            return False
++        self._pending[segment_ref] = _Pending(ledger, text, self._now)
++        self._seen.add(segment_ref)
++        self._reason = HoldReason.PROVISIONAL
++        return True
++
++    def edit(
++        self,
++        segment_ref: str,
++        kind: RevisionKind,
++        start: int,
++        end: int,
++        text: str = "",
++        tokens: tuple[TranscriptToken, ...] = (),
++        *,
++        expected_revision: int,
++    ) -> bool:
++        """Apply the same atomic insert/delete/replace to text and existing lineage.
++
++        Replacement token offsets are fragment-local. Fresh token references are
++        required by the ledger. A revision never resets the retention clock.
++        """
++        _ref(segment_ref)
++        _require(segment_ref in self._pending)
++        _require(
++            type(kind) is RevisionKind
++            and kind in (RevisionKind.INSERT, RevisionKind.DELETE, RevisionKind.REPLACE)
++        )
++        _text(text, 65_536)
++        pending = self._pending[segment_ref]
++        _require(
++            type(expected_revision) is int
++            and expected_revision == pending.ledger.revision
++            and not pending.ledger.to_dict()["finalized"]
++        )
++        _integer(start, len(pending.text))
++        _integer(end, len(pending.text))
++        _require(start <= end)
++        _require(kind is not RevisionKind.INSERT or start == end)
++        _require(kind is not RevisionKind.DELETE or (text == "" and tokens == ()))
++        if not self._admit():
++            return False
++        updated = pending.text[:start] + text + pending.text[end:]
++        if not self._capacity(len(updated), replacing=len(pending.text)):
++            return False
++        if kind is RevisionKind.INSERT:
++            pending.ledger.insert(
++                start, len(text), tokens, expected_revision=expected_revision
++            )
++        elif kind is RevisionKind.DELETE:
++            pending.ledger.delete(start, end, expected_revision=expected_revision)
++        else:
++            pending.ledger.replace(
++                start, end, len(text), tokens, expected_revision=expected_revision
++            )
++        pending.text = updated
++        pending.redactions = ()
++        self._reason = HoldReason.PROVISIONAL
++        return True
++
++    def finalize(self, segment_ref: str, *, expected_revision: int) -> bool:
++        """Seal text and timing through the existing ledger; this does not release it."""
++        _ref(segment_ref)
++        _require(segment_ref in self._pending)
++        ledger = self._pending[segment_ref].ledger
++        _require(
++            type(expected_revision) is int
++            and expected_revision == ledger.revision
++            and not ledger.to_dict()["finalized"]
++        )
++        if not self._admit():
++            return False
++        ledger.finalize(expected_revision=expected_revision)
++        return True
++
++    def lineage(self, segment_ref: str) -> dict[str, Any]:
++        """Copy current value-free lineage for citations or revision consumers."""
++        _ref(segment_ref)
++        _require(segment_ref in self._pending)
++        return self._pending[segment_ref].ledger.to_dict()
++
++    def tick(self) -> BufferState:
++        """Enforce the declared deadline while capture is idle; never release text."""
++        if self._state in (BufferState.OPEN, BufferState.ENDING):
++            self._admit()
++        return self._state
++
++    def finish(self) -> tuple[ReleasedSpeechSegment, ...]:
++        """Mark end of input and screen finalized text without trailing-context hold.
++
++        Provisional or unresolved segments remain held until explicit revision,
++        finalization and re-evaluation, deadline expiry, or close. No implicit
++        finalization or safe decision is manufactured at end of stream.
++        """
++        _require(
++            not self._busy and self._state in (BufferState.OPEN, BufferState.ENDING)
++        )
++        self._state = BufferState.ENDING
++        return self.release_ready()
++
++    def _request(self) -> PhiScreenRequest:
++        segments = tuple(
++            ProtectedSpeechSegment(
++                ref, item.ledger.revision, item.ledger.to_dict()["finalized"], item.text
++            )
++            for ref, item in self._pending.items()
++        )
++        fingerprint = _digest(
++            {
++                "session": self._session_ref,
++                "policy": asdict(self._policy),
++                "detector": self._declaration.artifact_digest,
++                "ending": self._state is BufferState.ENDING,
++                "segments": [
++                    [
++                        item.segment_ref,
++                        item.revision,
++                        item.finalized,
++                        hashlib.sha256(item.text.encode()).hexdigest(),
++                    ]
++                    for item in segments
++                ],
++            }
++        )
++        return PhiScreenRequest(fingerprint, segments)
++
++    def _validate(self, request: PhiScreenRequest, response: PhiScreenResult) -> None:
++        _require(
++            type(response) is PhiScreenResult
++            and response.request_digest == request.request_digest
++        )
++        _require(
++            type(response.decisions) is tuple
++            and len(response.decisions) == len(request.segments)
++        )
++        for segment, decision in zip(request.segments, response.decisions):
++            _require(type(decision) is SegmentPhiDecision)
++            decision.__post_init__()
++            _require(
++                (decision.segment_ref, decision.revision)
++                == (segment.segment_ref, segment.revision)
++            )
++            _require(all(span.end <= len(segment.text) for span in decision.redactions))
++
++    def release_ready(self) -> tuple[ReleasedSpeechSegment, ...]:
++        """Screen current context and release only the finalized, resolved prefix.
++
++        No previous decision is reused after a revision or context change. Invalid,
++        stale, partial or failed detector responses hold all text until retry or
++        expiry. Expiry during detector execution discards its output too.
++        """
++        if not self._admit():
++            return ()
++        if not self._pending:
++            if self._state is BufferState.ENDING:
++                self._state = BufferState.CLOSED
++            return ()
++        request = self._request()
++        eligible = len(request.segments) - (
++            self._policy.trailing_segments if self._state is BufferState.OPEN else 0
++        )
++        if eligible <= 0:
++            self._reason = HoldReason.TRAILING_CONTEXT
++            return ()
++        if any(not segment.finalized for segment in request.segments):
++            self._reason = HoldReason.PROVISIONAL
++            return ()
++        valid = False
++        known_redactions: dict[str, tuple[PhiRedactionSpan, ...]] = {}
++        self._busy = True
++        try:
++            declaration = self._screener.declaration
++            _require(
++                type(declaration) is PhiScreenDeclaration
++                and declaration == self._declaration
++            )
++            response = self._screener.screen(request)
++            self._validate(request, response)
++            known_redactions = {
++                segment.segment_ref: _merge_spans(
++                    self._pending[segment.segment_ref].redactions + decision.redactions
++                )
++                for segment, decision in zip(request.segments, response.decisions)
++            }
++            valid = True
++        except Exception:
++            pass
++        finally:
++            self._busy = False
++        if not self._observe_time():
++            return ()
++        if not valid:
++            self._reason = HoldReason.SCREEN_FAILED
++            return ()
++        # Finalized context cannot change under an already released decision.
++        # Keep every known redaction when earlier context leaves the buffer;
++        # subsequent detector omissions never make known PHI releasable again.
++        for segment, decision in zip(request.segments, response.decisions):
++            pending = self._pending[segment.segment_ref]
++            pending.redactions = known_redactions[segment.segment_ref]
++        unresolved = [
++            decision
++            for decision in response.decisions
++            if decision.resolution is not PhiResolution.RESOLVED
++        ]
++        if unresolved:
++            self._reason = (
++                HoldReason.CRITICAL_IDENTIFIER
++                if any(
++                    item.resolution is PhiResolution.CRITICAL_UNRESOLVED
++                    for item in unresolved
++                )
++                else HoldReason.UNRESOLVED_PHI
++            )
++            return ()
++        released = []
++        self._reason = None
++        for segment, decision in zip(request.segments[:eligible], response.decisions):
++            if not segment.finalized:
++                self._reason = HoldReason.PROVISIONAL
++                break
++            if decision.resolution is not PhiResolution.RESOLVED:
++                self._reason = (
++                    HoldReason.CRITICAL_IDENTIFIER
++                    if decision.resolution is PhiResolution.CRITICAL_UNRESOLVED
++                    else HoldReason.UNRESOLVED_PHI
++                )
++                break
++            pending = self._pending[segment.segment_ref]
++            text, mappings = _redact(segment.text, pending.redactions)
++            released.append(
++                ReleasedSpeechSegment(
++                    segment.segment_ref,
++                    segment.revision,
++                    request.request_digest,
++                    hashlib.sha256(text.encode()).hexdigest(),
++                    mappings,
++                    pending.ledger.to_json(),
++                    text,
++                )
++            )
++        # Rendering and lineage export also consume the declared latency budget.
++        # Commit the whole prefix only after their work passes the final check.
++        if not self._observe_time():
++            return ()
++        for item in released:
++            self._pending.pop(item.segment_ref)
++        self._released += len(released)
++        if not self._pending and self._state is BufferState.ENDING:
++            self._state = BufferState.CLOSED
++        elif self._pending and self._reason is None:
++            self._reason = HoldReason.TRAILING_CONTEXT
++        return tuple(released)
++
++    def close(self) -> None:
++        """Drop all pending protected text without release; leave borrowed detector open."""
++        _require(not self._busy)
++        self._discarded += len(self._pending)
++        self._pending.clear()
++        if self._state is not BufferState.ABSTAINED:
++            self._state, self._reason = BufferState.CLOSED, HoldReason.CLOSED
++
++    def to_json(self) -> str:
++        """Return bounded codes, counters and opaque revision references only."""
++        return json.dumps(
++            {
++                "schema_version": WITHHOLDING_SCHEMA_VERSION,
++                "state": self._state.value,
++                "reason": self._reason.value if self._reason else None,
++                "policy": asdict(self._policy),
++                "screen_artifact_digest": self._declaration.artifact_digest,
++                "operations": self._operations,
++                "released": self._released,
++                "discarded": self._discarded,
++                "pending": [
++                    {
++                        "segment_ref": ref,
++                        "revision": item.ledger.revision,
++                        "characters": len(item.text),
++                        "age_ms": self._now - item.inserted_ms,
++                    }
++                    for ref, item in self._pending.items()
++                ],
++            },
++            sort_keys=True,
++            separators=(",", ":"),
++        )
++
++
++def _merge_spans(spans: tuple[PhiRedactionSpan, ...]) -> tuple[PhiRedactionSpan, ...]:
++    merged: list[tuple[int, int]] = []
++    for span in sorted(spans, key=lambda item: (item.start, item.end)):
++        if merged and span.start <= merged[-1][1]:
++            merged[-1] = (merged[-1][0], max(merged[-1][1], span.end))
++        else:
++            merged.append((span.start, span.end))
++    _require(len(merged) <= 4096)
++    return tuple(PhiRedactionSpan(start, end) for start, end in merged)
++
++
++def _redact(
++    text: str, spans: tuple[PhiRedactionSpan, ...]
++) -> tuple[str, tuple[RedactionMapping, ...]]:
++    parts: list[str] = []
++    mappings: list[RedactionMapping] = []
++    source_at = output_at = 0
++    for span in spans:
++        start, end = span.start, span.end
++        if start > source_at:
++            part = text[source_at:start]
++            parts.append(part)
++            mappings.append(
++                RedactionMapping(
++                    source_at, start, output_at, output_at + len(part), False
++                )
++            )
++            output_at += len(part)
++        parts.append(_REDACTION)
++        mappings.append(
++            RedactionMapping(start, end, output_at, output_at + len(_REDACTION), True)
++        )
++        output_at += len(_REDACTION)
++        source_at = end
++    if source_at < len(text):
++        parts.append(text[source_at:])
++        mappings.append(
++            RedactionMapping(
++                source_at,
++                len(text),
++                output_at,
++                output_at + len(text) - source_at,
++                False,
++            )
++        )
++    return "".join(parts), tuple(mappings)
+diff --git a/scripts/security/effect_paths.json b/scripts/security/effect_paths.json
+index fe2082a4c0..ae23bf6dd7 100644
+--- a/scripts/security/effect_paths.json
++++ b/scripts/security/effect_paths.json
+@@ -365,6 +365,16 @@
+       "function": "MultimodalSession._run",
+       "module": "openmed.multimodal.runtime_session"
+     },
++    {
++      "classification": "operational",
++      "function": "WithholdingBuffer.edit",
++      "module": "openmed.multimodal.streaming.privacy.withholding_buffer"
++    },
++    {
++      "classification": "operational",
++      "function": "WithholdingBuffer.release_ready",
++      "module": "openmed.multimodal.streaming.privacy.withholding_buffer"
++    },
+     {
+       "module": "openmed.onnx.streaming_loader",
+       "function": "StreamingWeightLoader.load",
+diff --git a/tests/browser/brand/brand.spec.ts b/tests/browser/brand/brand.spec.ts
+index 1047dc135f..5c1e9e8d48 100644
+--- a/tests/browser/brand/brand.spec.ts
++++ b/tests/browser/brand/brand.spec.ts
+@@ -1339,7 +1339,10 @@ test("docs search, locale, theme, and code copy controls operate", async ({
+   await search.click();
+   await expect(search).toBeFocused();
+   await expect(page.locator("#__search")).toBeChecked();
+-  await search.pressSequentially("OpenMedSpan");
++  // Material submits on keyup. Fill first, then submit one complete query so
++  // partial-query results cannot replace the overflow fixture attached below.
++  await search.fill("OpenMedSpan");
++  await search.press("End");
+   await expect(searchMeta).toContainText(
+     /matching documents?/i,
+     { timeout: 20_000 },
+diff --git a/tests/unit/multimodal/streaming/privacy/test_withholding_buffer.py b/tests/unit/multimodal/streaming/privacy/test_withholding_buffer.py
+new file mode 100644
+index 0000000000..0c3f8a33ec
+--- /dev/null
++++ b/tests/unit/multimodal/streaming/privacy/test_withholding_buffer.py
+@@ -0,0 +1,385 @@
++"""Synthetic PHI, revision, deadline and context-loss controls for speech holdback."""
++
++import json
++import socket
++from dataclasses import replace
++
++import pytest
++
++from openmed.multimodal.streaming.privacy import (
++    BufferState,
++    HoldReason,
++    PhiRedactionSpan,
++    PhiResolution,
++    PhiScreenDeclaration,
++    PhiScreenResult,
++    SegmentPhiDecision,
++    WithholdingBuffer,
++    WithholdingError,
++    WithholdingPolicy,
++)
++from openmed.multimodal.streaming.transcript import RevisionKind, TranscriptToken
++
++SESSION, FIRST, SECOND, THIRD = (f"{value:032x}" for value in range(4))
++PRIVATE = "SYNTHETIC-PRIVATE-IDENTIFIER"
++
++
++class Clock:
++    def __init__(self):
++        self.seconds = 0.0
++
++    def __call__(self):
++        return self.seconds
++
++
++class Screener:
++    declaration = PhiScreenDeclaration(artifact_digest="a" * 64)
++
++    def __init__(self):
++        self.calls = []
++        self.resolution = PhiResolution.RESOLVED
++
++    def screen(self, request):
++        self.calls.append(request)
++        decisions = []
++        for segment in request.segments:
++            start = segment.text.find(PRIVATE)
++            decisions.append(
++                SegmentPhiDecision(
++                    segment_ref=segment.segment_ref,
++                    revision=segment.revision,
++                    resolution=self.resolution,
++                    redactions=(PhiRedactionSpan(start, start + len(PRIVATE)),)
++                    if start >= 0
++                    else (),
++                )
++            )
++        return PhiScreenResult(
++            request_digest=request.request_digest, decisions=tuple(decisions)
++        )
++
++
++def buffer(*, screener=None, clock=None, **limits):
++    return WithholdingBuffer(
++        SESSION,
++        screener or Screener(),
++        clock=clock or Clock(),
++        policy=WithholdingPolicy(**limits),
++    )
++
++
++def finalized(target, ref=FIRST, text="Synthetic text"):
++    assert target.append(ref, text)
++    assert target.finalize(ref, expected_revision=0)
++
++
++def test_provisional_and_trailing_context_never_release_before_final_screen():
++    screener = Screener()
++    with buffer(screener=screener) as target:
++        target.append(FIRST, PRIVATE)
++        assert target.release_ready() == ()
++        target.finalize(FIRST, expected_revision=0)
++        assert target.release_ready() == () and screener.calls == []
++        target.append(SECOND, "No allergy")
++        assert target.release_ready() == () and target.reason is HoldReason.PROVISIONAL
++        target.finalize(SECOND, expected_revision=0)
++        released = target.release_ready()
++        assert [item.segment_ref for item in released] == [FIRST]
++        assert released[0].text == "[REDACTED]"
++        assert target.finish()[0].text == "No allergy"
++        assert target.state is BufferState.CLOSED
++
++
++def test_editing_provisional_text_preserves_negation_and_retires_changed_lineage():
++    token = TranscriptToken(token_ref="a" * 32, start=0, end=3, start_ms=0, end_ms=10)
++    fresh = TranscriptToken(
++        token_ref="b" * 32, start=0, end=len(PRIVATE), start_ms=0, end_ms=10
++    )
++    with buffer(trailing_segments=0) as target:
++        target.append(FIRST, "old has no allergy", (token,))
++        assert target.release_ready() == ()
++        target.edit(
++            FIRST, RevisionKind.REPLACE, 0, 3, PRIVATE, (fresh,), expected_revision=0
++        )
++        assert target.lineage(FIRST)["operations"][0]["retired_tokens"] == ("a" * 32,)
++        target.finalize(FIRST, expected_revision=1)
++        result = target.release_ready()[0]
++        assert result.text == "[REDACTED] has no allergy"
++        assert result.revision == 2 and json.loads(result.lineage_json)["finalized"]
++        assert result.mappings[0].redacted
++        assert result.mappings[1].source_start == len(PRIVATE)
++
++
++@pytest.mark.parametrize(
++    "resolution,reason",
++    [
++        (PhiResolution.UNRESOLVED, HoldReason.UNRESOLVED_PHI),
++        (PhiResolution.CRITICAL_UNRESOLVED, HoldReason.CRITICAL_IDENTIFIER),
++    ],
++)
++def test_unresolved_identifier_in_any_context_withholds_the_whole_release(
++    resolution, reason
++):
++    screener = Screener()
++    screener.resolution = resolution
++    with buffer(screener=screener) as target:
++        finalized(target)
++        finalized(target, SECOND, PRIVATE)
++        assert target.release_ready() == () and target.reason is reason
++        assert target.finish() == () and target.state is BufferState.ENDING
++        screener.resolution = PhiResolution.RESOLVED
++        released = target.release_ready()
++        assert [item.segment_ref for item in released] == [FIRST, SECOND]
++        assert PRIVATE not in " ".join(item.text for item in released)
++
++
++def test_known_phi_cannot_reappear_when_previous_context_leaves():
++    class Forgetful(Screener):
++        def screen(self, request):
++            result = super().screen(request)
++            if len(self.calls) > 1:
++                return replace(
++                    result,
++                    decisions=tuple(
++                        replace(d, redactions=()) for d in result.decisions
++                    ),
++                )
++            return result
++
++    with buffer(screener=Forgetful()) as target:
++        finalized(target)
++        finalized(target, SECOND, PRIVATE)
++        assert target.release_ready()[0].segment_ref == FIRST
++        finalized(target, THIRD, "Synthetic context")
++        released = target.release_ready()
++        assert released[0].segment_ref == SECOND and released[0].text == "[REDACTED]"
++
++
++@pytest.mark.parametrize("mode", ["stale", "missing", "revision", "span", "exception"])
++def test_invalid_or_failed_screening_never_releases_or_echoes_payload(mode, caplog):
++    class Broken(Screener):
++        def screen(self, request):
++            result = super().screen(request)
++            if mode == "stale":
++                return replace(result, request_digest="f" * 64)
++            if mode == "missing":
++                return replace(result, decisions=())
++            if mode == "revision":
++                return replace(
++                    result, decisions=(replace(result.decisions[0], revision=0),)
++                )
++            if mode == "span":
++                return replace(
++                    result,
++                    decisions=(
++                        replace(
++                            result.decisions[0], redactions=(PhiRedactionSpan(0, 1000),)
++                        ),
++                    ),
++                )
++            raise RuntimeError(PRIVATE)
++
++    with buffer(screener=Broken(), trailing_segments=0) as target:
++        finalized(target, text=PRIVATE)
++        assert (
++            target.release_ready() == () and target.reason is HoldReason.SCREEN_FAILED
++        )
++        assert PRIVATE not in target.to_json() + repr(target) + caplog.text
++
++
++def test_old_decision_cannot_authorize_changed_context():
++    class Stale(Screener):
++        def screen(self, request):
++            if self.calls:
++                return self.previous
++            self.previous = super().screen(request)
++            return self.previous
++
++    screener = Stale()
++    with buffer(screener=screener) as target:
++        finalized(target)
++        finalized(target, SECOND, PRIVATE)
++        target.release_ready()
++        finalized(target, THIRD, "New context")
++        assert (
++            target.release_ready() == () and target.reason is HoldReason.SCREEN_FAILED
++        )
++
++
++@pytest.mark.parametrize("operation", ["release", "tick", "edit", "finalize"])
++def test_deadline_discards_pending_text_without_release(operation):
++    clock = Clock()
++    with buffer(clock=clock, trailing_segments=0, max_latency_ms=100) as target:
++        target.append(FIRST, PRIVATE)
++        clock.seconds = 0.101
++        if operation == "release":
++            assert target.release_ready() == ()
++        elif operation == "tick":
++            target.tick()
++        elif operation == "finalize":
++            assert not target.finalize(FIRST, expected_revision=0)
++        else:
++            assert not target.edit(
++                FIRST, RevisionKind.INSERT, 0, 0, "prefix", expected_revision=0
++            )
++        assert (
++            target.state is BufferState.ABSTAINED
++            and target.reason is HoldReason.LATENCY_LIMIT
++        )
++        report = json.loads(target.to_json())
++        assert report["pending"] == [] and report["discarded"] == 1
++
++
++def test_revisions_do_not_reset_the_deadline_and_slow_detector_cannot_release():
++    clock = Clock()
++    with buffer(clock=clock, max_latency_ms=100) as target:
++        target.append(FIRST, PRIVATE)
++        clock.seconds = 0.09
++        target.edit(FIRST, RevisionKind.INSERT, 0, 0, "prefix ", expected_revision=0)
++        clock.seconds = 0.101
++        assert target.tick() is BufferState.ABSTAINED
++
++    class Slow(Screener):
++        def screen(self, request):
++            clock.seconds += 0.2
++            return super().screen(request)
++
++    with buffer(
++        screener=Slow(), clock=clock, trailing_segments=0, max_latency_ms=100
++    ) as target:
++        finalized(target, text=PRIVATE)
++        assert (
++            target.release_ready() == () and target.reason is HoldReason.LATENCY_LIMIT
++        )
++
++
++@pytest.mark.parametrize(
++    "limits,second_text",
++    [
++        ({"max_segments": 1, "trailing_segments": 0}, "next"),
++        ({"max_chars": len(PRIVATE)}, "next"),
++    ],
++)
++def test_overflow_discards_every_pending_segment(limits, second_text):
++    with buffer(**limits) as target:
++        target.append(FIRST, PRIVATE)
++        assert not target.append(SECOND, second_text)
++        assert target.reason is HoldReason.BUFFER_LIMIT
++        assert json.loads(target.to_json())["pending"] == []
++        with pytest.raises(WithholdingError):
++            target.release_ready()
++
++
++def test_operation_limit_and_invalid_clock_fail_closed():
++    with buffer(max_operations=1) as target:
++        target.append(FIRST, PRIVATE)
++        assert target.tick() is BufferState.ABSTAINED
++        assert target.reason is HoldReason.OPERATION_LIMIT
++    clock = Clock()
++    with buffer(clock=clock) as target:
++        target.append(FIRST, PRIVATE)
++        clock.seconds = -0.1
++        assert target.tick() is BufferState.ABSTAINED
++        assert target.reason is HoldReason.CLOCK_INVALID
++
++
++def test_overlapping_redactions_merge_and_offsets_cover_released_text():
++    class Overlap(Screener):
++        def screen(self, request):
++            result = super().screen(request)
++            return replace(
++                result,
++                decisions=(
++                    replace(
++                        result.decisions[0],
++                        redactions=(PhiRedactionSpan(1, 4), PhiRedactionSpan(3, 6)),
++                    ),
++                ),
++            )
++
++    with buffer(screener=Overlap(), trailing_segments=0) as target:
++        finalized(target, text="abcdefgh")
++        result = target.release_ready()[0]
++        assert result.text == "a[REDACTED]gh"
++        assert [
++            (m.source_start, m.source_end, m.redacted) for m in result.mappings
++        ] == [(0, 1, False), (1, 6, True), (6, 8, False)]
++        assert result.mappings[-1].output_end == len(result.text)
++
++
++def test_context_exit_drops_pending_text_and_ended_segments_cannot_be_revised():
++    with buffer() as target:
++        finalized(target, text=PRIVATE)
++        with pytest.raises(ValueError):
++            target.edit(
++                FIRST, RevisionKind.DELETE, 0, len(PRIVATE), expected_revision=1
++            )
++    assert target.state is BufferState.CLOSED
++    assert json.loads(target.to_json())["pending"] == []
++
++
++def test_deterministic_replay_and_no_network_or_plaintext_in_reports(
++    monkeypatch, caplog
++):
++    def deny(*args, **kwargs):
++        pytest.fail("unexpected network")
++
++    monkeypatch.setattr(socket, "socket", deny)
++    outputs = []
++    for _ in range(2):
++        with buffer(trailing_segments=0) as target:
++            finalized(target, text=PRIVATE + " has no allergy")
++            result = target.finish()[0]
++            assert result.text == "[REDACTED] has no allergy"
++            outputs.append((result.to_dict(), target.to_json()))
++            assert (
++                PRIVATE
++                not in repr(result)
++                + json.dumps(result.to_dict())
++                + target.to_json()
++                + caplog.text
++            )
++    assert outputs[0] == outputs[1]
++
++
++def test_remote_detector_declaration_is_rejected_before_receiving_text():
++    class Remote(Screener):
++        @property
++        def declaration(self):
++            return PhiScreenDeclaration(artifact_digest="a" * 64, requires_network=True)
++
++    with pytest.raises(WithholdingError, match="^invalid speech withholding contract$"):
++        buffer(screener=Remote())
++
++
++def test_expiry_during_redaction_discards_the_entire_prepared_release(monkeypatch):
++    import openmed.multimodal.streaming.privacy.withholding_buffer as implementation
++
++    clock = Clock()
++    original = implementation._redact
++
++    def advance_while_rendering(*args):
++        result = original(*args)
++        clock.seconds += 0.2
++        return result
++
++    monkeypatch.setattr(implementation, "_redact", advance_while_rendering)
++    with buffer(clock=clock, trailing_segments=0, max_latency_ms=100) as target:
++        finalized(target, text=PRIVATE)
++        assert target.release_ready() == ()
++        report = json.loads(target.to_json())
++        assert report["released"] == 0 and report["discarded"] == 1
++        assert target.reason is HoldReason.LATENCY_LIMIT
++
++
++def test_stale_edit_cannot_clear_current_text_by_claiming_an_overflow():
++    with buffer(max_chars=30, trailing_segments=0) as target:
++        target.append(FIRST, "no allergy")
++        target.edit(FIRST, RevisionKind.INSERT, 0, 0, "has ", expected_revision=0)
++        with pytest.raises(WithholdingError):
++            target.edit(FIRST, RevisionKind.INSERT, 0, 0, "x" * 40, expected_revision=0)
++        assert (
++            target.state is BufferState.OPEN and target.lineage(FIRST)["revision"] == 1
++        )
++        target.finalize(FIRST, expected_revision=1)
++        assert target.finish()[0].text == "has no allergy"

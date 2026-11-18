@@ -1,0 +1,268 @@
+diff --git a/packages/definitions/src/fhir/r4/fhir.schema.json b/packages/definitions/src/fhir/r4/fhir.schema.json
+index d9ee9a3c383..0158c465466 100644
+--- a/packages/definitions/src/fhir/r4/fhir.schema.json
++++ b/packages/definitions/src/fhir/r4/fhir.schema.json
+@@ -65327,6 +65327,10 @@
+           "description": "Optional hash of the SMART Health Link passcode.",
+           "$ref": "#/definitions/string"
+         },
++        "passcodeFailures": {
++          "description": "Number of incorrect passcodes submitted for the SMART Health Link.",
++          "$ref": "#/definitions/integer"
++        },
+         "file": {
+           "description": "Encrypted file available from the SMART Health Link.",
+           "items": {
+diff --git a/packages/definitions/src/fhir/r4/profiles-medplum.json b/packages/definitions/src/fhir/r4/profiles-medplum.json
+index 20004236fdd..9456a6f0b5c 100644
+--- a/packages/definitions/src/fhir/r4/profiles-medplum.json
++++ b/packages/definitions/src/fhir/r4/profiles-medplum.json
+@@ -5883,6 +5883,21 @@
+               "max" : "1"
+             }
+           },
++          {
++            "id" : "SmartHealthLink.passcodeFailures",
++            "path" : "SmartHealthLink.passcodeFailures",
++            "definition" : "Number of incorrect passcodes submitted for the SMART Health Link.",
++            "min" : 0,
++            "max" : "1",
++            "type" : [{
++              "code" : "integer"
++            }],
++            "base" : {
++              "path" : "SmartHealthLink.passcodeFailures",
++              "min" : 0,
++              "max" : "1"
++            }
++          },
+           {
+             "id" : "SmartHealthLink.file",
+             "path" : "SmartHealthLink.file",
+diff --git a/packages/fhirtypes/dist/SmartHealthLink.d.ts b/packages/fhirtypes/dist/SmartHealthLink.d.ts
+index be5362c48f0..b66422095a6 100644
+--- a/packages/fhirtypes/dist/SmartHealthLink.d.ts
++++ b/packages/fhirtypes/dist/SmartHealthLink.d.ts
+@@ -135,6 +135,11 @@ export interface SmartHealthLink {
+    */
+   passcodeHash?: string;
+ 
++  /**
++   * Number of incorrect passcodes submitted for the SMART Health Link.
++   */
++  passcodeFailures?: number;
++
+   /**
+    * Encrypted file available from the SMART Health Link.
+    */
+diff --git a/packages/server/src/fhir/operations/smarthealth.test.ts b/packages/server/src/fhir/operations/smarthealth.test.ts
+index 85ac2f101ca..85678d1acda 100644
+--- a/packages/server/src/fhir/operations/smarthealth.test.ts
++++ b/packages/server/src/fhir/operations/smarthealth.test.ts
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ import { badRequest, ContentType, generateId } from '@medplum/core';
+ import type { Binary, Bundle, Parameters, Patient, SmartHealthLink } from '@medplum/fhirtypes';
++import bcrypt from 'bcrypt';
+ import express from 'express';
+ import { base64url, CompactEncrypt, CompactSign, exportJWK, generateKeyPair } from 'jose';
+ import { deflateRawSync } from 'node:zlib';
+@@ -12,6 +13,7 @@ import { loadTestConfig } from '../../config/loader';
+ import type { KeyLike } from '../../oauth/keys';
+ import { createTestProject } from '../../test.setup';
+ import type { Repository } from '../repo';
++import { SMART_HEALTH_LINK_PASSCODE_ATTEMPT_LIMIT } from './smarthealthlinks';
+ 
+ const app = express();
+ let accessToken: string;
+@@ -220,6 +222,62 @@ describe('SMART Health operations', () => {
+     expect(getBooleanParameter(viewerResolveResponse.body, 'valid')).toBe(true);
+   });
+ 
++  test('Revokes a SMART Health Link after too many incorrect passcodes', async () => {
++    const patient = await createPatient();
++    const generateResponse = await request(app)
++      .post(`/fhir/R4/Patient/${patient.id}/$generate-smart-health-link`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .set('Content-Type', ContentType.JSON)
++      .send({ passcode: '1234' });
++    expect(generateResponse).toHaveStatus(200);
++    const manifestPath = new URL(getStringParameter(generateResponse.body, 'manifestUrl')).pathname;
++    const postManifest = (passcode: string): request.Test =>
++      request(app).post(manifestPath).set('Content-Type', ContentType.JSON).send({ passcode });
++
++    for (let remaining = SMART_HEALTH_LINK_PASSCODE_ATTEMPT_LIMIT - 1; remaining > 0; remaining--) {
++      const wrongResponse = await postManifest('0000');
++      expect(wrongResponse).toHaveStatus(401);
++      expect(wrongResponse.body.remainingAttempts).toBe(remaining);
++    }
++
++    // A correct passcode does not use up an attempt
++    expect(await postManifest('1234')).toHaveStatus(200);
++
++    const lastResponse = await postManifest('0000');
++    expect(lastResponse).toHaveStatus(401);
++    expect(lastResponse.body.remainingAttempts).toBe(0);
++    expect(await readGeneratedSmartHealthLink(manifestPath)).toMatchObject({ status: 'revoked' });
++
++    const correctResponse = await postManifest('1234');
++    expect(correctResponse).toHaveStatus(400);
++    expect(correctResponse.body.error).toContain('revoked');
++  });
++
++  test('Rejects a correct passcode when the link is revoked during the check', async () => {
++    const patient = await createPatient();
++    const generateResponse = await request(app)
++      .post(`/fhir/R4/Patient/${patient.id}/$generate-smart-health-link`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .set('Content-Type', ContentType.JSON)
++      .send({ passcode: '1234' });
++    expect(generateResponse).toHaveStatus(200);
++    const manifestPath = new URL(getStringParameter(generateResponse.body, 'manifestUrl')).pathname;
++    const smartHealthLink = await readGeneratedSmartHealthLink(manifestPath);
++
++    // Stands in for concurrent incorrect guesses revoking the link while this one is checked
++    const compareSpy = vi.spyOn(bcrypt, 'compare').mockImplementationOnce(async () => {
++      await repo.updateResource<SmartHealthLink>({ ...smartHealthLink, status: 'revoked' });
++      return true;
++    });
++    const response = await request(app)
++      .post(manifestPath)
++      .set('Content-Type', ContentType.JSON)
++      .send({ passcode: '1234' });
++    compareSpy.mockRestore();
++    expect(response).toHaveStatus(400);
++    expect(response.body.error).toContain('revoked');
++  });
++
+   test('Rejects invalid SMART Health Links', async () => {
+     const patient = await createPatient();
+     const passcodeResponse = await request(app)
+@@ -235,7 +293,7 @@ describe('SMART Health operations', () => {
+       .post(manifestUrl.pathname)
+       .set('Content-Type', ContentType.JSON)
+       .send({ recipient: 'Test Recipient' });
+-    expect(missingPasscodeManifestResponse).toHaveStatus(400);
++    expect(missingPasscodeManifestResponse).toHaveStatus(401);
+     expect(missingPasscodeManifestResponse.body.error).toContain('passcode');
+ 
+     const wrongPasscodeResolveResponse = await request(app)
+diff --git a/packages/server/src/fhir/operations/smarthealthlinks.ts b/packages/server/src/fhir/operations/smarthealthlinks.ts
+index e030c8c2eb2..bc2195a7bf1 100644
+--- a/packages/server/src/fhir/operations/smarthealthlinks.ts
++++ b/packages/server/src/fhir/operations/smarthealthlinks.ts
+@@ -5,6 +5,7 @@ import type {
+   ResolveSmartHealthLinkParams,
+   SmartHealthLinkManifestFile,
+   SmartHealthLinkPayload,
++  WithId,
+ } from '@medplum/core';
+ import {
+   allOk,
+@@ -47,6 +48,14 @@ import { buildOutputParameters, parseInputParameters } from './utils/parameters'
+ const EXTERNAL_SMART_HEALTH_LINK_FETCH_TIMEOUT_MS = 5000;
+ const MAX_EXTERNAL_SMART_HEALTH_LINK_PAYLOAD_BYTES = 10 * 1024 * 1024;
+ 
++// The SHL spec requires a lifetime limit on incorrect passcodes; reaching it revokes the link
++export const SMART_HEALTH_LINK_PASSCODE_ATTEMPT_LIMIT = 10;
++
++interface SmartHealthLinkValidationError {
++  error: string;
++  remainingAttempts?: number;
++}
++
+ interface ResolvedSmartHealthLink {
+   manifest?: Record<string, unknown>;
+   fhirResources: Resource[];
+@@ -246,7 +255,8 @@ export async function smartHealthLinkManifestHandler(req: ExpressRequest, res: E
+   const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode : undefined;
+   const outcome = await validateSmartHealthLink(smartHealthLink, passcode);
+   if (outcome) {
+-    res.status(400).json({ error: outcome });
++    // The SHL spec requires 401 with the remaining attempts for an incorrect passcode
++    res.status(outcome.remainingAttempts === undefined ? 400 : 401).json(outcome);
+     return;
+   }
+   res
+@@ -269,7 +279,7 @@ export async function smartHealthLinkPayloadHandler(req: ExpressRequest, res: Ex
+   }
+   const outcome = await validateSmartHealthLink(smartHealthLink);
+   if (outcome) {
+-    res.status(400).json({ error: outcome });
++    res.status(400).json(outcome);
+     return;
+   }
+   const encrypted = await readSmartHealthLinkEncryptedFile(smartHealthLink);
+@@ -293,7 +303,7 @@ async function resolveGeneratedSmartHealthLink(
+   }
+   const outcome = await validateSmartHealthLink(smartHealthLink, passcode);
+   if (outcome) {
+-    throw new Error(outcome);
++    throw new Error(outcome.error);
+   }
+   if (smartHealthLink.mode === 'direct' && !recipient) {
+     throw new Error('Expected recipient parameter');
+@@ -427,24 +437,55 @@ async function buildSmartHealthLinkManifest(
+ }
+ 
+ async function validateSmartHealthLink(
+-  smartHealthLink: SmartHealthLink,
++  smartHealthLink: WithId<SmartHealthLink>,
+   passcode?: string
+-): Promise<string | undefined> {
++): Promise<SmartHealthLinkValidationError | undefined> {
+   if (smartHealthLink.status !== 'active') {
+-    return 'SMART Health Link has been revoked';
++    return { error: 'SMART Health Link has been revoked' };
+   }
+   if (smartHealthLink.expiresAt !== undefined && new Date(smartHealthLink.expiresAt).getTime() <= Date.now()) {
+-    return 'SMART Health Link has expired';
++    return { error: 'SMART Health Link has expired' };
+   }
+   if (smartHealthLink.flag?.includes('P')) {
+-    if (!passcode || !smartHealthLink.passcodeHash || !(await bcrypt.compare(passcode, smartHealthLink.passcodeHash))) {
+-      return 'Invalid SMART Health Link passcode';
+-    }
++    return checkSmartHealthLinkPasscode(smartHealthLink, passcode);
+   }
+   return undefined;
+ }
+ 
+-async function readSmartHealthLink(id: string | undefined): Promise<SmartHealthLink | undefined> {
++async function checkSmartHealthLinkPasscode(
++  smartHealthLink: WithId<SmartHealthLink>,
++  passcode: string | undefined
++): Promise<SmartHealthLinkValidationError | undefined> {
++  if (passcode && smartHealthLink.passcodeHash && (await bcrypt.compare(passcode, smartHealthLink.passcodeHash))) {
++    // Concurrent guesses all pass the status check before any failure is recorded,
++    // so a correct guess must not be honored if those failures have since revoked the link
++    const current = await readSmartHealthLink(smartHealthLink.id);
++    return current?.status === 'active' ? undefined : { error: 'SMART Health Link has been revoked' };
++  }
++  const failures = await recordSmartHealthLinkPasscodeFailure(smartHealthLink.id);
++  return {
++    error: 'Invalid SMART Health Link passcode',
++    remainingAttempts: Math.max(SMART_HEALTH_LINK_PASSCODE_ATTEMPT_LIMIT - failures, 0),
++  };
++}
++
++async function recordSmartHealthLinkPasscodeFailure(id: string): Promise<number> {
++  return getGlobalSystemRepo().withTransaction(
++    async (txRepo) => {
++      const smartHealthLink = await txRepo.readResource<SmartHealthLink>('SmartHealthLink', id);
++      const failures = (smartHealthLink.passcodeFailures ?? 0) + 1;
++      await txRepo.updateResource<SmartHealthLink>({
++        ...smartHealthLink,
++        passcodeFailures: failures,
++        status: failures >= SMART_HEALTH_LINK_PASSCODE_ATTEMPT_LIMIT ? 'revoked' : smartHealthLink.status,
++      });
++      return failures;
++    },
++    { resourceTypes: ['SmartHealthLink'], source: 'recordSmartHealthLinkPasscodeFailure' }
++  );
++}
++
++async function readSmartHealthLink(id: string | undefined): Promise<WithId<SmartHealthLink> | undefined> {
+   if (!id) {
+     return undefined;
+   }

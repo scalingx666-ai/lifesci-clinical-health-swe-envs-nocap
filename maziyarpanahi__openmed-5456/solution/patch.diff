@@ -1,0 +1,3745 @@
+diff --git a/docs/api/compatibility-gate.md b/docs/api/compatibility-gate.md
+index 2905473181..6999d6330e 100644
+--- a/docs/api/compatibility-gate.md
++++ b/docs/api/compatibility-gate.md
+@@ -26,9 +26,10 @@ The service error envelope currently exposes these stable categories:
+ `auth_rate_limited`, `authentication_required`, `backpressure`, `bad_request`,
+ `budget_exceeded`, `capability_error`, `circuit_breaker_open`,
+ `configuration_error`, `forbidden`, `grounding_invalid_request`,
+-`inference_error`, `input_error`, `internal_error`, `invalid_credentials`,
+-`missing_extra`, `model_load_error`, `not_ready`,
+-`offline_snapshot_unavailable`, `openmed_error`, `policy_error`,
++`incompatible_state`, `inference_error`, `input_error`, `internal_error`,
++`invalid_credentials`, `missing_extra`, `model_load_error`, `not_ready`,
++`offline_snapshot_unavailable`, `openmed_error`, `peer_contract_malformed`,
++`peer_incompatible`, `policy_error`,
+ `privacy_gateway_blocked`, `privacy_gateway_error`,
+ `privacy_gateway_not_configured`, `privacy_gateway_reidentification_error`,
+ `privacy_gateway_transport_error`, `rate_limited`,
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index f5c9c57cea..9b9599204c 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -225,6 +225,7 @@ classification:
+     - deploy/helm.md
+     - deploy/autoscaling.md
+     - deploy/operator.md
++    - deploy/upgrades.md
+     - deploy/openhim-mediator.md
+     - deploy/africa-reference-deployment.md
+     - deploy/multi-arch.md
+diff --git a/docs/deploy/upgrades.md b/docs/deploy/upgrades.md
+new file mode 100644
+index 0000000000..dfa69bbbc4
+--- /dev/null
++++ b/docs/deploy/upgrades.md
+@@ -0,0 +1,295 @@
++# Zero-Downtime Upgrades
++
++A rolling upgrade runs an old and a new OpenMed service build side by side
++while they share the async job store, the Journey store, webhook deliveries
++and peer traffic. This page defines which builds may coexist (the
++compatibility window), how each build proves it before it touches shared
++state, and the exact order, hold points, abort conditions and recovery path
++for an upgrade or a rollback.
++
++The contract lives in `openmed/service/compatibility.py`. Everything it
++publishes is value-free: generation numbers, schema versions, capability
++tokens, SHA-256 digests and controlled reason codes. It never contains
++hostnames, paths, configuration values, request bodies, identifiers or
++exception text. Partial or unknown compatibility is always a blocking state.
++
++## What each build publishes
++
++Every build declares one **contract generation** and a window of at most one
++prior generation (N and N-1):
++
++| Field | Meaning |
++| --- | --- |
++| `contract_generation` | Monotonic generation of this build's wire contracts, durable schemas and capabilities. |
++| `min_peer_generation` | Oldest peer generation this build shares state and traffic with: its own generation or the one before. |
++| `durable_schemas` | Per durable component, the persisted versions the build operates on (`read`) and the version it writes (`write`). |
++| `capabilities` | Worker capability tokens, such as `jobs.deidentify.v1`. |
++| `model_generations` | SHA-256 digests of the model generations the node serves. |
++| `peer_contract` | Compact `<generation>/<min_peer_generation>` token peers send on requests. |
++| `descriptor_digest` | Canonical SHA-256 digest of the descriptor, for rollout evidence. |
++
++The current build declares generation `1`:
++
++| Component | Read | Write | Source |
++| --- | --- | --- | --- |
++| `jobs` | 1-1 | 1 | Async job metadata store (`OPENMED_SERVICE_JOBS_STORE_PATH`). The unversioned layout written before this contract existed is version 1. |
++| `journey_local` | 3-3 | 3 | SQLite Journey store migration chain. |
++| `journey_postgres` | 3-3 | 3 | PostgreSQL Journey store migration chain. |
++
++Both Journey stores migrate older schemas forward when they open, so a build
++only operates on their latest version. A unit test fails when a store
++migration is added without updating this table.
++
++Read the descriptor of a running replica:
++
++```bash
++curl -s -H "X-API-Key: $OPENMED_COMPATIBILITY_KEY" \
++  http://127.0.0.1:8080/v1/compatibility
++```
++
++`GET /v1/compatibility` requires the `compatibility:read` scope when
++authentication is enabled and is excluded from the generated OpenAPI schema,
++like `/metrics`. Besides the descriptor it reports the persisted-state check
++(`state` is `compatible` or `blocked`, with one entry per probed component)
++and `admission` (`open`, or `draining` once shutdown has begun).
++
++Read the descriptor or the pairwise matrix of an image without starting it:
++
++```bash
++python -m openmed.service.compatibility descriptor
++python -m openmed.service.compatibility matrix
++```
++
++## Compatibility window rules
++
++1. **The newer build decides.** Two builds are compatible when the newer
++   build's `min_peer_generation` is at most the older build's generation.
++   An older build never guesses about a newer one; it trusts the window the
++   newer build declares.
++2. **Each build reads what the other writes.** For every durable component
++   both builds use, each build's `write` version must lie inside the other's
++   `read` range.
++3. **Expand, then contract.** A release may only start *writing* a schema
++   version that its predecessor already *reads*. Ship read support in
++   generation N (expand), and start writing the new version in N+1
++   (contract), which drops N-1 from its window.
++4. **Accepted work keeps its contract.** Every job record carries a
++   `compatibility` envelope with the admitting build's generation and window,
++   the schema versions it was persisted with, the capabilities a claimant
++   needs and the pinned model generation. A worker checks the envelope before
++   it marks the job running, so a node that cannot handle the work refuses it
++   before mutation and leaves it for a compatible worker.
++5. **Unknown blocks.** A damaged, unreadable or undeclared component, a peer
++   descriptor this build does not understand, and a job without a valid
++   envelope are refusals, never assumed successes.
++
++## Readiness and refusals
++
++- The REST service's `/readyz` returns `200` only when preload has finished
++  **and** every shared store it uses (today the async job store) is
++  compatible or empty. Otherwise it returns `503` with `error.code`
++  `incompatible_state` and value-free details:
++
++  ```json
++  {"components": {"jobs": {"state": "incompatible", "reason": "schema_ahead_of_window"}}}
++  ```
++
++  The check re-probes the shared stores at most every five seconds, so a
++  replica notices when a peer migrates shared state underneath it.
++- The Journey worker's `/readyz` already reports its store as `incompatible`
++  (`schema_unsupported`) when the persisted schema is newer than the build.
++  Probe an opened Journey store with `journey_store_observation()` to get the
++  same per-component decision as the REST gate.
++- A job store written outside the window is never loaded or overwritten. Job
++  routes return `503` `incompatible_state`, and the store re-checks the file
++  before every write in case another process replaced it.
++- Peers announce themselves with `X-OpenMed-Peer-Contract: <generation>/<min>`
++  on REST, or the `x-openmed-peer-contract` gRPC metadata key. An announced
++  peer outside the window is refused before parsing, loading or processing:
++  REST returns `409` `peer_incompatible` (details carry the reason and this
++  build's `peer_contract`), gRPC aborts with `FAILED_PRECONDITION` and the
++  reason code. A malformed or repeated token returns `400`
++  `peer_contract_malformed` or gRPC `INVALID_ARGUMENT`. Probes and
++  `/v1/compatibility` are never refused, so peers can always read why.
++- Requests without the header are ordinary clients and are not affected.
++
++| Reason code | Where | Meaning |
++| --- | --- | --- |
++| `peer_compatible` | handshake | The peer may run beside this build. |
++| `peer_generation_outside_window` | handshake | The newer build does not declare the older one. |
++| `peer_schema_outside_window` | handshake | A shared component is written in a version the other build cannot read. |
++| `peer_descriptor_unsupported` | handshake | The peer descriptor is not one this build understands. |
++| `peer_contract_malformed` | handshake | The peer contract token is missing, repeated or invalid. |
++| `work_compatible` | claim | This worker may claim the work. |
++| `work_generation_outside_window` | claim | The work was admitted by a build outside the window. |
++| `work_schema_outside_window` | claim | The work was persisted in a schema version this build cannot read. |
++| `work_component_unknown` | claim | The work references a durable component this build does not declare. |
++| `capability_missing` | claim | The work needs a capability this worker lacks. |
++| `model_generation_unavailable` | claim | The work is pinned to a model generation this node does not serve. |
++| `work_envelope_invalid` | claim | The work carries no valid envelope. |
++| `schema_compatible` / `schema_absent` | readiness | The component is usable or empty. |
++| `schema_migration_required` | readiness | Persisted state is older than this build operates on; run the migration first. |
++| `schema_ahead_of_window` | readiness, rollback | Persisted state was written by a newer build outside the window. |
++| `schema_unknown` | readiness | The component could not be read or is not declared. |
++| `rollback_within_window` | rollback | Returning to the target build is safe. |
++
++## Rolling upgrade order
++
++Use a surge rollout that never removes a ready replica before its replacement
++is ready: `maxUnavailable: 0` and `maxSurge: 1` in the
++[model operator](operator.md) `rolloutStrategy`, or the equivalent Deployment
++strategy. Keep `terminationGracePeriodSeconds` above
++`OPENMED_SERVICE_SHUTDOWN_DRAIN_SECONDS` (see [Helm](helm.md)).
++
++**Hold point 0: preflight.**
++
++1. Print the target image's descriptor and check it against a running
++   replica's descriptor:
++
++   ```python
++   import json
++   import urllib.request
++
++   from openmed.service.compatibility import CURRENT_CONTRACT, negotiate_peer
++
++   request = urllib.request.Request(
++       "http://127.0.0.1:8080/v1/compatibility",
++       headers={"X-API-Key": "<operator key with compatibility:read>"},
++   )
++   with urllib.request.urlopen(request, timeout=5) as response:
++       running = json.load(response)
++   peer = {key: running[key] for key in CURRENT_CONTRACT.to_dict()}
++   print(negotiate_peer(CURRENT_CONTRACT, peer).to_dict())
++   ```
++
++   Run it with the *target* image. Continue only on `peer_compatible`.
++2. Confirm every replica reports `state: compatible` and `/readyz` `200`.
++3. Take a verified backup of the job store and Journey store. It is the only
++   recovery path once a contract step has written a newer schema.
++
++**Steps.**
++
++1. Surge one replica of the new build. **Hold** until its `/readyz` returns
++   `200` and its `/v1/compatibility` reports `compatible`.
++2. Drain one old replica. Readiness drops first, then admission closes, and
++   in-flight requests, streams and jobs finish or checkpoint within the drain
++   budget. A checkpointed job keeps its envelope and is resumed by any
++   compatible worker.
++3. Repeat steps 1 and 2 until no old replica remains. **Hold** at the end
++   until every replica reports the new generation.
++4. Run Journey migrations only when the previous generation reads the target
++   schema. Because the Journey stores migrate forward on open, a migration to
++   a version the old generation cannot read is a contract step: start it only
++   after step 3, never while an older replica is running.
++
++**Abort conditions.** Stop the rollout and hold the current replica set if
++any of these appear:
++
++- a replica returns `503` `incompatible_state`, or `/v1/compatibility`
++  reports `state: blocked`;
++- a peer handshake returns `peer_incompatible` or `peer_contract_malformed`;
++- job claims are refused with `work_*`, `capability_missing` or
++  `model_generation_unavailable` and no compatible worker remains to take
++  them;
++- the number of ready replicas drops below the desired count minus one.
++
++## Rollback
++
++**Inside the window.** Before rolling back, confirm the target build still
++reads the persisted state and accepts every build that will run beside it:
++
++```python
++from openmed.service.compatibility import (
++    CompatibilityDescriptor,
++    SchemaObservation,
++    rollback_decision,
++)
++
++target = CompatibilityDescriptor.from_dict(target_descriptor)
++running = [CompatibilityDescriptor.from_dict(item) for item in running_descriptors]
++observations = {
++    name: SchemaObservation.at(item["schema_version"])
++    for name, item in running_snapshot["components"].items()
++    if "schema_version" in item
++}
++print(rollback_decision(target, running=running, observations=observations))
++```
++
++Continue only on `rollback_within_window`, then use the same surge-and-drain
++order in reverse. Jobs admitted by the newer build that need a capability the
++older build lacks stay queued and untouched; they complete after the next
++roll-forward. Nothing is lost or re-run because every claim takes a fresh
++lease and webhook deliveries keep a generation-independent identity.
++
++**Outside the window.** If the newer build has already written a schema the
++target cannot read, the target reports `schema_ahead_of_window`, never becomes
++ready and refuses to mutate shared state. The model operator's automatic
++rollback therefore stalls safely instead of corrupting newer state. Do not
++force it:
++
++1. Keep the newer build serving, or stop admission entirely.
++2. Restore the backup taken at hold point 0 into a fresh store.
++3. Start the older build against the restored store and verify `/readyz` and
++   `/v1/compatibility` before routing traffic to it.
++4. Keep the newer state untouched for roll-forward or investigation.
++
++## Integration points
++
++These pieces are delivered separately; the contract is designed for them to
++plug in without changing its decisions.
++
++- **Drain coordinator (#3576).** Register the compatibility surfaces as drain
++  participants with `register_drain_participant(app, participant)`. Its
++  stop-admission phase should be reflected in `/v1/compatibility`
++  `admission`, which today follows the service's shutting-down flag, and the
++  job participant must checkpoint leases with the record's `compatibility`
++  envelope unchanged.
++- **Durable-schema registry and migration rehearsal (#3578).** Replace the
++  static `DURABLE_SCHEMAS` table with ranges derived from the registry, and
++  have the rehearsal evaluate `evaluate_persisted_state()` for every
++  generation in `CONTRACT_HISTORY` against the rehearsed version. The drift
++  test that pins the table to the store migration chains then moves to the
++  registry.
++- **Durable jobs with leases (#3574).** Call
++  `check_work(local_descriptor(runtime), record["compatibility"])` before
++  taking a lease, replaying a checkpoint or delivering a webhook. Keep
++  idempotency keys, fencing tokens and webhook delivery identities
++  independent of the generation that created them.
++- **Backup and restore (#3577).** The restore step above relies on it for any
++  rollback outside the window.
++
++## Evidence
++
++`tests/integration/test_mixed_version_upgrade.py` runs offline, in process,
++with versioned fakes of the job store and Journey store. It treats the shipped
++generation as N-1 and adds a synthetic expand generation and a synthetic
++contract generation, then exercises:
++
++- every supported old/new API and worker combination, in both directions,
++  for request, stream, job, callback, store and model-generation workflows,
++  with no lost or duplicate committed effects;
++- a rolling upgrade that keeps a ready replica at every step while drained
++  replicas stop admission and checkpoint in-flight jobs;
++- lease fencing, idempotency keys and webhook replay across a mixed-version
++  handoff;
++- capability and model-generation refusals before claim;
++- a rollback inside the window followed by a roll-forward, and a rollback
++  outside the window that is refused until a backup is restored, with the
++  newer state left byte-identical.
++
++The machine-readable matrix comes from `compatibility_matrix()`, and each
++scenario records `RolloutEvidence` with generations, descriptor digests,
++decisions, reason codes and counts only. A test fails if the published matrix
++lists a supported combination the harness does not run.
++
++## Adding a generation
++
++1. Bump `CONTRACT_GENERATION`, set `MIN_PEER_GENERATION` to the previous
++   generation, and keep the previous contract as a literal in
++   `CONTRACT_HISTORY` (at most two entries).
++2. In an expand generation, widen `read` ranges and add capabilities, but
++   keep every `write` version readable by the previous generation.
++3. In the following contract generation, raise `write`, and set
++   `MIN_PEER_GENERATION` to the expand generation.
++4. Run the compatibility unit tests and the mixed-version harness, and update
++   the harness's synthetic generations if the new contract changes shape.
+diff --git a/docs/rest-service.md b/docs/rest-service.md
+index 6b1c56d8ae..070b423a63 100644
+--- a/docs/rest-service.md
++++ b/docs/rest-service.md
+@@ -37,6 +37,9 @@ truth for exact request and response schemas. Its current public operations are:
+ 
+ The opt-in `GET /metrics` route is intentionally excluded from the generated
+ schema and returns `404` unless metrics are enabled.
++The operator `/v1/compatibility` route is also excluded from the generated
++schema; it publishes the value-free upgrade contract described in
++[Zero-Downtime Upgrades](deploy/upgrades.md).
+ 
+ The service includes stricter request validation, shared model/pipeline reuse,
+ optional startup preload, bounded warm-pool residency, model keep-alive
+@@ -823,6 +826,10 @@ Readiness response after startup preload completes:
+ 
+ Before startup readiness, `/readyz` returns `503` with `error.code` set to
+ `not_ready`.
++When persisted shared state is outside this build's compatibility window,
++`/readyz` returns `503` with `error.code` set to `incompatible_state` and
++value-free per-component reasons; see
++[Zero-Downtime Upgrades](deploy/upgrades.md).
+ 
+ ### `GET /models/loaded`
+ 
+diff --git a/docs/serving/authentication.md b/docs/serving/authentication.md
+index 8da2e069d8..6fc2c96156 100644
+--- a/docs/serving/authentication.md
++++ b/docs/serving/authentication.md
+@@ -69,6 +69,7 @@ When authentication is enabled, the current built-in route scopes are:
+ | `POST /profile` | `profile:write` |
+ | `POST /cohort/resolve` | `cohort:read` |
+ | `GET /v1/journey/resources` | `journey:read` |
++| `GET /v1/compatibility` | `compatibility:read` |
+ | `POST /v1/decisions` | `decisions:write` |
+ | `POST /v1/systemone` | `decisions:write` and `pii:write` |
+ | `POST /brief` / `POST /ground` | `brief:write` / `ground:write` |
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 0e993a2fdb..4e32e7f87f 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -154,6 +154,7 @@ nav:
+       - Helm Deployment: deploy/helm.md
+       - Kubernetes Autoscaling: deploy/autoscaling.md
+       - Kubernetes Model Operator: deploy/operator.md
++      - Zero-Downtime Upgrades: deploy/upgrades.md
+       - OpenHIM De-identification Mediator: deploy/openhim-mediator.md
+       - African Facility-to-HMIS Reference: deploy/africa-reference-deployment.md
+       - Multi-Arch Containers: deploy/multi-arch.md
+diff --git a/openmed/service/api_compatibility.py b/openmed/service/api_compatibility.py
+index f473d61c97..0c9a7f7cbf 100644
+--- a/openmed/service/api_compatibility.py
++++ b/openmed/service/api_compatibility.py
+@@ -41,6 +41,7 @@
+     "circuit_breaker_open",
+     "forbidden",
+     "grounding_invalid_request",
++    "incompatible_state",
+     "inbound_duplicate_mapping",
+     "inbound_duplicate_placeholder",
+     "inbound_duplicate_response_key",
+@@ -56,6 +57,8 @@
+     "not_ready",
+     "offline_snapshot_unavailable",
+     "payload_too_large",
++    "peer_contract_malformed",
++    "peer_incompatible",
+     "outbound_privacy_error",
+     "outbound_redaction_failed",
+     "outbound_redactor_required",
+diff --git a/openmed/service/app.py b/openmed/service/app.py
+index 603bc6e9b9..75584f7539 100644
+--- a/openmed/service/app.py
++++ b/openmed/service/app.py
+@@ -50,6 +50,7 @@
+     ServiceAuth,
+     parse_service_auth_config,
+     request_needs_admission,
++    route_key_for_request,
+     validate_route_policies,
+ )
+ from .batcher import (
+@@ -66,6 +67,17 @@
+     FHIRBulkJobManager,
+ )
+ from .coalesce import RequestCoalescer, coalescing_key
++from .compatibility import (
++    CURRENT_CONTRACT,
++    JOB_STORE_COMPONENT,
++    PEER_CONTRACT_HEADER,
++    CompatibilityGate,
++    IncompatibleStateError,
++    SchemaObservation,
++    job_store_observation,
++    local_descriptor,
++    peer_contract_decision,
++)
+ from .governed_workflows import WorkflowGovernanceService, WorkflowHTTPPolicy
+ from .jobs import DeidentifyJobQueue, job_response_payload
+ from .journey_resources import (
+@@ -175,6 +187,7 @@
+ _MANIFEST_HEADER = "X-OpenMed-Manifest"
+ _MAX_MANIFEST_HEADER_BYTES = 8192
+ _SYSTEM_ONE_PATH = "/v1/systemone"
++_COMPATIBILITY_PATH = "/v1/compatibility"
+ _MODEL_BACKED_PATHS = frozenset(
+     path
+     for (_, path), policy in ROUTE_POLICIES.items()
+@@ -759,6 +772,74 @@ def _get_journey_resource_catalog(request: Request) -> JourneyResourceCatalog:
+     return catalog
+ 
+ 
++def _create_compatibility_gate(
++    app: FastAPI, runtime: ServiceRuntime
++) -> CompatibilityGate:
++    """Gate readiness on the persisted state this process shares with peers."""
++
++    def job_store_probe() -> SchemaObservation:
++        queue = getattr(app.state, "job_queue", None)
++        if queue is None:
++            return SchemaObservation.absent()
++        return job_store_observation(queue.store.path)
++
++    return CompatibilityGate(
++        local_descriptor(runtime),
++        {JOB_STORE_COMPONENT: job_store_probe},
++    )
++
++
++def _get_compatibility_gate(request: Request) -> CompatibilityGate:
++    gate = getattr(request.app.state, "compatibility", None)
++    if gate is None:
++        gate = _create_compatibility_gate(request.app, _get_service_runtime(request))
++        request.app.state.compatibility = gate
++    return gate
++
++
++def _incompatible_state_response(blocking: Mapping[str, Any]) -> JSONResponse:
++    return _error_response(
++        503,
++        "incompatible_state",
++        "Persisted state is outside this build's compatibility window",
++        details={
++            "components": {
++                name: {"state": item.state.value, "reason": item.code}
++                for name, item in sorted(blocking.items())
++            }
++        },
++    )
++
++
++def _peer_contract_rejection(request: Request) -> Optional[JSONResponse]:
++    """Refuse an announced peer outside the window before any processing."""
++    values = request.headers.getlist(PEER_CONTRACT_HEADER)
++    if not values or request.url.path == _COMPATIBILITY_PATH:
++        return None
++    policy = ROUTE_POLICIES.get(route_key_for_request(request))
++    if policy is None or policy.admission == "probe":
++        return None
++    decision = peer_contract_decision(CURRENT_CONTRACT, values)
++    if decision.compatible:
++        return None
++    if decision.code == "peer_contract_malformed":
++        return _error_response(
++            400,
++            "peer_contract_malformed",
++            "Peer contract header is malformed",
++            details=None,
++        )
++    return _error_response(
++        409,
++        "peer_incompatible",
++        "Peer build is outside this build's compatibility window",
++        details={
++            "reason": decision.code,
++            "peer_contract": CURRENT_CONTRACT.peer_contract,
++        },
++    )
++
++
+ async def _run_maybe_coalesced(
+     request: Request,
+     endpoint: str,
+@@ -866,6 +947,10 @@ async def lifespan(fastapi_app: FastAPI):
+             metrics=getattr(fastapi_app.state, "metrics", None)
+         )
+         _attach_runtime(fastapi_app, runtime)
++        fastapi_app.state.compatibility = _create_compatibility_gate(
++            fastapi_app, runtime
++        )
++        await run_in_threadpool(fastapi_app.state.compatibility.report, force=True)
+         if getattr(fastapi_app.state, "smart_backend_jobs", None) is None:
+             fastapi_app.state.smart_backend_jobs = SMARTBackendJobManager()
+         if getattr(fastapi_app.state, "fhir_bulk_jobs", None) is None:
+@@ -1048,6 +1133,9 @@ def reject(status: int, code: str) -> JSONResponse:
+ 
+     @app.middleware("http")
+     async def _readiness_middleware(request: Request, call_next):
++        peer_rejection = _peer_contract_rejection(request)
++        if peer_rejection is not None:
++            return peer_rejection
+         if request_needs_admission(request):
+             state = request.app.state
+             if getattr(state, "shutting_down", False):
+@@ -1155,6 +1243,18 @@ async def _timeout_handler(_: Request, exc: ServiceTimeoutError) -> JSONResponse
+             details={"timeout_seconds": exc.timeout_seconds},
+         )
+ 
++    @app.exception_handler(IncompatibleStateError)
++    async def _incompatible_state_handler(
++        _: Request,
++        exc: IncompatibleStateError,
++    ) -> JSONResponse:
++        return _error_response(
++            503,
++            "incompatible_state",
++            "Persisted state is outside this build's compatibility window",
++            details=exc.to_details(),
++        )
++
+     @app.exception_handler(BackpressureError)
+     async def _backpressure_handler(
+         _: Request,
+@@ -1309,14 +1409,31 @@ async def livez() -> Dict[str, str]:
+ 
+     @app.get("/readyz")
+     async def readyz(request: Request):
+-        if getattr(request.app.state, "ready", False):
+-            return {"status": "ready", "service": SERVICE_NAME}
+-        return _error_response(
+-            503,
+-            "not_ready",
+-            "Service preload has not completed",
+-            details=None,
+-        )
++        if not getattr(request.app.state, "ready", False):
++            return _error_response(
++                503,
++                "not_ready",
++                "Service preload has not completed",
++                details=None,
++            )
++        report = await run_in_threadpool(_get_compatibility_gate(request).report)
++        if not report.ready:
++            return _incompatible_state_response(report.blocking())
++        return {"status": "ready", "service": SERVICE_NAME}
++
++    @app.get(_COMPATIBILITY_PATH, include_in_schema=False)
++    async def compatibility(request: Request) -> Dict[str, Any]:
++        """Publish the value-free contract and persisted-state compatibility."""
++        snapshot = await run_in_threadpool(_get_compatibility_gate(request).snapshot)
++        return {
++            **snapshot,
++            "service": SERVICE_NAME,
++            "admission": (
++                "draining"
++                if getattr(request.app.state, "shutting_down", False)
++                else "open"
++            ),
++        }
+ 
+     @app.get(
+         "/v1/journey/resources",
+diff --git a/openmed/service/auth.py b/openmed/service/auth.py
+index c244343470..eb629cb497 100644
+--- a/openmed/service/auth.py
++++ b/openmed/service/auth.py
+@@ -75,6 +75,7 @@ class RoutePolicy:
+     ("POST", "/profile"): RoutePolicy(("profile:write",), "heavy"),
+     ("POST", "/cohort/resolve"): RoutePolicy(("cohort:read",), "heavy"),
+     ("GET", "/v1/journey/resources"): RoutePolicy(("journey:read",), "heavy"),
++    ("GET", "/v1/compatibility"): RoutePolicy(("compatibility:read",), "control"),
+     ("POST", "/v1/decisions"): RoutePolicy(("decisions:write",), "model"),
+     ("POST", "/v1/systemone"): RoutePolicy(("decisions:write", "pii:write"), "model"),
+     ("POST", "/brief"): RoutePolicy(("brief:write",), "model"),
+diff --git a/openmed/service/compatibility.py b/openmed/service/compatibility.py
+new file mode 100644
+index 0000000000..467090814b
+--- /dev/null
++++ b/openmed/service/compatibility.py
+@@ -0,0 +1,1271 @@
++"""Mixed-version compatibility contract for zero-downtime service upgrades.
++
++A rolling upgrade briefly runs two builds side by side. This module declares
++which builds may share durable state and traffic, and gives every surface one
++fail-closed decision to make *before* it processes or mutates anything:
++
++* :data:`CURRENT_CONTRACT` publishes this build's contract generation, the
++  oldest peer generation it shares state with, the schema range it reads and
++  the schema version it writes for every durable component, and its worker
++  capabilities.
++* :func:`negotiate_peer` and :func:`peer_contract_decision` decide whether a
++  peer build may run beside this one.
++* :func:`check_work` decides whether this node may claim one unit of persisted
++  work (a job record, checkpoint or webhook delivery) before mutating it.
++* :func:`evaluate_persisted_state` gates readiness on the schema versions of
++  the shared stores.
++* :func:`rollback_decision` says whether returning to an older build is still
++  inside the declared window.
++
++Compatibility rule (N/N-1). Generation numbers increase monotonically and each
++build declares a window of at most one prior generation. The newer of two
++builds owns the decision: two builds are compatible when the newer build's
++``min_peer_generation`` is at most the older build's generation and, for every
++durable component both use, each build reads the schema version the other
++writes. A release may therefore only start *writing* a schema version that its
++predecessor already *reads* (expand first, contract in the next generation).
++
++Every output is value-free: controlled lowercase tokens, integers and SHA-256
++digests. Hostnames, paths, payloads, identifiers, configuration values and
++exception text never enter a descriptor, decision, report or evidence record.
++Partial or unknown compatibility is always a blocking result.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import re
++import sys
++import threading
++import time
++from collections.abc import Callable, Iterable, Mapping, Sequence
++from dataclasses import dataclass, field, replace
++from enum import Enum
++from pathlib import Path
++from types import MappingProxyType
++from typing import Any
++
++COMPATIBILITY_SCHEMA_VERSION = "openmed.service.compatibility.v1"
++COMPATIBILITY_MATRIX_SCHEMA_VERSION = "openmed.service.compatibility-matrix.v1"
++ROLLOUT_EVIDENCE_SCHEMA_VERSION = "openmed.service.rollout-evidence.v1"
++
++#: Contract generation published by this build. Bump it whenever a wire
++#: contract, durable schema or worker capability changes in a way an older
++#: build cannot ignore, and declare the new window in :data:`CONTRACT_HISTORY`.
++CONTRACT_GENERATION = 1
++#: Oldest peer generation this build shares durable state and traffic with.
++MIN_PEER_GENERATION = 1
++#: Schema version of the async job metadata store written by this build. The
++#: unversioned layout written before this contract existed is version 1.
++JOB_STORE_SCHEMA_VERSION = 1
++
++PEER_CONTRACT_HEADER = "X-OpenMed-Peer-Contract"
++PEER_CONTRACT_METADATA_KEY = "x-openmed-peer-contract"
++DEFAULT_REFRESH_INTERVAL_SECONDS = 5.0
++MAX_GENERATION = 9999
++MAX_SCHEMA_VERSION = 9999
++
++JOB_STORE_COMPONENT = "jobs"
++JOURNEY_LOCAL_COMPONENT = "journey_local"
++JOURNEY_POSTGRES_COMPONENT = "journey_postgres"
++
++JOB_DEIDENTIFY_CAPABILITY = "jobs.deidentify.v1"
++JOB_WEBHOOK_CAPABILITY = "jobs.webhook.v1"
++STREAM_NDJSON_CAPABILITY = "stream.ndjson.v1"
++WORKER_CAPABILITIES = frozenset(
++    {JOB_DEIDENTIFY_CAPABILITY, JOB_WEBHOOK_CAPABILITY, STREAM_NDJSON_CAPABILITY}
++)
++
++PEER_REASON_CODES = frozenset(
++    {
++        "peer_compatible",
++        "peer_contract_malformed",
++        "peer_descriptor_unsupported",
++        "peer_generation_outside_window",
++        "peer_schema_outside_window",
++    }
++)
++WORK_REASON_CODES = frozenset(
++    {
++        "work_compatible",
++        "work_envelope_invalid",
++        "work_generation_outside_window",
++        "work_component_unknown",
++        "work_schema_outside_window",
++        "capability_missing",
++        "model_generation_unavailable",
++    }
++)
++STATE_REASON_CODES = frozenset(
++    {
++        "schema_compatible",
++        "schema_absent",
++        "schema_migration_required",
++        "schema_ahead_of_window",
++        "schema_unknown",
++    }
++)
++ROLLBACK_REASON_CODES = frozenset({"rollback_within_window"})
++REASON_CODES = (
++    PEER_REASON_CODES | WORK_REASON_CODES | STATE_REASON_CODES | ROLLBACK_REASON_CODES
++)
++
++_STATE_BY_CODE = {
++    "schema_migration_required": "pending",
++    "schema_ahead_of_window": "incompatible",
++    "schema_unknown": "unknown",
++}
++_TOKEN_RE = re.compile(r"[a-z][a-z0-9_]{0,31}(?:\.[a-z0-9_]{1,32}){0,4}\Z")
++_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
++_PEER_CONTRACT_RE = re.compile(r"([1-9][0-9]{0,3})/([1-9][0-9]{0,3})\Z")
++_DESCRIPTOR_KEYS = frozenset(
++    {
++        "schema_version",
++        "contract_generation",
++        "min_peer_generation",
++        "durable_schemas",
++        "capabilities",
++        "model_generations",
++    }
++)
++_ENVELOPE_KEYS = frozenset(
++    {
++        "contract_generation",
++        "min_peer_generation",
++        "schema_versions",
++        "required_capabilities",
++        "model_generation",
++    }
++)
++
++
++class CompatibilityError(ValueError):
++    """Raised when a contract, descriptor or envelope is not well formed.
++
++    Attributes:
++        code: Controlled reason code; the message never contains input values.
++    """
++
++    def __init__(self, code: str) -> None:
++        super().__init__("Compatibility contract input is invalid")
++        self.code = code
++
++
++class IncompatibleStateError(RuntimeError):
++    """Raised before a durable store is mutated outside the declared window.
++
++    Attributes:
++        component: Controlled durable component name.
++        code: Controlled reason code from :data:`STATE_REASON_CODES`.
++    """
++
++    def __init__(self, component: str, code: str) -> None:
++        super().__init__("Persisted state is outside the compatibility window")
++        self.component = component
++        self.code = code
++
++    @property
++    def state(self) -> str:
++        """Return the blocking readiness state implied by :attr:`code`."""
++        return _STATE_BY_CODE.get(self.code, "unknown")
++
++    def to_details(self) -> dict[str, Any]:
++        """Return value-free error details for service envelopes."""
++        return {
++            "components": {self.component: {"state": self.state, "reason": self.code}}
++        }
++
++
++def _is_version(value: Any, *, maximum: int) -> bool:
++    return type(value) is int and 1 <= value <= maximum
++
++
++def _require_version(value: Any, *, maximum: int, code: str) -> int:
++    if not _is_version(value, maximum=maximum):
++        raise CompatibilityError(code)
++    return int(value)
++
++
++def _require_token(value: Any, *, code: str) -> str:
++    if type(value) is not str or _TOKEN_RE.fullmatch(value) is None:
++        raise CompatibilityError(code)
++    return value
++
++
++def _require_digest(value: Any, *, code: str) -> str:
++    if type(value) is not str or _DIGEST_RE.fullmatch(value) is None:
++        raise CompatibilityError(code)
++    return value
++
++
++def _require_window(generation: int, min_peer_generation: int, *, code: str) -> None:
++    if not generation - 1 <= min_peer_generation <= generation:
++        raise CompatibilityError(code)
++
++
++def _canonical_digest(payload: Mapping[str, Any]) -> str:
++    encoded = json.dumps(
++        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
++    ).encode("ascii")
++    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
++
++
++def model_generation_ref(model_id: str) -> str:
++    """Return the value-free reference used to pin work to a model generation.
++
++    Args:
++        model_id: Public served model identifier or rollout pointer.
++
++    Returns:
++        ``sha256:<hex>`` digest of the identifier.
++    """
++    if type(model_id) is not str or not model_id:
++        raise CompatibilityError("model_generation_invalid")
++    return f"sha256:{hashlib.sha256(model_id.encode('utf-8')).hexdigest()}"
++
++
++@dataclass(frozen=True, slots=True)
++class SchemaRange:
++    """Schema versions one build reads and writes for one durable component.
++
++    Attributes:
++        read_min: Oldest persisted version the build operates on without a
++            migration.
++        read_max: Newest persisted version the build operates on.
++        write: Version the build writes. It must lie inside the read range.
++    """
++
++    read_min: int
++    read_max: int
++    write: int
++
++    def __post_init__(self) -> None:
++        for value in (self.read_min, self.read_max, self.write):
++            _require_version(value, maximum=MAX_SCHEMA_VERSION, code="schema_invalid")
++        if not self.read_min <= self.write <= self.read_max:
++            raise CompatibilityError("schema_invalid")
++
++    def reads(self, version: int) -> bool:
++        """Return whether this build operates on persisted ``version``."""
++        return self.read_min <= version <= self.read_max
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the value-free wire representation."""
++        return {"read": [self.read_min, self.read_max], "write": self.write}
++
++    @classmethod
++    def from_dict(cls, payload: Any) -> "SchemaRange":
++        """Parse a strict wire representation.
++
++        Raises:
++            CompatibilityError: When the payload is not a valid range.
++        """
++        if not isinstance(payload, Mapping) or set(payload) != {"read", "write"}:
++            raise CompatibilityError("schema_invalid")
++        read = payload["read"]
++        if not isinstance(read, list) or len(read) != 2:
++            raise CompatibilityError("schema_invalid")
++        return cls(read_min=read[0], read_max=read[1], write=payload["write"])
++
++
++def _freeze_schemas(schemas: Mapping[str, SchemaRange]) -> Mapping[str, SchemaRange]:
++    if not isinstance(schemas, Mapping):
++        raise CompatibilityError("contract_invalid")
++    frozen: dict[str, SchemaRange] = {}
++    for name in sorted(schemas):
++        _require_token(name, code="contract_invalid")
++        value = schemas[name]
++        if not isinstance(value, SchemaRange):
++            raise CompatibilityError("contract_invalid")
++        frozen[name] = value
++    return MappingProxyType(frozen)
++
++
++@dataclass(frozen=True, slots=True)
++class CompatibilityDescriptor:
++    """Value-free compatibility contract one build publishes to its peers.
++
++    Attributes:
++        contract_generation: Monotonic contract generation of the build.
++        min_peer_generation: Oldest peer generation the build shares state
++            with; either the build's own generation or the one before it.
++        durable_schemas: Read range and write version per durable component.
++        capabilities: Worker capability tokens the build can execute.
++        model_generations: Digests of the model generations the build serves.
++    """
++
++    contract_generation: int
++    min_peer_generation: int
++    durable_schemas: Mapping[str, SchemaRange]
++    capabilities: frozenset[str]
++    model_generations: frozenset[str] = field(default_factory=frozenset)
++
++    def __post_init__(self) -> None:
++        generation = _require_version(
++            self.contract_generation, maximum=MAX_GENERATION, code="contract_invalid"
++        )
++        minimum = _require_version(
++            self.min_peer_generation, maximum=MAX_GENERATION, code="contract_invalid"
++        )
++        _require_window(generation, minimum, code="contract_invalid")
++        object.__setattr__(
++            self, "durable_schemas", _freeze_schemas(self.durable_schemas)
++        )
++        object.__setattr__(
++            self,
++            "capabilities",
++            frozenset(
++                _require_token(item, code="contract_invalid")
++                for item in self.capabilities
++            ),
++        )
++        object.__setattr__(
++            self,
++            "model_generations",
++            frozenset(
++                _require_digest(item, code="contract_invalid")
++                for item in self.model_generations
++            ),
++        )
++
++    @property
++    def peer_contract(self) -> str:
++        """Return the compact ``<generation>/<min_peer_generation>`` token."""
++        return f"{self.contract_generation}/{self.min_peer_generation}"
++
++    def with_model_generations(self, refs: Iterable[str]) -> "CompatibilityDescriptor":
++        """Return a copy that serves exactly the given model generation digests."""
++        return replace(self, model_generations=frozenset(refs))
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the deterministic, value-free wire representation."""
++        return {
++            "schema_version": COMPATIBILITY_SCHEMA_VERSION,
++            "contract_generation": self.contract_generation,
++            "min_peer_generation": self.min_peer_generation,
++            "durable_schemas": {
++                name: schema.to_dict() for name, schema in self.durable_schemas.items()
++            },
++            "capabilities": sorted(self.capabilities),
++            "model_generations": sorted(self.model_generations),
++        }
++
++    def digest(self) -> str:
++        """Return a canonical SHA-256 digest of :meth:`to_dict`."""
++        return _canonical_digest(self.to_dict())
++
++    @classmethod
++    def from_dict(cls, payload: Any) -> "CompatibilityDescriptor":
++        """Parse a peer descriptor strictly.
++
++        Args:
++            payload: Decoded JSON object published by a peer.
++
++        Returns:
++            The parsed descriptor.
++
++        Raises:
++            CompatibilityError: With code ``peer_descriptor_unsupported`` when the
++                payload is not a descriptor this build understands.
++        """
++        code = "peer_descriptor_unsupported"
++        if not isinstance(payload, Mapping) or set(payload) != _DESCRIPTOR_KEYS:
++            raise CompatibilityError(code)
++        if payload["schema_version"] != COMPATIBILITY_SCHEMA_VERSION:
++            raise CompatibilityError(code)
++        schemas = payload["durable_schemas"]
++        capabilities = payload["capabilities"]
++        models = payload["model_generations"]
++        if (
++            not isinstance(schemas, Mapping)
++            or not isinstance(capabilities, list)
++            or not isinstance(models, list)
++        ):
++            raise CompatibilityError(code)
++        try:
++            return cls(
++                contract_generation=payload["contract_generation"],
++                min_peer_generation=payload["min_peer_generation"],
++                durable_schemas={
++                    _require_token(name, code=code): SchemaRange.from_dict(value)
++                    for name, value in schemas.items()
++                },
++                capabilities=frozenset(capabilities),
++                model_generations=frozenset(models),
++            )
++        except (CompatibilityError, TypeError):
++            raise CompatibilityError(code) from None
++
++
++#: Durable schema declarations of this build. The Journey ranges mirror the
++#: append-only migration chains in ``openmed.structured.store``; both stores
++#: migrate older schemas forward on open, so they operate only on their latest
++#: version. A drift test fails when a migration is added without updating this
++#: table, which is where the durable-schema registry plugs in.
++DURABLE_SCHEMAS: Mapping[str, SchemaRange] = MappingProxyType(
++    {
++        JOB_STORE_COMPONENT: SchemaRange(
++            read_min=1, read_max=1, write=JOB_STORE_SCHEMA_VERSION
++        ),
++        JOURNEY_LOCAL_COMPONENT: SchemaRange(read_min=3, read_max=3, write=3),
++        JOURNEY_POSTGRES_COMPONENT: SchemaRange(read_min=3, read_max=3, write=3),
++    }
++)
++
++CURRENT_CONTRACT = CompatibilityDescriptor(
++    contract_generation=CONTRACT_GENERATION,
++    min_peer_generation=MIN_PEER_GENERATION,
++    durable_schemas=DURABLE_SCHEMAS,
++    capabilities=WORKER_CAPABILITIES,
++)
++
++#: Every generation inside the supported window, oldest first. The last entry
++#: is always :data:`CURRENT_CONTRACT`; generation N keeps N-1 here until the
++#: window closes, and the published matrix is derived from this tuple.
++CONTRACT_HISTORY: tuple[CompatibilityDescriptor, ...] = (CURRENT_CONTRACT,)
++
++
++def local_descriptor(
++    runtime: Any = None,
++    *,
++    contract: CompatibilityDescriptor = CURRENT_CONTRACT,
++) -> CompatibilityDescriptor:
++    """Return this node's descriptor, including its served model generations.
++
++    Args:
++        runtime: Optional service runtime exposing ``served_model_ids()``.
++        contract: Static contract to extend; defaults to :data:`CURRENT_CONTRACT`.
++
++    Returns:
++        Descriptor whose model generations are digests of the served model ids.
++    """
++    served = getattr(runtime, "served_model_ids", None)
++    if not callable(served):
++        return contract
++    return contract.with_model_generations(
++        model_generation_ref(model_id) for model_id in served()
++    )
++
++
++@dataclass(frozen=True, slots=True)
++class CompatibilityDecision:
++    """Typed, value-free outcome of one compatibility check.
++
++    Attributes:
++        compatible: Whether the checked peer, work item or rollback may proceed.
++        code: Controlled reason code from :data:`REASON_CODES`.
++        component: Durable component that caused a refusal, when applicable.
++    """
++
++    compatible: bool
++    code: str
++    component: str | None = None
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the value-free representation."""
++        payload: dict[str, Any] = {"compatible": self.compatible, "code": self.code}
++        if self.component is not None:
++            payload["component"] = self.component
++        return payload
++
++
++def _allow(code: str) -> CompatibilityDecision:
++    return CompatibilityDecision(True, code)
++
++
++def _deny(code: str, component: str | None = None) -> CompatibilityDecision:
++    return CompatibilityDecision(False, code, component)
++
++
++def generations_compatible(
++    generation: int,
++    min_peer_generation: int,
++    other_generation: int,
++    other_min_peer_generation: int,
++) -> bool:
++    """Apply the N/N-1 rule: the newer build must declare the older one.
++
++    Args:
++        generation: First build's contract generation.
++        min_peer_generation: First build's oldest supported peer generation.
++        other_generation: Second build's contract generation.
++        other_min_peer_generation: Second build's oldest supported peer.
++
++    Returns:
++        Whether the two generations may share state and traffic.
++    """
++    if generation >= other_generation:
++        return min_peer_generation <= other_generation
++    return other_min_peer_generation <= generation
++
++
++def negotiate_peer(
++    local: CompatibilityDescriptor,
++    peer: CompatibilityDescriptor | Mapping[str, Any],
++) -> CompatibilityDecision:
++    """Decide whether a peer build may run beside ``local``.
++
++    Args:
++        local: This node's descriptor.
++        peer: The peer's descriptor, or its decoded wire representation.
++
++    Returns:
++        ``peer_compatible`` or a typed refusal. Unparseable peers are refused.
++    """
++    if not isinstance(peer, CompatibilityDescriptor):
++        try:
++            peer = CompatibilityDescriptor.from_dict(peer)
++        except CompatibilityError:
++            return _deny("peer_descriptor_unsupported")
++    if not generations_compatible(
++        local.contract_generation,
++        local.min_peer_generation,
++        peer.contract_generation,
++        peer.min_peer_generation,
++    ):
++        return _deny("peer_generation_outside_window")
++    shared = sorted(local.durable_schemas.keys() & peer.durable_schemas.keys())
++    for component in shared:
++        mine = local.durable_schemas[component]
++        theirs = peer.durable_schemas[component]
++        if not (mine.reads(theirs.write) and theirs.reads(mine.write)):
++            return _deny("peer_schema_outside_window", component)
++    return _allow("peer_compatible")
++
++
++def parse_peer_contract(raw: Any) -> tuple[int, int]:
++    """Parse a ``<generation>/<min_peer_generation>`` peer contract token.
++
++    Raises:
++        CompatibilityError: With code ``peer_contract_malformed``.
++    """
++    code = "peer_contract_malformed"
++    if type(raw) is not str:
++        raise CompatibilityError(code)
++    match = _PEER_CONTRACT_RE.fullmatch(raw.strip())
++    if match is None:
++        raise CompatibilityError(code)
++    generation, minimum = int(match.group(1)), int(match.group(2))
++    _require_window(generation, minimum, code=code)
++    return generation, minimum
++
++
++def peer_contract_decision(
++    local: CompatibilityDescriptor,
++    values: Sequence[Any],
++) -> CompatibilityDecision:
++    """Decide on a peer that announced itself with one peer contract token.
++
++    The token carries generation and window only; the durable schema check is
++    implied because every generation publishes exactly one contract and
++    :data:`CONTRACT_HISTORY` is verified to be self-consistent. Peers that need
++    the per-component decision exchange full descriptors with
++    :func:`negotiate_peer`.
++
++    Args:
++        local: This node's descriptor.
++        values: Every value the peer sent for :data:`PEER_CONTRACT_HEADER`.
++
++    Returns:
++        ``peer_compatible`` or a typed refusal; repeated values are malformed.
++    """
++    if len(values) != 1:
++        return _deny("peer_contract_malformed")
++    try:
++        generation, minimum = parse_peer_contract(values[0])
++    except CompatibilityError:
++        return _deny("peer_contract_malformed")
++    if not generations_compatible(
++        local.contract_generation, local.min_peer_generation, generation, minimum
++    ):
++        return _deny("peer_generation_outside_window")
++    return _allow("peer_compatible")
++
++
++@dataclass(frozen=True, slots=True)
++class WorkEnvelope:
++    """Contract stamp persisted with one unit of shared work.
++
++    Accepted work keeps the contract and model generation it was admitted
++    under until completion or a durable checkpoint, so every claimant can
++    refuse it before mutation.
++
++    Attributes:
++        contract_generation: Generation of the build that admitted the work.
++        min_peer_generation: That build's oldest supported peer generation.
++        schema_versions: Durable schema version per component the work uses.
++        required_capabilities: Capabilities a claimant must provide.
++        model_generation: Digest of the pinned model generation, if any.
++    """
++
++    contract_generation: int
++    min_peer_generation: int
++    schema_versions: Mapping[str, int]
++    required_capabilities: frozenset[str]
++    model_generation: str | None = None
++
++    def __post_init__(self) -> None:
++        code = "work_envelope_invalid"
++        generation = _require_version(
++            self.contract_generation, maximum=MAX_GENERATION, code=code
++        )
++        minimum = _require_version(
++            self.min_peer_generation, maximum=MAX_GENERATION, code=code
++        )
++        _require_window(generation, minimum, code=code)
++        if not isinstance(self.schema_versions, Mapping):
++            raise CompatibilityError(code)
++        versions = {
++            _require_token(name, code=code): _require_version(
++                self.schema_versions[name], maximum=MAX_SCHEMA_VERSION, code=code
++            )
++            for name in sorted(self.schema_versions)
++        }
++        object.__setattr__(self, "schema_versions", MappingProxyType(versions))
++        object.__setattr__(
++            self,
++            "required_capabilities",
++            frozenset(
++                _require_token(item, code=code) for item in self.required_capabilities
++            ),
++        )
++        if self.model_generation is not None:
++            _require_digest(self.model_generation, code=code)
++
++    @classmethod
++    def for_work(
++        cls,
++        descriptor: CompatibilityDescriptor,
++        *,
++        components: Iterable[str],
++        required_capabilities: Iterable[str],
++        model_generation: str | None = None,
++    ) -> "WorkEnvelope":
++        """Stamp new work with the admitting build's contract.
++
++        Args:
++            descriptor: Descriptor of the admitting build.
++            components: Durable components the work will be persisted in.
++            required_capabilities: Capabilities a claimant must provide.
++            model_generation: Optional pinned model generation digest.
++
++        Returns:
++            Envelope recording the write versions of ``components``.
++        """
++        return cls(
++            contract_generation=descriptor.contract_generation,
++            min_peer_generation=descriptor.min_peer_generation,
++            schema_versions={
++                name: descriptor.durable_schemas[name].write for name in components
++            },
++            required_capabilities=frozenset(required_capabilities),
++            model_generation=model_generation,
++        )
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the deterministic, value-free persisted representation."""
++        return {
++            "contract_generation": self.contract_generation,
++            "min_peer_generation": self.min_peer_generation,
++            "schema_versions": dict(self.schema_versions),
++            "required_capabilities": sorted(self.required_capabilities),
++            "model_generation": self.model_generation,
++        }
++
++    @classmethod
++    def from_dict(cls, payload: Any) -> "WorkEnvelope":
++        """Parse a persisted envelope strictly.
++
++        Raises:
++            CompatibilityError: With code ``work_envelope_invalid``.
++        """
++        code = "work_envelope_invalid"
++        if not isinstance(payload, Mapping) or set(payload) != _ENVELOPE_KEYS:
++            raise CompatibilityError(code)
++        capabilities = payload["required_capabilities"]
++        if not isinstance(capabilities, list):
++            raise CompatibilityError(code)
++        try:
++            return cls(
++                contract_generation=payload["contract_generation"],
++                min_peer_generation=payload["min_peer_generation"],
++                schema_versions=payload["schema_versions"],
++                required_capabilities=frozenset(capabilities),
++                model_generation=payload["model_generation"],
++            )
++        except TypeError:
++            raise CompatibilityError(code) from None
++
++
++def check_work(
++    local: CompatibilityDescriptor,
++    envelope: WorkEnvelope | Mapping[str, Any] | None,
++) -> CompatibilityDecision:
++    """Decide whether ``local`` may claim one unit of persisted work.
++
++    Call this before taking a lease, marking a job running, replaying a
++    checkpoint or delivering a webhook. A refusal leaves the work untouched
++    for a compatible claimant.
++
++    Args:
++        local: This node's descriptor.
++        envelope: The work's persisted envelope; ``None`` means it has none.
++
++    Returns:
++        ``work_compatible`` or a typed refusal.
++    """
++    if not isinstance(envelope, WorkEnvelope):
++        try:
++            envelope = WorkEnvelope.from_dict(envelope)
++        except CompatibilityError:
++            return _deny("work_envelope_invalid")
++    if not generations_compatible(
++        local.contract_generation,
++        local.min_peer_generation,
++        envelope.contract_generation,
++        envelope.min_peer_generation,
++    ):
++        return _deny("work_generation_outside_window")
++    for component, version in envelope.schema_versions.items():
++        schema = local.durable_schemas.get(component)
++        if schema is None:
++            return _deny("work_component_unknown", component)
++        if not schema.reads(version):
++            return _deny("work_schema_outside_window", component)
++    if not envelope.required_capabilities <= local.capabilities:
++        return _deny("capability_missing")
++    if (
++        envelope.model_generation is not None
++        and envelope.model_generation not in local.model_generations
++    ):
++        return _deny("model_generation_unavailable")
++    return _allow("work_compatible")
++
++
++class CompatibilityState(str, Enum):
++    """Readiness state of one durable component against this build."""
++
++    COMPATIBLE = "compatible"
++    ABSENT = "absent"
++    PENDING = "pending"
++    INCOMPATIBLE = "incompatible"
++    UNKNOWN = "unknown"
++
++
++_USABLE_STATES = frozenset({CompatibilityState.COMPATIBLE, CompatibilityState.ABSENT})
++
++
++@dataclass(frozen=True, slots=True)
++class SchemaObservation:
++    """What a probe saw in one persisted store, without any stored values.
++
++    Attributes:
++        known: Whether the probe could determine the persisted state.
++        version: Persisted schema version, or ``None`` when nothing is stored.
++    """
++
++    known: bool
++    version: int | None = None
++
++    @classmethod
++    def absent(cls) -> "SchemaObservation":
++        """Return the observation for a store with no persisted state yet."""
++        return cls(known=True)
++
++    @classmethod
++    def unknown(cls) -> "SchemaObservation":
++        """Return the blocking observation for unreadable or damaged state."""
++        return cls(known=False)
++
++    @classmethod
++    def at(cls, version: Any) -> "SchemaObservation":
++        """Return an observation for a persisted version, or unknown if invalid."""
++        if not _is_version(version, maximum=MAX_SCHEMA_VERSION):
++            return cls.unknown()
++        return cls(known=True, version=int(version))
++
++
++@dataclass(frozen=True, slots=True)
++class ComponentCompatibility:
++    """Value-free compatibility of one durable component.
++
++    Attributes:
++        state: Readiness state.
++        code: Controlled reason code from :data:`STATE_REASON_CODES`.
++        schema_version: Persisted version, when one was observed.
++    """
++
++    state: CompatibilityState
++    code: str
++    schema_version: int | None = None
++
++    @property
++    def usable(self) -> bool:
++        """Whether this build may read and mutate the component."""
++        return self.state in _USABLE_STATES
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the value-free representation."""
++        payload: dict[str, Any] = {"state": self.state.value, "code": self.code}
++        if self.schema_version is not None:
++            payload["schema_version"] = self.schema_version
++        return payload
++
++
++def evaluate_component(
++    schema: SchemaRange | None,
++    observation: SchemaObservation,
++) -> ComponentCompatibility:
++    """Compare one persisted schema observation with a declared range.
++
++    Args:
++        schema: This build's range for the component, or ``None`` if undeclared.
++        observation: Probe result for the component.
++
++    Returns:
++        The component's state; unknown and undeclared state is blocking.
++    """
++    version = observation.version
++    if not observation.known:
++        return ComponentCompatibility(CompatibilityState.UNKNOWN, "schema_unknown")
++    if version is None:
++        return ComponentCompatibility(CompatibilityState.ABSENT, "schema_absent")
++    if schema is None:
++        return ComponentCompatibility(CompatibilityState.UNKNOWN, "schema_unknown")
++    if version < schema.read_min:
++        return ComponentCompatibility(
++            CompatibilityState.PENDING, "schema_migration_required", version
++        )
++    if version > schema.read_max:
++        return ComponentCompatibility(
++            CompatibilityState.INCOMPATIBLE, "schema_ahead_of_window", version
++        )
++    return ComponentCompatibility(
++        CompatibilityState.COMPATIBLE, "schema_compatible", version
++    )
++
++
++@dataclass(frozen=True, slots=True)
++class PersistedStateReport:
++    """Readiness view of every probed durable component.
++
++    Attributes:
++        components: Compatibility per component name.
++    """
++
++    components: Mapping[str, ComponentCompatibility]
++
++    @property
++    def ready(self) -> bool:
++        """Whether every probed component is compatible or empty."""
++        return all(item.usable for item in self.components.values())
++
++    def blocking(self) -> dict[str, ComponentCompatibility]:
++        """Return the components that block readiness."""
++        return {name: item for name, item in self.components.items() if not item.usable}
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the value-free representation."""
++        return {
++            "state": "compatible" if self.ready else "blocked",
++            "components": {
++                name: self.components[name].to_dict()
++                for name in sorted(self.components)
++            },
++        }
++
++
++def evaluate_persisted_state(
++    local: CompatibilityDescriptor,
++    observations: Mapping[str, SchemaObservation],
++) -> PersistedStateReport:
++    """Gate readiness on the persisted schema of each shared store.
++
++    Args:
++        local: This node's descriptor.
++        observations: Probe result per durable component in use.
++
++    Returns:
++        Report whose ``ready`` property is false for any blocking component.
++    """
++    return PersistedStateReport(
++        components=MappingProxyType(
++            {
++                name: evaluate_component(
++                    local.durable_schemas.get(name), observations[name]
++                )
++                for name in sorted(observations)
++            }
++        )
++    )
++
++
++def rollback_decision(
++    target: CompatibilityDescriptor,
++    *,
++    running: Iterable[CompatibilityDescriptor],
++    observations: Mapping[str, SchemaObservation],
++) -> CompatibilityDecision:
++    """Decide whether returning to ``target`` stays inside the declared window.
++
++    A rollback is permitted only while ``target`` is compatible with every
++    build still running and reads every persisted schema without migration.
++    Otherwise restore a verified backup taken before the newer schema was
++    written instead of starting the older build.
++
++    Args:
++        target: Descriptor of the build to return to.
++        running: Descriptors of builds that will coexist during the rollback.
++        observations: Probe result per durable component in use.
++
++    Returns:
++        ``rollback_within_window`` or the first blocking reason code.
++    """
++    for peer in running:
++        decision = negotiate_peer(target, peer)
++        if not decision.compatible:
++            return decision
++    report = evaluate_persisted_state(target, observations)
++    for name, component in report.components.items():
++        if not component.usable:
++            return _deny(component.code, name)
++    return _allow("rollback_within_window")
++
++
++def compatibility_matrix(
++    contracts: Sequence[CompatibilityDescriptor] = CONTRACT_HISTORY,
++) -> dict[str, Any]:
++    """Return the machine-readable pairwise compatibility matrix.
++
++    Args:
++        contracts: Generations inside the declared window, oldest first.
++
++    Returns:
++        Value-free matrix with one entry per unordered generation pair.
++    """
++    ordered = sorted(contracts, key=lambda item: item.contract_generation)
++    combinations = []
++    for index, older in enumerate(ordered):
++        for newer in ordered[index:]:
++            decision = negotiate_peer(newer, older)
++            combinations.append(
++                {
++                    "older": older.contract_generation,
++                    "newer": newer.contract_generation,
++                    **decision.to_dict(),
++                }
++            )
++    return {
++        "schema_version": COMPATIBILITY_MATRIX_SCHEMA_VERSION,
++        "generations": [item.contract_generation for item in ordered],
++        "descriptor_digests": {
++            str(item.contract_generation): item.digest() for item in ordered
++        },
++        "combinations": combinations,
++    }
++
++
++def validate_contract_history(
++    contracts: Sequence[CompatibilityDescriptor] = CONTRACT_HISTORY,
++) -> None:
++    """Check that a declared window is consecutive and self-compatible.
++
++    Raises:
++        CompatibilityError: With code ``contract_history_invalid``.
++    """
++    code = "contract_history_invalid"
++    generations = [item.contract_generation for item in contracts]
++    if not generations or generations != list(
++        range(generations[0], generations[0] + len(generations))
++    ):
++        raise CompatibilityError(code)
++    if len(contracts) > 2:
++        raise CompatibilityError(code)
++    for older, newer in zip(contracts, contracts[1:]):
++        if not negotiate_peer(newer, older).compatible:
++            raise CompatibilityError(code)
++
++
++ObservationProbe = Callable[[], SchemaObservation]
++
++
++class CompatibilityGate:
++    """Cached readiness gate over the persisted state of shared stores.
++
++    Probes are re-run at most once per ``refresh_interval_seconds`` so that a
++    rolling migration by a newer peer is noticed without probing on every
++    request. A probe that raises or returns anything else is unknown, which
++    blocks readiness.
++    """
++
++    def __init__(
++        self,
++        descriptor: CompatibilityDescriptor,
++        probes: Mapping[str, ObservationProbe],
++        *,
++        refresh_interval_seconds: float = DEFAULT_REFRESH_INTERVAL_SECONDS,
++        clock: Callable[[], float] = time.monotonic,
++    ) -> None:
++        """Create a gate.
++
++        Args:
++            descriptor: This node's descriptor.
++            probes: One observation probe per durable component in use.
++            refresh_interval_seconds: Minimum seconds between probe runs.
++            clock: Monotonic clock in seconds.
++        """
++        self.descriptor = descriptor
++        self._probes = dict(probes)
++        for name in self._probes:
++            _require_token(name, code="contract_invalid")
++        self._interval = max(0.0, float(refresh_interval_seconds))
++        self._clock = clock
++        self._lock = threading.Lock()
++        self._report: PersistedStateReport | None = None
++        self._checked_at = 0.0
++
++    def report(self, *, force: bool = False) -> PersistedStateReport:
++        """Return the current report, re-probing when it is stale."""
++        with self._lock:
++            now = self._clock()
++            if (
++                force
++                or self._report is None
++                or now - self._checked_at >= self._interval
++            ):
++                self._report = evaluate_persisted_state(
++                    self.descriptor, self._observe()
++                )
++                self._checked_at = now
++            return self._report
++
++    def snapshot(self, *, force: bool = False) -> dict[str, Any]:
++        """Return the descriptor, its digest and the current report."""
++        report = self.report(force=force)
++        return {
++            **self.descriptor.to_dict(),
++            "peer_contract": self.descriptor.peer_contract,
++            "descriptor_digest": self.descriptor.digest(),
++            **report.to_dict(),
++        }
++
++    def _observe(self) -> dict[str, SchemaObservation]:
++        observations: dict[str, SchemaObservation] = {}
++        for name, probe in self._probes.items():
++            try:
++                observation = probe()
++            except Exception:
++                observation = SchemaObservation.unknown()
++            if not isinstance(observation, SchemaObservation):
++                observation = SchemaObservation.unknown()
++            observations[name] = observation
++        return observations
++
++
++def job_store_document_observation(document: Any) -> SchemaObservation:
++    """Return the schema observation for a decoded job metadata document.
++
++    The unversioned layout written before this contract existed is version 1.
++    """
++    if not isinstance(document, Mapping):
++        return SchemaObservation.unknown()
++    if "schema_version" in document:
++        return SchemaObservation.at(document["schema_version"])
++    if isinstance(document.get("jobs"), Mapping):
++        return SchemaObservation.at(1)
++    return SchemaObservation.unknown()
++
++
++def job_store_observation(path: Path) -> SchemaObservation:
++    """Probe the async job metadata store without exposing its contents.
++
++    Args:
++        path: Store file location. It never enters the observation.
++
++    Returns:
++        Absent when the file does not exist, unknown when it cannot be read.
++    """
++    try:
++        raw = Path(path).read_text(encoding="utf-8")
++    except FileNotFoundError:
++        return SchemaObservation.absent()
++    except (OSError, UnicodeDecodeError):
++        return SchemaObservation.unknown()
++    try:
++        document = json.loads(raw)
++    except (ValueError, RecursionError):
++        return SchemaObservation.unknown()
++    return job_store_document_observation(document)
++
++
++def journey_store_observation(store: Any) -> SchemaObservation:
++    """Probe an opened Journey store through its ``schema_version`` property.
++
++    Args:
++        store: ``SQLiteJourneyStore``, ``PostgresJourneyStore`` or a fake.
++
++    Returns:
++        The persisted version, absent for an empty chain, or unknown on error.
++    """
++    try:
++        version = store.schema_version
++    except Exception:
++        return SchemaObservation.unknown()
++    if version == 0:
++        return SchemaObservation.absent()
++    return SchemaObservation.at(version)
++
++
++class RolloutEvidence:
++    """Value-free, machine-readable record of one rollout rehearsal.
++
++    Every field is a controlled token, an integer or a descriptor digest, so
++    the evidence can be attached to a release without review for PHI.
++    """
++
++    def __init__(self, scenario: str) -> None:
++        """Create an empty record for a named scenario token."""
++        self.scenario = _require_token(scenario, code="evidence_invalid")
++        self._steps: list[dict[str, Any]] = []
++        self._digests: dict[str, str] = {}
++        self._counts: dict[str, int] = {}
++
++    def register(self, descriptor: CompatibilityDescriptor) -> None:
++        """Record the digest of a participating generation."""
++        self._digests[str(descriptor.contract_generation)] = descriptor.digest()
++
++    def record(
++        self,
++        step: str,
++        decision: CompatibilityDecision,
++        *,
++        generations: Sequence[int],
++    ) -> None:
++        """Record one decision taken during the rehearsal.
++
++        Args:
++            step: Controlled step token.
++            decision: The decision taken.
++            generations: Generations involved, in the order they acted.
++        """
++        _require_token(step, code="evidence_invalid")
++        if decision.code not in REASON_CODES:
++            raise CompatibilityError("evidence_invalid")
++        entry: dict[str, Any] = {
++            "step": step,
++            "generations": [
++                _require_version(item, maximum=MAX_GENERATION, code="evidence_invalid")
++                for item in generations
++            ],
++            **decision.to_dict(),
++        }
++        self._steps.append(entry)
++        self.count(decision.code)
++
++    def count(self, name: str, amount: int = 1) -> None:
++        """Increment a controlled counter."""
++        _require_token(name, code="evidence_invalid")
++        self._counts[name] = self._counts.get(name, 0) + int(amount)
++
++    @property
++    def steps(self) -> tuple[dict[str, Any], ...]:
++        """Recorded steps, oldest first."""
++        return tuple(dict(step) for step in self._steps)
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the deterministic evidence document."""
++        return {
++            "schema_version": ROLLOUT_EVIDENCE_SCHEMA_VERSION,
++            "scenario": self.scenario,
++            "descriptor_digests": dict(sorted(self._digests.items())),
++            "steps": [dict(step) for step in self._steps],
++            "counts": dict(sorted(self._counts.items())),
++        }
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    """Print this build's descriptor or compatibility matrix as JSON.
++
++    Args:
++        argv: Command-line arguments; defaults to ``sys.argv[1:]``.
++
++    Returns:
++        Process exit status.
++    """
++    parser = argparse.ArgumentParser(
++        prog="python -m openmed.service.compatibility",
++        description="Print the value-free service compatibility contract.",
++    )
++    parser.add_argument(
++        "view",
++        choices=("descriptor", "matrix"),
++        nargs="?",
++        default="descriptor",
++    )
++    args = parser.parse_args(argv)
++    if args.view == "matrix":
++        payload = compatibility_matrix()
++    else:
++        payload = {
++            **CURRENT_CONTRACT.to_dict(),
++            "peer_contract": CURRENT_CONTRACT.peer_contract,
++            "descriptor_digest": CURRENT_CONTRACT.digest(),
++        }
++    sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
++    return 0
++
++
++__all__ = [
++    "COMPATIBILITY_MATRIX_SCHEMA_VERSION",
++    "COMPATIBILITY_SCHEMA_VERSION",
++    "CONTRACT_GENERATION",
++    "CONTRACT_HISTORY",
++    "CURRENT_CONTRACT",
++    "DURABLE_SCHEMAS",
++    "JOB_DEIDENTIFY_CAPABILITY",
++    "JOB_STORE_COMPONENT",
++    "JOB_STORE_SCHEMA_VERSION",
++    "JOB_WEBHOOK_CAPABILITY",
++    "JOURNEY_LOCAL_COMPONENT",
++    "JOURNEY_POSTGRES_COMPONENT",
++    "MIN_PEER_GENERATION",
++    "PEER_CONTRACT_HEADER",
++    "PEER_CONTRACT_METADATA_KEY",
++    "REASON_CODES",
++    "ROLLOUT_EVIDENCE_SCHEMA_VERSION",
++    "STREAM_NDJSON_CAPABILITY",
++    "WORKER_CAPABILITIES",
++    "CompatibilityDecision",
++    "CompatibilityDescriptor",
++    "CompatibilityError",
++    "CompatibilityGate",
++    "PersistedStateReport",
++    "CompatibilityState",
++    "ComponentCompatibility",
++    "IncompatibleStateError",
++    "RolloutEvidence",
++    "SchemaObservation",
++    "SchemaRange",
++    "WorkEnvelope",
++    "check_work",
++    "compatibility_matrix",
++    "evaluate_component",
++    "evaluate_persisted_state",
++    "generations_compatible",
++    "job_store_document_observation",
++    "job_store_observation",
++    "journey_store_observation",
++    "local_descriptor",
++    "model_generation_ref",
++    "negotiate_peer",
++    "parse_peer_contract",
++    "peer_contract_decision",
++    "rollback_decision",
++    "validate_contract_history",
++]
++
++
++if __name__ == "__main__":  # pragma: no cover - thin CLI wrapper
++    raise SystemExit(main())
+diff --git a/openmed/service/grpc_server.py b/openmed/service/grpc_server.py
+index 58b1a31f3a..f7086fb1bb 100644
+--- a/openmed/service/grpc_server.py
++++ b/openmed/service/grpc_server.py
+@@ -12,6 +12,11 @@
+ from openmed.core.streaming import deidentify_stream
+ 
+ from .app import _analyze_payload, _pii_deidentify_payload, _pii_extract_payload
++from .compatibility import (
++    CURRENT_CONTRACT,
++    PEER_CONTRACT_METADATA_KEY,
++    peer_contract_decision,
++)
+ from .proto.generated import openmed_pb2, openmed_pb2_grpc
+ from .runtime import ModelNotServedError, ServiceRuntime
+ from .schemas import AnalyzeRequest, PIIDeidentifyRequest, PIIExtractRequest
+@@ -49,6 +54,7 @@ def Deidentify(self, request, context):
+ 
+     def StreamDeidentify(self, request, context):
+         """Stream redacted text fragments for chunked de-identification."""
++        _abort_incompatible_peer(context)
+         chunks = _stream_chunks(request)
+         fallback_text = "".join(chunks) if chunks else request.request.text
+         try:
+@@ -154,7 +160,33 @@ def serve(
+     return server
+ 
+ 
++def _peer_rejection(context: Any) -> tuple[grpc.StatusCode, str] | None:
++    """Return a typed refusal for an announced peer outside the window."""
++    metadata = getattr(context, "invocation_metadata", None)
++    if not callable(metadata):
++        return None
++    values = [
++        value for key, value in (metadata() or ()) if key == PEER_CONTRACT_METADATA_KEY
++    ]
++    if not values:
++        return None
++    decision = peer_contract_decision(CURRENT_CONTRACT, values)
++    if decision.compatible:
++        return None
++    if decision.code == "peer_contract_malformed":
++        return grpc.StatusCode.INVALID_ARGUMENT, decision.code
++    return grpc.StatusCode.FAILED_PRECONDITION, decision.code
++
++
++def _abort_incompatible_peer(context: Any) -> None:
++    rejection = _peer_rejection(context)
++    if rejection is not None:
++        context.abort(*rejection)
++
++
+ def _run_unary(context: grpc.ServicerContext, operation: Callable[[], Any]) -> Any:
++    # Refuse incompatible peers before parsing, loading or processing anything.
++    _abort_incompatible_peer(context)
+     try:
+         return operation()
+     except ModelNotServedError:
+diff --git a/openmed/service/jobs.py b/openmed/service/jobs.py
+index 74e4910601..9bde29d5f8 100644
+--- a/openmed/service/jobs.py
++++ b/openmed/service/jobs.py
+@@ -17,6 +17,24 @@
+ import openmed
+ from openmed.core.audit import hash_text
+ 
++from .compatibility import (
++    CURRENT_CONTRACT,
++    JOB_DEIDENTIFY_CAPABILITY,
++    JOB_STORE_COMPONENT,
++    JOB_STORE_SCHEMA_VERSION,
++    JOB_WEBHOOK_CAPABILITY,
++    CompatibilityDescriptor,
++    CompatibilityState,
++    ComponentCompatibility,
++    IncompatibleStateError,
++    SchemaObservation,
++    WorkEnvelope,
++    check_work,
++    evaluate_component,
++    job_store_observation,
++    local_descriptor,
++    model_generation_ref,
++)
+ from .runtime import ServiceRuntime
+ from .schemas import DeidentifyJobDocument, DeidentifyJobRequest, JobWebhookRequest
+ from .webhooks import WebhookDeliveryResult, deliver_webhook
+@@ -96,12 +114,28 @@ def _copy_record(record: dict[str, Any]) -> dict[str, Any]:
+     return copy.deepcopy(record)
+ 
+ 
++_FileSignature = tuple[int, int, int]
++
++
++def _file_signature(path: Path) -> Optional[_FileSignature]:
++    try:
++        stat = path.stat()
++    except FileNotFoundError:
++        return None
++    return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
++
++
+ class LocalJobStore:
+     """Durable local metadata store for async jobs.
+ 
+     The store intentionally persists only metadata and no raw submitted text or
+     redacted output. Raw job payloads live in memory until a worker processes
+     them.
++
++    The file records its schema version. A store persisted by a build outside
++    this build's compatibility window is never loaded or overwritten: every
++    operation raises :class:`IncompatibleStateError` before mutation, including
++    when another process replaces the file while this one is running.
+     """
+ 
+     def __init__(
+@@ -115,11 +149,27 @@ def __init__(
+         self.ttl_seconds = int(ttl_seconds)
+         self.clock = clock
+         self._lock = threading.RLock()
++        self._schema = CURRENT_CONTRACT.durable_schemas[JOB_STORE_COMPONENT]
++        self._blocked: Optional[ComponentCompatibility] = None
++        self._published_signature: Optional[_FileSignature] = None
+         self._records: dict[str, dict[str, Any]] = self._load()
+ 
++    @property
++    def compatibility(self) -> ComponentCompatibility:
++        """Return the value-free compatibility of the persisted store."""
++        with self._lock:
++            if self._blocked is not None:
++                return self._blocked
++            if self._published_signature is None:
++                return evaluate_component(self._schema, SchemaObservation.absent())
++            return evaluate_component(
++                self._schema, SchemaObservation.at(JOB_STORE_SCHEMA_VERSION)
++            )
++
+     def create(self, record: dict[str, Any]) -> dict[str, Any]:
+         """Persist a new job record."""
+         with self._lock:
++            self._require_compatible_locked()
+             previous = _copy_record(self._records)
+             self.cleanup_expired_locked()
+             job_id = str(record["id"])
+@@ -130,6 +180,7 @@ def create(self, record: dict[str, Any]) -> dict[str, Any]:
+     def get(self, job_id: str) -> Optional[dict[str, Any]]:
+         """Return one job record, if present."""
+         with self._lock:
++            self._require_compatible_locked()
+             self.cleanup_expired_locked()
+             record = self._records.get(job_id)
+             return None if record is None else _copy_record(record)
+@@ -137,6 +188,7 @@ def get(self, job_id: str) -> Optional[dict[str, Any]]:
+     def update(self, job_id: str, **changes: Any) -> dict[str, Any]:
+         """Apply changes to a job record and persist them."""
+         with self._lock:
++            self._require_compatible_locked()
+             previous = _copy_record(self._records)
+             record = self._records[job_id]
+             record.update(_copy_record(changes))
+@@ -147,6 +199,7 @@ def update(self, job_id: str, **changes: Any) -> dict[str, Any]:
+     def cleanup_expired(self) -> None:
+         """Remove terminal records whose TTL has elapsed."""
+         with self._lock:
++            self._require_compatible_locked()
+             previous = _copy_record(self._records)
+             if self.cleanup_expired_locked():
+                 self._publish_locked(previous)
+@@ -172,16 +225,45 @@ def _load(self) -> dict[str, dict[str, Any]]:
+             raise ValueError("Job metadata store contains invalid JSON") from None
+         if not isinstance(raw, dict):
+             raise ValueError("Job metadata store must contain a JSON object")
++        if "schema_version" in raw:
++            compatibility = evaluate_component(
++                self._schema, SchemaObservation.at(raw["schema_version"])
++            )
++            if compatibility.state is CompatibilityState.UNKNOWN:
++                raise ValueError("Job metadata store schema version is invalid")
++            if not compatibility.usable:
++                # Leave newer or older state untouched for a compatible build.
++                self._blocked = compatibility
++                return {}
+         jobs = raw.get("jobs")
+         if not isinstance(jobs, dict):
+             raise ValueError("Job metadata store must contain a jobs object")
+         if any(not isinstance(record, dict) for record in jobs.values()):
+             raise ValueError("Job metadata store contains an invalid job record")
++        self._published_signature = _file_signature(self.path)
+         return {str(job_id): dict(record) for job_id, record in jobs.items()}
+ 
++    def _require_compatible_locked(self) -> None:
++        if self._blocked is not None:
++            raise IncompatibleStateError(JOB_STORE_COMPONENT, self._blocked.code)
++
++    def _verify_on_disk_schema_locked(self) -> None:
++        """Refuse to replace a file another build rewrote outside the window."""
++        signature = _file_signature(self.path)
++        if signature is None or signature == self._published_signature:
++            return
++        compatibility = evaluate_component(
++            self._schema, job_store_observation(self.path)
++        )
++        if compatibility.usable:
++            return
++        self._blocked = compatibility
++        raise IncompatibleStateError(JOB_STORE_COMPONENT, compatibility.code)
++
+     def _persist_locked(self) -> None:
++        self._verify_on_disk_schema_locked()
+         self.path.parent.mkdir(parents=True, exist_ok=True)
+-        payload = {"jobs": self._records}
++        payload = {"schema_version": JOB_STORE_SCHEMA_VERSION, "jobs": self._records}
+         temp_name: str | None = None
+         try:
+             with tempfile.NamedTemporaryFile(
+@@ -194,6 +276,7 @@ def _persist_locked(self) -> None:
+                 json.dump(payload, handle, ensure_ascii=True, indent=2, sort_keys=True)
+                 handle.write("\n")
+             os.replace(temp_name, self.path)
++            self._published_signature = _file_signature(self.path)
+         except BaseException:
+             if temp_name is not None:
+                 try:
+@@ -224,7 +307,12 @@ def _parse_timestamp(raw_value: Any) -> datetime:
+ 
+ 
+ class DeidentifyJobQueue:
+-    """Bounded local worker pool for async de-identification jobs."""
++    """Bounded local worker pool for async de-identification jobs.
++
++    Every record is stamped with a :class:`WorkEnvelope` naming the contract
++    and model generation it was admitted under, and a worker checks that
++    envelope with :func:`check_work` before it marks the job running.
++    """
+ 
+     def __init__(
+         self,
+@@ -234,11 +322,15 @@ def __init__(
+         max_workers: int = DEFAULT_JOBS_WORKERS,
+         webhook_sender: WebhookSender = deliver_webhook,
+         clock: Callable[[], datetime] = _utc_now,
++        descriptor: Optional[CompatibilityDescriptor] = None,
+     ) -> None:
+         self.runtime = runtime
+         self.store = store
+         self.webhook_sender = webhook_sender
+         self.clock = clock
++        self.descriptor = (
++            descriptor if descriptor is not None else local_descriptor(runtime)
++        )
+         self._executor = ThreadPoolExecutor(
+             max_workers=int(max_workers),
+             thread_name_prefix="openmed-job",
+@@ -312,9 +404,53 @@ def _new_record(self, payload: DeidentifyJobRequest) -> dict[str, Any]:
+             "started_at": None,
+             "completed_at": None,
+             "expires_at": self._expiry_timestamp(now),
++            "compatibility": self._work_envelope(payload).to_dict(),
+         }
+ 
++    def _work_envelope(self, payload: DeidentifyJobRequest) -> WorkEnvelope:
++        capabilities = {JOB_DEIDENTIFY_CAPABILITY}
++        if payload.webhook is not None:
++            capabilities.add(JOB_WEBHOOK_CAPABILITY)
++        # Pin the model generation whenever this node publishes the generations
++        # it serves, so a claimant that does not serve it refuses the job.
++        model_generation = (
++            model_generation_ref(payload.model_name)
++            if self.descriptor.model_generations
++            else None
++        )
++        return WorkEnvelope.for_work(
++            self.descriptor,
++            components=(JOB_STORE_COMPONENT,),
++            required_capabilities=capabilities,
++            model_generation=model_generation,
++        )
++
++    def _refuse_incompatible_work(self, item: _JobWorkItem) -> bool:
++        """Fail a job this worker cannot handle before claiming it."""
++        record = self.store.get(item.job_id)
++        if record is None:
++            return True
++        decision = check_work(self.descriptor, record.get("compatibility"))
++        if decision.compatible:
++            return False
++        completed_at = self.clock()
++        final_record = self.store.update(
++            item.job_id,
++            status="failed",
++            error={
++                "type": "IncompatibleWork",
++                "message": "Job was refused before processing",
++                "code": decision.code,
++            },
++            completed_at=_isoformat(completed_at),
++            expires_at=self._expiry_timestamp(completed_at),
++        )
++        self._send_terminal_webhook(item.payload.webhook, final_record)
++        return True
++
+     def _run_job(self, item: _JobWorkItem) -> None:
++        if self._refuse_incompatible_work(item):
++            return
+         started_at = self.clock()
+         self.store.update(
+             item.job_id,
+diff --git a/tests/integration/test_mixed_version_upgrade.py b/tests/integration/test_mixed_version_upgrade.py
+new file mode 100644
+index 0000000000..cf83d778c1
+--- /dev/null
++++ b/tests/integration/test_mixed_version_upgrade.py
+@@ -0,0 +1,739 @@
++"""Offline N/N-1 mixed-version harness for zero-downtime service upgrades.
++
++Two or three contract generations share one in-process job store and one
++Journey store through versioned fakes. Every node makes its decisions with the
++real ``openmed.service.compatibility`` contract: peer negotiation, work claims,
++readiness on persisted state, and rollback checks. The fakes model the parts
++that live in other components (leases with fencing tokens, checkpoints,
++idempotency keys and webhook delivery identity) so the harness can prove that
++no committed effect is lost or duplicated across a rolling upgrade, a rollback
++inside the window, and a refusal outside it.
++
++Generation 1 is the shipped :data:`CURRENT_CONTRACT`. Generation 2 is a
++synthetic *expand* step (reads the next schema, still writes the current one,
++adds a capability). Generation 3 is a synthetic *contract* step (writes the new
++schema and drops generation 1 from its window).
++"""
++
++from __future__ import annotations
++
++import copy
++import hashlib
++import json
++import re
++from collections import Counter
++from dataclasses import dataclass, field
++from typing import Any
++
++import pytest
++
++from openmed.service.compatibility import (
++    CONTRACT_HISTORY,
++    CURRENT_CONTRACT,
++    CompatibilityDecision,
++    CompatibilityDescriptor,
++    CompatibilityGate,
++    IncompatibleStateError,
++    RolloutEvidence,
++    SchemaObservation,
++    SchemaRange,
++    WorkEnvelope,
++    check_work,
++    compatibility_matrix,
++    model_generation_ref,
++    negotiate_peer,
++    peer_contract_decision,
++    rollback_decision,
++)
++
++pytestmark = pytest.mark.integration
++
++MODEL_V1 = "OpenMed/synthetic-pii-v1"
++MODEL_V2 = "OpenMed/synthetic-pii-v2"
++BASE_CAPABILITY = "jobs.deidentify.v1"
++NEXT_CAPABILITY = "jobs.deidentify.v2"
++
++OLD = CURRENT_CONTRACT
++EXPAND = CompatibilityDescriptor(
++    contract_generation=2,
++    min_peer_generation=1,
++    durable_schemas={
++        **CURRENT_CONTRACT.durable_schemas,
++        "jobs": SchemaRange(read_min=1, read_max=2, write=1),
++        "journey_local": SchemaRange(read_min=3, read_max=4, write=3),
++    },
++    capabilities=CURRENT_CONTRACT.capabilities | {NEXT_CAPABILITY},
++)
++CONTRACT = CompatibilityDescriptor(
++    contract_generation=3,
++    min_peer_generation=2,
++    durable_schemas={
++        **CURRENT_CONTRACT.durable_schemas,
++        "jobs": SchemaRange(read_min=1, read_max=2, write=2),
++        "journey_local": SchemaRange(read_min=3, read_max=4, write=4),
++    },
++    capabilities=EXPAND.capabilities,
++)
++WINDOW = (OLD, EXPAND, CONTRACT)
++SERVED = {1: (MODEL_V1,), 2: (MODEL_V1, MODEL_V2), 3: (MODEL_V1, MODEL_V2)}
++SHARED_COMPONENTS = ("jobs", "journey_local")
++
++_MATRIX = compatibility_matrix(WINDOW)
++SUPPORTED = tuple(
++    (row["older"], row["newer"]) for row in _MATRIX["combinations"] if row["compatible"]
++)
++UNSUPPORTED = tuple(
++    (row["older"], row["newer"])
++    for row in _MATRIX["combinations"]
++    if not row["compatible"]
++)
++#: Every (API generation, worker generation) pair the harness runs, in both
++#: directions, derived from the matrix so no supported pair can be skipped.
++COMBINATIONS = tuple(
++    sorted(
++        {
++            pair
++            for older, newer in SUPPORTED
++            for pair in ((older, newer), (newer, older))
++        }
++    )
++)
++BY_GENERATION = {item.contract_generation: item for item in WINDOW}
++
++_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
++_TOKEN = re.compile(r"[a-z0-9_.\-]+\Z")
++
++
++class Draining(RuntimeError):
++    """Raised when a draining node is asked to admit new work."""
++
++
++class PeerRefused(RuntimeError):
++    """Raised when a node refuses an announced peer before processing."""
++
++    def __init__(self, decision: CompatibilityDecision) -> None:
++        super().__init__("peer refused")
++        self.decision = decision
++
++
++def _digest(text: str) -> str:
++    return f"sha256:{hashlib.sha256(text.encode('ascii')).hexdigest()}"
++
++
++@dataclass
++class SharedState:
++    """Versioned fake of the job store and Journey store all nodes share."""
++
++    schemas: dict[str, int] = field(
++        default_factory=lambda: {
++            "jobs": OLD.durable_schemas["jobs"].write,
++            "journey_local": OLD.durable_schemas["journey_local"].write,
++        }
++    )
++    records: dict[str, dict[str, Any]] = field(default_factory=dict)
++    idempotency: dict[str, str] = field(default_factory=dict)
++    fence: int = 0
++    effects: list[tuple[str, int]] = field(default_factory=list)
++    artifacts: dict[str, int] = field(default_factory=dict)
++    deliveries: Counter[str] = field(default_factory=Counter)
++    mutations: int = 0
++
++    def observe(self, component: str) -> SchemaObservation:
++        return SchemaObservation.at(self.schemas[component])
++
++    def digest(self) -> str:
++        payload = {
++            "schemas": self.schemas,
++            "records": self.records,
++            "idempotency": self.idempotency,
++            "fence": self.fence,
++            "effects": self.effects,
++            "artifacts": self.artifacts,
++            "deliveries": dict(self.deliveries),
++        }
++        return _digest(json.dumps(payload, sort_keys=True))
++
++    def backup(self) -> "SharedState":
++        """Model a verified backup of the shared stores (#3577)."""
++        return copy.deepcopy(self)
++
++
++@dataclass(frozen=True)
++class Lease:
++    job_id: str
++    fence: int
++    owner: str
++
++
++class Node:
++    """One API-and-worker process of a given contract generation."""
++
++    def __init__(
++        self,
++        name: str,
++        contract: CompatibilityDescriptor,
++        shared: SharedState,
++        evidence: RolloutEvidence,
++    ) -> None:
++        self.name = name
++        self.descriptor = contract.with_model_generations(
++            model_generation_ref(model)
++            for model in SERVED[contract.contract_generation]
++        )
++        self.shared = shared
++        self.evidence = evidence
++        self.admitting = True
++        self.alive = True
++        self.open_streams = 0
++        self.gate = CompatibilityGate(
++            self.descriptor,
++            {
++                component: (lambda component=component: shared.observe(component))
++                for component in SHARED_COMPONENTS
++            },
++            refresh_interval_seconds=0,
++        )
++        evidence.register(contract)
++
++    @property
++    def generation(self) -> int:
++        return self.descriptor.contract_generation
++
++    def ready(self) -> bool:
++        return self.alive and self.admitting and self.gate.report().ready
++
++    def accept_peer(self, peer: "Node") -> CompatibilityDecision:
++        """Negotiate with a peer; the header and descriptor paths must agree."""
++        full = negotiate_peer(self.descriptor, peer.descriptor.to_dict())
++        header = peer_contract_decision(
++            self.descriptor, [peer.descriptor.peer_contract]
++        )
++        assert header.compatible is full.compatible
++        self.evidence.record(
++            "peer_negotiation", full, generations=[peer.generation, self.generation]
++        )
++        return full
++
++    def _require_writable(self) -> None:
++        report = self.gate.report(force=True)
++        for component, item in report.blocking().items():
++            self.evidence.count("mutation_refused")
++            raise IncompatibleStateError(component, item.code)
++
++    def _write(self) -> None:
++        self._require_writable()
++        for component in SHARED_COMPONENTS:
++            write = self.descriptor.durable_schemas[component].write
++            self.shared.schemas[component] = max(self.shared.schemas[component], write)
++        self.shared.mutations += 1
++
++    def handle_request(self, via: "Node") -> int:
++        """Serve one synchronous request a peer forwarded with its contract."""
++        decision = self.accept_peer(via)
++        if not decision.compatible:
++            raise PeerRefused(decision)
++        if not self.admitting:
++            raise Draining()
++        self.evidence.count("requests_completed")
++        return self.generation
++
++    def open_stream(self) -> int:
++        if not self.admitting:
++            raise Draining()
++        self.open_streams += 1
++        return self.generation
++
++    def close_stream(self) -> None:
++        self.open_streams -= 1
++        self.evidence.count("streams_completed")
++
++    def submit(
++        self,
++        key: str,
++        *,
++        documents: int = 2,
++        model: str = MODEL_V1,
++        capabilities: frozenset[str] = frozenset({BASE_CAPABILITY}),
++        via: "Node | None" = None,
++    ) -> str:
++        if via is not None:
++            decision = self.accept_peer(via)
++            if not decision.compatible:
++                raise PeerRefused(decision)
++        if not self.admitting:
++            raise Draining()
++        self._require_writable()
++        existing = self.shared.idempotency.get(key)
++        if existing is not None:
++            self.evidence.count("idempotent_replays")
++            return existing
++        job_id = f"job{len(self.shared.records):04d}"
++        envelope = WorkEnvelope.for_work(
++            self.descriptor,
++            components=SHARED_COMPONENTS,
++            required_capabilities=capabilities,
++            model_generation=model_generation_ref(model),
++        )
++        self._write()
++        self.shared.records[job_id] = {
++            "status": "queued",
++            "envelope": envelope.to_dict(),
++            "documents": documents,
++            "checkpoint": 0,
++            "lease": None,
++        }
++        self.shared.idempotency[key] = job_id
++        self.evidence.count("jobs_accepted")
++        return job_id
++
++    def claim(self) -> Lease | None:
++        if not (self.alive and self.admitting):
++            return None
++        self._require_writable()
++        for job_id, record in sorted(self.shared.records.items()):
++            if record["status"] != "queued":
++                continue
++            decision = check_work(self.descriptor, record["envelope"])
++            self.evidence.record(
++                "work_claim",
++                decision,
++                generations=[
++                    record["envelope"]["contract_generation"],
++                    self.generation,
++                ],
++            )
++            if not decision.compatible:
++                continue
++            self.shared.fence += 1
++            record["lease"] = {"owner": self.name, "fence": self.shared.fence}
++            record["status"] = "running"
++            self._write()
++            return Lease(job_id, self.shared.fence, self.name)
++        return None
++
++    def _holds(self, lease: Lease) -> bool:
++        current = self.shared.records[lease.job_id]["lease"]
++        if current is None or current["fence"] != lease.fence:
++            self.evidence.count("stale_fence_rejected")
++            return False
++        return True
++
++    def process(self, lease: Lease, *, limit: int | None = None) -> bool:
++        """Commit documents from the checkpoint; return whether the job finished."""
++        record = self.shared.records[lease.job_id]
++        processed = 0
++        while record["checkpoint"] < record["documents"]:
++            if limit is not None and processed >= limit:
++                return False
++            if not self._holds(lease):
++                return False
++            self._write()
++            self.shared.effects.append((lease.job_id, record["checkpoint"]))
++            record["checkpoint"] += 1
++            processed += 1
++        if not self._holds(lease):
++            return False
++        self._finish(lease)
++        return True
++
++    def _finish(self, lease: Lease) -> None:
++        record = self.shared.records[lease.job_id]
++        self._write()
++        # Journey artifact: content-addressed, so a replay is idempotent.
++        artifact = _digest(f"{lease.job_id}:{record['documents']}")
++        if artifact in self.shared.artifacts:
++            self.evidence.count("artifact_replays_suppressed")
++        else:
++            self.shared.artifacts[artifact] = record["documents"]
++        record["status"] = "done"
++        record["lease"] = None
++        self.evidence.count("jobs_completed")
++        self.deliver_webhook(lease.job_id)
++
++    def deliver_webhook(self, job_id: str) -> None:
++        """Send the terminal webhook under a generation-independent identity."""
++        delivery_id = _digest(f"{job_id}:job.done")
++        if self.shared.deliveries[delivery_id]:
++            self.evidence.count("webhook_replays_suppressed")
++            return
++        self._write()
++        self.shared.deliveries[delivery_id] += 1
++
++    def begin_drain(self) -> None:
++        """Drop readiness and stop admitting requests, streams and claims."""
++        self.admitting = False
++
++    def drain(self, leases: tuple[Lease, ...] = ()) -> None:
++        """Stop admission, checkpoint in-flight leases, then stop.
++
++        This mirrors the drain coordinator phases (stop admission, finish or
++        checkpoint in-flight work, release) without depending on it.
++        """
++        self.begin_drain()
++        for lease in leases:
++            record = self.shared.records[lease.job_id]
++            if record["status"] == "running" and self._holds(lease):
++                record["status"] = "queued"
++                record["lease"] = None
++                self._write()
++                self.evidence.count("checkpointed")
++        assert self.open_streams == 0
++        self.alive = False
++
++
++class Fleet:
++    """Rolling-upgrade orchestrator over a shared state."""
++
++    def __init__(self, shared: SharedState, evidence: RolloutEvidence) -> None:
++        self.shared = shared
++        self.evidence = evidence
++        self.nodes: list[Node] = []
++        self._names = 0
++
++    def live(self) -> list[Node]:
++        return [node for node in self.nodes if node.alive]
++
++    def join(self, contract: CompatibilityDescriptor) -> Node:
++        self._names += 1
++        node = Node(f"node{self._names}", contract, self.shared, self.evidence)
++        for peer in self.live():
++            for decision in (node.accept_peer(peer), peer.accept_peer(node)):
++                if not decision.compatible:
++                    raise PeerRefused(decision)
++        self.nodes.append(node)
++        return node
++
++    def assert_serving(self) -> None:
++        ready = [node for node in self.live() if node.ready()]
++        assert ready, "rolling upgrade lost readiness"
++        for node in ready:
++            for peer in ready:
++                assert negotiate_peer(node.descriptor, peer.descriptor).compatible
++
++    def run_until_idle(self) -> None:
++        progressed = True
++        while progressed:
++            progressed = False
++            for node in self.live():
++                lease = node.claim()
++                if lease is not None:
++                    node.process(lease)
++                    progressed = True
++
++
++def _assert_exactly_once(shared: SharedState, job_ids: list[str]) -> None:
++    for job_id in job_ids:
++        record = shared.records[job_id]
++        assert record["status"] == "done"
++        effects = [effect for effect in shared.effects if effect[0] == job_id]
++        assert effects == [(job_id, index) for index in range(record["documents"])]
++        assert shared.deliveries[_digest(f"{job_id}:job.done")] == 1
++    assert len(shared.effects) == len(set(shared.effects))
++
++
++def _assert_value_free(document: Any) -> None:
++    def strings(value: Any) -> list[str]:
++        if isinstance(value, str):
++            return [value]
++        if isinstance(value, dict):
++            return [s for key, inner in value.items() for s in (key, *strings(inner))]
++        if isinstance(value, list):
++            return [s for inner in value for s in strings(inner)]
++        return []
++
++    for text in strings(document):
++        assert _DIGEST.fullmatch(text) or _TOKEN.fullmatch(text), text
++    serialized = json.dumps(document)
++    for forbidden in ("synthetic-pii", "node1", "job0", "OpenMed/"):
++        assert forbidden not in serialized
++
++
++def test_harness_window_extends_the_published_contract() -> None:
++    assert CONTRACT_HISTORY[-1] is OLD
++    assert BY_GENERATION[1].digest() == CURRENT_CONTRACT.digest()
++    assert SUPPORTED == ((1, 1), (1, 2), (2, 2), (2, 3), (3, 3))
++    assert UNSUPPORTED == ((1, 3),)
++
++
++@pytest.mark.parametrize(("api_generation", "worker_generation"), COMBINATIONS)
++def test_every_supported_combination_completes_every_workflow(
++    api_generation: int, worker_generation: int
++) -> None:
++    shared = SharedState()
++    evidence = RolloutEvidence("supported_combination")
++    fleet = Fleet(shared, evidence)
++    api = fleet.join(BY_GENERATION[api_generation])
++    worker = fleet.join(BY_GENERATION[worker_generation])
++
++    assert worker.handle_request(via=api) == worker_generation
++    assert worker.open_stream() == worker_generation
++    worker.close_stream()
++
++    job_ids = [
++        api.submit("synthetic-key-a", via=None),
++        worker.submit("synthetic-key-b", documents=3, via=api),
++    ]
++    assert worker.submit("synthetic-key-a", via=api) == job_ids[0]
++    assert api.submit("synthetic-key-b") == job_ids[1]
++
++    leases = []
++    while (lease := worker.claim()) is not None:
++        leases.append(lease)
++        assert worker.process(lease)
++    assert [lease.job_id for lease in leases] == job_ids
++    for job_id in job_ids:
++        worker.deliver_webhook(job_id)
++        api.deliver_webhook(job_id)
++    # Accepted work keeps the contract and model generation it was admitted
++    # under through completion, whichever generation finished it.
++    envelopes = [
++        WorkEnvelope.from_dict(shared.records[job]["envelope"]) for job in job_ids
++    ]
++    assert [item.contract_generation for item in envelopes] == [
++        api_generation,
++        worker_generation,
++    ]
++    assert {item.model_generation for item in envelopes} == {
++        model_generation_ref(MODEL_V1)
++    }
++
++    _assert_exactly_once(shared, job_ids)
++    assert sorted(shared.artifacts.values()) == [2, 3]
++    assert api.ready() and worker.ready()
++    counts = evidence.to_dict()["counts"]
++    assert counts["idempotent_replays"] == 2
++    assert counts["webhook_replays_suppressed"] == 4
++    assert counts["requests_completed"] == 1
++    assert counts["streams_completed"] == 1
++    assert "mutation_refused" not in counts
++    _assert_value_free(evidence.to_dict())
++
++
++def test_lease_fencing_survives_a_mixed_version_handoff() -> None:
++    shared = SharedState()
++    evidence = RolloutEvidence("lease_handoff")
++    fleet = Fleet(shared, evidence)
++    old, new = fleet.join(OLD), fleet.join(EXPAND)
++    job_id = old.submit("synthetic-key", documents=4)
++    stale = old.claim()
++    assert stale is not None
++    assert old.process(stale, limit=1) is False
++    # The old worker stalls; its lease expires and the newer worker reclaims
++    # the checkpoint with a higher fencing token.
++    shared.records[job_id]["status"] = "queued"
++    shared.records[job_id]["lease"] = None
++    fresh = new.claim()
++    assert fresh is not None and fresh.fence > stale.fence
++    assert old.process(stale) is False
++    assert new.process(fresh)
++    _assert_exactly_once(shared, [job_id])
++    assert evidence.to_dict()["counts"]["stale_fence_rejected"] >= 1
++
++
++def test_unsupported_combinations_fail_before_mutation() -> None:
++    for older, newer in UNSUPPORTED:
++        shared = SharedState()
++        evidence = RolloutEvidence("unsupported_combination")
++        fleet = Fleet(shared, evidence)
++        old = fleet.join(BY_GENERATION[older])
++        with pytest.raises(PeerRefused) as refused:
++            fleet.join(BY_GENERATION[newer])
++        assert refused.value.decision.code == "peer_generation_outside_window"
++        assert [node.generation for node in fleet.live()] == [older]
++
++        # Even without a handshake, the newer build's work and state are
++        # refused by the older build before it mutates anything.
++        stray = Node("stray", BY_GENERATION[newer], shared, evidence)
++        with pytest.raises(PeerRefused):
++            old.submit("synthetic-key", via=stray)
++        job_id = stray.submit("synthetic-key")
++        before = (shared.digest(), shared.mutations)
++        assert not old.ready()
++        with pytest.raises(IncompatibleStateError) as blocked:
++            old.claim()
++        assert blocked.value.code == "schema_ahead_of_window"
++        with pytest.raises(IncompatibleStateError):
++            old.submit("synthetic-other")
++        assert check_work(old.descriptor, shared.records[job_id]["envelope"]).code == (
++            "work_generation_outside_window"
++        )
++        assert (shared.digest(), shared.mutations) == before
++
++
++def test_new_api_work_an_old_worker_cannot_handle_waits_for_a_capable_worker() -> None:
++    shared = SharedState()
++    evidence = RolloutEvidence("capability_handoff")
++    fleet = Fleet(shared, evidence)
++    old, new = fleet.join(OLD), fleet.join(EXPAND)
++    needs_v2 = new.submit(
++        "synthetic-v2", capabilities=frozenset({BASE_CAPABILITY, NEXT_CAPABILITY})
++    )
++    pinned = new.submit("synthetic-model-v2", model=MODEL_V2)
++    before = (shared.digest(), shared.mutations)
++    assert old.claim() is None
++    assert (shared.digest(), shared.mutations) == before
++    codes = [step["code"] for step in evidence.steps if step["step"] == "work_claim"]
++    assert codes == ["capability_missing", "model_generation_unavailable"]
++    fleet.run_until_idle()
++    _assert_exactly_once(shared, [needs_v2, pinned])
++    assert shared.records[pinned]["envelope"]["model_generation"] == (
++        model_generation_ref(MODEL_V2)
++    )
++
++
++def test_rolling_upgrade_drains_and_hands_off_without_lost_or_duplicate_work() -> None:
++    shared = SharedState()
++    evidence = RolloutEvidence("rolling_upgrade")
++    fleet = Fleet(shared, evidence)
++    old_a, old_b = fleet.join(OLD), fleet.join(OLD)
++    job_ids = [old_a.submit(f"synthetic-{index}", documents=3) for index in range(3)]
++    in_flight = old_a.claim()
++    assert in_flight is not None and not old_a.process(in_flight, limit=1)
++    stream_generation = old_b.open_stream()
++    fleet.assert_serving()
++
++    new_a = fleet.join(EXPAND)
++    fleet.assert_serving()
++    old_a.drain((in_flight,))
++    assert not old_a.ready()
++    with pytest.raises(Draining):
++        old_a.submit("synthetic-late")
++    fleet.assert_serving()
++    assert old_a.process(in_flight) is False
++
++    resumed = new_a.claim()
++    assert resumed is not None and resumed.job_id == in_flight.job_id
++    assert shared.records[resumed.job_id]["checkpoint"] == 1
++    assert new_a.process(resumed)
++    job_ids.append(
++        new_a.submit(
++            "synthetic-v2",
++            capabilities=frozenset({BASE_CAPABILITY, NEXT_CAPABILITY}),
++            via=old_b,
++        )
++    )
++    job_ids.append(old_b.submit("synthetic-from-old", via=new_a))
++    assert old_b.submit("synthetic-0", via=new_a) == job_ids[0]
++
++    new_b = fleet.join(EXPAND)
++    old_b.begin_drain()
++    with pytest.raises(Draining):
++        old_b.open_stream()
++    # The stream admitted before the drain finishes on its own generation.
++    assert stream_generation == 1
++    old_b.close_stream()
++    old_b.drain()
++    fleet.assert_serving()
++    fleet.run_until_idle()
++
++    assert {node.generation for node in fleet.live()} == {2}
++    assert new_b.ready()
++    _assert_exactly_once(shared, job_ids)
++    assert shared.schemas == {"jobs": 1, "journey_local": 3}
++    document = evidence.to_dict()
++    assert document["counts"]["checkpointed"] == 1
++    assert document["counts"]["streams_completed"] == 1
++    assert "mutation_refused" not in document["counts"]
++    _assert_value_free(document)
++
++
++def test_rollback_within_window_then_roll_forward_keeps_every_job() -> None:
++    shared = SharedState()
++    evidence = RolloutEvidence("rollback_within_window")
++    fleet = Fleet(shared, evidence)
++    new_a, new_b = fleet.join(EXPAND), fleet.join(EXPAND)
++    plain = new_a.submit("synthetic-plain")
++    needs_v2 = new_a.submit(
++        "synthetic-v2", capabilities=frozenset({BASE_CAPABILITY, NEXT_CAPABILITY})
++    )
++    observations = {name: shared.observe(name) for name in SHARED_COMPONENTS}
++    decision = rollback_decision(
++        OLD, running=[new_a.descriptor], observations=observations
++    )
++    evidence.record("rollback_check", decision, generations=[2, 1])
++    assert decision.code == "rollback_within_window"
++
++    old_a = fleet.join(OLD)
++    new_a.drain()
++    old_b = fleet.join(OLD)
++    new_b.drain()
++    fleet.assert_serving()
++    fleet.run_until_idle()
++    assert shared.records[plain]["status"] == "done"
++    assert shared.records[needs_v2]["status"] == "queued"
++    assert shared.records[needs_v2]["lease"] is None
++
++    forward = fleet.join(EXPAND)
++    old_a.drain()
++    old_b.drain()
++    fleet.assert_serving()
++    fleet.run_until_idle()
++    assert forward.ready()
++    _assert_exactly_once(shared, [plain, needs_v2])
++    _assert_value_free(evidence.to_dict())
++
++
++def test_rollback_outside_the_window_is_refused_until_a_backup_is_restored() -> None:
++    shared = SharedState()
++    evidence = RolloutEvidence("rollback_outside_window")
++    fleet = Fleet(shared, evidence)
++    expand_a, expand_b = fleet.join(EXPAND), fleet.join(EXPAND)
++    first = expand_a.submit("synthetic-before")
++    fleet.run_until_idle()
++    backup = shared.backup()
++
++    contract_a = fleet.join(CONTRACT)
++    expand_a.drain()
++    second = contract_a.submit("synthetic-after", via=expand_b)
++    assert shared.schemas == {"jobs": 2, "journey_local": 4}
++    fleet.run_until_idle()
++    fleet.assert_serving()
++    _assert_exactly_once(shared, [first, second])
++
++    observations = {name: shared.observe(name) for name in SHARED_COMPONENTS}
++    to_expand = rollback_decision(
++        EXPAND, running=[contract_a.descriptor], observations=observations
++    )
++    to_old = rollback_decision(
++        OLD, running=[expand_b.descriptor], observations=observations
++    )
++    evidence.record("rollback_check", to_expand, generations=[3, 2])
++    evidence.record("rollback_check", to_old, generations=[3, 1])
++    assert to_expand.code == "rollback_within_window"
++    assert (to_old.code, to_old.component) == ("schema_ahead_of_window", "jobs")
++    with pytest.raises(PeerRefused):
++        fleet.join(OLD)
++
++    newer_state = (shared.digest(), shared.mutations)
++    stray_old = Node("stray", OLD, shared, evidence)
++    assert not stray_old.ready()
++    for attempt in (stray_old.claim, lambda: stray_old.submit("synthetic-x")):
++        with pytest.raises(IncompatibleStateError):
++            attempt()
++    assert (shared.digest(), shared.mutations) == newer_state
++
++    restored = backup.backup()
++    recovered = Node("recovered", OLD, restored, evidence)
++    assert recovered.ready()
++    assert restored.records[first]["status"] == "done"
++    assert second not in restored.records
++    assert (shared.digest(), shared.mutations) == newer_state
++    _assert_value_free(evidence.to_dict())
++
++
++def test_published_matrix_contains_no_untested_supported_combination() -> None:
++    published = compatibility_matrix()
++    supported = {
++        (row["older"], row["newer"])
++        for row in published["combinations"]
++        if row["compatible"]
++    }
++    assert supported <= set(SUPPORTED)
++    for older, newer in supported:
++        assert (older, newer) in COMBINATIONS and (newer, older) in COMBINATIONS
++        for generation in (older, newer):
++            assert published["descriptor_digests"][str(generation)] == (
++                BY_GENERATION[generation].digest()
++            )
++    _assert_value_free(published)
++    _assert_value_free(_MATRIX)
+diff --git a/tests/unit/service/test_compatibility.py b/tests/unit/service/test_compatibility.py
+new file mode 100644
+index 0000000000..f244e6cf9a
+--- /dev/null
++++ b/tests/unit/service/test_compatibility.py
+@@ -0,0 +1,804 @@
++"""Unit tests for the mixed-version service compatibility contract."""
++
++from __future__ import annotations
++
++import json
++import re
++from dataclasses import replace
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any
++
++import grpc
++import pytest
++from fastapi.testclient import TestClient
++
++from openmed.service import compatibility as compat
++from openmed.service import jobs
++from openmed.service import runtime as service_runtime
++from openmed.service.app import create_app
++from openmed.service.auth import ROUTE_POLICIES, hash_api_key
++from openmed.service.compatibility import (
++    CONTRACT_HISTORY,
++    CURRENT_CONTRACT,
++    PEER_CONTRACT_HEADER,
++    PEER_CONTRACT_METADATA_KEY,
++    REASON_CODES,
++    CompatibilityDescriptor,
++    CompatibilityError,
++    CompatibilityGate,
++    CompatibilityState,
++    IncompatibleStateError,
++    RolloutEvidence,
++    SchemaObservation,
++    SchemaRange,
++    WorkEnvelope,
++    check_work,
++    compatibility_matrix,
++    evaluate_component,
++    evaluate_persisted_state,
++    job_store_observation,
++    journey_store_observation,
++    local_descriptor,
++    model_generation_ref,
++    negotiate_peer,
++    peer_contract_decision,
++    rollback_decision,
++    validate_contract_history,
++)
++from openmed.service.proto.generated import openmed_pb2
++from openmed.service.schemas import DeidentifyJobDocument, DeidentifyJobRequest
++from openmed.structured.store import LATEST_MIGRATION_VERSION
++from openmed.structured.store.postgres import LATEST_POSTGRES_MIGRATION_VERSION
++
++LOOPBACK_BASE_URL = "http://127.0.0.1"
++_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
++_TOKEN = re.compile(r"[a-z0-9_.\-/]+\Z")
++
++
++class FakeLoader:
++    """Model loader double; compatibility checks never load models."""
++
++    def __init__(self, config: Any) -> None:
++        self.config = config
++
++    def resolve_model_name(self, model_name: str) -> str:
++        return model_name
++
++    def loaded_models(self) -> dict[str, Any]:
++        return {}
++
++
++@pytest.fixture(autouse=True)
++def service_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
++    for name in (
++        "OPENMED_SERVICE_AUTH_ENABLED",
++        "OPENMED_SERVICE_AUTH_API_KEYS",
++        "OPENMED_SERVICE_PRELOAD_MODELS",
++        "OPENMED_SERVICE_SERVED_MODELS",
++        "OPENMED_SERVICE_JOBS_WORKERS",
++    ):
++        monkeypatch.delenv(name, raising=False)
++    store_path = tmp_path / "service-jobs.json"
++    monkeypatch.setenv("OPENMED_PROFILE", "test")
++    monkeypatch.setenv("OPENMED_SERVICE_JOBS_STORE_PATH", str(store_path))
++    monkeypatch.setattr(service_runtime, "ModelLoader", FakeLoader)
++    return store_path
++
++
++def _contract(
++    generation: int,
++    minimum: int,
++    *,
++    jobs_range: tuple[int, int, int] = (1, 1, 1),
++    capabilities: frozenset[str] = frozenset({"jobs.deidentify.v1"}),
++) -> CompatibilityDescriptor:
++    read_min, read_max, write = jobs_range
++    return CompatibilityDescriptor(
++        contract_generation=generation,
++        min_peer_generation=minimum,
++        durable_schemas={"jobs": SchemaRange(read_min, read_max, write)},
++        capabilities=capabilities,
++    )
++
++
++def _strings(value: Any) -> list[str]:
++    if isinstance(value, str):
++        return [value]
++    if isinstance(value, dict):
++        return [
++            item for key, inner in value.items() for item in (key, *_strings(inner))
++        ]
++    if isinstance(value, list):
++        return [item for inner in value for item in _strings(inner)]
++    return []
++
++
++def _assert_value_free(payload: Any, *forbidden: str) -> None:
++    for text in _strings(payload):
++        assert _DIGEST.fullmatch(text) or _TOKEN.fullmatch(text), text
++    serialized = json.dumps(payload)
++    for item in forbidden:
++        assert item not in serialized
++
++
++# --- Published contract -----------------------------------------------------
++
++
++def test_current_contract_declares_a_self_consistent_n_minus_one_window() -> None:
++    assert CONTRACT_HISTORY[-1] is CURRENT_CONTRACT
++    assert CURRENT_CONTRACT.contract_generation == compat.CONTRACT_GENERATION
++    assert CURRENT_CONTRACT.min_peer_generation == compat.MIN_PEER_GENERATION
++    assert CURRENT_CONTRACT.peer_contract == "1/1"
++    assert CURRENT_CONTRACT.capabilities == compat.WORKER_CAPABILITIES
++    validate_contract_history()
++
++
++def test_durable_schema_table_matches_the_store_migration_chains() -> None:
++    schemas = CURRENT_CONTRACT.durable_schemas
++    assert schemas["jobs"].write == compat.JOB_STORE_SCHEMA_VERSION
++    assert schemas["journey_local"] == SchemaRange(
++        LATEST_MIGRATION_VERSION, LATEST_MIGRATION_VERSION, LATEST_MIGRATION_VERSION
++    )
++    assert schemas["journey_postgres"] == SchemaRange(
++        LATEST_POSTGRES_MIGRATION_VERSION,
++        LATEST_POSTGRES_MIGRATION_VERSION,
++        LATEST_POSTGRES_MIGRATION_VERSION,
++    )
++
++
++def test_contract_history_rejects_gaps_wide_windows_and_incompatible_steps() -> None:
++    one = _contract(1, 1)
++    two = _contract(2, 1, jobs_range=(1, 2, 1))
++    three = _contract(3, 2, jobs_range=(1, 2, 2))
++    validate_contract_history((one, two))
++    for history in ((), (one, three), (one, two, three), (one, _contract(2, 2))):
++        with pytest.raises(CompatibilityError) as raised:
++            validate_contract_history(history)
++        assert raised.value.code == "contract_history_invalid"
++
++
++def test_descriptor_round_trips_and_digest_is_canonical() -> None:
++    descriptor = local_descriptor(
++        SimpleNamespace(served_model_ids=lambda: ("OpenMed/synthetic-pii-v1",))
++    )
++    payload = descriptor.to_dict()
++    assert CompatibilityDescriptor.from_dict(json.loads(json.dumps(payload))) == (
++        descriptor
++    )
++    assert descriptor.digest() == CompatibilityDescriptor.from_dict(payload).digest()
++    assert descriptor.digest() != CURRENT_CONTRACT.digest()
++    assert payload["model_generations"] == [
++        model_generation_ref("OpenMed/synthetic-pii-v1")
++    ]
++    _assert_value_free(payload, "OpenMed/synthetic-pii-v1")
++    assert local_descriptor(SimpleNamespace()) is CURRENT_CONTRACT
++
++
++@pytest.mark.parametrize(
++    "mutate",
++    [
++        lambda p: p.update(schema_version="openmed.service.compatibility.v0"),
++        lambda p: p.update(unexpected=True),
++        lambda p: p.update(contract_generation=True),
++        lambda p: p.update(contract_generation=3, min_peer_generation=1),
++        lambda p: p.update(min_peer_generation=2),
++        lambda p: p.update(capabilities=["Not A Token"]),
++        lambda p: p.update(capabilities="jobs.deidentify.v1"),
++        lambda p: p.update(model_generations=["OpenMed/synthetic"]),
++        lambda p: p["durable_schemas"].update(jobs={"read": [2, 3], "write": 1}),
++        lambda p: p["durable_schemas"].update(jobs={"read": [1], "write": 1}),
++        lambda p: p["durable_schemas"].update({"../etc": {"read": [1, 1], "write": 1}}),
++    ],
++)
++def test_descriptor_parser_rejects_anything_it_does_not_understand(mutate) -> None:
++    payload = json.loads(json.dumps(CURRENT_CONTRACT.to_dict()))
++    mutate(payload)
++    with pytest.raises(CompatibilityError) as raised:
++        CompatibilityDescriptor.from_dict(payload)
++    assert raised.value.code == "peer_descriptor_unsupported"
++    assert "etc" not in str(raised.value)
++    assert negotiate_peer(CURRENT_CONTRACT, payload).code == (
++        "peer_descriptor_unsupported"
++    )
++
++
++# --- Peer negotiation -------------------------------------------------------
++
++
++def test_peer_negotiation_applies_the_newer_build_window() -> None:
++    one = _contract(1, 1)
++    two = _contract(2, 1, jobs_range=(1, 2, 1))
++    three = _contract(3, 2, jobs_range=(1, 2, 2))
++    cases = [
++        (one, one, "peer_compatible"),
++        (one, two, "peer_compatible"),
++        (two, one, "peer_compatible"),
++        (two, three, "peer_compatible"),
++        (three, two, "peer_compatible"),
++        (one, three, "peer_generation_outside_window"),
++        (three, one, "peer_generation_outside_window"),
++    ]
++    for local, peer, code in cases:
++        decision = negotiate_peer(local, peer)
++        assert decision.code == code
++        assert decision.compatible is (code == "peer_compatible")
++
++
++def test_peer_negotiation_refuses_unreadable_shared_schemas() -> None:
++    writes_two_early = _contract(2, 1, jobs_range=(1, 2, 2))
++    decision = negotiate_peer(_contract(1, 1), writes_two_early)
++    assert decision.to_dict() == {
++        "compatible": False,
++        "code": "peer_schema_outside_window",
++        "component": "jobs",
++    }
++    other_store = CompatibilityDescriptor(
++        contract_generation=1,
++        min_peer_generation=1,
++        durable_schemas={"other": SchemaRange(5, 5, 5)},
++        capabilities=frozenset(),
++    )
++    assert negotiate_peer(_contract(1, 1), other_store).compatible
++
++
++@pytest.mark.parametrize(
++    ("values", "code"),
++    [
++        (["1/1"], "peer_compatible"),
++        (["2/1"], "peer_compatible"),
++        (["2/2"], "peer_generation_outside_window"),
++        (["3/2"], "peer_generation_outside_window"),
++        ([], "peer_contract_malformed"),
++        (["1/1", "1/1"], "peer_contract_malformed"),
++        ([""], "peer_contract_malformed"),
++        (["1"], "peer_contract_malformed"),
++        (["01/1"], "peer_contract_malformed"),
++        (["1/2"], "peer_contract_malformed"),
++        (["3/1"], "peer_contract_malformed"),
++        (["a/b"], "peer_contract_malformed"),
++        ([b"1/1"], "peer_contract_malformed"),
++    ],
++)
++def test_peer_contract_token_decision(values: list[Any], code: str) -> None:
++    assert peer_contract_decision(CURRENT_CONTRACT, values).code == code
++
++
++# --- Work claims ------------------------------------------------------------
++
++
++def _envelope(**changes: Any) -> dict[str, Any]:
++    payload = WorkEnvelope.for_work(
++        CURRENT_CONTRACT,
++        components=("jobs",),
++        required_capabilities={"jobs.deidentify.v1"},
++        model_generation=model_generation_ref("OpenMed/synthetic-pii-v1"),
++    ).to_dict()
++    payload.update(changes)
++    return payload
++
++
++def test_work_claim_checks_generation_schema_capability_and_model() -> None:
++    worker = CURRENT_CONTRACT.with_model_generations(
++        [model_generation_ref("OpenMed/synthetic-pii-v1")]
++    )
++    other_model = model_generation_ref("OpenMed/synthetic-pii-v2")
++    cases = [
++        (_envelope(), "work_compatible", None),
++        (
++            _envelope(contract_generation=2, min_peer_generation=1),
++            "work_compatible",
++            None,
++        ),
++        (
++            _envelope(contract_generation=3, min_peer_generation=2),
++            "work_generation_outside_window",
++            None,
++        ),
++        (_envelope(schema_versions={"jobs": 2}), "work_schema_outside_window", "jobs"),
++        (
++            _envelope(schema_versions={"ledger": 1}),
++            "work_component_unknown",
++            "ledger",
++        ),
++        (
++            _envelope(required_capabilities=["jobs.deidentify.v2"]),
++            "capability_missing",
++            None,
++        ),
++        (_envelope(model_generation=other_model), "model_generation_unavailable", None),
++        (_envelope(model_generation=None), "work_compatible", None),
++        (None, "work_envelope_invalid", None),
++        ({"contract_generation": 1}, "work_envelope_invalid", None),
++        (_envelope(schema_versions={"jobs": True}), "work_envelope_invalid", None),
++        (_envelope(schema_versions=[1]), "work_envelope_invalid", None),
++        (
++            _envelope(model_generation="OpenMed/synthetic"),
++            "work_envelope_invalid",
++            None,
++        ),
++    ]
++    for envelope, code, component in cases:
++        decision = check_work(worker, envelope)
++        assert (decision.code, decision.component) == (code, component)
++        assert decision.compatible is (code == "work_compatible")
++        assert decision.code in REASON_CODES
++
++
++def test_work_envelope_round_trips_without_values() -> None:
++    envelope = WorkEnvelope.from_dict(_envelope())
++    assert WorkEnvelope.from_dict(envelope.to_dict()) == envelope
++    _assert_value_free(envelope.to_dict(), "synthetic-pii")
++
++
++# --- Persisted state --------------------------------------------------------
++
++
++def test_component_evaluation_blocks_unknown_newer_and_unmigrated_state() -> None:
++    schema = SchemaRange(2, 3, 3)
++    cases = [
++        (SchemaObservation.absent(), CompatibilityState.ABSENT, "schema_absent"),
++        (SchemaObservation.at(2), CompatibilityState.COMPATIBLE, "schema_compatible"),
++        (SchemaObservation.at(3), CompatibilityState.COMPATIBLE, "schema_compatible"),
++        (
++            SchemaObservation.at(1),
++            CompatibilityState.PENDING,
++            "schema_migration_required",
++        ),
++        (
++            SchemaObservation.at(4),
++            CompatibilityState.INCOMPATIBLE,
++            "schema_ahead_of_window",
++        ),
++        (SchemaObservation.unknown(), CompatibilityState.UNKNOWN, "schema_unknown"),
++        (SchemaObservation.at(True), CompatibilityState.UNKNOWN, "schema_unknown"),
++        (SchemaObservation.at("3"), CompatibilityState.UNKNOWN, "schema_unknown"),
++    ]
++    for observation, state, code in cases:
++        result = evaluate_component(schema, observation)
++        assert (result.state, result.code) == (state, code)
++        assert result.usable is (state in {"absent", "compatible"})
++    undeclared = evaluate_component(None, SchemaObservation.at(1))
++    assert undeclared.state is CompatibilityState.UNKNOWN
++    report = evaluate_persisted_state(
++        CURRENT_CONTRACT,
++        {"jobs": SchemaObservation.at(1), "journey_local": SchemaObservation.at(9)},
++    )
++    assert not report.ready
++    assert set(report.blocking()) == {"journey_local"}
++    assert report.to_dict() == {
++        "state": "blocked",
++        "components": {
++            "jobs": {
++                "state": "compatible",
++                "code": "schema_compatible",
++                "schema_version": 1,
++            },
++            "journey_local": {
++                "state": "incompatible",
++                "code": "schema_ahead_of_window",
++                "schema_version": 9,
++            },
++        },
++    }
++
++
++def test_job_store_probe_reports_versions_without_reading_records(
++    tmp_path: Path,
++) -> None:
++    path = tmp_path / "jobs.json"
++    assert job_store_observation(path) == SchemaObservation.absent()
++    cases = [
++        ('{"jobs": {}}', SchemaObservation.at(1)),
++        ('{"schema_version": 1, "jobs": {}}', SchemaObservation.at(1)),
++        ('{"schema_version": 2, "jobs": {}}', SchemaObservation.at(2)),
++        ('{"schema_version": true, "jobs": {}}', SchemaObservation.unknown()),
++        ("{}", SchemaObservation.unknown()),
++        ("[]", SchemaObservation.unknown()),
++        ("{broken", SchemaObservation.unknown()),
++    ]
++    for contents, expected in cases:
++        path.write_text(contents, encoding="utf-8")
++        assert job_store_observation(path) == expected
++    assert job_store_observation(tmp_path) == SchemaObservation.unknown()
++
++
++def test_journey_store_probe_maps_schema_versions() -> None:
++    assert journey_store_observation(SimpleNamespace(schema_version=3)) == (
++        SchemaObservation.at(3)
++    )
++    assert journey_store_observation(SimpleNamespace(schema_version=0)) == (
++        SchemaObservation.absent()
++    )
++
++    class Broken:
++        @property
++        def schema_version(self) -> int:
++            raise RuntimeError("synthetic probe failure")
++
++    assert journey_store_observation(Broken()) == SchemaObservation.unknown()
++
++
++def test_gate_caches_reports_and_treats_failing_probes_as_unknown() -> None:
++    now = [0.0]
++    calls: list[int] = []
++    versions = [1]
++
++    def probe() -> SchemaObservation:
++        calls.append(1)
++        return SchemaObservation.at(versions[0])
++
++    gate = CompatibilityGate(
++        CURRENT_CONTRACT,
++        {"jobs": probe},
++        refresh_interval_seconds=5.0,
++        clock=lambda: now[0],
++    )
++    assert gate.report().ready
++    versions[0] = 2
++    assert gate.report().ready and len(calls) == 1
++    now[0] = 5.0
++    assert not gate.report().ready and len(calls) == 2
++    versions[0] = 1
++    assert gate.report(force=True).ready and len(calls) == 3
++
++    def explode() -> SchemaObservation:
++        raise OSError("synthetic /var/lib/openmed failure")
++
++    for failing in (explode, lambda: "compatible"):
++        gate = CompatibilityGate(CURRENT_CONTRACT, {"jobs": failing})
++        snapshot = gate.snapshot()
++        assert snapshot["state"] == "blocked"
++        assert snapshot["components"]["jobs"]["code"] == "schema_unknown"
++        _assert_value_free(snapshot, "/var/lib")
++
++
++def test_rollback_requires_peer_and_persisted_state_compatibility() -> None:
++    one = _contract(1, 1, jobs_range=(1, 1, 1))
++    two = _contract(2, 1, jobs_range=(1, 2, 1))
++    three = _contract(3, 2, jobs_range=(1, 2, 2))
++    allowed = rollback_decision(
++        two, running=[three], observations={"jobs": SchemaObservation.at(2)}
++    )
++    assert allowed.code == "rollback_within_window"
++    peer = rollback_decision(
++        one, running=[three], observations={"jobs": SchemaObservation.at(1)}
++    )
++    assert peer.code == "peer_generation_outside_window"
++    state = rollback_decision(
++        one, running=[two], observations={"jobs": SchemaObservation.at(2)}
++    )
++    assert (state.code, state.component) == ("schema_ahead_of_window", "jobs")
++
++
++def test_matrix_and_evidence_are_machine_readable_and_value_free() -> None:
++    one = _contract(1, 1)
++    two = _contract(2, 1, jobs_range=(1, 2, 1))
++    three = _contract(3, 2, jobs_range=(1, 2, 2))
++    matrix = compatibility_matrix((three, one, two))
++    assert matrix["generations"] == [1, 2, 3]
++    assert [
++        (row["older"], row["newer"], row["code"]) for row in matrix["combinations"]
++    ] == [
++        (1, 1, "peer_compatible"),
++        (1, 2, "peer_compatible"),
++        (1, 3, "peer_generation_outside_window"),
++        (2, 2, "peer_compatible"),
++        (2, 3, "peer_compatible"),
++        (3, 3, "peer_compatible"),
++    ]
++    _assert_value_free(matrix)
++    assert compatibility_matrix()["generations"] == [1]
++
++    evidence = RolloutEvidence("rolling_upgrade")
++    evidence.register(one)
++    evidence.record("peer_join", negotiate_peer(one, two), generations=[1, 2])
++    evidence.count("jobs_completed", 2)
++    document = evidence.to_dict()
++    assert document["counts"] == {"jobs_completed": 2, "peer_compatible": 1}
++    _assert_value_free(document)
++    for bad in ("Free Text", "/etc/passwd", "a" * 40):
++        with pytest.raises(CompatibilityError):
++            evidence.count(bad)
++    with pytest.raises(CompatibilityError):
++        evidence.record(
++            "step", compat.CompatibilityDecision(True, "made_up"), generations=[1]
++        )
++    with pytest.raises(CompatibilityError):
++        evidence.record("step", negotiate_peer(one, two), generations=[True])
++
++
++def test_cli_prints_descriptor_and_matrix(capsys: pytest.CaptureFixture[str]) -> None:
++    assert compat.main([]) == 0
++    descriptor = json.loads(capsys.readouterr().out)
++    assert descriptor["descriptor_digest"] == CURRENT_CONTRACT.digest()
++    assert descriptor["peer_contract"] == "1/1"
++    assert compat.main(["matrix"]) == 0
++    assert json.loads(capsys.readouterr().out) == compatibility_matrix()
++
++
++# --- Job store and queue ----------------------------------------------------
++
++
++def test_job_store_writes_its_schema_version_and_reads_the_legacy_layout(
++    tmp_path: Path,
++) -> None:
++    path = tmp_path / "jobs.json"
++    path.write_text('{"jobs": {"synthetic": {"id": "synthetic"}}}', encoding="utf-8")
++    store = jobs.LocalJobStore(path)
++    assert store.compatibility.code == "schema_compatible"
++    store.create({"id": "synthetic-new", "status": "queued"})
++    document = json.loads(path.read_text(encoding="utf-8"))
++    assert document["schema_version"] == compat.JOB_STORE_SCHEMA_VERSION
++    assert set(document["jobs"]) == {"synthetic", "synthetic-new"}
++    assert jobs.LocalJobStore(tmp_path / "missing.json").compatibility.code == (
++        "schema_absent"
++    )
++
++
++def test_job_store_outside_the_window_is_never_loaded_or_overwritten(
++    tmp_path: Path,
++) -> None:
++    path = tmp_path / "jobs.json"
++    contents = '{"schema_version": 2, "jobs": {"synthetic": {"id": "synthetic"}}}'
++    path.write_text(contents, encoding="utf-8")
++    store = jobs.LocalJobStore(path)
++    assert store.compatibility.code == "schema_ahead_of_window"
++    operations = [
++        lambda: store.create({"id": "synthetic-new", "status": "queued"}),
++        lambda: store.get("synthetic"),
++        lambda: store.update("synthetic", status="running"),
++        store.cleanup_expired,
++    ]
++    for operation in operations:
++        with pytest.raises(IncompatibleStateError) as raised:
++            operation()
++        assert raised.value.to_details() == {
++            "components": {
++                "jobs": {"state": "incompatible", "reason": "schema_ahead_of_window"}
++            }
++        }
++    assert path.read_text(encoding="utf-8") == contents
++    path.write_text('{"schema_version": "2", "jobs": {}}', encoding="utf-8")
++    with pytest.raises(ValueError, match="schema version is invalid"):
++        jobs.LocalJobStore(path)
++
++
++def test_job_store_refuses_to_replace_a_file_a_newer_build_rewrote(
++    tmp_path: Path,
++) -> None:
++    path = tmp_path / "jobs.json"
++    store = jobs.LocalJobStore(path)
++    store.create({"id": "synthetic-a", "status": "queued"})
++    newer = '{"schema_version": 2, "jobs": {}, "leases": {}}'
++    path.write_text(newer, encoding="utf-8")
++    with pytest.raises(IncompatibleStateError):
++        store.update("synthetic-a", status="running")
++    assert path.read_text(encoding="utf-8") == newer
++    assert store._records["synthetic-a"]["status"] == "queued"
++    with pytest.raises(IncompatibleStateError):
++        store.get("synthetic-a")
++
++    compatible_writer = jobs.LocalJobStore(tmp_path / "other.json")
++    compatible_writer.create({"id": "synthetic-b", "status": "queued"})
++    (tmp_path / "other.json").write_text(
++        '{"schema_version": 1, "jobs": {}}', encoding="utf-8"
++    )
++    compatible_writer.update("synthetic-b", status="running")
++
++
++def test_job_queue_stamps_and_checks_the_contract_before_claiming(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    runtime = SimpleNamespace(served_model_ids=lambda: ("OpenMed/synthetic-pii-v1",))
++    store = jobs.LocalJobStore(tmp_path / "jobs.json")
++    queue = jobs.DeidentifyJobQueue(runtime, store=store)
++    payload = DeidentifyJobRequest(
++        documents=[DeidentifyJobDocument(id="synthetic-0", text="synthetic text")],
++        model_name="OpenMed/synthetic-pii-v1",
++    )
++    record = queue._new_record(payload)
++    assert record["compatibility"] == {
++        "contract_generation": 1,
++        "min_peer_generation": 1,
++        "schema_versions": {"jobs": 1},
++        "required_capabilities": ["jobs.deidentify.v1"],
++        "model_generation": model_generation_ref("OpenMed/synthetic-pii-v1"),
++    }
++    newer = dict(record["compatibility"], contract_generation=3, min_peer_generation=2)
++    store.create({**record, "compatibility": newer})
++    processed: list[str] = []
++    monkeypatch.setattr(
++        queue, "_deidentify_document", lambda *_: processed.append("document")
++    )
++    try:
++        queue._run_job(jobs._JobWorkItem(record["id"], payload))
++    finally:
++        queue.shutdown()
++    refused = store.get(record["id"])
++    assert refused is not None
++    assert processed == []
++    assert refused["status"] == "failed"
++    assert refused["started_at"] is None
++    assert refused["error"] == {
++        "type": "IncompatibleWork",
++        "message": "Job was refused before processing",
++        "code": "work_generation_outside_window",
++    }
++
++
++# --- REST and gRPC surfaces -------------------------------------------------
++
++
++def test_compatibility_route_publishes_a_value_free_snapshot(
++    service_env: Path,
++) -> None:
++    assert ROUTE_POLICIES[("GET", "/v1/compatibility")].scopes == (
++        "compatibility:read",
++    )
++    app = create_app()
++    with TestClient(app, base_url=LOOPBACK_BASE_URL) as client:
++        response = client.get("/v1/compatibility")
++    assert response.status_code == 200
++    body = response.json()
++    assert body["contract_generation"] == 1
++    assert body["peer_contract"] == "1/1"
++    assert body["state"] == "compatible"
++    assert body["admission"] == "open"
++    assert body["components"] == {"jobs": {"state": "absent", "code": "schema_absent"}}
++    assert body["descriptor_digest"] == app.state.compatibility.descriptor.digest()
++    assert body["model_generations"]
++    _assert_value_free(body, str(service_env), "127.0.0.1", "localhost")
++    assert "/v1/compatibility" not in app.openapi()["paths"]
++
++
++def test_compatibility_route_requires_its_scope(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setenv("OPENMED_SERVICE_AUTH_ENABLED", "true")
++    monkeypatch.setenv(
++        "OPENMED_SERVICE_AUTH_API_KEYS",
++        json.dumps(
++            [
++                {
++                    "id": "synthetic-key",
++                    "key_hash": hash_api_key("synthetic-secret"),
++                    "principal": "synthetic-peer",
++                    "scopes": ["compatibility:read"],
++                },
++                {
++                    "id": "other-key",
++                    "key_hash": hash_api_key("other-secret"),
++                    "principal": "synthetic-client",
++                    "scopes": ["jobs:read"],
++                },
++            ]
++        ),
++    )
++    with TestClient(create_app(), base_url=LOOPBACK_BASE_URL) as client:
++        assert client.get("/v1/compatibility").status_code == 401
++        denied = client.get("/v1/compatibility", headers={"X-API-Key": "other-secret"})
++        allowed = client.get(
++            "/v1/compatibility", headers={"X-API-Key": "synthetic-secret"}
++        )
++    assert denied.status_code == 403
++    assert allowed.status_code == 200
++
++
++def test_readiness_and_job_admission_fail_closed_on_newer_persisted_state(
++    service_env: Path,
++) -> None:
++    contents = '{"schema_version": 2, "jobs": {}}'
++    service_env.write_text(contents, encoding="utf-8")
++    with TestClient(create_app(), base_url=LOOPBACK_BASE_URL) as client:
++        ready = client.get("/readyz")
++        submitted = client.post(
++            "/jobs", json={"documents": [{"id": "synthetic", "text": "synthetic"}]}
++        )
++        status = client.get("/jobs/synthetic")
++        snapshot = client.get("/v1/compatibility").json()
++    expected = {
++        "components": {
++            "jobs": {"state": "incompatible", "reason": "schema_ahead_of_window"}
++        }
++    }
++    for response in (ready, submitted, status):
++        assert response.status_code == 503
++        assert response.json()["error"]["code"] == "incompatible_state"
++        assert response.json()["error"]["details"] == expected
++    assert snapshot["state"] == "blocked"
++    assert service_env.read_text(encoding="utf-8") == contents
++    _assert_value_free(ready.json()["error"]["details"], str(service_env))
++
++
++def test_readiness_follows_a_peer_migrating_the_shared_store(service_env: Path) -> None:
++    app = create_app()
++    with TestClient(app, base_url=LOOPBACK_BASE_URL) as client:
++        assert client.get("/readyz").status_code == 200
++        service_env.write_text('{"schema_version": 2, "jobs": {}}', encoding="utf-8")
++        app.state.compatibility.report(force=True)
++        assert client.get("/readyz").json()["error"]["code"] == "incompatible_state"
++        service_env.write_text('{"schema_version": 1, "jobs": {}}', encoding="utf-8")
++        app.state.compatibility.report(force=True)
++        assert client.get("/readyz").status_code == 200
++
++
++def test_rest_refuses_incompatible_peers_before_processing(service_env: Path) -> None:
++    body = {"documents": [{"id": "synthetic", "text": "synthetic"}]}
++    with TestClient(create_app(), base_url=LOOPBACK_BASE_URL) as client:
++        outside = client.post("/jobs", json=body, headers={PEER_CONTRACT_HEADER: "3/2"})
++        malformed = client.post("/jobs", json=body, headers={PEER_CONTRACT_HEADER: "x"})
++        probe = client.get("/readyz", headers={PEER_CONTRACT_HEADER: "x"})
++        descriptor = client.get(
++            "/v1/compatibility", headers={PEER_CONTRACT_HEADER: "3/2"}
++        )
++        assert not service_env.exists()
++        accepted = client.post(
++            "/jobs", json=body, headers={PEER_CONTRACT_HEADER: "2/1"}
++        )
++        client.app.state.job_queue.shutdown()
++    assert outside.status_code == 409
++    assert outside.json()["error"]["code"] == "peer_incompatible"
++    assert outside.json()["error"]["details"] == {
++        "reason": "peer_generation_outside_window",
++        "peer_contract": "1/1",
++    }
++    assert malformed.status_code == 400
++    assert malformed.json()["error"]["code"] == "peer_contract_malformed"
++    assert probe.status_code == 200
++    assert descriptor.status_code == 200
++    assert accepted.status_code == 202
++    assert accepted.json()["compatibility"]["contract_generation"] == 1
++
++
++def test_grpc_refuses_incompatible_peers_before_loading(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    from openmed.service.grpc_server import OpenMedGrpcServicer
++
++    runtime = service_runtime.ServiceRuntime.from_env()
++
++    class Aborted(Exception):
++        pass
++
++    class Context:
++        def __init__(self, value: str) -> None:
++            self.value = value
++            self.aborted: tuple[Any, str] | None = None
++
++        def invocation_metadata(self) -> tuple[tuple[str, str], ...]:
++            return ((PEER_CONTRACT_METADATA_KEY, self.value),)
++
++        def abort(self, code: Any, details: str) -> None:
++            self.aborted = (code, details)
++            raise Aborted()
++
++    servicer = OpenMedGrpcServicer(runtime)
++    for value, expected in (
++        (
++            "3/2",
++            (grpc.StatusCode.FAILED_PRECONDITION, "peer_generation_outside_window"),
++        ),
++        ("x", (grpc.StatusCode.INVALID_ARGUMENT, "peer_contract_malformed")),
++    ):
++        unary = Context(value)
++        with pytest.raises(Aborted):
++            servicer.Analyze(openmed_pb2.AnalyzeRequest(text="synthetic"), unary)
++        assert unary.aborted == expected
++        stream = Context(value)
++        with pytest.raises(Aborted):
++            list(
++                servicer.StreamDeidentify(
++                    openmed_pb2.DeidentifyStreamRequest(chunks=["synthetic"]),
++                    stream,
++                )
++            )
++        assert stream.aborted == expected
++    assert runtime._loader is None
++
++
++def test_reason_codes_are_controlled_tokens() -> None:
++    for code in REASON_CODES:
++        assert re.fullmatch(r"[a-z][a-z_]+", code)
++    assert replace(CURRENT_CONTRACT) == CURRENT_CONTRACT

@@ -1,0 +1,589 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 517f3f17d..1aa6adc10 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Run the pinned d3-edge model on CPU for local text, image and video decisions with an explicit custom-code allowlist (#4262).
++
+ - Contain optional media decoder probes in disposable Linux workers with hard resource limits, denied writes/network/process creation, content-free outcomes and synthetic crash/recovery controls (#3206).
+ 
+ - Render deterministic synthetic clinical forms, letters, labels and fax-like pages with actual glyph boxes, PHI truth, page reading order and reproducible scan corruption, preserving hidden annotations and source-linked image evidence (#2848).
+diff --git a/docs/decision-models.md b/docs/decision-models.md
+index 77eb201db..c4472fe5c 100644
+--- a/docs/decision-models.md
++++ b/docs/decision-models.md
+@@ -208,6 +208,22 @@ sequence classifier. It loads through the existing local NLI path and is
+ qualified with `openmed nli-qualify`, so it serves the NLI verifier in
+ `verify()` and the guarded brief rather than the decision contract.
+ 
++### d3-edge on CPU
++
++The optional `D3EdgeDecisionBackend` accepts text, local images and bounded video. Install the model runtime separately in an isolated environment (`transformers==5.17.0`, CPU PyTorch, torchvision, Pillow, NumPy and einops). Acquire the exact snapshot separately. Use an owner-controlled read-only snapshot and a private, trusted runtime cache. The adapter refuses a different runtime, additional executable files or changed code or model bytes. It does not download a model or accept its terms.
++
++Set `HF_HUB_OFFLINE=1` and `OPENMED_TRUSTED_REMOTE_CODE_MODELS=vllm-sr/d3-edge` before starting Python. This authorizes the pinned repository's custom code to run in the process; use an isolated service account without unrelated credentials. Larger d3 variants still require a compatible local server.
++
++```python
++# Fragment: requires a local model snapshot and the optional pinned runtime.
++from pathlib import Path
++from openmed.structured.decision_d3 import D3EdgeDecisionBackend
++
++backend = D3EdgeDecisionBackend(
++    Path("/models/d3-edge/bee5e872f75b9c5d1405767bf244a6948b95c0af")
++)
++```
++
+ ### Qualifying an in-process backend
+ 
+ `openmed decision-qualify --backend-factory module:function` imports a
+@@ -251,7 +267,7 @@ The supported path column distinguishes documented model inputs from OpenMed ada
+ | `fastino/GLiNER2.5-Decide-1B` | 1.19B | Apache-2.0 | text (English) | In process: GLiNER2.5 |
+ | `knowledgator/gliclass-v4-edge` | 440M | Apache-2.0 | text, instruction prompt, few-shot examples | In process: GLiClass v4 |
+ | `lion-ai/MedDecider-4B-NLI` | 4.2B | Apache-2.0 | premise and claim pairs (English) | In process: NLI verifier through `runtime="torch"` |
+-| `vllm-sr/d3-edge` | 0.59B | Apache-2.0 | text or JSON, images, video | Local server through the bridge (text only) |
++| `vllm-sr/d3-edge` | 0.59B | Apache-2.0 | text or JSON, images, video | In process: pinned CPU adapter; also compatible local System One server |
+ | `vllm-sr/d3-mini` | 4.5B | Apache-2.0 | text, images, video | Local server through the bridge (text only) |
+ | `vllm-sr/d3-flash` | 8.4B | Apache-2.0 | text, images, video | Local server through the bridge (text only) |
+ | `perplexity-ai/pplx-decider-flash-v1.2` | 4.5B | Apache-2.0 | text, images | Compatible local HTTP adapter required (text only) |
+@@ -269,7 +285,7 @@ What the bridge models need on the serving side, from their model cards:
+ 
+ | Model | Serving requirements |
+ | --- | --- |
+-| `vllm-sr/d3-edge`, `vllm-sr/d3-mini`, `vllm-sr/d3-flash` | Remote code and an exact `transformers` pin, with a server script (`d3_server.py`) shipped next to the weights. The remote code and pin are also why `d3-edge` is not loaded in process. |
++| `vllm-sr/d3-edge`, `vllm-sr/d3-mini`, `vllm-sr/d3-flash` | Remote code and an exact `transformers` pin, with a server script (`d3_server.py`) shipped next to the weights. Only the pinned edge revision has an in-process adapter. |
+ | `perplexity-ai/pplx-decider-flash-v1.2` | Python 3.12+, a CUDA GPU with about 9 GiB for weights plus working memory, and the bundled package; its card demonstrates an in-process API, so provide a compatible HTTP adapter ([model card](https://huggingface.co/perplexity-ai/pplx-decider-flash-v1.2)) |
+ | `sky7350/Mica-v0.5-4B` | A CUDA INT8 server, or the GGUF files on llama.cpp (Apple silicon or CPU) |
+ | `h2oai/h2o-lightning-4b` | vLLM with the shim bundled with the weights; GGUF builds are also published |
+diff --git a/openmed/structured/decision_d3.py b/openmed/structured/decision_d3.py
+new file mode 100644
+index 000000000..2f490e4d4
+--- /dev/null
++++ b/openmed/structured/decision_d3.py
+@@ -0,0 +1,171 @@
++"""Opt-in in-process d3-edge decision adapter, CPU only and offline."""
++
++from __future__ import annotations
++
++import io
++import sys
++import threading
++from dataclasses import replace
++from pathlib import Path
++from typing import Any
++
++from .decision import (
++    DecisionBackendIdentity,
++    DecisionBackendKind,
++    DecisionBackendOutput,
++    DecisionMode,
++    DecisionRequest,
++    DecisionUnsupportedError,
++)
++from .decision_interop import from_system_one_response, to_system_one_request
++from .decision_media import DecisionMedia, _rgb, _video_info
++from .decision_snapshot import SnapshotPin, require_runtime, verify_snapshot
++
++D3_EDGE = SnapshotPin(
++    "vllm-sr/d3-edge",
++    "bee5e872f75b9c5d1405767bf244a6948b95c0af",
++    (
++        "d3_engine.py",
++        "d3_fast.py",
++        "d3_format.py",
++        "d3_kernels.py",
++        "d3_runtime.py",
++        "d3_server.py",
++        "modeling_d3.py",
++        "pipeline_d3.py",
++    ),
++    (
++        "MODEL_MANIFEST.json",
++        "chat_template.jinja",
++        "config.json",
++        "decision_config.json",
++        "merges.txt",
++        "model-00001-of-00001.safetensors",
++        "model.safetensors.index.json",
++        "preprocessor_config.json",
++        "readout.safetensors",
++        "tokenizer.json",
++        "tokenizer_config.json",
++        "video_preprocessor_config.json",
++        "vocab.json",
++    ),
++    "f0be22a5bebcc9de31abf1e6447cd8a5753bd93d35fde840f15601618d1d6fc6",
++    "646ac9bf0d64dcacaccb2b4791fda47b61d26a5c317e2cd40c7a48fbef24d281",
++    frozenset(
++        {
++            ".eval_results",
++            ".gitattributes",
++            ".cache",
++            "assets",
++            "LICENSE",
++            "NOTICE",
++            "README.md",
++            "requirements.txt",
++        }
++    ),
++)
++D3_TRANSFORMERS = "5.17.0"
++
++
++def _local_image(item: DecisionMedia) -> Any:
++    from PIL import Image
++
++    with Image.open(io.BytesIO(item.protected_bytes()), formats=["PNG"]) as img:
++        if img.mode == "RGBA":
++            canvas = Image.new("RGB", img.size, "white")
++            canvas.paste(img, mask=img.getchannel("A"))
++            return canvas
++        return img.convert("RGB")
++
++
++def _local_video(item: DecisionMedia, model: Any) -> Any:
++    import numpy as np
++
++    blob = item.protected_bytes()
++    info = _video_info(blob)
++    pixels = np.frombuffer(_rgb(blob, info), dtype=np.uint8).reshape(
++        info.frames, info.height, info.width, 3
++    )
++    runtime = sys.modules[type(model._require()).__module__]
++    indices = runtime.video_sample_indices(info.frames, float(info.fps))
++    return runtime._video(
++        [pixels[i] for i in indices], indices, float(info.fps), info.frames
++    )
++
++
++class D3EdgeDecisionBackend:
++    """Local specialist for text, verified images and timed RGB video frames."""
++
++    supported_media_types = frozenset({"image/png", "video/mp4"})
++    identity = DecisionBackendIdentity(
++        backend_id="openmed.d3_edge",
++        kind=DecisionBackendKind.SPECIALIST,
++        runtime="transformers_cpu",
++        model_id=D3_EDGE.repository,
++        revision=D3_EDGE.revision,
++        license_id="Apache-2.0",
++    )
++
++    def __init__(self, model_directory: Path, *, revision: str = D3_EDGE.revision):
++        self._snapshot = verify_snapshot(model_directory, revision, D3_EDGE)
++        require_runtime(D3_TRANSFORMERS)
++        try:
++            from transformers import AutoModel
++
++            model = AutoModel.from_pretrained(
++                str(self._snapshot.root),
++                trust_remote_code=True,
++                local_files_only=True,
++                use_safetensors=True,
++                device="cpu",
++            ).eval()
++        except Exception:
++            pass
++        else:
++            self._snapshot.check()
++            self._model = model
++            self._lock = threading.Lock()
++            return
++        raise DecisionUnsupportedError("decision_d3_load_failed")
++
++    def score(self, request: DecisionRequest) -> DecisionBackendOutput:
++        """Return model probabilities for one supported question."""
++        if request.mode is DecisionMode.QUESTION_SET:
++            raise DecisionUnsupportedError("decision_question_set_required")
++        return self.score_questions(request)[request.as_questions()[0].question_id]
++
++    def score_questions(
++        self, request: DecisionRequest
++    ) -> dict[str, DecisionBackendOutput]:
++        """Score a question set in one forward call; no URL or path is passed as media."""
++        if any(x.media_type not in self.supported_media_types for x in request.media):
++            raise DecisionUnsupportedError("decision_d3_media_unsupported")
++        wire = to_system_one_request(replace(request, media=()))
++        with self._lock:
++            self._snapshot.check()
++            try:
++                import torch
++
++                images = [
++                    _local_image(i)
++                    for i in request.media
++                    if i.media_type == "image/png"
++                ]
++                videos = [
++                    _local_video(i, self._model)
++                    for i in request.media
++                    if i.media_type == "video/mp4"
++                ]
++                with torch.inference_mode():
++                    data = self._model.system_one(
++                        state=wire["state"],
++                        questions=wire["questions"],
++                        images=images or None,
++                        videos=videos or None,
++                    )
++            except Exception:
++                pass
++            else:
++                self._snapshot.check()
++                return from_system_one_response(request, data)
++        raise RuntimeError("decision_d3_inference_failed")
+diff --git a/openmed/structured/decision_snapshot.py b/openmed/structured/decision_snapshot.py
+new file mode 100644
+index 000000000..37b466d2f
+--- /dev/null
++++ b/openmed/structured/decision_snapshot.py
+@@ -0,0 +1,165 @@
++"""Verify operator-approved local model snapshots before executing custom code."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import stat
++from dataclasses import dataclass, field
++from importlib.metadata import PackageNotFoundError, version
++from pathlib import Path
++
++from openmed.structured.decision import DecisionUnsupportedError
++
++
++class DecisionSnapshotError(DecisionUnsupportedError):
++    """Controlled local snapshot refusal; never includes paths or upstream errors."""
++
++
++@dataclass(frozen=True, slots=True)
++class SnapshotPin:
++    """Trusted manifest of executable sources and runtime assets for one revision."""
++
++    repository: str
++    revision: str
++    python_files: tuple[str, ...]
++    runtime_files: tuple[str, ...]
++    python_sha256: str
++    runtime_sha256: str
++    auxiliary: frozenset[str]
++
++
++def _refuse(code: str) -> None:
++    raise DecisionSnapshotError(code)
++
++
++def _entries(
++    root: Path, pin: SnapshotPin
++) -> tuple[tuple[str, Path, tuple[int, ...]], ...]:
++    files = set(pin.python_files + pin.runtime_files)
++    names = {p.name for p in root.iterdir()}
++    if not files <= names or names - files - pin.auxiliary:
++        _refuse("decision_snapshot_inventory_mismatch")
++    items = []
++    for name in sorted(files):
++        path = root / name
++        target = path.resolve(strict=True)
++        # Standard Hub snapshots use relative links to the same repository's
++        # blob store. A standalone snapshot must contain its own regular files.
++        if target.parent != root and not (
++            root.parent.name == "snapshots"
++            and target.parent == root.parent.parent / "blobs"
++        ):
++            _refuse("decision_snapshot_external_file")
++        st = target.stat()
++        if not stat.S_ISREG(st.st_mode) or not 0 < st.st_size <= 4 * 1024**3:
++            _refuse("decision_snapshot_invalid_file")
++        items.append(
++            (
++                name,
++                target,
++                (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns),
++            )
++        )
++    return tuple(items)
++
++
++@dataclass(frozen=True, slots=True)
++class VerifiedSnapshot:
++    """Content-verified local files and their original filesystem identities."""
++
++    root: Path = field(repr=False)
++    pin: SnapshotPin
++    _entries: tuple[tuple[str, Path, tuple[int, ...]], ...] = field(repr=False)
++
++    def check(self) -> None:
++        """Withhold inference if the verified local inventory has changed."""
++        try:
++            same = _entries(self.root, self.pin) == self._entries
++        except (OSError, RuntimeError):
++            same = False
++        if not same:
++            _refuse("decision_snapshot_changed")
++
++
++def verify_snapshot(path: Path, revision: str, pin: SnapshotPin) -> VerifiedSnapshot:
++    """Verify an exact revision, custom-code allowlist and all runtime assets."""
++    from openmed.torch.privacy_filter import is_trusted_for_remote_code
++
++    if revision != pin.revision:
++        _refuse("decision_snapshot_revision_mismatch")
++    # Require explicit operator consent for this repository, even if an unrelated
++    # local directory has been named after it.
++    allowed = {
++        v.strip().lower()
++        for v in os.getenv("OPENMED_TRUSTED_REMOTE_CODE_MODELS", "").split(",")
++    }
++    if pin.repository.lower() not in allowed or not is_trusted_for_remote_code(
++        pin.repository
++    ):
++        _refuse("decision_custom_code_not_allowed")
++    if (
++        not isinstance(path, Path)
++        or not path.is_absolute()
++        or str(path).startswith(("//", "\\\\"))
++    ):
++        _refuse("decision_local_snapshot_required")
++    try:
++        root = path.resolve(strict=True)
++        if not root.is_dir() or (
++            root.parent.name == "snapshots" and root.name != revision
++        ):
++            _refuse("decision_snapshot_revision_mismatch")
++        entries = _entries(root, pin)
++        if sum(st[2] for _, _, st in entries) > 5 * 1024**3:
++            _refuse("decision_snapshot_size_limit")
++        code: list[list[object]] = []
++        assets: list[list[object]] = []
++        for name, target, identity in entries:
++            digest = hashlib.sha256()
++            with target.open("rb") as handle:
++                left = identity[2]
++                while left:
++                    chunk = handle.read(min(left, 2**20))
++                    if not chunk:
++                        _refuse("decision_snapshot_changed")
++                    digest.update(chunk)
++                    left -= len(chunk)
++                if handle.read(1):
++                    _refuse("decision_snapshot_changed")
++            row: list[object] = [name, identity[2], digest.hexdigest()]
++            (code if name in pin.python_files else assets).append(row)
++        for rows, expected, reason in (
++            (code, pin.python_sha256, "decision_snapshot_code_mismatch"),
++            (assets, pin.runtime_sha256, "decision_snapshot_assets_mismatch"),
++        ):
++            if (
++                hashlib.sha256(
++                    json.dumps(rows, separators=(",", ":"), ensure_ascii=True).encode()
++                ).hexdigest()
++                != expected
++            ):
++                _refuse(reason)
++        snapshot = VerifiedSnapshot(root, pin, entries)
++        snapshot.check()
++        return snapshot
++    except (OSError, RuntimeError):
++        pass
++    raise DecisionSnapshotError("decision_snapshot_unavailable")
++
++
++def require_runtime(expected: str) -> None:
++    """Never import custom model code in a mismatched or online environment."""
++    try:
++        matches = version("transformers") == expected
++    except PackageNotFoundError:
++        matches = False
++    if not matches:
++        _refuse("decision_transformers_version_mismatch")
++    try:
++        from huggingface_hub.constants import HF_HUB_OFFLINE
++    except ImportError:
++        HF_HUB_OFFLINE = False
++    if not HF_HUB_OFFLINE:
++        _refuse("decision_offline_runtime_required")
+diff --git a/tests/unit/structured/test_decision_d3.py b/tests/unit/structured/test_decision_d3.py
+new file mode 100644
+index 000000000..eec95823b
+--- /dev/null
++++ b/tests/unit/structured/test_decision_d3.py
+@@ -0,0 +1,177 @@
++"""Pinned local code load controls and optional CPU end-to-end integration."""
++
++from __future__ import annotations
++
++import hashlib
++import io
++import json
++import os
++from dataclasses import replace
++from pathlib import Path
++
++import pytest
++
++from openmed.structured import decision_d3 as module
++from openmed.structured import decision_snapshot as snapshots
++from openmed.structured.decision import (
++    DecisionMode,
++    DecisionRequest,
++    DecisionState,
++    decide,
++)
++from openmed.structured.decision_media import DecisionMedia
++
++
++def pinned(root):
++    rows = []
++    for name in ("modeling.py", "config.json"):
++        data = (root / name).read_bytes()
++        rows.append([[name, len(data), hashlib.sha256(data).hexdigest()]])
++    codes, assets = (
++        hashlib.sha256(json.dumps(r, separators=(",", ":")).encode()).hexdigest()
++        for r in rows
++    )
++    return snapshots.SnapshotPin(
++        "example/synthetic",
++        "1" * 40,
++        ("modeling.py",),
++        ("config.json",),
++        codes,
++        assets,
++        frozenset(),
++    )
++
++
++def test_snapshot_fails_closed_before_any_custom_load(tmp_path, monkeypatch):
++    (tmp_path / "modeling.py").write_text("# synthetic fixture\n")
++    (tmp_path / "config.json").write_text("{}")
++    pin = pinned(tmp_path)
++    monkeypatch.delenv("OPENMED_TRUSTED_REMOTE_CODE_MODELS", raising=False)
++    with pytest.raises(snapshots.DecisionSnapshotError, match="not_allowed"):
++        snapshots.verify_snapshot(tmp_path, pin.revision, pin)
++    monkeypatch.setenv("OPENMED_TRUSTED_REMOTE_CODE_MODELS", pin.repository)
++    with pytest.raises(snapshots.DecisionSnapshotError, match="revision"):
++        snapshots.verify_snapshot(tmp_path, "2" * 40, pin)
++    snapshot = snapshots.verify_snapshot(tmp_path, pin.revision, pin)
++    (tmp_path / "extra.py").write_text("raise RuntimeError('PRIVATE')\n")
++    with pytest.raises(snapshots.DecisionSnapshotError, match="inventory"):
++        snapshots.verify_snapshot(tmp_path, pin.revision, pin)
++    (tmp_path / "extra.py").unlink()
++    (tmp_path / "modeling.py").write_text("# changed\n")
++    with pytest.raises(snapshots.DecisionSnapshotError, match="code_mismatch"):
++        snapshots.verify_snapshot(tmp_path, pin.revision, pin)
++    with pytest.raises(snapshots.DecisionSnapshotError, match="changed"):
++        snapshot.check()
++    (tmp_path / "modeling.py").write_text("# synthetic fixture\n")
++    (tmp_path / "config.json").write_text('{"altered":true}')
++    with pytest.raises(snapshots.DecisionSnapshotError, match="assets_mismatch"):
++        snapshots.verify_snapshot(tmp_path, pin.revision, pin)
++
++
++def test_runtime_mismatch_never_imports_custom_model(monkeypatch):
++    monkeypatch.setattr(snapshots, "version", lambda name: "5.0.0")
++    with pytest.raises(
++        snapshots.DecisionSnapshotError, match="transformers_version_mismatch"
++    ):
++        snapshots.require_runtime(module.D3_TRANSFORMERS)
++
++
++def image():
++    from PIL import Image
++
++    f = io.BytesIO()
++    Image.new("RGBA", (64, 64), (200, 10, 30, 0)).save(f, format="PNG")
++    b = f.getvalue()
++    return DecisionMedia(
++        b,
++        media_type="image/png",
++        byte_size=len(b),
++        sha256=hashlib.sha256(b).hexdigest(),
++    )
++
++
++def test_admitted_image_is_pixels_and_uncertain_answer_abstains(monkeypatch):
++    pytest.importorskip("torch")
++    import threading
++    from types import SimpleNamespace
++    from unittest.mock import Mock
++
++    from PIL import Image
++
++    backend = object.__new__(module.D3EdgeDecisionBackend)
++    backend._snapshot = SimpleNamespace(check=lambda: None)
++    backend._lock = threading.Lock()
++
++    def score(**kw):
++        assert list(kw["questions"]) == ["decision"] and kw["videos"] is None
++        (img,) = kw["images"]
++        assert isinstance(img, Image.Image) and img.getpixel((1, 1)) == (255, 255, 255)
++        return {"answers": {"decision": {"type": "noul", "noul": 0.5}}}
++
++    backend._model = SimpleNamespace(system_one=Mock(side_effect=score))
++    request = DecisionRequest(
++        DecisionMode.BOOLEAN_CHOICE,
++        "synthetic",
++        options=("true", "false"),
++        media=(image(),),
++    )
++    result = decide(request, backend=backend)
++    assert result.state is DecisionState.ABSTAINED and result.choice is None
++    assert "synthetic" not in repr(result.backend)
++    assert backend._model.system_one.call_count == 1
++
++
++@pytest.mark.integration
++@pytest.mark.slow
++def test_pinned_d3_cpu_answers_text_image_video():
++    import shutil
++    import subprocess
++
++    model = os.getenv("OPENMED_D3_EDGE_SNAPSHOT")
++    if not model:
++        pytest.skip("operator-supplied pinned d3-edge snapshot")
++    backend = module.D3EdgeDecisionBackend(Path(model))
++    request = DecisionRequest(
++        DecisionMode.BOOLEAN_CHOICE,
++        "Synthetic color test",
++        options=("true", "false"),
++        instructions="Does the sample show a solid color?",
++        timeout_ms=30000,
++    )
++    ffmpeg = shutil.which("ffmpeg")
++    assert ffmpeg is not None
++    video = subprocess.check_output(
++        [
++            ffmpeg,
++            "-v",
++            "error",
++            "-f",
++            "lavfi",
++            "-i",
++            "color=c=red:s=64x64:r=4:d=1",
++            "-c:v",
++            "libx264rgb",
++            "-bf",
++            "0",
++            "-threads",
++            "1",
++            "-movflags",
++            "empty_moov+frag_keyframe+default_base_moof",
++            "-f",
++            "mp4",
++            "pipe:1",
++        ]
++    )
++    clip = DecisionMedia(
++        video,
++        media_type="video/mp4",
++        byte_size=len(video),
++        sha256=hashlib.sha256(video).hexdigest(),
++    )
++    for media in [(), (image(),), (clip,)]:
++        result = decide(replace(request, media=media), backend=backend)
++        assert result.state in {DecisionState.SUCCESS, DecisionState.ABSTAINED}
++        assert (
++            len(result.option_scores) == 2
++            and result.backend["revision"] == module.D3_EDGE.revision
++        )

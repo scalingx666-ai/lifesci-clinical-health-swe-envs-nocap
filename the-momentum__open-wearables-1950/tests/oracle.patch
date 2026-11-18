@@ -1,0 +1,427 @@
+diff --git a/backend/app/services/providers/api_client.py b/backend/app/services/providers/api_client.py
+index 358b1e7e9e..0f5e8e0f1a 100644
+--- a/backend/app/services/providers/api_client.py
++++ b/backend/app/services/providers/api_client.py
+@@ -23,6 +23,45 @@
+ MAX_RETRIES = 3
+ RETRY_BASE_DELAY = 15.0  # Base delay for exponential backoff (seconds): 15s, 30s, 60s
+ 
++# Tokens are refreshed this long before they expire.
++TOKEN_REFRESH_BUFFER = timedelta(minutes=5)
++
++# A sync makes many provider requests on one session, so the token is kept on the session instead of
++# re-reading user_connection each time; only this long, so a disconnect made elsewhere stops the sync.
++TOKEN_CACHE_TTL_SECONDS = 60.0
++
++# Session.info key of that cache: (user_id, provider) -> (access_token, token_expires_at, cached at).
++_TOKEN_CACHE_KEY = "provider_access_tokens"
++
++
++def _token_cache(db: DbSession) -> dict[tuple[UUID, str], tuple[str, datetime | None, float]]:
++    return db.info.setdefault(_TOKEN_CACHE_KEY, {})
++
++
++def _cached_token(db: DbSession, key: tuple[UUID, str]) -> str | None:
++    cache = _token_cache(db)
++    if (entry := cache.get(key)) is None:
++        return None
++    token, expires_at, cached_at = entry
++    if time.monotonic() - cached_at < TOKEN_CACHE_TTL_SECONDS and _is_token_fresh(expires_at):
++        return token
++    del cache[key]
++    return None
++
++
++def _cache_token(db: DbSession, key: tuple[UUID, str], token: str, expires_at: datetime | None) -> str:
++    _token_cache(db)[key] = (token, expires_at, time.monotonic())
++    return token
++
++
++def _is_token_fresh(token_expires_at: datetime | None) -> bool:
++    return not token_expires_at or token_expires_at >= datetime.now(timezone.utc) + TOKEN_REFRESH_BUFFER
++
++
++def invalidate_cached_token(db: DbSession, user_id: UUID, provider_name: str) -> None:
++    """Drop the session's cached token, so the next get_valid_token reads the connection again."""
++    _token_cache(db).pop((user_id, provider_name), None)
++
+ 
+ def get_valid_token(
+     db: DbSession,
+@@ -38,12 +77,19 @@ def get_valid_token(
+     Used by make_authenticated_request and by calls that send the token outside
+     of it, e.g. provider deregistration.
+     """
++    cache_key = (user_id, provider_name)
++    if cached := _cached_token(db, cache_key):
++        return cached
++
+     connection = connection_repo.get_by_user_and_provider(db, user_id, provider_name)
+     if not connection:
+         raise HTTPException(
+             status_code=status.HTTP_401_UNAUTHORIZED,
+             detail=f"User not connected to {provider_name}",
+         )
++    # The session may hold this connection from before another worker refreshed it; only the token
++    # columns are reloaded, so unflushed changes to it stay.
++    db.refresh(connection, attribute_names=["access_token", "refresh_token", "token_expires_at"])
+ 
+     # SDK-based providers don't have access tokens
+     if not connection.access_token:
+@@ -52,8 +98,7 @@ def get_valid_token(
+             detail=f"No access token available for {provider_name} (SDK-based provider?)",
+         )
+ 
+-    # Check if token is expired (with 5 minute buffer)
+-    if connection.token_expires_at and connection.token_expires_at < datetime.now(timezone.utc) + timedelta(minutes=5):
++    if not _is_token_fresh(connection.token_expires_at):
+         # Scope distributed lock per user/provider to avoid concurrent refresh race conditions.
+ 
+         redis_client = get_redis_client()
+@@ -77,15 +122,16 @@ def get_valid_token(
+ 
+             # 1. If the token never expires, return it directly
+             # 2. If it expires in the future (> 5 min buffer), return existing token
++            if _is_token_fresh(connection.token_expires_at):
++                return _cache_token(db, cache_key, connection.access_token, connection.token_expires_at)
++
+             now = datetime.now(timezone.utc)
+-            if not connection.token_expires_at or connection.token_expires_at >= now + timedelta(minutes=5):
+-                return connection.access_token
+ 
+             # Expired with nothing to refresh it with: the grant is dead, so revoke it like a
+             # rejected refresh token (stops retries, emits connection.revoked).
+             if not connection.refresh_token:
+                 # Inside the refresh buffer but not yet expired: keep using the token until it dies.
+-                if connection.token_expires_at > now:
++                if connection.token_expires_at and connection.token_expires_at > now:
+                     return connection.access_token
+                 if revoke_on_failure:
+                     oauth.revoke_connection(db, user_id, reason="no_refresh_token")
+@@ -98,9 +144,28 @@ def get_valid_token(
+             token_response = oauth.refresh_access_token(
+                 db, user_id, connection.refresh_token, revoke_on_failure=revoke_on_failure
+             )
+-            return token_response.access_token
++            # The refresh stored the new expiry on this session's connection
++            return _cache_token(db, cache_key, token_response.access_token, connection.token_expires_at)
++
++    return _cache_token(db, cache_key, connection.access_token, connection.token_expires_at)
+ 
+-    return connection.access_token
++
++def _reload_token_after_401(
++    db: DbSession,
++    user_id: UUID,
++    provider_name: str,
++    connection_repo: UserConnectionRepository,
++    oauth: BaseOAuthTemplate,
++    rejected_token: str,
++) -> str | None:
++    """Re-read the token after the provider rejected it; return it only if it changed.
++
++    The rejected token may come from the session cache while another worker has
++    already refreshed the connection, which revokes the old access token at some providers.
++    """
++    invalidate_cached_token(db, user_id, provider_name)
++    token = get_valid_token(db, user_id, provider_name, connection_repo, oauth)
++    return token if token != rejected_token else None
+ 
+ 
+ def make_authenticated_request(
+@@ -169,6 +234,7 @@ def make_authenticated_request(
+ 
+     # Make request with retry logic for rate limiting
+     url = f"{api_base_url}{endpoint}"
++    token_reloaded = False
+ 
+     for attempt in range(MAX_RETRIES + 1):
+         try:
+@@ -262,6 +328,15 @@ def make_authenticated_request(
+                 time.sleep(backoff_delay)
+                 continue
+ 
++            if e.response.status_code == 401 and not token_reloaded and attempt < MAX_RETRIES:
++                token_reloaded = True
++                if new_token := _reload_token_after_401(
++                    db, user_id, provider_name, connection_repo, oauth, access_token
++                ):
++                    access_token = new_token
++                    request_headers["Authorization"] = f"Bearer {access_token}"
++                    continue
++
+             log_structured(
+                 logger,
+                 "error",
+@@ -319,11 +394,18 @@ def download_binary_content(
+     """
+     access_token = get_valid_token(db, user_id, provider_name, connection_repo, oauth)
+     headers = {"Authorization": f"Bearer {access_token}"}
++    token_reloaded = False
+ 
+     for attempt in range(MAX_RETRIES + 1):
+         response = httpx.get(
+             url, headers=headers, timeout=settings.provider_request_timeout_seconds, follow_redirects=True
+         )
++        if response.status_code == 401 and not token_reloaded and attempt < MAX_RETRIES:
++            token_reloaded = True
++            if new_token := _reload_token_after_401(db, user_id, provider_name, connection_repo, oauth, access_token):
++                access_token = new_token
++                headers["Authorization"] = f"Bearer {access_token}"
++                continue
+         if response.status_code == 429 and attempt < MAX_RETRIES:
+             backoff_delay = RETRY_BASE_DELAY * (2**attempt)
+             log_structured(
+diff --git a/backend/app/services/providers/garmin/handlers/lifecycle.py b/backend/app/services/providers/garmin/handlers/lifecycle.py
+index 43deeae96a..a66d519e58 100644
+--- a/backend/app/services/providers/garmin/handlers/lifecycle.py
++++ b/backend/app/services/providers/garmin/handlers/lifecycle.py
+@@ -13,7 +13,7 @@
+ from app.repositories import UserConnectionRepository
+ from app.schemas.auth import ConnectionStatus
+ from app.services.outgoing_webhooks.events import on_connection_revoked
+-from app.services.providers.api_client import get_valid_token
++from app.services.providers.api_client import get_valid_token, invalidate_cached_token
+ from app.services.providers.garmin.oauth import GarminOAuth
+ from app.utils.structured_logging import log_structured
+ 
+@@ -35,6 +35,9 @@ def _current_grant_is_active(
+     if not connection.access_token:
+         return False
+     try:
++        # A token cached earlier in this session may have been refreshed since by another worker,
++        # and Garmin rejecting it would revoke an active grant.
++        invalidate_cached_token(db, connection.user_id, "garmin")
+         # The caller revokes with reason "deregistration"; a failed refresh must not revoke
+         # first with "refresh_failed".
+         access_token = get_valid_token(
+diff --git a/backend/tests/providers/sensorbio/test_sensorbio_api_spec.py b/backend/tests/providers/sensorbio/test_sensorbio_api_spec.py
+index 94aeaff17c..b58ff0b04a 100644
+--- a/backend/tests/providers/sensorbio/test_sensorbio_api_spec.py
++++ b/backend/tests/providers/sensorbio/test_sensorbio_api_spec.py
+@@ -349,7 +349,7 @@ def test_api_client_http2_flag_forwarded() -> None:
+         mock_client_cls.return_value = mock_client_instance
+ 
+         client_req(
+-            db=DB,
++            db=MagicMock(info={}),  # real dict: get_valid_token caches the token in Session.info
+             user_id=USER_ID,
+             connection_repo=mock_repo,
+             oauth=mock_oauth,
+diff --git a/backend/tests/providers/test_api_client_token_cache.py b/backend/tests/providers/test_api_client_token_cache.py
+new file mode 100644
+index 0000000000..4f5064ce55
+--- /dev/null
++++ b/backend/tests/providers/test_api_client_token_cache.py
+@@ -0,0 +1,163 @@
++"""get_valid_token caches the token on the session, so a sync reads user_connection once."""
++
++from datetime import datetime, timedelta, timezone
++from typing import Any
++from unittest.mock import MagicMock, patch
++
++import httpx
++import pytest
++from fastapi import HTTPException
++from freezegun import freeze_time
++from sqlalchemy import text
++from sqlalchemy.orm import Session
++
++from app.repositories import UserConnectionRepository
++from app.services.providers import api_client
++from app.services.providers.api_client import download_binary_content, get_valid_token, make_authenticated_request
++from tests.factories import UserConnectionFactory
++
++API_BASE_URL = "https://api.example.com"
++
++
++@pytest.fixture
++def connection() -> Any:
++    return UserConnectionFactory(provider="whoop", token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
++
++
++@pytest.fixture
++def repo() -> Any:
++    repo = UserConnectionRepository()
++    with patch.object(repo, "get_by_user_and_provider", wraps=repo.get_by_user_and_provider):
++        yield repo
++
++
++def _client_returning(*responses: httpx.Response) -> MagicMock:
++    """Mock httpx.Client; sent Authorization headers land in ``client.sent_auth`` (copied, as the dict is reused)."""
++    client = MagicMock()
++    client.__enter__.return_value = client
++    client.sent_auth = []
++    pending = list(responses)
++
++    def send(**kwargs: Any) -> httpx.Response:
++        client.sent_auth.append(kwargs["headers"]["Authorization"])
++        return pending.pop(0)
++
++    client.request.side_effect = send
++    return client
++
++
++def _response(status_code: int, json: Any = None) -> httpx.Response:
++    return httpx.Response(status_code, json=json, request=httpx.Request("GET", f"{API_BASE_URL}/v1/data"))
++
++
++def _request(db: Session, connection: Any, repo: Any) -> Any:
++    return make_authenticated_request(
++        db=db,
++        user_id=connection.user_id,
++        connection_repo=repo,
++        oauth=MagicMock(),
++        api_base_url=API_BASE_URL,
++        provider_name="whoop",
++        endpoint="/v1/data",
++    )
++
++
++def test_repeated_calls_read_connection_once(db: Session, connection: Any, repo: Any) -> None:
++    tokens = [get_valid_token(db, connection.user_id, "whoop", repo, MagicMock()) for _ in range(5)]
++
++    assert tokens == [connection.access_token] * 5
++    assert repo.get_by_user_and_provider.call_count == 1
++
++
++def test_cached_token_close_to_expiry_is_refreshed(db: Session, connection: Any, repo: Any) -> None:
++    oauth = MagicMock()
++    oauth.refresh_access_token.return_value.access_token = "refreshed"
++    get_valid_token(db, connection.user_id, "whoop", repo, oauth)
++
++    with freeze_time(datetime.now(timezone.utc) + timedelta(minutes=58)):
++        token = get_valid_token(db, connection.user_id, "whoop", repo, oauth)
++
++    assert token == "refreshed"
++    oauth.refresh_access_token.assert_called_once()
++
++
++def test_a_refreshed_token_is_reused(db: Session, connection: Any, repo: Any) -> None:
++    def refresh(db_session: Session, _user_id: Any, refresh_token: str, **_: Any) -> Any:
++        repo.update_tokens(db_session, connection, "refreshed", refresh_token, 3600)
++        return MagicMock(access_token="refreshed")
++
++    oauth = MagicMock()
++    oauth.refresh_access_token.side_effect = refresh
++
++    with freeze_time(datetime.now(timezone.utc) + timedelta(minutes=58)):
++        tokens = [get_valid_token(db, connection.user_id, "whoop", repo, oauth) for _ in range(3)]
++
++    assert tokens == ["refreshed"] * 3
++    oauth.refresh_access_token.assert_called_once()
++    # Both reads belong to the refresh itself: one before the lock, one inside it
++    assert repo.get_by_user_and_provider.call_count == 2
++
++
++def test_a_disconnect_made_elsewhere_is_seen_once_the_cached_token_ages(
++    db: Session, connection: Any, repo: Any
++) -> None:
++    """A sync must not outlive a disconnect, or it writes back the data a purge just deleted."""
++    clock = MagicMock()
++    clock.monotonic.return_value = 0.0
++    with patch.object(api_client, "time", clock):
++        get_valid_token(db, connection.user_id, "whoop", repo, MagicMock())
++        db.execute(text("UPDATE user_connection SET access_token = NULL WHERE id = :id"), {"id": connection.id})
++        clock.monotonic.return_value = api_client.TOKEN_CACHE_TTL_SECONDS + 1
++
++        with pytest.raises(HTTPException):
++            get_valid_token(db, connection.user_id, "whoop", repo, MagicMock())
++
++
++def test_request_retries_with_token_refreshed_elsewhere(db: Session, connection: Any, repo: Any) -> None:
++    stale_token = get_valid_token(db, connection.user_id, "whoop", repo, MagicMock())
++    # Raw SQL, like another worker's session: the connection instance in this session stays stale.
++    db.execute(
++        text("UPDATE user_connection SET access_token = 'refreshed-by-another-worker' WHERE id = :id"),
++        {"id": connection.id},
++    )
++    client = _client_returning(_response(401), _response(200, json={"ok": True}))
++
++    with patch("app.services.providers.api_client.httpx.Client", return_value=client):
++        result = _request(db, connection, repo)
++
++    assert result == {"ok": True}
++    assert client.sent_auth == [f"Bearer {stale_token}", "Bearer refreshed-by-another-worker"]
++
++
++def test_download_retries_with_token_refreshed_elsewhere(db: Session, connection: Any, repo: Any) -> None:
++    stale_token = get_valid_token(db, connection.user_id, "whoop", repo, MagicMock())
++    db.execute(
++        text("UPDATE user_connection SET access_token = 'refreshed-by-another-worker' WHERE id = :id"),
++        {"id": connection.id},
++    )
++    request = httpx.Request("GET", f"{API_BASE_URL}/file")
++    sent_auth: list[str] = []
++
++    def get(url: str, headers: dict[str, str], **kwargs: Any) -> httpx.Response:
++        sent_auth.append(headers["Authorization"])
++        status_code = 401 if len(sent_auth) == 1 else 200
++        return httpx.Response(status_code, content=b"file", request=request)
++
++    with patch("app.services.providers.api_client.httpx.get", side_effect=get):
++        content = download_binary_content(db, connection.user_id, repo, MagicMock(), "whoop", f"{API_BASE_URL}/file")
++
++    assert content == b"file"
++    assert sent_auth == [f"Bearer {stale_token}", "Bearer refreshed-by-another-worker"]
++
++
++def test_request_does_not_retry_when_token_is_unchanged(db: Session, connection: Any, repo: Any) -> None:
++    client = _client_returning(_response(401), _response(200, json={"ok": True}))
++
++    with (
++        patch("app.services.providers.api_client.httpx.Client", return_value=client),
++        pytest.raises(HTTPException) as exc_info,
++    ):
++        _request(db, connection, repo)
++
++    assert exc_info.value.status_code == 401
++    assert client.request.call_count == 1
+diff --git a/backend/tests/tasks/test_garmin_webhook_task.py b/backend/tests/tasks/test_garmin_webhook_task.py
+index 990a8a222e..1243d3e3ed 100644
+--- a/backend/tests/tasks/test_garmin_webhook_task.py
++++ b/backend/tests/tasks/test_garmin_webhook_task.py
+@@ -16,10 +16,13 @@
+ import httpx
+ import pytest
+ from celery.exceptions import Retry
++from sqlalchemy import text
+ from sqlalchemy.orm import Session
+ 
+ from app.integrations.celery.tasks.webhook_push_task import process_webhook_push
++from app.repositories import UserConnectionRepository
+ from app.schemas.auth import ConnectionStatus
++from app.services.providers.api_client import get_valid_token
+ from app.services.providers.garmin.oauth import GarminOAuth
+ from tests.factories import UserConnectionFactory, UserFactory
+ 
+@@ -735,6 +738,29 @@ def test_stale_ping_ignored_when_current_grant_is_active(
+         assert connection.status == ConnectionStatus.ACTIVE
+         mock_revoked_webhook.assert_not_called()
+ 
++    def test_grant_check_ignores_token_cached_in_session(
++        self,
++        task_db: Session,
++        mock_external_apis: dict[str, MagicMock],
++        mock_garmin_user_id: MagicMock,
++        mock_revoked_webhook: MagicMock,
++    ) -> None:
++        """A token refreshed by another worker is used, not the stale one cached earlier in the session."""
++        connection = UserConnectionFactory(user=UserFactory(), provider="garmin", provider_user_id="garmin_user_123")
++        get_valid_token(task_db, connection.user_id, "garmin", UserConnectionRepository(), MagicMock())
++        task_db.execute(
++            text("UPDATE user_connection SET access_token = 'refreshed-by-another-worker' WHERE id = :id"),
++            {"id": connection.id},
++        )
++        mock_garmin_user_id.side_effect = None
++        mock_garmin_user_id.return_value = "garmin_user_123"
++
++        result = process_webhook_push.run("garmin", {"deregistrations": [{"userId": "garmin_user_123"}]}, "trace-040")
++
++        assert result["deregistrations"]["ignored_stale"] == 1
++        mock_garmin_user_id.assert_called_once_with("refreshed-by-another-worker")
++        mock_revoked_webhook.assert_not_called()
++
+     @pytest.mark.parametrize(
+         "user_id_response",
+         [

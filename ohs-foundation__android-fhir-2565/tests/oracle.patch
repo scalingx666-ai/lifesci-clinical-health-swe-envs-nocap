@@ -1,0 +1,441 @@
+diff --git a/engine/src/androidTest/java/com/google/android/fhir/db/impl/DatabaseImplTest.kt b/engine/src/androidTest/java/com/google/android/fhir/db/impl/DatabaseImplTest.kt
+index 0bf51f7003..cd568b023a 100644
+--- a/engine/src/androidTest/java/com/google/android/fhir/db/impl/DatabaseImplTest.kt
++++ b/engine/src/androidTest/java/com/google/android/fhir/db/impl/DatabaseImplTest.kt
+@@ -39,6 +39,7 @@ import com.google.android.fhir.search.Order
+ import com.google.android.fhir.search.Search
+ import com.google.android.fhir.search.StringFilterModifier
+ import com.google.android.fhir.search.execute
++import com.google.android.fhir.search.filter.ReferenceParamFilterCriterion
+ import com.google.android.fhir.search.getQuery
+ import com.google.android.fhir.search.has
+ import com.google.android.fhir.search.include
+@@ -5178,6 +5179,32 @@ class DatabaseImplTest {
+       assertThat(localChangeResourceReferences.size).isEqualTo(locallyCreatedPatients.size)
+     }
+ 
++  @Test
++  fun searchTasksForManyPatientsReturnCorrectly() = runBlocking {
++    val patients = (0 until 990).map { Patient().apply { id = "task-patient-index-$it" } }
++    database.insert(*patients.toTypedArray())
++    val tasks =
++      patients.mapIndexed { index, patient ->
++        Task().apply {
++          id = "patient-$index-task"
++          `for` = Reference().apply { reference = "Patient/${patient.logicalId}" }
++        }
++      }
++    database.insert(*tasks.toTypedArray())
++
++    val patientsSearchIdList =
++      patients.take(980).map<Patient, ReferenceParamFilterCriterion.() -> Unit> {
++        { value = "Patient/${it.logicalId}" }
++      }
++    val searchQuery =
++      Search(ResourceType.Task)
++        .apply { filter(Task.SUBJECT, *patientsSearchIdList.toTypedArray()) }
++        .getQuery()
++
++    val searchResults = database.search<Task>(searchQuery)
++    assertThat(searchResults.size).isEqualTo(980)
++  }
++
+   private companion object {
+     const val mockEpochTimeStamp = 1628516301000
+     const val TEST_PATIENT_1_ID = "test_patient_1"
+diff --git a/engine/src/main/java/com/google/android/fhir/search/MoreSearch.kt b/engine/src/main/java/com/google/android/fhir/search/MoreSearch.kt
+index 2d1f4044f5..e12919b8d7 100644
+--- a/engine/src/main/java/com/google/android/fhir/search/MoreSearch.kt
++++ b/engine/src/main/java/com/google/android/fhir/search/MoreSearch.kt
+@@ -685,6 +685,8 @@ internal val DateTimeType.rangeEpochMillis
+ 
+ data class ConditionParam<T>(val condition: String, val params: List<T>) {
+   constructor(condition: String, vararg params: T) : this(condition, params.asList())
++
++  val queryString = if (params.size > 1) "($condition)" else condition
+ }
+ 
+ private enum class SortTableInfo(val tableName: String, val columnName: String) {
+diff --git a/engine/src/main/java/com/google/android/fhir/search/filter/FilterCriterion.kt b/engine/src/main/java/com/google/android/fhir/search/filter/FilterCriterion.kt
+index f6755b685d..71673db2db 100644
+--- a/engine/src/main/java/com/google/android/fhir/search/filter/FilterCriterion.kt
++++ b/engine/src/main/java/com/google/android/fhir/search/filter/FilterCriterion.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2021-2023 Google LLC
++ * Copyright 2021-2024 Google LLC
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -58,7 +58,7 @@ internal sealed class FilterCriteria(
+     return SearchQuery(
+       """
+       SELECT resourceUuid FROM $entityTableName
+-      WHERE resourceType = ? AND index_name = ? AND ${conditionParams.toQueryString(operation)} 
++      WHERE resourceType = ? AND index_name = ?${if (conditionParams.isNotEmpty()) " AND ${conditionParams.toQueryString(operation)}" else ""}
+       """,
+       listOf(type.name, param.paramName) + conditionParams.flatMap { it.params },
+     )
+@@ -85,16 +85,15 @@ internal sealed class FilterCriteria(
+    * This function takes care of wrapping the conditions in brackets so that they are evaluated as
+    * intended.
+    */
+-  private fun List<ConditionParam<*>>.toQueryString(operation: Operation) =
+-    this.joinToString(
+-      separator = " ${operation.logicalOperator} ",
+-      prefix = if (size > 1) "(" else "",
+-      postfix = if (size > 1) ")" else "",
+-    ) {
+-      if (it.params.size > 1) {
+-        "(${it.condition})"
+-      } else {
+-        it.condition
+-      }
++  private fun List<ConditionParam<*>>.toQueryString(operation: Operation): String {
++    if (this.size == 1) {
++      return first().queryString
+     }
++
++    val mid = this.size / 2
++    val left = this.subList(0, mid).toQueryString(operation)
++    val right = this.subList(mid, this.size).toQueryString(operation)
++
++    return "($left ${operation.logicalOperator} $right)"
++  }
+ }
+diff --git a/engine/src/test/java/com/google/android/fhir/impl/FhirEngineImplTest.kt b/engine/src/test/java/com/google/android/fhir/impl/FhirEngineImplTest.kt
+index 1d46c67aa8..31303f3e88 100644
+--- a/engine/src/test/java/com/google/android/fhir/impl/FhirEngineImplTest.kt
++++ b/engine/src/test/java/com/google/android/fhir/impl/FhirEngineImplTest.kt
+@@ -17,6 +17,7 @@
+ package com.google.android.fhir.impl
+ 
+ import androidx.test.core.app.ApplicationProvider
++import ca.uhn.fhir.rest.gclient.TokenClientParam
+ import ca.uhn.fhir.rest.param.ParamPrefixEnum
+ import com.google.android.fhir.FhirServices.Companion.builder
+ import com.google.android.fhir.LocalChange
+@@ -26,6 +27,7 @@ import com.google.android.fhir.get
+ import com.google.android.fhir.lastUpdated
+ import com.google.android.fhir.logicalId
+ import com.google.android.fhir.search.LOCAL_LAST_UPDATED_PARAM
++import com.google.android.fhir.search.filter.TokenParamFilterCriterion
+ import com.google.android.fhir.search.search
+ import com.google.android.fhir.sync.AcceptLocalConflictResolver
+ import com.google.android.fhir.sync.AcceptRemoteConflictResolver
+@@ -323,6 +325,36 @@ class FhirEngineImplTest {
+       .isTrue()
+   }
+ 
++  @Test
++  fun `search() should return patients filtered by param _id`() = runTest {
++    val patient1 = Patient().apply { id = "patient-1" }
++    val patient2 = Patient().apply { id = "patient-2" }
++    val patient3 = Patient().apply { id = "patient-45" }
++    val patient4 = Patient().apply { id = "patient-4355" }
++    val patient5 = Patient().apply { id = "patient-899" }
++    val patient6 = Patient().apply { id = "patient-883376" }
++    fhirEngine.create(patient1, patient2, patient3, patient4, patient5, patient6)
++
++    val filterValues =
++      listOf(patient2, patient3, patient1, patient5, patient4, patient6).map<
++        Patient,
++        TokenParamFilterCriterion.() -> Unit,
++      > {
++        { value = of(it.logicalId) }
++      }
++    val patientSearchResult =
++      fhirEngine.search<Patient> { filter(TokenClientParam("_id"), *filterValues.toTypedArray()) }
++    assertThat(patientSearchResult.map { it.resource.logicalId })
++      .containsExactly(
++        "patient-2",
++        "patient-45",
++        "patient-1",
++        "patient-4355",
++        "patient-899",
++        "patient-883376",
++      )
++  }
++
+   @Test
+   fun syncUpload_uploadLocalChange_success() = runTest {
+     val localChanges = mutableListOf<LocalChange>()
+diff --git a/engine/src/test/java/com/google/android/fhir/search/SearchTest.kt b/engine/src/test/java/com/google/android/fhir/search/SearchTest.kt
+index 938dd64bc6..6fea58fc2a 100644
+--- a/engine/src/test/java/com/google/android/fhir/search/SearchTest.kt
++++ b/engine/src/test/java/com/google/android/fhir/search/SearchTest.kt
+@@ -22,6 +22,7 @@ import ca.uhn.fhir.model.api.TemporalPrecisionEnum
+ import ca.uhn.fhir.rest.param.ParamPrefixEnum
+ import com.google.android.fhir.DateProvider
+ import com.google.android.fhir.epochDay
++import com.google.android.fhir.search.filter.ReferenceParamFilterCriterion
+ import com.google.common.truth.Correspondence
+ import com.google.common.truth.Truth.assertThat
+ import java.math.BigDecimal
+@@ -31,6 +32,7 @@ import java.util.UUID
+ import kotlin.math.absoluteValue
+ import kotlin.math.roundToLong
+ import kotlinx.coroutines.runBlocking
++import org.hl7.fhir.r4.model.CarePlan
+ import org.hl7.fhir.r4.model.CodeType
+ import org.hl7.fhir.r4.model.CodeableConcept
+ import org.hl7.fhir.r4.model.Coding
+@@ -2752,6 +2754,258 @@ class SearchTest {
+       .inOrder()
+   }
+ 
++  @Test
++  fun `search CarePlan filter with large list of patient reference`() {
++    val patientIdReferenceList = (1..990).map { "Patient/patient-$it" }
++    val patientIdList =
++      patientIdReferenceList.map<String, ReferenceParamFilterCriterion.() -> Unit> {
++        { value = it }
++      }
++    val query =
++      Search(ResourceType.CarePlan)
++        .apply { filter(CarePlan.SUBJECT, *patientIdList.toTypedArray()) }
++        .getQuery()
++
++    val queryString = query.query
++    assertThat(queryString)
++      .isEqualTo(
++        """
++          SELECT a.resourceUuid, a.serializedResource
++          FROM ResourceEntity a
++          WHERE a.resourceType = ?
++          AND a.resourceUuid IN (
++          SELECT resourceUuid FROM ReferenceIndexEntity
++          WHERE resourceType = ? AND index_name = ? AND (((((((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR (((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))))) OR (((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))))) OR ((((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))))) OR (((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))))))) OR (((((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))))) OR (((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))))) OR ((((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))))) OR (((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))))))) OR ((((((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR (((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))))) OR (((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))))) OR ((((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))))) OR (((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))))))) OR (((((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))))) OR (((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))))) OR ((((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))))) OR (((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))) OR ((((index_value = ? OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))) OR ((((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))) OR (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))))))))))
++          )
++        """
++          .trimIndent(),
++      )
++
++    assertThat(query.args)
++      .containsExactly(
++        "CarePlan",
++        "CarePlan",
++        "subject",
++        *patientIdReferenceList.toTypedArray(),
++      )
++      .inOrder()
++  }
++
++  @Test
++  fun `search CarePlan filter with no reference`() {
++    val query = Search(ResourceType.CarePlan).apply { filter(CarePlan.SUBJECT) }.getQuery()
++
++    val queryString = query.query
++    assertThat(queryString)
++      .isEqualTo(
++        """
++              SELECT a.resourceUuid, a.serializedResource
++              FROM ResourceEntity a
++              WHERE a.resourceType = ?
++              AND a.resourceUuid IN (
++              SELECT resourceUuid FROM ReferenceIndexEntity
++              WHERE resourceType = ? AND index_name = ?
++              )
++        """
++          .trimIndent(),
++      )
++
++    assertThat(query.args)
++      .containsExactly(
++        "CarePlan",
++        "CarePlan",
++        "subject",
++      )
++      .inOrder()
++  }
++
++  @Test
++  fun `search CarePlan filter with one patient reference`() {
++    val query =
++      Search(ResourceType.CarePlan)
++        .apply { filter(CarePlan.SUBJECT, { value = "Patient/patient-0" }) }
++        .getQuery()
++
++    val queryString = query.query
++    assertThat(queryString)
++      .isEqualTo(
++        """
++              SELECT a.resourceUuid, a.serializedResource
++              FROM ResourceEntity a
++              WHERE a.resourceType = ?
++              AND a.resourceUuid IN (
++              SELECT resourceUuid FROM ReferenceIndexEntity
++              WHERE resourceType = ? AND index_name = ? AND index_value = ?
++              )
++        """
++          .trimIndent(),
++      )
++
++    assertThat(query.args)
++      .containsExactly(
++        "CarePlan",
++        "CarePlan",
++        "subject",
++        "Patient/patient-0",
++      )
++      .inOrder()
++  }
++
++  @Test
++  fun `search CarePlan filter with two patient references`() {
++    val query =
++      Search(ResourceType.CarePlan)
++        .apply {
++          filter(CarePlan.SUBJECT, { value = "Patient/patient-0" }, { value = "Patient/patient-1" })
++        }
++        .getQuery()
++
++    val queryString = query.query
++    assertThat(queryString)
++      .isEqualTo(
++        """
++              SELECT a.resourceUuid, a.serializedResource
++              FROM ResourceEntity a
++              WHERE a.resourceType = ?
++              AND a.resourceUuid IN (
++              SELECT resourceUuid FROM ReferenceIndexEntity
++              WHERE resourceType = ? AND index_name = ? AND (index_value = ? OR index_value = ?)
++              )
++        """
++          .trimIndent(),
++      )
++
++    assertThat(query.args)
++      .containsExactly(
++        "CarePlan",
++        "CarePlan",
++        "subject",
++        "Patient/patient-0",
++        "Patient/patient-1",
++      )
++      .inOrder()
++  }
++
++  @Test
++  fun `search CarePlan filter with three patient references`() {
++    val query =
++      Search(ResourceType.CarePlan)
++        .apply {
++          filter(
++            CarePlan.SUBJECT,
++            { value = "Patient/patient-0" },
++            { value = "Patient/patient-1" },
++            { value = "Patient/patient-4" },
++          )
++        }
++        .getQuery()
++
++    val queryString = query.query
++    assertThat(queryString)
++      .isEqualTo(
++        """
++              SELECT a.resourceUuid, a.serializedResource
++              FROM ResourceEntity a
++              WHERE a.resourceType = ?
++              AND a.resourceUuid IN (
++              SELECT resourceUuid FROM ReferenceIndexEntity
++              WHERE resourceType = ? AND index_name = ? AND (index_value = ? OR (index_value = ? OR index_value = ?))
++              )
++        """
++          .trimIndent(),
++      )
++
++    assertThat(query.args)
++      .containsExactly(
++        "CarePlan",
++        "CarePlan",
++        "subject",
++        "Patient/patient-0",
++        "Patient/patient-1",
++        "Patient/patient-4",
++      )
++      .inOrder()
++  }
++
++  @Test
++  fun `search CarePlan filter with four patient references`() {
++    val query =
++      Search(ResourceType.CarePlan)
++        .apply {
++          filter(
++            CarePlan.SUBJECT,
++            { value = "Patient/patient-0" },
++            { value = "Patient/patient-1" },
++            { value = "Patient/patient-4" },
++            { value = "Patient/patient-7" },
++          )
++        }
++        .getQuery()
++
++    val queryString = query.query
++    assertThat(queryString)
++      .isEqualTo(
++        """
++              SELECT a.resourceUuid, a.serializedResource
++              FROM ResourceEntity a
++              WHERE a.resourceType = ?
++              AND a.resourceUuid IN (
++              SELECT resourceUuid FROM ReferenceIndexEntity
++              WHERE resourceType = ? AND index_name = ? AND ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?))
++              )
++        """
++          .trimIndent(),
++      )
++
++    assertThat(query.args)
++      .containsExactly(
++        "CarePlan",
++        "CarePlan",
++        "subject",
++        "Patient/patient-0",
++        "Patient/patient-1",
++        "Patient/patient-4",
++        "Patient/patient-7",
++      )
++      .inOrder()
++  }
++
++  @Test
++  fun `search CarePlan filter with 8 patient references`() {
++    val patientIdReferenceList = (0..7).map { "Patient/patient-$it" }
++    val patientIdList =
++      patientIdReferenceList.map<String, ReferenceParamFilterCriterion.() -> Unit> {
++        { value = it }
++      }
++    val query =
++      Search(ResourceType.CarePlan)
++        .apply { filter(CarePlan.SUBJECT, *patientIdList.toTypedArray()) }
++        .getQuery()
++
++    assertThat(query.query)
++      .isEqualTo(
++        """
++                SELECT a.resourceUuid, a.serializedResource
++                FROM ResourceEntity a
++                WHERE a.resourceType = ?
++                AND a.resourceUuid IN (
++                SELECT resourceUuid FROM ReferenceIndexEntity
++                WHERE resourceType = ? AND index_name = ? AND (((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)) OR ((index_value = ? OR index_value = ?) OR (index_value = ? OR index_value = ?)))
++                )
++          """
++          .trimIndent(),
++      )
++
++    assertThat(query.args)
++      .containsExactly(
++        "CarePlan",
++        "CarePlan",
++        "subject",
++        *patientIdReferenceList.toTypedArray(),
++      )
++      .inOrder()
++  }
++
+   private companion object {
+     const val mockEpochTimeStamp = 1628516301000
+     const val APPROXIMATION_COEFFICIENT = 0.1

@@ -1,0 +1,436 @@
+diff --git a/backend/app/services/providers/api_client.py b/backend/app/services/providers/api_client.py
+index 79464dd2f3..a78ab2f54a 100644
+--- a/backend/app/services/providers/api_client.py
++++ b/backend/app/services/providers/api_client.py
+@@ -29,6 +29,8 @@ def get_valid_token(
+     provider_name: str,
+     connection_repo: UserConnectionRepository,
+     oauth: BaseOAuthTemplate,
++    *,
++    revoke_on_failure: bool = True,
+ ) -> str:
+     """Get a valid access token, refreshing if necessary.
+ 
+@@ -90,7 +92,9 @@ def get_valid_token(
+                     detail=f"Token expired and no refresh token available for {provider_name}",
+                 )
+ 
+-            token_response = oauth.refresh_access_token(db, user_id, connection.refresh_token)
++            token_response = oauth.refresh_access_token(
++                db, user_id, connection.refresh_token, revoke_on_failure=revoke_on_failure
++            )
+             return token_response.access_token
+ 
+     return connection.access_token
+diff --git a/backend/app/services/providers/garmin/handlers/lifecycle.py b/backend/app/services/providers/garmin/handlers/lifecycle.py
+index 01a3108b73..43deeae96a 100644
+--- a/backend/app/services/providers/garmin/handlers/lifecycle.py
++++ b/backend/app/services/providers/garmin/handlers/lifecycle.py
+@@ -2,20 +2,59 @@
+ 
+ Handles webhook events that change the state of a user's Garmin connection:
+ - userPermissionsChange: update the OAuth scope stored on the connection
+-- deregistrations: mark the connection as revoked
++- deregistrations: mark the connection as revoked, unless Garmin confirms the current grant is active
+ """
+ 
+ import logging
+ from typing import Any
+ 
+ from app.database import DbSession
++from app.models import UserConnection
+ from app.repositories import UserConnectionRepository
++from app.schemas.auth import ConnectionStatus
+ from app.services.outgoing_webhooks.events import on_connection_revoked
++from app.services.providers.api_client import get_valid_token
++from app.services.providers.garmin.oauth import GarminOAuth
+ from app.utils.structured_logging import log_structured
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _current_grant_is_active(
++    db: DbSession,
++    connection_repo: UserConnectionRepository,
++    oauth: GarminOAuth,
++    connection: UserConnection,
++    garmin_user_id: str,
++    trace_id: str,
++) -> bool:
++    """Garmin keeps the same userId across re-authorizations and can deliver the deregistration
++    ping for an old grant after the user has reconnected, so the ping alone does not prove the
++    current grant is gone. Anything short of a confirmed active grant counts as deregistered.
++    """
++    if not connection.access_token:
++        return False
++    try:
++        # The caller revokes with reason "deregistration"; a failed refresh must not revoke
++        # first with "refresh_failed".
++        access_token = get_valid_token(
++            db, connection.user_id, "garmin", connection_repo, oauth, revoke_on_failure=False
++        )
++        return oauth.get_user_id(access_token) == garmin_user_id
++    except Exception as e:
++        log_structured(
++            logger,
++            "info",
++            "Garmin did not confirm an active grant for deregistration ping",
++            provider="garmin",
++            trace_id=trace_id,
++            garmin_user_id=garmin_user_id,
++            user_id=str(connection.user_id),
++            error=str(e),
++        )
++        return False
++
++
+ def process_user_permissions(
+     db: DbSession,
+     connection_repo: UserConnectionRepository,
+@@ -74,11 +113,12 @@ def process_user_permissions(
+ def process_deregistrations(
+     db: DbSession,
+     connection_repo: UserConnectionRepository,
++    oauth: GarminOAuth,
+     deregistrations_list: list[dict[str, Any]],
+     trace_id: str,
+ ) -> dict[str, Any]:
+     """Handle deregistration entries — mark connections as revoked."""
+-    results: dict[str, Any] = {"revoked": 0, "errors": []}
++    results: dict[str, Any] = {"revoked": 0, "ignored_stale": 0, "errors": []}
+ 
+     if not isinstance(deregistrations_list, list):
+         return {"revoked": 0, "errors": ["Invalid deregistrations payload format"]}
+@@ -105,6 +145,23 @@ def process_deregistrations(
+             )
+             continue
+ 
++        # E.g. revoked by our own disconnect; revoking again would emit a second connection.revoked.
++        if connection.status == ConnectionStatus.REVOKED:
++            continue
++
++        if _current_grant_is_active(db, connection_repo, oauth, connection, garmin_user_id, trace_id):
++            log_structured(
++                logger,
++                "info",
++                "Ignored stale Garmin deregistration ping, current grant is active",
++                provider="garmin",
++                trace_id=trace_id,
++                garmin_user_id=garmin_user_id,
++                user_id=str(connection.user_id),
++            )
++            results["ignored_stale"] += 1
++            continue
++
+         connection_repo.mark_as_revoked(db, connection)
+         on_connection_revoked(
+             user_id=connection.user_id,
+diff --git a/backend/app/services/providers/garmin/oauth.py b/backend/app/services/providers/garmin/oauth.py
+index 0e7a6518b5..8a4a7b810d 100644
+--- a/backend/app/services/providers/garmin/oauth.py
++++ b/backend/app/services/providers/garmin/oauth.py
+@@ -48,6 +48,15 @@ def deregister_user(self, access_token: str, provider_user_id: str | None = None
+         )
+         response.raise_for_status()
+ 
++    def get_user_id(self, access_token: str) -> str | None:
++        response = httpx.get(
++            f"{self.api_base_url}/partner-gateway/rest/user/id",
++            headers={"Authorization": f"Bearer {access_token}"},
++            timeout=30.0,
++        )
++        response.raise_for_status()
++        return response.json().get("userId")
++
+     def _get_provider_user_info(self, token_response: OAuthTokenResponse, user_id: str) -> dict[str, str | None]:
+         """Fetches Garmin user ID and API permissions."""
+         # Fetch user ID (critical - fail returns all None)
+diff --git a/backend/app/services/providers/garmin/strategy.py b/backend/app/services/providers/garmin/strategy.py
+index 5fdba9dba5..d98f154fd8 100644
+--- a/backend/app/services/providers/garmin/strategy.py
++++ b/backend/app/services/providers/garmin/strategy.py
+@@ -53,6 +53,7 @@ def __init__(self):
+         self.webhooks = GarminWebhookHandler(
+             garmin_workouts=self.workouts,
+             garmin_247=self.data_247,
++            oauth=self.oauth,
+         )
+ 
+     @property
+diff --git a/backend/app/services/providers/garmin/webhook_handler.py b/backend/app/services/providers/garmin/webhook_handler.py
+index 97f2529f47..e31768bb65 100644
+--- a/backend/app/services/providers/garmin/webhook_handler.py
++++ b/backend/app/services/providers/garmin/webhook_handler.py
+@@ -33,6 +33,7 @@
+     process_user_permissions,
+ )
+ from app.services.providers.garmin.handlers.wellness import process_wellness_items
++from app.services.providers.garmin.oauth import GarminOAuth
+ from app.services.providers.garmin.workouts import GarminWorkouts
+ from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
+ from app.services.raw_payload_storage import store_raw_payload
+@@ -73,10 +74,11 @@ class GarminWebhookHandler(BaseWebhookHandler):
+     failing closed when the value is not configured.
+     """
+ 
+-    def __init__(self, garmin_workouts: GarminWorkouts, garmin_247: Garmin247Data) -> None:
++    def __init__(self, garmin_workouts: GarminWorkouts, garmin_247: Garmin247Data, oauth: GarminOAuth) -> None:
+         super().__init__("garmin")
+         self.garmin_workouts = garmin_workouts
+         self.garmin_247 = garmin_247
++        self.oauth = oauth
+         self.connection_repo = UserConnectionRepository()
+ 
+     def extract_user_id(self, payload: dict[str, Any]) -> str | None:
+@@ -321,7 +323,7 @@ def _process_lifecycle_events(
+         if "deregistrations" in payload:
+             try:
+                 response["deregistrations"] = process_deregistrations(
+-                    db, self.connection_repo, payload["deregistrations"], request_trace_id
++                    db, self.connection_repo, self.oauth, payload["deregistrations"], request_trace_id
+                 )
+             except Exception as e:
+                 log_structured(
+diff --git a/backend/app/services/providers/templates/base_oauth.py b/backend/app/services/providers/templates/base_oauth.py
+index dead429bcf..15c55952fe 100644
+--- a/backend/app/services/providers/templates/base_oauth.py
++++ b/backend/app/services/providers/templates/base_oauth.py
+@@ -133,8 +133,14 @@ def handle_callback(self, db: DbSession, code: str, state: str) -> OAuthState:
+ 
+         return oauth_state
+ 
+-    def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
+-        """Refreshes the access token using the refresh token."""
++    def refresh_access_token(
++        self, db: DbSession, user_id: UUID, refresh_token: str, *, revoke_on_failure: bool = True
++    ) -> OAuthTokenResponse:
++        """Refreshes the access token using the refresh token.
++
++        Pass ``revoke_on_failure=False`` when the caller revokes the connection itself with a
++        more specific reason than ``refresh_failed``.
++        """
+         data, headers = self._prepare_refresh_request(refresh_token)
+ 
+         try:
+@@ -180,7 +186,8 @@ def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str)
+             )
+             # 400/401 = refresh token is dead so revoke + notify
+             if e.response.status_code in (HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED):
+-                self._revoke_connection(db, user_id, reason="refresh_failed")
++                if revoke_on_failure:
++                    self._revoke_connection(db, user_id, reason="refresh_failed")
+                 raise HTTPException(
+                     status_code=HTTP_401_UNAUTHORIZED,
+                     detail=f"Refresh token rejected for {self.provider_name}; reconnection required",
+diff --git a/backend/app/services/providers/withings/oauth.py b/backend/app/services/providers/withings/oauth.py
+index e2548f809e..7348fb4b62 100644
+--- a/backend/app/services/providers/withings/oauth.py
++++ b/backend/app/services/providers/withings/oauth.py
+@@ -97,7 +97,9 @@ def _exchange_token(self, code: str, code_verifier: str | None) -> OAuthTokenRes
+         }
+         return self._request_token(payload, task="exchange_token")
+ 
+-    def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
++    def refresh_access_token(
++        self, db: DbSession, user_id: UUID, refresh_token: str, *, revoke_on_failure: bool = True
++    ) -> OAuthTokenResponse:
+         payload = {
+             "action": "requesttoken",
+             "grant_type": "refresh_token",
+@@ -108,7 +110,7 @@ def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str)
+         try:
+             token_response = self._request_token(payload, task="refresh_access_token")
+         except WithingsTokenError as exc:
+-            if exc.invalid_grant:
++            if exc.invalid_grant and revoke_on_failure:
+                 self._revoke_connection(db, user_id, reason="refresh_failed")
+             raise
+ 
+diff --git a/backend/tests/services/test_user_connection_service.py b/backend/tests/services/test_user_connection_service.py
+index 2bf5f5f381..6479de6101 100644
+--- a/backend/tests/services/test_user_connection_service.py
++++ b/backend/tests/services/test_user_connection_service.py
+@@ -500,7 +500,9 @@ def test_refreshes_expired_token_before_deregistering(self, db: Session) -> None
+ 
+         user_connection_service.deregister_from_provider(db, user.id, "garmin", oauth)
+ 
+-        oauth.refresh_access_token.assert_called_once_with(db, user.id, connection.refresh_token)
++        oauth.refresh_access_token.assert_called_once_with(
++            db, user.id, connection.refresh_token, revoke_on_failure=True
++        )
+         oauth.deregister_user.assert_called_once_with("fresh", provider_user_id=connection.provider_user_id)
+ 
+     def test_uses_stored_token_when_still_valid(self, db: Session) -> None:
+diff --git a/backend/tests/tasks/test_garmin_webhook_task.py b/backend/tests/tasks/test_garmin_webhook_task.py
+index 32b93eedf0..990a8a222e 100644
+--- a/backend/tests/tasks/test_garmin_webhook_task.py
++++ b/backend/tests/tasks/test_garmin_webhook_task.py
+@@ -9,18 +9,24 @@
+ - Retry behaviour on infrastructure errors
+ """
+ 
++from collections.abc import Generator
++from datetime import datetime, timezone
+ from unittest.mock import MagicMock, patch
+ 
++import httpx
+ import pytest
+ from celery.exceptions import Retry
+ from sqlalchemy.orm import Session
+ 
+ from app.integrations.celery.tasks.webhook_push_task import process_webhook_push
+ from app.schemas.auth import ConnectionStatus
++from app.services.providers.garmin.oauth import GarminOAuth
+ from tests.factories import UserConnectionFactory, UserFactory
+ 
+ MODULE = "app.integrations.celery.tasks.webhook_push_task"
+ HANDLER_MODULE = "app.services.providers.garmin.webhook_handler"
++LIFECYCLE_MODULE = "app.services.providers.garmin.handlers.lifecycle"
++BASE_OAUTH_MODULE = "app.services.providers.templates.base_oauth"
+ 
+ 
+ @pytest.fixture
+@@ -655,6 +661,23 @@ def test_push_webhook_permissions_not_a_list(
+         assert result["userPermissionsChange"]["errors"] == ["Invalid userPermissions payload format"]
+ 
+ 
++def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
++    request = httpx.Request("GET", "https://apis.garmin.com/partner-gateway/rest/user/id")
++    return httpx.HTTPStatusError("error", request=request, response=httpx.Response(status_code, request=request))
++
++
++@pytest.fixture
++def mock_garmin_user_id() -> Generator[MagicMock, None, None]:
++    with patch.object(GarminOAuth, "get_user_id", side_effect=_http_status_error(401)) as mock:
++        yield mock
++
++
++@pytest.fixture
++def mock_revoked_webhook() -> Generator[MagicMock, None, None]:
++    with patch(f"{LIFECYCLE_MODULE}.on_connection_revoked") as mock:
++        yield mock
++
++
+ class TestGarminDeregistrationWebhook:
+     """Tests for deregistration handling via process_push."""
+ 
+@@ -662,6 +685,7 @@ def test_push_webhook_deregistration_revokes_connection(
+         self,
+         task_db: Session,
+         mock_external_apis: dict[str, MagicMock],
++        mock_garmin_user_id: MagicMock,
+     ) -> None:
+         """Test that deregistration revokes the connection."""
+         # Arrange
+@@ -691,6 +715,111 @@ def test_push_webhook_deregistration_revokes_connection(
+         task_db.refresh(connection)
+         assert connection.status == ConnectionStatus.REVOKED
+ 
++    def test_stale_ping_ignored_when_current_grant_is_active(
++        self,
++        task_db: Session,
++        mock_external_apis: dict[str, MagicMock],
++        mock_garmin_user_id: MagicMock,
++        mock_revoked_webhook: MagicMock,
++    ) -> None:
++        """A ping for an old grant must not revoke a connection the user re-authorized."""
++        connection = UserConnectionFactory(user=UserFactory(), provider="garmin", provider_user_id="garmin_user_123")
++        mock_garmin_user_id.side_effect = None
++        mock_garmin_user_id.return_value = "garmin_user_123"
++
++        result = process_webhook_push.run("garmin", {"deregistrations": [{"userId": "garmin_user_123"}]}, "trace-036")
++
++        assert result["deregistrations"] == {"revoked": 0, "ignored_stale": 1, "errors": []}
++        mock_garmin_user_id.assert_called_once_with(connection.access_token)
++        task_db.refresh(connection)
++        assert connection.status == ConnectionStatus.ACTIVE
++        mock_revoked_webhook.assert_not_called()
++
++    @pytest.mark.parametrize(
++        "user_id_response",
++        [
++            pytest.param(_http_status_error(503), id="garmin_error"),
++            pytest.param("other_garmin_user", id="different_user"),
++        ],
++    )
++    def test_revokes_unless_garmin_confirms_the_grant(
++        self,
++        task_db: Session,
++        mock_external_apis: dict[str, MagicMock],
++        mock_garmin_user_id: MagicMock,
++        mock_revoked_webhook: MagicMock,
++        user_id_response: Exception | str,
++    ) -> None:
++        connection = UserConnectionFactory(user=UserFactory(), provider="garmin", provider_user_id="garmin_user_123")
++        if isinstance(user_id_response, Exception):
++            mock_garmin_user_id.side_effect = user_id_response
++        else:
++            mock_garmin_user_id.side_effect = None
++            mock_garmin_user_id.return_value = user_id_response
++
++        result = process_webhook_push.run("garmin", {"deregistrations": [{"userId": "garmin_user_123"}]}, "trace-037")
++
++        assert result["deregistrations"]["revoked"] == 1
++        task_db.refresh(connection)
++        assert connection.status == ConnectionStatus.REVOKED
++        mock_revoked_webhook.assert_called_once()
++
++    def test_already_revoked_connection_is_not_revoked_again(
++        self,
++        task_db: Session,
++        mock_external_apis: dict[str, MagicMock],
++        mock_garmin_user_id: MagicMock,
++        mock_revoked_webhook: MagicMock,
++    ) -> None:
++        """The ping that follows our own disconnect must not emit a second connection.revoked."""
++        UserConnectionFactory(
++            user=UserFactory(),
++            provider="garmin",
++            provider_user_id="garmin_user_123",
++            status=ConnectionStatus.REVOKED,
++            access_token=None,
++            refresh_token=None,
++        )
++
++        result = process_webhook_push.run("garmin", {"deregistrations": [{"userId": "garmin_user_123"}]}, "trace-038")
++
++        assert result["deregistrations"]["revoked"] == 0
++        mock_garmin_user_id.assert_not_called()
++        mock_revoked_webhook.assert_not_called()
++
++    def test_dead_refresh_token_revokes_once_as_deregistration(
++        self,
++        task_db: Session,
++        mock_external_apis: dict[str, MagicMock],
++        mock_garmin_user_id: MagicMock,
++        mock_revoked_webhook: MagicMock,
++    ) -> None:
++        """Push tokens are usually expired by the time Garmin deregisters the user. The refresh must
++        not revoke with "refresh_failed" first, or integrators get a misleading reason."""
++        connection = UserConnectionFactory(
++            user=UserFactory(),
++            provider="garmin",
++            provider_user_id="garmin_user_123",
++            token_expires_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
++        )
++        request = httpx.Request("POST", "https://diauth.garmin.com/di-oauth2-service/oauth/token")
++
++        with (
++            patch("httpx.post", return_value=httpx.Response(400, request=request)),
++            patch(f"{BASE_OAUTH_MODULE}.on_connection_revoked") as mock_refresh_revoked_webhook,
++        ):
++            result = process_webhook_push.run(
++                "garmin", {"deregistrations": [{"userId": "garmin_user_123"}]}, "trace-039"
++            )
++
++        assert result["deregistrations"]["revoked"] == 1
++        task_db.refresh(connection)
++        assert connection.status == ConnectionStatus.REVOKED
++        mock_garmin_user_id.assert_not_called()
++        mock_refresh_revoked_webhook.assert_not_called()
++        mock_revoked_webhook.assert_called_once()
++        assert mock_revoked_webhook.call_args.kwargs["reason"] == "deregistration"
++
+     def test_push_webhook_deregistration_unknown_user(
+         self,
+         task_db: Session,

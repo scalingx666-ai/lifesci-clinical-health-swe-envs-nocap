@@ -1,0 +1,583 @@
+diff --git a/backend/app/api/routes/v1/import_xml.py b/backend/app/api/routes/v1/import_xml.py
+index 380c5cbd22..5ca084f96c 100644
+--- a/backend/app/api/routes/v1/import_xml.py
++++ b/backend/app/api/routes/v1/import_xml.py
+@@ -8,7 +8,6 @@
+ from app.config import settings
+ from app.database import DbSession
+ from app.integrations.celery.tasks.process_aws_upload_task import complete_and_process_aws_upload
+-from app.integrations.celery.tasks.process_xml_upload_task import process_xml_upload
+ from app.schemas.providers.apple.apple_xml import (
+     MultipartAbortRequest,
+     MultipartAbortResponse,
+@@ -25,6 +24,12 @@
+ from app.schemas.responses.upload import UploadDataResponse
+ from app.services import ApiKeyDep, user_service
+ from app.services.providers.apple.apple_xml.aws_service import require_bucket_name
++from app.services.providers.apple.apple_xml.direct_upload_service import (
++    direct_upload_limit,
++    direct_upload_service,
++    mib,
++    too_large_detail,
++)
+ from app.services.providers.apple.apple_xml.multipart_upload_service import multipart_upload_service
+ from app.services.providers.apple.apple_xml.presigned_url_service import presigned_url_service
+ from app.services.providers.apple.apple_xml.sns_service import sns_service
+@@ -164,23 +169,37 @@ def abort_multipart_upload(
+     return MultipartAbortResponse(status="aborted", key=request.key)
+ 
+ 
+-@router.post("/users/{user_id}/import/apple/xml/direct", responses={**_USER_NOT_FOUND})
++@router.post(
++    "/users/{user_id}/import/apple/xml/direct",
++    responses={
++        **_USER_NOT_FOUND,
++        **problem_doc(
++            413,
++            f"File is over {mib(direct_upload_limit())} MiB",
++            too_large_detail(direct_upload_limit() + 1),
++        ),
++        **problem_doc(503, "Task queue unavailable", "Unable to queue XML processing"),
++    },
++    description=(
++        f"Import an Apple Health XML file of up to {mib(direct_upload_limit())} MiB "
++        "into the database. "
++        "Larger files must use the S3 multipart upload."
++    ),
++)
+ def import_xml_file(
+     user_id: UUID,
+     file: UploadFile,
+     db: DbSession,
+     _api_key: ApiKeyDep,
+ ) -> dict[str, str]:
+-    """Import XML file into the database."""
++    """Queue a small XML upload for import."""
+     user_service.get(db, user_id, raise_404=True)
+-    file_contents = file.file.read()
+-    filename = file.filename or "upload.xml"
+-
+-    task = process_xml_upload.delay(file_contents=file_contents, filename=filename, user_id=str(user_id))
++    # Starlette's multipart parser always sets the size of the spooled file.
++    task_id = direct_upload_service.queue_import(str(user_id), file.file, file.size or 0, file.filename or "upload.xml")
+ 
+     return {
+         "status": "processing",
+-        "task_id": task.id,
++        "task_id": task_id,
+         "user_id": str(user_id),
+     }
+ 
+diff --git a/backend/app/integrations/celery/tasks/process_xml_upload_task.py b/backend/app/integrations/celery/tasks/process_xml_upload_task.py
+index a05ff9bbad..39d9e68e54 100644
+--- a/backend/app/integrations/celery/tasks/process_xml_upload_task.py
++++ b/backend/app/integrations/celery/tasks/process_xml_upload_task.py
+@@ -106,10 +106,10 @@ def process_xml_upload(file_contents: bytes, filename: str, user_id: str) -> dic
+         SessionLocal() as db,
+     ):
+         try:
+-            temp_dir = tempfile.gettempdir()
+-            temp_xml_file = os.path.join(temp_dir, f"temp_import_{filename}")
+-
+-            with open(temp_xml_file, "wb") as f:
++            # A unique name per task: concurrent uploads share the filename (every iPhone
++            # exports "export.xml"), and a shared path would mix their contents.
++            fd, temp_xml_file = tempfile.mkstemp(prefix="temp_import_", suffix=".xml")
++            with os.fdopen(fd, "wb") as f:
+                 f.write(file_contents)
+ 
+             stats = _import_xml_data(db, temp_xml_file, user_id)
+diff --git a/backend/app/schemas/providers/apple/apple_xml/__init__.py b/backend/app/schemas/providers/apple/apple_xml/__init__.py
+index c0bc54df37..307d5f6176 100644
+--- a/backend/app/schemas/providers/apple/apple_xml/__init__.py
++++ b/backend/app/schemas/providers/apple/apple_xml/__init__.py
+@@ -1,6 +1,7 @@
+ from .aws import (
+     DEFAULT_EXPIRATION_SECONDS,
+     DEFAULT_FILE_SIZE,
++    MAX_DIRECT_UPLOAD_SIZE,
+     MAX_EXPIRATION_SECONDS,
+     MAX_FILE_SIZE,
+     MIN_EXPIRATION_SECONDS,
+@@ -39,6 +40,7 @@
+     "DEFAULT_EXPIRATION_SECONDS",
+     "MIN_FILE_SIZE",
+     "MAX_FILE_SIZE",
++    "MAX_DIRECT_UPLOAD_SIZE",
+     "DEFAULT_FILE_SIZE",
+     # Multipart
+     "MultipartCreateRequest",
+diff --git a/backend/app/schemas/providers/apple/apple_xml/aws.py b/backend/app/schemas/providers/apple/apple_xml/aws.py
+index 87268c0dba..aa8894fa43 100644
+--- a/backend/app/schemas/providers/apple/apple_xml/aws.py
++++ b/backend/app/schemas/providers/apple/apple_xml/aws.py
+@@ -8,6 +8,9 @@
+ MIN_FILE_SIZE = 1024  # 1KB
+ MAX_FILE_SIZE = settings.apple_xml_max_file_size_bytes
+ DEFAULT_FILE_SIZE = 50 * 1024 * 1024  # 50MB
++# A direct upload travels inside the Celery message: Redis caps it at 512 MiB (~288 MiB of file after
++# encoding) and the API holds several copies while publishing. Larger files go through multipart.
++MAX_DIRECT_UPLOAD_SIZE = 200 * 1024 * 1024  # 200MB
+ 
+ 
+ class PresignedURLRequest(BaseModel):
+diff --git a/backend/app/services/providers/apple/apple_xml/direct_upload_service.py b/backend/app/services/providers/apple/apple_xml/direct_upload_service.py
+new file mode 100644
+index 0000000000..68a50b5b47
+--- /dev/null
++++ b/backend/app/services/providers/apple/apple_xml/direct_upload_service.py
+@@ -0,0 +1,52 @@
++from typing import BinaryIO
++
++from app.config import settings
++from app.integrations.celery.tasks.process_xml_upload_task import process_xml_upload
++from app.schemas.providers.apple.apple_xml import MAX_DIRECT_UPLOAD_SIZE, MAX_FILE_SIZE
++from app.utils.exceptions import ContentTooLargeError, ServiceUnavailableError
++from app.utils.structured_logging import get_logger
++
++logger = get_logger(__name__)
++
++_MIB = 1024 * 1024
++_MULTIPART_CREATE_PATH = f"POST {settings.api_v1}/users/{{user_id}}/import/apple/xml/s3/multipart/create"
++
++
++def direct_upload_limit() -> int:
++    return min(MAX_DIRECT_UPLOAD_SIZE, MAX_FILE_SIZE)
++
++
++def mib(size: int) -> str:
++    return f"{size // _MIB}"
++
++
++def too_large_detail(file_size: int) -> str:
++    # Multipart rejects files over the product-wide limit too, so only point there when it would accept the file.
++    if file_size > MAX_FILE_SIZE:
++        return f"XML import accepts files up to {mib(MAX_FILE_SIZE)} MiB."
++    return (
++        f"Direct upload accepts files up to {mib(direct_upload_limit())} MiB. "
++        f"Use the multipart upload ({_MULTIPART_CREATE_PATH}) for larger files."
++    )
++
++
++class DirectUploadService:
++    def queue_import(self, user_id: str, file: BinaryIO, file_size: int, filename: str) -> str:
++        """Queue a small XML upload for import; the file travels inside the Celery message."""
++        if file_size > direct_upload_limit():
++            raise ContentTooLargeError(too_large_detail(file_size))
++        try:
++            task = process_xml_upload.delay(file_contents=file.read(), filename=filename, user_id=user_id)
++        except Exception as e:
++            logger.error(
++                "Failed to queue direct XML upload",
++                exc_info=e,
++                action="xml_direct_upload_queue_failed",
++                user_id=user_id,
++                file_size=file_size,
++            )
++            raise ServiceUnavailableError("Unable to queue XML processing") from e
++        return task.id
++
++
++direct_upload_service = DirectUploadService()
+diff --git a/backend/app/utils/exceptions.py b/backend/app/utils/exceptions.py
+index cc9fa5fd54..0a33e4afd4 100644
+--- a/backend/app/utils/exceptions.py
++++ b/backend/app/utils/exceptions.py
+@@ -98,6 +98,10 @@ class ConflictError(AppError):
+     status_code = status.HTTP_409_CONFLICT
+ 
+ 
++class ContentTooLargeError(AppError):
++    status_code = status.HTTP_413_CONTENT_TOO_LARGE
++
++
+ class ResourceNotFoundError(NotFoundError):
+     def __init__(self, entity_name: str, entity_id: int | UUID | None = None):
+         self.entity_name = entity_name
+diff --git a/backend/scripts/start/worker.sh b/backend/scripts/start/worker.sh
+index b3132430a9..185645a3f9 100755
+--- a/backend/scripts/start/worker.sh
++++ b/backend/scripts/start/worker.sh
+@@ -8,7 +8,10 @@ uv run celery -A app.main:celery_app worker --loglevel=info --pool=threads -Q de
+ io_pid=$!
+ 
+ echo "Starting CPU worker..."
+-uv run celery -A app.main:celery_app worker --loglevel=info --pool=prefork --concurrency=2 -Q xml_sync -n cpu@%h &
++# XML imports are long and a direct upload carries the whole file in its message. With early
++# acks a prefetch multiplier of 1 still reserves one extra message per busy process, so
++# prefetch is disabled: the worker fetches a task only when a process is free.
++uv run celery -A app.main:celery_app worker --loglevel=info --pool=prefork --concurrency=2 --prefetch-multiplier=1 --disable-prefetch -Q xml_sync -n cpu@%h &
+ cpu_pid=$!
+ 
+ # This shell is PID 1 in the container, so a SIGTERM from `docker stop` only reaches
+diff --git a/backend/tests/api/v1/test_import_data.py b/backend/tests/api/v1/test_import_data.py
+index 5f9bfc21e7..7272106e43 100644
+--- a/backend/tests/api/v1/test_import_data.py
++++ b/backend/tests/api/v1/test_import_data.py
+@@ -1,7 +1,7 @@
+ """
+ Tests for import data endpoints.
+ 
+-Tests the /api/v1/users/{user_id}/import/apple/xml endpoint for XML import
++Tests the /api/v1/users/{user_id}/import/apple/xml endpoints for XML import
+ and the /api/v1/sns/notification endpoint its uploads are announced on.
+ """
+ 
+@@ -9,6 +9,8 @@
+ from uuid import uuid4
+ 
+ from fastapi.testclient import TestClient
++from httpx import Response
++from kombu.exceptions import OperationalError
+ from sqlalchemy.orm import Session
+ 
+ from tests.factories import ApiKeyFactory, UserFactory
+@@ -123,6 +125,9 @@ def test_generate_presigned_url_rejects_non_uuid_user_id(self, client: TestClien
+         assert response.status_code == 422
+ 
+ 
++_SERVICE = "app.services.providers.apple.apple_xml.direct_upload_service"
++
++
+ class TestXMLDirectImportEndpoint:
+     URL = "/api/v1/users/{user_id}/import/apple/xml/direct"
+ 
+@@ -130,7 +135,7 @@ def test_queues_import_for_existing_user(self, client: TestClient, db: Session)
+         user = UserFactory()
+         headers = api_key_headers(ApiKeyFactory().plain_key)
+ 
+-        with patch("app.api.routes.v1.import_xml.process_xml_upload.delay") as delay:
++        with patch(f"{_SERVICE}.process_xml_upload.delay") as delay:
+             delay.return_value.id = "task-id"
+             response = client.post(
+                 self.URL.format(user_id=user.id),
+@@ -145,7 +150,7 @@ def test_queues_import_for_existing_user(self, client: TestClient, db: Session)
+     def test_unknown_user_is_not_queued(self, client: TestClient, db: Session) -> None:
+         headers = api_key_headers(ApiKeyFactory().plain_key)
+ 
+-        with patch("app.api.routes.v1.import_xml.process_xml_upload.delay") as delay:
++        with patch(f"{_SERVICE}.process_xml_upload.delay") as delay:
+             response = client.post(
+                 self.URL.format(user_id=uuid4()),
+                 headers=headers,
+@@ -158,7 +163,7 @@ def test_unknown_user_is_not_queued(self, client: TestClient, db: Session) -> No
+     def test_rejects_non_uuid_user_id(self, client: TestClient, db: Session) -> None:
+         headers = api_key_headers(ApiKeyFactory().plain_key)
+ 
+-        with patch("app.api.routes.v1.import_xml.process_xml_upload.delay") as delay:
++        with patch(f"{_SERVICE}.process_xml_upload.delay") as delay:
+             response = client.post(
+                 self.URL.format(user_id="not-a-uuid"),
+                 headers=headers,
+@@ -191,3 +196,103 @@ def test_invalid_notification_does_not_echo_the_body(self, client: TestClient, d
+         assert response.status_code == 400
+         assert response.json()["detail"] == "Invalid SNS notification"
+         assert "secret-marker" not in response.text
++
++
++_MIB = 1024 * 1024
++_XML = b"<HealthData></HealthData>"
++
++
++def _upload_direct(client: TestClient, user_id: str, content: bytes) -> Response:
++    api_key = ApiKeyFactory()
++    return client.post(
++        f"/api/v1/users/{user_id}/import/apple/xml/direct",
++        headers=api_key_headers(api_key.plain_key),
++        files={"file": ("export.xml", content, "application/xml")},
++    )
++
++
++class TestDirectXMLUpload:
++    """Test suite for the direct XML upload endpoint."""
++
++    def test_queues_file_at_limit(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++
++        with (
++            patch(f"{_SERVICE}.MAX_DIRECT_UPLOAD_SIZE", len(_XML)),
++            patch(f"{_SERVICE}.process_xml_upload") as mock_task,
++        ):
++            mock_task.delay.return_value.id = "task-1"
++            response = _upload_direct(client, str(user.id), _XML)
++
++        assert response.status_code == 200
++        assert response.json() == {"status": "processing", "task_id": "task-1", "user_id": str(user.id)}
++        mock_task.delay.assert_called_once_with(file_contents=_XML, filename="export.xml", user_id=str(user.id))
++
++    def test_rejects_file_over_limit_without_queueing(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++
++        with (
++            patch(f"{_SERVICE}.MAX_DIRECT_UPLOAD_SIZE", len(_XML) - 1),
++            patch(f"{_SERVICE}.process_xml_upload") as mock_task,
++        ):
++            response = _upload_direct(client, str(user.id), _XML)
++
++        assert response.status_code == 413
++        assert response.headers["content-type"] == "application/problem+json"
++        mock_task.delay.assert_not_called()
++
++    def test_lower_product_limit_applies_to_direct_upload(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++
++        with (
++            patch(f"{_SERVICE}.MAX_FILE_SIZE", len(_XML) - 1),
++            patch(f"{_SERVICE}.process_xml_upload") as mock_task,
++        ):
++            response = _upload_direct(client, str(user.id), _XML)
++
++        assert response.status_code == 413
++        mock_task.delay.assert_not_called()
++
++    def test_413_message_points_to_multipart(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++
++        with (
++            patch(f"{_SERVICE}.MAX_DIRECT_UPLOAD_SIZE", 3 * _MIB),
++            patch(f"{_SERVICE}.process_xml_upload"),
++        ):
++            response = _upload_direct(client, str(user.id), b"x" * (3 * _MIB + 1))
++
++        assert response.status_code == 413
++        assert response.json()["detail"] == (
++            "Direct upload accepts files up to 3 MiB. "
++            "Use the multipart upload (POST /api/v1/users/{user_id}/import/apple/xml/s3/multipart/create) "
++            "for larger files."
++        )
++
++    def test_413_message_skips_multipart_for_file_over_product_limit(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++
++        with (
++            patch(f"{_SERVICE}.MAX_DIRECT_UPLOAD_SIZE", 2 * _MIB),
++            patch(f"{_SERVICE}.MAX_FILE_SIZE", 3 * _MIB),
++            patch(f"{_SERVICE}.process_xml_upload"),
++        ):
++            response = _upload_direct(client, str(user.id), b"x" * (3 * _MIB + 1))
++
++        assert response.status_code == 413
++        assert response.json()["detail"] == "XML import accepts files up to 3 MiB."
++
++    def test_returns_503_when_queue_rejects_task(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++
++        with (
++            patch(f"{_SERVICE}.process_xml_upload") as mock_task,
++            patch(f"{_SERVICE}.logger") as mock_logger,
++        ):
++            mock_task.delay.side_effect = OperationalError("Error 32 while writing to socket. Broken pipe.")
++            response = _upload_direct(client, str(user.id), _XML)
++
++        assert response.status_code == 503
++        assert response.json()["detail"] == "Unable to queue XML processing"
++        mock_logger.error.assert_called_once()
++        assert mock_logger.error.call_args.kwargs["action"] == "xml_direct_upload_queue_failed"
+diff --git a/backend/tests/tasks/test_process_xml_upload_task.py b/backend/tests/tasks/test_process_xml_upload_task.py
+new file mode 100644
+index 0000000000..275ac44d35
+--- /dev/null
++++ b/backend/tests/tasks/test_process_xml_upload_task.py
+@@ -0,0 +1,78 @@
++"""
++Tests for process_xml_upload Celery task.
++
++Tests how the task stores the uploaded XML before importing it.
++"""
++
++import os
++import tempfile
++from collections.abc import Generator
++from dataclasses import dataclass, field
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++from uuid import uuid4
++
++import pytest
++from sqlalchemy.orm import Session
++
++from app.integrations.celery.tasks.process_xml_upload_task import process_xml_upload
++from app.schemas.providers.apple.apple_xml import XMLParseStats
++
++_TASK = "app.integrations.celery.tasks.process_xml_upload_task"
++
++
++@dataclass
++class FakeImport:
++    """Stands in for the XML import, recording each temp file it was given."""
++
++    files: list[tuple[str, bytes]] = field(default_factory=list)
++    error: Exception | None = None
++
++    def __call__(self, _db: Session, xml_path: str, _user_id: str) -> XMLParseStats:
++        self.files.append((xml_path, Path(xml_path).read_bytes()))
++        if self.error is not None:
++            raise self.error
++        return XMLParseStats()
++
++
++@pytest.fixture
++def fake_import(db: Session) -> Generator[FakeImport, None, None]:
++    fake = FakeImport()
++    with (
++        patch(f"{_TASK}.SessionLocal") as mock_session_local,
++        patch(f"{_TASK}._import_xml_data", side_effect=fake),
++        patch(f"{_TASK}.emit_sync_started"),
++        patch(f"{_TASK}.emit_sync_completed"),
++        patch(f"{_TASK}.emit_sync_failed"),
++        patch(f"{_TASK}.try_record_data_types"),
++    ):
++        mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
++        mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
++        yield fake
++
++
++class TestProcessXMLUploadTempFile:
++    def test_uploads_with_the_same_filename_get_separate_files(self, fake_import: FakeImport) -> None:
++        process_xml_upload(file_contents=b"<A/>", filename="export.xml", user_id=str(uuid4()))
++        process_xml_upload(file_contents=b"<B/>", filename="export.xml", user_id=str(uuid4()))
++
++        (path_a, content_a), (path_b, content_b) = fake_import.files
++        assert path_a != path_b
++        assert (content_a, content_b) == (b"<A/>", b"<B/>")
++
++    def test_temp_file_name_ignores_client_filename_and_is_removed(self, fake_import: FakeImport) -> None:
++        process_xml_upload(file_contents=b"<A/>", filename="../../evil.xml", user_id=str(uuid4()))
++
++        ((path, _),) = fake_import.files
++        assert os.path.dirname(path) == tempfile.gettempdir()
++        assert "evil" not in os.path.basename(path)
++        assert not os.path.exists(path)
++
++    def test_temp_file_is_removed_when_import_fails(self, fake_import: FakeImport) -> None:
++        fake_import.error = RuntimeError("parse failed")
++
++        with pytest.raises(RuntimeError, match="parse failed"):
++            process_xml_upload(file_contents=b"<A/>", filename="export.xml", user_id=str(uuid4()))
++
++        ((path, _),) = fake_import.files
++        assert not os.path.exists(path)
+diff --git a/docs/api-reference/guides/apple-xml-import.mdx b/docs/api-reference/guides/apple-xml-import.mdx
+index 2564f4e06d..52cc5a689c 100644
+--- a/docs/api-reference/guides/apple-xml-import.mdx
++++ b/docs/api-reference/guides/apple-xml-import.mdx
+@@ -17,7 +17,7 @@ Import complete Apple Health data exports via XML files using one of these metho
+ 
+ 1. **S3-compatible multipart upload** (Recommended) - For large files, uploads parts directly to an S3-compatible bucket (AWS S3 or self-hosted), reports progress, and explicitly queues processing.
+ 2. **S3 presigned POST with SNS** - AWS-only workflow for deployments configured with `APPLE_XML_UPLOAD_COMPLETION_MODE=sns`.
+-3. **Direct Upload** - For smaller files or testing, uploads directly to the API
++3. **Direct Upload** - For files up to 200 MiB or testing, uploads directly to the API. Needs no object storage.
+ 
+ ## Authentication
+ 
+@@ -670,6 +670,33 @@ as retryable with exponential backoff.
+       </Step>
+     </Steps>
+ 
++    <Warning>
++      Direct upload accepts files up to **200 MiB**. The file is passed to the worker
++      inside the task queue message, so the API, Redis and the worker each hold a copy
++      of it in memory. An Apple Health export from a few years of Apple Watch use is
++      usually larger, so use the multipart upload for real exports. If
++      `APPLE_XML_MAX_FILE_SIZE_BYTES` is set lower, that limit applies here too.
++    </Warning>
++
++    | Status | Meaning |
++    |--------|---------|
++    | `200 OK` | File queued for processing |
++    | `401` | Invalid or missing API key |
++    | `413` | File is over 200 MiB. Use the multipart upload |
++    | `422` | The request has no `file` part |
++    | `503` | The task queue is unavailable. Retry with backoff |
++
++    <ResponseExample>
++    ```json 413 File too large
++    {
++      "title": "Content Too Large",
++      "status": 413,
++      "detail": "Direct upload accepts files up to 200 MiB. Use the multipart upload (POST /api/v1/users/{user_id}/import/apple/xml/s3/multipart/create) for larger files.",
++      "code": "CONTENT_TOO_LARGE"
++    }
++    ```
++    </ResponseExample>
++
+     <Accordion title="View Complete Script (Copy & Run)">
+     ```python upload_xml_direct.py
+     #!/usr/bin/env python3
+@@ -696,10 +723,11 @@ as retryable with exponential backoff.
+             print(f"Error: File not found: {file_path}")
+             sys.exit(1)
+         
+-        # Check file size
+-        file_size_mb = file_path.stat().st_size / (1024 * 1024)
+-        if file_size_mb > 10:
+-            print(f"Warning: File is {file_size_mb:.1f}MB. Consider using S3 method for large files.")
++        # Direct upload accepts files up to 200 MiB
++        file_size_mib = file_path.stat().st_size / (1024 * 1024)
++        if file_size_mib > 200:
++            print(f"Error: File is {file_size_mib:.1f} MiB. Use the multipart upload for files over 200 MiB.")
++            sys.exit(1)
+         
+         # Upload directly
+         print(f"Uploading {file_path.name}...")
+@@ -746,7 +774,7 @@ See [Data Types Guide](/architecture/data-types) for complete list.
+ 
+ <CardGroup cols={2}>
+   <Card title="Use S3 for Large Files" icon="cloud-arrow-up">
+-    Files over 10MB should use multipart upload to avoid API request limits
++    Direct upload accepts files up to 200 MiB. Use multipart upload for anything larger
+   </Card>
+   
+   <Card title="Handle Async Processing" icon="clock">
+diff --git a/docs/openapi.json b/docs/openapi.json
+index 5759b0ee79..ad93695b20 100644
+--- a/docs/openapi.json
++++ b/docs/openapi.json
+@@ -7325,7 +7325,7 @@
+           "External: Apple Health Import"
+         ],
+         "summary": "Import Xml File",
+-        "description": "Import XML file into the database.",
++        "description": "Import an Apple Health XML file of up to 200 MiB into the database. Larger files must use the S3 multipart upload.",
+         "operationId": "import_xml_file_api_v1_users__user_id__import_apple_xml_direct_post",
+         "security": [
+           {
+@@ -7401,6 +7401,38 @@
+               }
+             }
+           },
++          "413": {
++            "description": "File is over 200 MiB",
++            "content": {
++              "application/problem+json": {
++                "schema": {
++                  "$ref": "#/components/schemas/Problem"
++                },
++                "example": {
++                  "title": "Content Too Large",
++                  "status": 413,
++                  "detail": "Direct upload accepts files up to 200 MiB. Use the multipart upload (POST /api/v1/users/{user_id}/import/apple/xml/s3/multipart/create) for larger files.",
++                  "code": "CONTENT_TOO_LARGE"
++                }
++              }
++            }
++          },
++          "503": {
++            "description": "Task queue unavailable",
++            "content": {
++              "application/problem+json": {
++                "schema": {
++                  "$ref": "#/components/schemas/Problem"
++                },
++                "example": {
++                  "title": "Service Unavailable",
++                  "status": 503,
++                  "detail": "Unable to queue XML processing",
++                  "code": "SERVICE_UNAVAILABLE"
++                }
++              }
++            }
++          },
+           "422": {
+             "description": "Validation Error",
+             "content": {

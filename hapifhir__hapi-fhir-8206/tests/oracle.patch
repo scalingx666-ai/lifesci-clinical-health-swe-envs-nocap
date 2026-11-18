@@ -1,0 +1,974 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8203-make-sender-outbox-table-configurable-batches.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8203-make-sender-outbox-table-configurable-batches.yaml
+new file mode 100644
+index 000000000000..9491cd26e403
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8203-make-sender-outbox-table-configurable-batches.yaml
+@@ -0,0 +1,4 @@
++---
++type: perf
++issue: 8203
++title: "Previously, a bottleneck existed in the Subscription Matching service such that messages could only be sent one at a time. This has been changed, and by default, batches of 1000 messages are sent to the matching topic/queue. This is configurable via the `SubscriptionSettings#setSubscriptionSubmissionBatchSize(int theSubscriptionSubmissionBatchSize)`."
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/IResourceModifiedDao.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/IResourceModifiedDao.java
+index 6499ee2ff97b..f11919995997 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/IResourceModifiedDao.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/IResourceModifiedDao.java
+@@ -30,6 +30,8 @@
+ import org.springframework.data.jpa.repository.Query;
+ import org.springframework.data.repository.query.Param;
+ 
++import java.util.Collection;
++
+ public interface IResourceModifiedDao
+ 		extends JpaRepository<ResourceModifiedEntity, PersistedResourceModifiedMessageEntityPK>,
+ 				IHapiFhirJpaRepository {
+@@ -40,4 +42,15 @@ public interface IResourceModifiedDao
+ 	@Modifying
+ 	@Query("delete from ResourceModifiedEntity r where r.myResourceModifiedEntityPK =:pk")
+ 	int removeById(@Param("pk") PersistedResourceModifiedMessageEntityPK thePK);
++
++	/**
++	 * Delete a whole batch of rows with a single statement so that draining a page of
++	 * HFJ_RESOURCE_MODIFIED costs one database round trip instead of one per row.
++	 *
++	 * @param thePKs the primary keys of the rows to delete
++	 * @return the number of rows deleted
++	 */
++	@Modifying
++	@Query("delete from ResourceModifiedEntity r where r.myResourceModifiedEntityPK in :pks")
++	int removeByPks(@Param("pks") Collection<PersistedResourceModifiedMessageEntityPK> thePKs);
+ }
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/subscription/ResourceModifiedMessagePersistenceSvcImpl.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/subscription/ResourceModifiedMessagePersistenceSvcImpl.java
+index 95e98b5d8f03..16cd3ffcb68d 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/subscription/ResourceModifiedMessagePersistenceSvcImpl.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/subscription/ResourceModifiedMessagePersistenceSvcImpl.java
+@@ -40,6 +40,7 @@
+ import ca.uhn.fhir.subscription.api.IResourceModifiedMessagePersistenceSvc;
+ import com.fasterxml.jackson.core.JsonProcessingException;
+ import com.fasterxml.jackson.databind.ObjectMapper;
++import org.apache.commons.collections4.ListUtils;
+ import org.hl7.fhir.instance.model.api.IBaseResource;
+ import org.hl7.fhir.instance.model.api.IIdType;
+ import org.slf4j.Logger;
+@@ -47,8 +48,11 @@
+ import org.springframework.data.domain.Page;
+ import org.springframework.data.domain.Pageable;
+ 
++import java.util.Collection;
+ import java.util.Date;
++import java.util.List;
+ import java.util.Optional;
++import java.util.stream.Collectors;
+ 
+ import static ca.uhn.fhir.jpa.model.entity.PersistedResourceModifiedMessageEntityPK.with;
+ 
+@@ -59,6 +63,12 @@
+  */
+ public class ResourceModifiedMessagePersistenceSvcImpl implements IResourceModifiedMessagePersistenceSvc {
+ 
++	/**
++	 * The maximum number of primary keys deleted by a single statement.  The primary key is composed of three columns,
++	 * so each key costs three bound parameters and Oracle refuses any statement carrying more than 1000 of them.
++	 */
++	static final int DELETE_BATCH_SIZE = 250;
++
+ 	private final FhirContext myFhirContext;
+ 
+ 	private final IResourceModifiedDao myResourceModifiedDao;
+@@ -150,6 +160,23 @@ public boolean deleteByPK(IPersistedResourceModifiedMessagePK theResourceModifie
+ 		return removedCount == 1;
+ 	}
+ 
++	@Override
++	public int deleteByPKs(Collection<IPersistedResourceModifiedMessagePK> theResourceModifiedPKs) {
++		if (theResourceModifiedPKs.isEmpty()) {
++			return 0;
++		}
++
++		List<PersistedResourceModifiedMessageEntityPK> pks = theResourceModifiedPKs.stream()
++				.map(PersistedResourceModifiedMessageEntityPK.class::cast)
++				.collect(Collectors.toList());
++
++		int retVal = 0;
++		for (List<PersistedResourceModifiedMessageEntityPK> nextChunk : ListUtils.partition(pks, DELETE_BATCH_SIZE)) {
++			retVal += myResourceModifiedDao.removeByPks(nextChunk);
++		}
++		return retVal;
++	}
++
+ 	protected ResourceModifiedMessage inflateResourceModifiedMessageFromEntity(
+ 			ResourceModifiedEntity theResourceModifiedEntity) {
+ 		String resourceType = theResourceModifiedEntity.getResourceType();
+diff --git a/hapi-fhir-jpaserver-model/src/main/java/ca/uhn/fhir/jpa/model/config/BaseSubscriptionSettings.java b/hapi-fhir-jpaserver-model/src/main/java/ca/uhn/fhir/jpa/model/config/BaseSubscriptionSettings.java
+index 7dc146c4e93f..1030eda12540 100644
+--- a/hapi-fhir-jpaserver-model/src/main/java/ca/uhn/fhir/jpa/model/config/BaseSubscriptionSettings.java
++++ b/hapi-fhir-jpaserver-model/src/main/java/ca/uhn/fhir/jpa/model/config/BaseSubscriptionSettings.java
+@@ -21,6 +21,7 @@
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import org.apache.commons.collections4.CollectionUtils;
++import org.apache.commons.lang3.Validate;
+ import org.hl7.fhir.dstu2.model.Subscription;
+ 
+ import java.util.Collections;
+@@ -35,6 +36,7 @@ public abstract class BaseSubscriptionSettings {
+ 	public static final String DEFAULT_RESTHOOK_ENDPOINTURL_VALIDATION_REGEX =
+ 			"https?://[-%()_.!~*';/?:@&=+$,#A-Za-z0-9\\[\\]]+";
+ 	public static final long DEFAULT_SUBMISSION_INTERVAL_IN_MS = 5000;
++	public static final int DEFAULT_SUBMISSION_BATCH_SIZE = 1000;
+ 
+ 	private final Set<Subscription.SubscriptionChannelType> mySupportedSubscriptionTypes = new HashSet<>();
+ 	private String myEmailFromAddress = DEFAULT_EMAIL_FROM_ADDRESS;
+@@ -44,6 +46,7 @@ public abstract class BaseSubscriptionSettings {
+ 	private boolean myEnableInMemorySubscriptionMatching = true;
+ 	private boolean myTriggerSubscriptionsForNonVersioningChanges;
+ 	private long mySubmissionIntervalInMs = DEFAULT_SUBMISSION_INTERVAL_IN_MS;
++	private int mySubscriptionSubmissionBatchSize = DEFAULT_SUBMISSION_BATCH_SIZE;
+ 
+ 	/**
+ 	 * @since 6.8.0
+@@ -322,4 +325,40 @@ public long getSubscriptionIntervalInMs() {
+ 	public void setSubscriptionIntervalInMs(long theSubscriptionIntervalInMs) {
+ 		mySubmissionIntervalInMs = theSubscriptionIntervalInMs;
+ 	}
++
++	/**
++	 * The number of persisted Resource Changes which are read from the DB and submitted to the subscription matching
++	 * queue as a single batch. Defaults to {@literal 1000}.
++	 * <p>
++	 * The cost of synchronizing with the message broker, and of deleting the rows which were submitted, is paid once
++	 * per batch instead of once per row, so a larger batch yields greater delivery throughput on brokers where a
++	 * durable publish is expensive. The batch is also the unit of retry: when a submission fails, the whole batch is
++	 * left in the database and re-submitted on a later delivery pass.
++	 * </p>
++	 *
++	 * @since 8.12.0
++	 */
++	public int getSubscriptionSubmissionBatchSize() {
++		return mySubscriptionSubmissionBatchSize;
++	}
++
++	/**
++	 * The number of persisted Resource Changes which are read from the DB and submitted to the subscription matching
++	 * queue as a single batch. Defaults to {@literal 1000}.
++	 * <p>
++	 * The cost of synchronizing with the message broker, and of deleting the rows which were submitted, is paid once
++	 * per batch instead of once per row, so a larger batch yields greater delivery throughput on brokers where a
++	 * durable publish is expensive. The batch is also the unit of retry: when a submission fails, the whole batch is
++	 * left in the database and re-submitted on a later delivery pass.
++	 * </p>
++	 *
++	 * @param theSubscriptionSubmissionBatchSize the number of rows to submit per batch, which must be greater than zero
++	 * @throws IllegalArgumentException if <code>theSubscriptionSubmissionBatchSize</code> is not greater than zero
++	 * @since 8.12.0
++	 */
++	public void setSubscriptionSubmissionBatchSize(int theSubscriptionSubmissionBatchSize) {
++		Validate.isTrue(
++				theSubscriptionSubmissionBatchSize > 0, "theSubscriptionSubmissionBatchSize must be greater than 0");
++		mySubscriptionSubmissionBatchSize = theSubscriptionSubmissionBatchSize;
++	}
+ }
+diff --git a/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/async/AsyncResourceModifiedSubmitterSvc.java b/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/async/AsyncResourceModifiedSubmitterSvc.java
+index c67dafa16302..a373fc964f6a 100644
+--- a/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/async/AsyncResourceModifiedSubmitterSvc.java
++++ b/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/async/AsyncResourceModifiedSubmitterSvc.java
+@@ -20,15 +20,17 @@
+  * #L%
+  */
+ 
++import ca.uhn.fhir.jpa.model.config.SubscriptionSettings;
+ import ca.uhn.fhir.jpa.model.entity.IPersistedResourceModifiedMessage;
+ import ca.uhn.fhir.subscription.api.IResourceModifiedConsumerWithRetries;
+ import ca.uhn.fhir.subscription.api.IResourceModifiedMessagePersistenceSvc;
+-import com.google.common.annotations.VisibleForTesting;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.data.domain.Page;
+ import org.springframework.data.domain.PageRequest;
+ 
++import java.util.List;
++
+ /**
+  * The purpose of this service is to submit messages to the processing pipeline for which previous attempts at
+  * submission has failed.  See also {@link AsyncResourceModifiedProcessingSchedulerSvc} and {@link IResourceModifiedMessagePersistenceSvc}.
+@@ -37,21 +39,24 @@
+ public class AsyncResourceModifiedSubmitterSvc {
+ 	private static final Logger ourLog = LoggerFactory.getLogger(AsyncResourceModifiedSubmitterSvc.class);
+ 
+-	public static final int MAX_LIMIT = 1000;
+-
+ 	private final IResourceModifiedMessagePersistenceSvc myResourceModifiedMessagePersistenceSvc;
+ 	private final IResourceModifiedConsumerWithRetries myResourceModifiedConsumer;
++	private final SubscriptionSettings mySubscriptionSettings;
+ 
+ 	public AsyncResourceModifiedSubmitterSvc(
+ 			IResourceModifiedMessagePersistenceSvc theResourceModifiedMessagePersistenceSvc,
+-			IResourceModifiedConsumerWithRetries theResourceModifiedConsumer) {
++			IResourceModifiedConsumerWithRetries theResourceModifiedConsumer,
++			SubscriptionSettings theSubscriptionSettings) {
+ 		myResourceModifiedMessagePersistenceSvc = theResourceModifiedMessagePersistenceSvc;
+ 		myResourceModifiedConsumer = theResourceModifiedConsumer;
++		mySubscriptionSettings = theSubscriptionSettings;
+ 	}
+ 
+ 	public void runDeliveryPass() {
+ 		boolean hasMoreToFetch = false;
+-		int limit = getLimit();
++		// the page size doubles as the batch size: one page is submitted to the broker as one batch.  The setter
++		// guarantees a positive value, so PageRequest.of can never be handed a non positive page size here.
++		int limit = mySubscriptionSettings.getSubscriptionSubmissionBatchSize();
+ 		do {
+ 			// we always take the 0th page, because we're deleting the elements as we process them
+ 			Page<IPersistedResourceModifiedMessage> persistedResourceModifiedMsgsPage =
+@@ -62,22 +67,19 @@ public void runDeliveryPass() {
+ 
+ 			hasMoreToFetch = persistedResourceModifiedMsgsPage.hasNext();
+ 
+-			for (IPersistedResourceModifiedMessage persistedResourceModifiedMessage :
+-					persistedResourceModifiedMsgsPage) {
+-				boolean wasProcessed = myResourceModifiedConsumer.submitPersisedResourceModifiedMessage(
+-						persistedResourceModifiedMessage);
++			List<IPersistedResourceModifiedMessage> batch = persistedResourceModifiedMsgsPage.getContent();
++			if (batch.isEmpty()) {
++				// nothing left to submit: never issue an empty broker or database round trip
++				break;
++			}
++
++			// submit the whole page as a single batch so that the cost of synchronizing with the broker, and of
++			// deleting the rows, is paid once for the page instead of once per row.
++			int processedCount = myResourceModifiedConsumer.submitPersistedResourceModifiedMessages(batch);
+ 
+-				if (!wasProcessed) {
+-					// we're not fetching anymore no matter what
+-					hasMoreToFetch = false;
+-					break;
+-				}
++			if (processedCount < batch.size()) {
++				hasMoreToFetch = false;
+ 			}
+ 		} while (hasMoreToFetch);
+ 	}
+-
+-	@VisibleForTesting
+-	public static int getLimit() {
+-		return MAX_LIMIT;
+-	}
+ }
+diff --git a/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/submit/config/SubscriptionSubmitterConfig.java b/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/submit/config/SubscriptionSubmitterConfig.java
+index 8c189394d22a..ac5591aa8c77 100644
+--- a/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/submit/config/SubscriptionSubmitterConfig.java
++++ b/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/submit/config/SubscriptionSubmitterConfig.java
+@@ -108,9 +108,10 @@ public AsyncResourceModifiedProcessingSchedulerSvc asyncResourceModifiedProcessi
+ 	@Bean
+ 	public AsyncResourceModifiedSubmitterSvc asyncResourceModifiedSubmitterSvc(
+ 			IResourceModifiedMessagePersistenceSvc theIResourceModifiedMessagePersistenceSvc,
+-			IResourceModifiedConsumerWithRetries theResourceModifiedConsumer) {
++			IResourceModifiedConsumerWithRetries theResourceModifiedConsumer,
++			SubscriptionSettings theSubscriptionSettings) {
+ 		return new AsyncResourceModifiedSubmitterSvc(
+-				theIResourceModifiedMessagePersistenceSvc, theResourceModifiedConsumer);
++				theIResourceModifiedMessagePersistenceSvc, theResourceModifiedConsumer, theSubscriptionSettings);
+ 	}
+ 
+ 	@Bean
+diff --git a/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/submit/svc/ResourceModifiedSubmitterSvc.java b/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/submit/svc/ResourceModifiedSubmitterSvc.java
+index 9d95308df853..1155be9da706 100644
+--- a/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/submit/svc/ResourceModifiedSubmitterSvc.java
++++ b/hapi-fhir-jpaserver-subscription/src/main/java/ca/uhn/fhir/jpa/subscription/submit/svc/ResourceModifiedSubmitterSvc.java
+@@ -23,6 +23,7 @@
+ import ca.uhn.fhir.broker.api.ChannelProducerSettings;
+ import ca.uhn.fhir.broker.api.IChannelProducer;
+ import ca.uhn.fhir.broker.api.ISendResult;
++import ca.uhn.fhir.i18n.Msg;
+ import ca.uhn.fhir.jpa.dao.tx.IHapiTransactionService;
+ import ca.uhn.fhir.jpa.model.config.SubscriptionSettings;
+ import ca.uhn.fhir.jpa.model.entity.IPersistedResourceModifiedMessage;
+@@ -33,6 +34,7 @@
+ import ca.uhn.fhir.jpa.subscription.model.ResourceModifiedMessage;
+ import ca.uhn.fhir.jpa.subscription.submit.interceptor.SubscriptionMatcherInterceptor;
+ import ca.uhn.fhir.rest.server.exceptions.ResourceNotFoundException;
++import ca.uhn.fhir.rest.server.messaging.IMessage;
+ import ca.uhn.fhir.subscription.api.IResourceModifiedConsumerWithRetries;
+ import ca.uhn.fhir.subscription.api.IResourceModifiedMessagePersistenceSvc;
+ import ca.uhn.fhir.util.IoUtils;
+@@ -47,6 +49,10 @@
+ import org.springframework.transaction.annotation.Propagation;
+ import org.springframework.transaction.support.TransactionCallback;
+ 
++import java.util.ArrayList;
++import java.util.List;
++import java.util.stream.Collectors;
++
+ import static ca.uhn.fhir.jpa.subscription.match.matcher.subscriber.SubscriptionMatchingListener.SUBSCRIPTION_MATCHING_CHANNEL_NAME;
+ 
+ /**
+@@ -112,6 +118,23 @@ public ISendResult submitResourceModified(ResourceModifiedMessage theMsg) {
+ 		return myMatchingChannelProducer.send(new ResourceModifiedJsonMessage(theMsg));
+ 	}
+ 
++	/**
++	 * Submit a whole batch of messages to the broker in a single call so that the cost of synchronizing with the broker
++	 * is paid once for the batch rather than once per message.
++	 *
++	 * @param theMessages the messages to submit
++	 * @return the result of each send operation, in the same order as <code>theMessages</code>
++	 */
++	protected List<ISendResult> submitResourceModifiedBatch(List<IMessage<ResourceModifiedMessage>> theMessages) {
++		startIfNeeded();
++
++		ourLog.trace("Sending {} resource modified messages to processing channel", theMessages.size());
++		Validate.notNull(
++				myMatchingChannelProducer,
++				"A SubscriptionMatcherInterceptor has been registered without calling start() on it.");
++		return myMatchingChannelProducer.sendAll(theMessages);
++	}
++
+ 	/**
+ 	 * This method will inflate the ResourceModifiedMessage represented by the IPersistedResourceModifiedMessage and attempts
+ 	 * to submit it to the subscription processing pipeline.
+@@ -131,6 +154,103 @@ public boolean submitPersisedResourceModifiedMessage(
+ 				.execute(doProcessResourceModifiedInTransaction(thePersistedResourceModifiedMessage));
+ 	}
+ 
++	/**
++	 * This method drains a whole batch of IPersistedResourceModifiedMessage in a single unit of work: one transaction,
++	 * one batched delete and one batched submission to the broker.  It is the batched counterpart of
++	 * {@link #submitPersisedResourceModifiedMessage(IPersistedResourceModifiedMessage)}.
++	 * <p>
++	 * The batch is all-or-nothing.  If the broker rejects any message of the batch, whether by throwing or by returning
++	 * an unsuccessful {@link ISendResult}, the transaction is rolled back so that every row remains available for
++	 * re-submission at a later time.  Rows are never deleted unless the whole batch was acknowledged by the broker,
++	 * since the pipeline tolerates delivering a message more than once but never tolerates losing one.
++	 * </p>
++	 *
++	 * @param thePersistedResourceModifiedMessages the batch of messages requiring submission
++	 * @return the number of messages which were successfully processed, which is <code>0</code> when the batch was
++	 * rolled back.
++	 */
++	@Override
++	public int submitPersistedResourceModifiedMessages(
++			List<IPersistedResourceModifiedMessage> thePersistedResourceModifiedMessages) {
++		if (thePersistedResourceModifiedMessages.isEmpty()) {
++			// nothing to do: never open a transaction, hit the database or talk to the broker for an empty batch
++			return 0;
++		}
++
++		return myHapiTransactionService
++				.withSystemRequest()
++				.withPropagation(Propagation.REQUIRES_NEW)
++				.execute(doProcessResourceModifiedBatchInTransaction(thePersistedResourceModifiedMessages));
++	}
++
++	/**
++	 * The batched counterpart of {@link #doProcessResourceModifiedInTransaction(IPersistedResourceModifiedMessage)}.  It
++	 * requires execution in a transaction so that the batched deletion of the persistedResourceModifiedMessage pointed
++	 * to by <code>thePersistedResourceModifiedMessages</code> can be rolled back in the event where submission fails.
++	 *
++	 * @param thePersistedResourceModifiedMessages the batch of messages requiring submission
++	 * @return the number of messages which were successfully processed, which is <code>0</code> when the batch was
++	 * rolled back.
++	 */
++	protected TransactionCallback<Integer> doProcessResourceModifiedBatchInTransaction(
++			List<IPersistedResourceModifiedMessage> thePersistedResourceModifiedMessages) {
++		return theStatus -> {
++			int batchSize = thePersistedResourceModifiedMessages.size();
++			List<IMessage<ResourceModifiedMessage>> messagesToSend;
++
++			try {
++				deletePersistedResourceModifiedMessages(thePersistedResourceModifiedMessages);
++
++				messagesToSend = createMessagesToSend(thePersistedResourceModifiedMessages);
++			} catch (Exception ex) {
++				// catching Exception is deliberate here, despite this generally being frowned upon: any failure while
++				// preparing the batch must roll the transaction back, since we cannot tell how much of the batch was
++				// affected and losing a row is not acceptable.
++				ourLog.error(
++						Msg.code(3017)
++								+ "Failed to prepare a batch of {} resource modified messages for submission.  Further attempts will be performed at later time.",
++						batchSize,
++						ex);
++				theStatus.setRollbackOnly();
++				return 0;
++			}
++
++			if (messagesToSend.isEmpty()) {
++				// every row of the batch was unusable, but they have been deleted, so the pass may keep going
++				return batchSize;
++			}
++
++			try {
++				List<ISendResult> sendResults = submitResourceModifiedBatch(messagesToSend);
++
++				if (!isEverySendSuccessful(sendResults, messagesToSend.size())) {
++					// a producer is allowed to report a failed send without throwing.  The single message path discards
++					// its ISendResult, so this is a failure mode which only the batch API can observe; it means the
++					// broker did not acknowledge the messages, so it is handled exactly like a
++					// MessageDeliveryException.
++					ourLog.error(
++							Msg.code(3018)
++									+ "Channel submission was not acknowledged for a batch of {} resource modified messages.  Further attempts will be performed at later time.",
++							batchSize);
++					theStatus.setRollbackOnly();
++					return 0;
++				}
++			} catch (Exception exception) {
++				// we encountered an issue when trying to send the batch so mark the transaction for rollback.  We
++				// cannot tell which messages of the batch were acknowledged, so no row of the batch may be deleted.
++				ourLog.error(
++						Msg.code(3019)
++								+ "Channel submission failed for a batch of {} resource modified messages.  Further attempts will be performed at later time.",
++						batchSize,
++						exception);
++				theStatus.setRollbackOnly();
++				return 0;
++			}
++
++			return batchSize;
++		};
++	}
++
+ 	/**
+ 	 * This method is the cornerstone in the submit and retry upon failure mechanism for messages needing submission to the subscription processing pipeline.
+ 	 * It requires execution in a transaction for rollback of deleting the persistedResourceModifiedMessage pointed to by <code>thePersistedResourceModifiedMessage<code/>
+@@ -190,6 +310,55 @@ private ResourceModifiedMessage createResourceModifiedMessageWithoutInflation(
+ 				thePersistedResourceModifiedMessage);
+ 	}
+ 
++	/**
++	 * Build the outgoing message for every row of the batch.  A row whose stored summary cannot be turned into a
++	 * message can never be submitted, so it is dropped from the batch and left deleted - exactly what the single
++	 * message path does - rather than blocking every other message of the batch forever.
++	 */
++	private List<IMessage<ResourceModifiedMessage>> createMessagesToSend(
++			List<IPersistedResourceModifiedMessage> thePersistedResourceModifiedMessages) {
++		List<IMessage<ResourceModifiedMessage>> retVal = new ArrayList<>(thePersistedResourceModifiedMessages.size());
++
++		for (IPersistedResourceModifiedMessage nextPersistedResourceModifiedMessage :
++				thePersistedResourceModifiedMessages) {
++			try {
++				retVal.add(new ResourceModifiedJsonMessage(
++						createResourceModifiedMessageWithoutInflation(nextPersistedResourceModifiedMessage)));
++			} catch (Exception ex) {
++				ourLog.error(
++						Msg.code(3020)
++								+ "Unexpected error encountered while processing resource modified message {}. Marking as processed to prevent further errors.",
++						nextPersistedResourceModifiedMessage.getPersistedResourceModifiedMessagePk(),
++						ex);
++			}
++		}
++
++		return retVal;
++	}
++
++	private static boolean isEverySendSuccessful(List<ISendResult> theSendResults, int theExpectedResultCount) {
++		if (theSendResults == null || theSendResults.size() != theExpectedResultCount) {
++			return false;
++		}
++		return theSendResults.stream().allMatch(ISendResult::isSuccessful);
++	}
++
++	private void deletePersistedResourceModifiedMessages(
++			List<IPersistedResourceModifiedMessage> thePersistedResourceModifiedMessages) {
++		List<IPersistedResourceModifiedMessagePK> pks = thePersistedResourceModifiedMessages.stream()
++				.map(IPersistedResourceModifiedMessage::getPersistedResourceModifiedMessagePk)
++				.collect(Collectors.toList());
++
++		int deletedCount = myResourceModifiedMessagePersistenceSvc.deleteByPKs(pks);
++
++		if (deletedCount < pks.size()) {
++			ourLog.warn(
++					"Only {} of {} persisted resource modified messages were deleted, the remainder had already been deleted.  The whole batch will be submitted.",
++					deletedCount,
++					pks.size());
++		}
++	}
++
+ 	private boolean deletePersistedResourceModifiedMessage(IPersistedResourceModifiedMessagePK theResourceModifiedPK) {
+ 		try {
+ 			// delete the entry to lock the row to ensure unique processing
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/subscription/async/AsyncSubscriptionMessageSubmissionIT.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/subscription/async/AsyncSubscriptionMessageSubmissionIT.java
+index 259c73aef5be..15d255436669 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/subscription/async/AsyncSubscriptionMessageSubmissionIT.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/subscription/async/AsyncSubscriptionMessageSubmissionIT.java
+@@ -11,6 +11,7 @@
+ import ca.uhn.fhir.jpa.model.entity.PersistedResourceModifiedMessageEntityPK;
+ import ca.uhn.fhir.jpa.model.entity.ResourceModifiedEntity;
+ import ca.uhn.fhir.jpa.subscription.BaseSubscriptionsR4Test;
++import ca.uhn.fhir.jpa.subscription.channel.impl.LinkedBlockingChannel;
+ import ca.uhn.fhir.jpa.subscription.channel.subscription.SubscriptionChannelFactory;
+ import ca.uhn.fhir.jpa.subscription.match.matcher.matching.IResourceModifiedConsumer;
+ import ca.uhn.fhir.jpa.subscription.model.ResourceModifiedJsonMessage;
+@@ -18,6 +19,7 @@
+ import ca.uhn.fhir.jpa.subscription.submit.interceptor.SubscriptionMatcherInterceptor;
+ import ca.uhn.fhir.jpa.subscription.submit.interceptor.SynchronousSubscriptionMatcherInterceptor;
+ import ca.uhn.fhir.jpa.test.util.StoppableSubscriptionDeliveringRestHookListener;
++import ca.uhn.fhir.jpa.util.SqlQuery;
+ import ca.uhn.fhir.rest.api.server.SystemRequestDetails;
+ import ca.uhn.test.util.LogbackTestExtension;
+ import ch.qos.logback.classic.Level;
+@@ -41,10 +43,19 @@
+ import org.springframework.context.annotation.Configuration;
+ import org.springframework.context.annotation.Primary;
+ import org.springframework.data.domain.Pageable;
++import org.springframework.messaging.Message;
++import org.springframework.messaging.MessageChannel;
++import org.springframework.messaging.MessageDeliveryException;
++import org.springframework.messaging.support.ChannelInterceptor;
+ import org.springframework.test.context.ContextConfiguration;
+ 
++import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.Locale;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import static ca.uhn.fhir.util.HapiExtensions.EX_SEND_DELETE_MESSAGES;
+ import static org.assertj.core.api.Assertions.assertThat;
+@@ -54,6 +65,21 @@
+ @ContextConfiguration(classes = {AsyncSubscriptionMessageSubmissionIT.SpringConfig.class})
+ public class AsyncSubscriptionMessageSubmissionIT extends BaseSubscriptionsR4Test {
+ 
++	/**
++	 * A page of persisted rows small enough to stay well under the default
++	 * {@link SubscriptionSettings#getSubscriptionSubmissionBatchSize()}, so that a single delivery pass fetches all of
++	 * them in one page.
++	 */
++	private static final int NUMBER_OF_ROWS_TO_SEED = 5;
++
++	/**
++	 * A batch size deliberately smaller than {@link #NUMBER_OF_ROWS_TO_SEED} so that a single delivery pass has to
++	 * drain the seeded rows over several batches.
++	 */
++	private static final int SMALL_SUBMISSION_BATCH_SIZE = 2;
++
++	private static final String RESOURCE_MODIFIED_TABLE_NAME = "HFJ_RESOURCE_MODIFIED";
++
+ 	@RegisterExtension
+ 	public LogbackTestExtension myLogbackTestExtension = new LogbackTestExtension(AsyncResourceModifiedSubmitterSvc.class.getName(), Level.DEBUG);
+ 
+@@ -81,6 +107,7 @@ public void cleanupStoppableSubscriptionDeliveringRestHookListener() {
+ 		myStoppableSubscriptionDeliveringRestHookListener.setCountDownLatch(null);
+ 		myStoppableSubscriptionDeliveringRestHookListener.resume();
+ 		mySubscriptionSettings.setTriggerSubscriptionsForNonVersioningChanges(new SubscriptionSettings().isTriggerSubscriptionsForNonVersioningChanges());
++		mySubscriptionSettings.setSubscriptionSubmissionBatchSize(new SubscriptionSettings().getSubscriptionSubmissionBatchSize());
+ 		myStorageSettings.setTagStorageMode(new JpaStorageSettings().getTagStorageMode());
+ 		myConsumer.close();
+ 	}
+@@ -105,7 +132,7 @@ public void runDeliveryPass_withManyResources_isBatchedAndKeepsResourceUsageDown
+ 		// setup
+ 		String resourceType = "Patient";
+ 		int factor = 5;
+-		int numberOfResourcesToCreate = factor * AsyncResourceModifiedSubmitterSvc.MAX_LIMIT;
++		int numberOfResourcesToCreate = factor * mySubscriptionSettings.getSubscriptionSubmissionBatchSize();
+ 
+ 		ResourceModifiedEntity entity = new ResourceModifiedEntity();
+ 		PersistedResourceModifiedMessageEntityPK rpm = new PersistedResourceModifiedMessageEntityPK();
+@@ -136,6 +163,133 @@ public void runDeliveryPass_withManyResources_isBatchedAndKeepsResourceUsageDown
+ 		assertEquals(factor, events.size());
+ 	}
+ 
++	@Test
++	// the purpose of this test is to assert that a single delivery pass amortizes the cost of draining a page of
++	// persisted rows: every row is delivered, and the page is removed from HFJ_RESOURCE_MODIFIED with a single
++	// DELETE statement rather than one statement per row.
++	void runDeliveryPass_withPageOfPersistedRows_drainsRowsInOneBatchAndDeliversEveryMessage() throws Exception {
++		String aCode = "zoop";
++		String aSystem = "SNOMED-CT";
++
++		// given a MESSAGE subscription whose terminal endpoint is the queue our test listener consumes
++		createAndSubmitSubscriptionWithCriteria("[Observation]");
++		waitForActivatedSubscriptionCount(1);
++
++		// drain everything the subscription create and activation left behind so that we measure only our own rows
++		waitForQueueToDrain();
++		myAsyncResourceModifiedSubmitterSvc.runDeliveryPass();
++		waitForQueueToDrain();
++		myResourceModifiedDao.deleteAll();
++		assertCountOfResourcesNeedingSubmission(0);
++		myTestMessageListenerWithLatchWithLatch.clear();
++
++		List<String> expectedPayloadIds = new ArrayList<>();
++		for (int i = 0; i < NUMBER_OF_ROWS_TO_SEED; i++) {
++			Observation observation = sendObservation(aCode, aSystem);
++			expectedPayloadIds.add(observation.getIdElement().toUnqualifiedVersionless().getValue());
++		}
++		assertThat(myResourceModifiedDao.count()).isEqualTo(NUMBER_OF_ROWS_TO_SEED);
++
++		// when
++		myCaptureQueriesListener.clear();
++		myTestMessageListenerWithLatchWithLatch.setExpectedCount(NUMBER_OF_ROWS_TO_SEED);
++		myAsyncResourceModifiedSubmitterSvc.runDeliveryPass();
++		myTestMessageListenerWithLatchWithLatch.awaitExpected();
++
++		// then - every row was drained
++		assertThat(myResourceModifiedDao.count()).isZero();
++
++		// then - every message reached the real subscription terminal endpoint
++		assertThat(myTestMessageListenerWithLatchWithLatch.getReceivedMessages())
++			.extracting(theMessage -> theMessage.getPayload().getPayloadId())
++			.containsExactlyInAnyOrderElementsOf(expectedPayloadIds);
++
++		// then - the whole page was removed with a single DELETE, not one DELETE per row
++		List<SqlQuery> resourceModifiedDeletes = myCaptureQueriesListener.getDeleteQueries().stream()
++			.filter(theQuery -> theQuery.getSql(false, false).toUpperCase(Locale.ROOT).contains(RESOURCE_MODIFIED_TABLE_NAME))
++			.toList();
++		assertThat(resourceModifiedDeletes).hasSize(1);
++		// myCaptureQueriesListener collapses identical SQL that Hibernate JDBC-batches into a single SqlQuery whose
++		// getSize() is the number of statements in the batch. Without this assertion a delete that still runs once per
++		// row, but inside one batched transaction, would collapse to one SqlQuery and pass the check above while
++		// performing N round trips - exactly the defect this test exists to catch.
++		assertThat(resourceModifiedDeletes.get(0).getSize()).isEqualTo(1);
++	}
++
++	@Test
++	// the purpose of this test is to assert that the configured submission batch size is what drives how many rows a
++	// single delivery pass drains at a time: a batch size smaller than the number of waiting rows must make the pass
++	// drain them over several batches, while still emptying the table.
++	void runDeliveryPass_withSmallConfiguredBatchSize_drainsPersistedRowsInSeveralBatches() throws Exception {
++		// given a configured batch size smaller than the number of rows waiting for submission
++		mySubscriptionSettings.setSubscriptionSubmissionBatchSize(SMALL_SUBMISSION_BATCH_SIZE);
++		myResourceModifiedDao.deleteAll();
++
++		SystemRequestDetails requestDetails = new SystemRequestDetails();
++		for (int i = 0; i < NUMBER_OF_ROWS_TO_SEED; i++) {
++			myPatientDao.create(new Patient(), requestDetails);
++		}
++		assertThat(myResourceModifiedDao.count()).isEqualTo(NUMBER_OF_ROWS_TO_SEED);
++
++		// when
++		myCaptureQueriesListener.clear();
++		myAsyncResourceModifiedSubmitterSvc.runDeliveryPass();
++
++		// then - the pass still drains every row
++		assertThat(myResourceModifiedDao.count()).isZero();
++
++		// then - the rows left HFJ_RESOURCE_MODIFIED one batch at a time.  The very same rows are removed by a single
++		// DELETE when the batch size is left at its default (see
++		// runDeliveryPass_withPageOfPersistedRows_drainsRowsInOneBatchAndDeliversEveryMessage), so this count is only
++		// reachable if the configured value really is the page and batch size the delivery pass works with.
++		int expectedNumberOfBatches =
++			(NUMBER_OF_ROWS_TO_SEED + SMALL_SUBMISSION_BATCH_SIZE - 1) / SMALL_SUBMISSION_BATCH_SIZE;
++		List<SqlQuery> resourceModifiedDeletes = myCaptureQueriesListener.getDeleteQueries().stream()
++			.filter(theQuery -> theQuery.getSql(false, false).toUpperCase(Locale.ROOT).contains(RESOURCE_MODIFIED_TABLE_NAME))
++			.toList();
++		assertThat(resourceModifiedDeletes).hasSize(expectedNumberOfBatches);
++
++		waitForQueueToDrain();
++	}
++
++	@Test
++	// the purpose of this test is to assert that no persisted row is lost when the broker rejects a message part way
++	// through a delivery pass: every row must still be in the database afterwards, and a later pass must drain them.
++	void runDeliveryPass_whenBrokerRejectsMessageMidBatch_leavesEveryRowInTheDatabaseAndNextPassDrainsThem() throws Exception {
++		// given N persisted rows and no subscription, so nothing reaches the matching channel while we seed
++		myResourceModifiedDao.deleteAll();
++
++		SystemRequestDetails requestDetails = new SystemRequestDetails();
++		List<String> expectedPayloadIds = new ArrayList<>();
++		for (int i = 0; i < NUMBER_OF_ROWS_TO_SEED; i++) {
++			DaoMethodOutcome outcome = myPatientDao.create(new Patient(), requestDetails);
++			expectedPayloadIds.add(outcome.getId().toUnqualifiedVersionless().getValue());
++		}
++		assertThat(myResourceModifiedDao.count()).isEqualTo(NUMBER_OF_ROWS_TO_SEED);
++
++		// given a broker that rejects the third message it is handed
++		RecordAndFailNthMessageInterceptor failingInterceptor = new RecordAndFailNthMessageInterceptor(3);
++		LinkedBlockingChannel matchingChannel = mySubscriptionTestUtil.getMatchingChannel();
++		matchingChannel.addInterceptor(failingInterceptor);
++
++		// when the pass runs against the failing broker
++		myAsyncResourceModifiedSubmitterSvc.runDeliveryPass();
++
++		// then - nothing may be lost: every row is still waiting for submission
++		assertThat(myResourceModifiedDao.count()).isEqualTo(NUMBER_OF_ROWS_TO_SEED);
++		assertCountOfResourcesNeedingSubmission(NUMBER_OF_ROWS_TO_SEED);
++
++		// when the broker recovers and the next pass runs
++		failingInterceptor.disableFailure();
++		myAsyncResourceModifiedSubmitterSvc.runDeliveryPass();
++
++		// then - the table drains and every payload reached the matching channel across the two passes
++		assertThat(myResourceModifiedDao.count()).isZero();
++		assertThat(failingInterceptor.getObservedPayloadIds()).containsAll(expectedPayloadIds);
++
++		waitForQueueToDrain();
++	}
++
+ 	@Test
+ 	// the purpose of this test is to assert that a resource matching a given subscription is
+ 	// delivered asynchronously to the subscription processing pipeline.
+@@ -255,6 +409,46 @@ private void assertCountOfResourcesReceivedAtSubscriptionTerminalEndpoint(int ex
+ 		assertThat(myTestMessageListenerWithLatchWithLatch.getReceivedMessages()).hasSize(expectedCount);
+ 	}
+ 
++	/**
++	 * Records the payload id of every message handed to the matching channel and, until
++	 * {@link #disableFailure()} is called, rejects the n-th one the way a broker that refuses a publish would.
++	 * Spring rethrows a {@link MessageDeliveryException} raised from <code>preSend</code> unchanged, which is
++	 * exactly the failure the production submitter catches.
++	 */
++	private static class RecordAndFailNthMessageInterceptor implements ChannelInterceptor {
++		private final int myFailOnMessageNumber;
++		private final AtomicInteger mySeenCount = new AtomicInteger();
++		private final Set<String> myObservedPayloadIds = ConcurrentHashMap.newKeySet();
++		private volatile boolean myFailureEnabled = true;
++
++		RecordAndFailNthMessageInterceptor(int theFailOnMessageNumber) {
++			myFailOnMessageNumber = theFailOnMessageNumber;
++		}
++
++		@Override
++		public Message<?> preSend(Message<?> theMessage, MessageChannel theChannel) {
++			int seen = mySeenCount.incrementAndGet();
++
++			if (theMessage instanceof ResourceModifiedJsonMessage resourceModifiedJsonMessage) {
++				myObservedPayloadIds.add(resourceModifiedJsonMessage.getPayload().getPayloadId());
++			}
++
++			if (myFailureEnabled && seen == myFailOnMessageNumber) {
++				throw new MessageDeliveryException(theMessage, "Simulated broker rejection of message " + seen);
++			}
++
++			return theMessage;
++		}
++
++		void disableFailure() {
++			myFailureEnabled = false;
++		}
++
++		Set<String> getObservedPayloadIds() {
++			return myObservedPayloadIds;
++		}
++	}
++
+ 	@Configuration
+ 	public static class SpringConfig {
+ 
+diff --git a/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/method/IMethodBinding.java b/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/method/IMethodBinding.java
+index dbc2c2e54d63..41b40683aeec 100644
+--- a/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/method/IMethodBinding.java
++++ b/hapi-fhir-server/src/main/java/ca/uhn/fhir/rest/server/method/IMethodBinding.java
+@@ -1,3 +1,22 @@
++/*-
++ * #%L
++ * HAPI FHIR - Server Framework
++ * %%
++ * Copyright (C) 2014 - 2026 Smile CDR, Inc.
++ * %%
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ * #L%
++ */
+ package ca.uhn.fhir.rest.server.method;
+ 
+ import ca.uhn.fhir.rest.api.RestOperationTypeEnum;
+diff --git a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/broker/api/IChannelProducer.java b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/broker/api/IChannelProducer.java
+index ad4eaf725f83..114507b7c26c 100644
+--- a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/broker/api/IChannelProducer.java
++++ b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/broker/api/IChannelProducer.java
+@@ -21,6 +21,9 @@
+ 
+ import ca.uhn.fhir.rest.server.messaging.IMessage;
+ 
++import java.util.List;
++import java.util.stream.Collectors;
++
+ /**
+  * Sends messages to a Message Broker.
+  *
+@@ -40,4 +43,21 @@ public interface IChannelProducer<T> {
+ 	 * @return the result of the send operation
+ 	 */
+ 	ISendResult send(IMessage<T> theMessage);
++
++	/**
++	 * Send a batch of messages to the broker.
++	 * <p>
++	 * The default implementation simply sends each message in turn, which preserves the semantics of
++	 * {@link #send(IMessage)} exactly. Implementations backed by a broker that can amortize the cost of
++	 * synchronizing a batch (for example a single transacted JMS session, or a single flush) are expected to
++	 * override this method.
++	 * </p>
++	 *
++	 * @param theMessages the messages to send, in the order in which they should be sent
++	 * @return the result of each send operation, in the same order as <code>theMessages</code>
++	 * @since 8.12.0
++	 */
++	default List<ISendResult> sendAll(List<IMessage<T>> theMessages) {
++		return theMessages.stream().map(this::send).collect(Collectors.toList());
++	}
+ }
+diff --git a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/broker/jms/ISpringMessagingChannelProducer.java b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/broker/jms/ISpringMessagingChannelProducer.java
+index e5c04297d8c7..a3e606feb6f3 100644
+--- a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/broker/jms/ISpringMessagingChannelProducer.java
++++ b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/broker/jms/ISpringMessagingChannelProducer.java
+@@ -19,7 +19,29 @@
+  */
+ package ca.uhn.fhir.broker.jms;
+ 
++import org.springframework.messaging.Message;
+ import org.springframework.messaging.MessageChannel;
+ import org.springframework.messaging.support.InterceptableChannel;
+ 
+-public interface ISpringMessagingChannelProducer extends MessageChannel, InterceptableChannel {}
++import java.util.List;
++import java.util.stream.Collectors;
++
++public interface ISpringMessagingChannelProducer extends MessageChannel, InterceptableChannel {
++
++	/**
++	 * Send a batch of messages to this channel.
++	 * <p>
++	 * The default implementation simply sends each message in turn, which preserves the semantics of
++	 * {@link MessageChannel#send(Message)} exactly. Implementations backed by a broker that can amortize the cost of
++	 * synchronizing a batch (for example a single transacted JMS session) are expected to override this method so that
++	 * the whole batch costs one round trip instead of one round trip per message.
++	 * </p>
++	 *
++	 * @param theMessages the messages to send, in the order in which they should be sent
++	 * @return whether each message was sent, in the same order as <code>theMessages</code>
++	 * @since 8.12.0
++	 */
++	default List<Boolean> sendAll(List<Message<?>> theMessages) {
++		return theMessages.stream().map(this::send).collect(Collectors.toList());
++	}
++}
+diff --git a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/broker/jms/SpringMessagingProducerAdapter.java b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/broker/jms/SpringMessagingProducerAdapter.java
+index 86a45eed15f5..c2dc45b5d59a 100644
+--- a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/broker/jms/SpringMessagingProducerAdapter.java
++++ b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/broker/jms/SpringMessagingProducerAdapter.java
+@@ -28,6 +28,9 @@
+ import org.springframework.messaging.Message;
+ import org.springframework.messaging.support.ChannelInterceptor;
+ 
++import java.util.List;
++import java.util.stream.Collectors;
++
+ /**
+  * Adapt a Spring Messaging (JMS) Queue to {@link IChannelProducer}
+  *
+@@ -51,6 +54,27 @@ public String getChannelName() {
+ 
+ 	@Override
+ 	public ISendResult send(IMessage<T> theMessage) {
++		Message<?> message = validateAndCastToSpringMessage(theMessage);
++
++		return new SpringMessagingSendResult(mySpringMessagingChannelProducer.send(message));
++	}
++
++	/**
++	 * Delegate the whole batch to the underlying Spring Messaging producer in a single call so that producers able to
++	 * amortize the cost of a batch (for example over a single transacted JMS session) can do so. Every message is
++	 * validated first, exactly as {@link #send(IMessage)} validates a single message.
++	 */
++	@Override
++	public List<ISendResult> sendAll(List<IMessage<T>> theMessages) {
++		List<Message<?>> messages =
++				theMessages.stream().map(this::validateAndCastToSpringMessage).collect(Collectors.toList());
++
++		return mySpringMessagingChannelProducer.sendAll(messages).stream()
++				.map(SpringMessagingSendResult::new)
++				.collect(Collectors.toList());
++	}
++
++	private Message<?> validateAndCastToSpringMessage(IMessage<T> theMessage) {
+ 		if (!myMessageType.isAssignableFrom(theMessage.getClass())) {
+ 			throw new ConfigurationException(Msg.code(2665) + "Expecting message of type " + myMessageType
+ 					+ ". But received message of type: " + theMessage.getClass());
+@@ -60,9 +84,8 @@ public ISendResult send(IMessage<T> theMessage) {
+ 			throw new ConfigurationException(Msg.code(2664) + "Expecting message of type " + Message.class
+ 					+ ". But received message of type: " + theMessage.getClass());
+ 		}
+-		Message<?> message = (Message<?>) theMessage;
+ 
+-		return new SpringMessagingSendResult(mySpringMessagingChannelProducer.send(message));
++		return (Message<?>) theMessage;
+ 	}
+ 
+ 	public void addInterceptor(ChannelInterceptor theInterceptor) {
+diff --git a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/subscription/api/IResourceModifiedConsumerWithRetries.java b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/subscription/api/IResourceModifiedConsumerWithRetries.java
+index db4309994858..c742ad540b84 100644
+--- a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/subscription/api/IResourceModifiedConsumerWithRetries.java
++++ b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/subscription/api/IResourceModifiedConsumerWithRetries.java
+@@ -23,6 +23,8 @@
+ import ca.uhn.fhir.jpa.model.entity.IPersistedResourceModifiedMessage;
+ import ca.uhn.fhir.jpa.subscription.match.matcher.matching.IResourceModifiedConsumer;
+ 
++import java.util.List;
++
+ /**
+  * The implementer of this interface participates in the retry upon failure mechanism for messages submitted
+  * to the subscription processing pipeline.
+@@ -38,4 +40,24 @@ public interface IResourceModifiedConsumerWithRetries {
+ 	 */
+ 	boolean submitPersisedResourceModifiedMessage(
+ 			IPersistedResourceModifiedMessage thePersistedResourceModifiedMessage);
++
++	/**
++	 * The implementer of this method should submit the whole batch of ResourceModifiedMessage represented by
++	 * <code>thePersistedResourceModifiedMessages</code> to a broker (see {@link IResourceModifiedConsumer}) as a single
++	 * unit of work, and if submission succeeds, delete all of the IPersistedResourceModifiedMessage.  The point of this
++	 * method is to amortize the cost of synchronizing with the broker (and with the database) across the whole batch
++	 * instead of paying it once per message.
++	 * <p>
++	 * The batch is all-or-nothing: when submission fails, no IPersistedResourceModifiedMessage may be deleted, since the
++	 * subscription pipeline tolerates delivering a message more than once but never tolerates losing one.
++	 * </p>
++	 *
++	 * @param thePersistedResourceModifiedMessages The IPersistedResourceModifiedMessage requiring submission, in the
++	 *                                             order in which they should be submitted.
++	 * @return The number of IPersistedResourceModifiedMessage which were successfully processed, which is
++	 * <code>0</code> when the batch was rolled back.
++	 * @since 8.12.0
++	 */
++	int submitPersistedResourceModifiedMessages(
++			List<IPersistedResourceModifiedMessage> thePersistedResourceModifiedMessages);
+ }
+diff --git a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/subscription/api/IResourceModifiedMessagePersistenceSvc.java b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/subscription/api/IResourceModifiedMessagePersistenceSvc.java
+index d4f543fa0fae..3a2d6d11f77c 100644
+--- a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/subscription/api/IResourceModifiedMessagePersistenceSvc.java
++++ b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/subscription/api/IResourceModifiedMessagePersistenceSvc.java
+@@ -26,6 +26,7 @@
+ import org.springframework.data.domain.Page;
+ import org.springframework.data.domain.Pageable;
+ 
++import java.util.Collection;
+ import java.util.Optional;
+ 
+ /**
+@@ -52,6 +53,25 @@ public interface IResourceModifiedMessagePersistenceSvc {
+ 	 */
+ 	boolean deleteByPK(IPersistedResourceModifiedMessagePK thePersistedResourceModifiedMessagePK);
+ 
++	/**
++	 * Delete a batch of persistedResourceModifiedMessage by their primary keys.
++	 * <p>
++	 * The default implementation simply deletes each primary key in turn, which preserves the semantics of
++	 * {@link #deleteByPK(IPersistedResourceModifiedMessagePK)} exactly.  Implementations backed by a store which can
++	 * delete many rows in a single round trip are expected to override this method.
++	 * </p>
++	 *
++	 * @param thePersistedResourceModifiedMessagePKs The primary keys of the persistedResourceModifiedMessage to delete.
++	 * @return The number of persistedResourceModifiedMessage which were deleted.  This can be smaller than the number of
++	 * primary keys provided when some of them had already been deleted.
++	 * @since 8.12.0
++	 */
++	default int deleteByPKs(Collection<IPersistedResourceModifiedMessagePK> thePersistedResourceModifiedMessagePKs) {
++		return (int) thePersistedResourceModifiedMessagePKs.stream()
++				.filter(this::deleteByPK)
++				.count();
++	}
++
+ 	/**
+ 	 * Persist a resourceModifiedMessage and return its resulting persisted representation.
+ 	 *

@@ -1,0 +1,249 @@
+diff --git a/frontend/e2e/mock-api.ts b/frontend/e2e/mock-api.ts
+index a69a8f94ce..d1aeb859fb 100644
+--- a/frontend/e2e/mock-api.ts
++++ b/frontend/e2e/mock-api.ts
+@@ -88,6 +88,7 @@ const late = (name: string, ms: number) =>
+ 	SLOW.has(name) ? new Promise((resolve) => setTimeout(resolve, ms)) : undefined;
+ let LIFECYCLE_ENABLED = true;
+ let EMAIL_ENABLED = true;
++let WEBHOOKS_ENABLED = true;
+ /** Lets a test see what an untouched archive looks like on the dashboard. */
+ let EMPTY_ARCHIVE = false;
+ 
+@@ -120,6 +121,7 @@ const server = Bun.serve({
+ 			SLOW = new Set();
+ 			LIFECYCLE_ENABLED = true;
+ 			EMAIL_ENABLED = true;
++			WEBHOOKS_ENABLED = true;
+ 			EMPTY_ARCHIVE = false;
+ 			resetWorkouts();
+ 			resetSleep();
+@@ -148,9 +150,14 @@ const server = Bun.serve({
+ 			return new Response(null, { status: 204 });
+ 		}
+ 
++		if (pathname === '/__webhooks-off') {
++			WEBHOOKS_ENABLED = false;
++			return new Response(null, { status: 204 });
++		}
++
+ 		if (pathname === '/api/v1/config') {
+ 			return json({
+-				outgoing_webhooks_enabled: true,
++				outgoing_webhooks_enabled: WEBHOOKS_ENABLED,
+ 				data_lifecycle_enabled: LIFECYCLE_ENABLED,
+ 				email_enabled: EMAIL_ENABLED
+ 			});
+@@ -191,6 +198,17 @@ const server = Bun.serve({
+ 			return json(makeEventTypes());
+ 		}
+ 
++		// As the backend does: the event types are a static list, the rest needs Svix.
++		if (!WEBHOOKS_ENABLED && pathname.startsWith('/api/v1/webhooks/endpoints')) {
++			return json(
++				{
++					detail:
++						'Outgoing webhooks are not enabled (set OUTGOING_WEBHOOKS_ENABLED=true in the backend environment).'
++				},
++				503
++			);
++		}
++
+ 		const testMatch = pathname.match(/^\/api\/v1\/webhooks\/endpoints\/([^/]+)\/test$/);
+ 		if (testMatch && request.method === 'POST') {
+ 			const { event_type } = await request.json();
+diff --git a/frontend/e2e/webhooks.e2e.ts b/frontend/e2e/webhooks.e2e.ts
+index 45a310696c..12337efe07 100644
+--- a/frontend/e2e/webhooks.e2e.ts
++++ b/frontend/e2e/webhooks.e2e.ts
+@@ -273,3 +273,21 @@ test('says an empty filter means every event, later ones included', async ({ pag
+ 		card.getByText('Every event, including ones added after this was created.')
+ 	).toBeVisible();
+ });
++
++test('says webhooks are off on this instance, rather than failing the page', async ({
++	page,
++	request
++}) => {
++	await request.post('http://localhost:8787/__webhooks-off');
++	await page.goto('/webhooks');
++
++	await expect(page.getByText(/Outgoing webhooks are not enabled/)).toBeVisible();
++	await expect(page.getByRole('button', { name: 'New subscription' })).toBeDisabled();
++});
++
++test('sends deliveries back to the list when webhooks are off', async ({ page, request }) => {
++	await request.post('http://localhost:8787/__webhooks-off');
++	await page.goto('/webhooks/ep_live/deliveries');
++
++	await expect(page).toHaveURL('/webhooks');
++});
+diff --git a/frontend/src/lib/config/features.ts b/frontend/src/lib/config/features.ts
+new file mode 100644
+index 0000000000..0dca7ba347
+--- /dev/null
++++ b/frontend/src/lib/config/features.ts
+@@ -0,0 +1,2 @@
++/** What this instance has switched on, from `/config`. */
++export type Features = { lifecycle: boolean; email: boolean; webhooks: boolean };
+diff --git a/frontend/src/lib/server/config.ts b/frontend/src/lib/server/config.ts
+index 969ecd2ef7..eb0eb3a7e1 100644
+--- a/frontend/src/lib/server/config.ts
++++ b/frontend/src/lib/server/config.ts
+@@ -1,5 +1,6 @@
+ import { apiGet } from './api';
+-import type { Features } from '$lib/settings/tabs';
++import { optional } from './optional';
++import type { Features } from '$lib/config/features';
+ 
+ /** Mirrors `ConfigResponse`. A backend older than a flag leaves it out. */
+ export type AppConfig = {
+@@ -12,6 +13,12 @@ export const fetchFeatures = async (accessToken: string): Promise<Features> => {
+ 	const config = await apiGet<AppConfig>('/api/v1/config', accessToken);
+ 	return {
+ 		lifecycle: config.data_lifecycle_enabled !== false,
+-		email: config.email_enabled !== false
++		email: config.email_enabled !== false,
++		// Off by default: without it the webhook endpoints answer 503.
++		webhooks: config.outgoing_webhooks_enabled === true
+ 	};
+ };
++
++/** Unreadable config switches nothing off: each page then reports what is wrong itself. */
++export const readFeatures = (accessToken: string) =>
++	optional(fetchFeatures(accessToken), { lifecycle: true, email: true, webhooks: true });
+diff --git a/frontend/src/lib/settings/tabs.ts b/frontend/src/lib/settings/tabs.ts
+index 1d4de3b596..2431d13a4f 100644
+--- a/frontend/src/lib/settings/tabs.ts
++++ b/frontend/src/lib/settings/tabs.ts
+@@ -4,6 +4,7 @@ import ArrowDownUp from '@lucide/svelte/icons/arrow-down-up';
+ import Archive from '@lucide/svelte/icons/archive';
+ import Users from '@lucide/svelte/icons/users';
+ import Sprout from '@lucide/svelte/icons/sprout';
++import type { Features } from '$lib/config/features';
+ import type { Component } from 'svelte';
+ import { resolve } from '$app/paths';
+ 
+@@ -16,9 +17,6 @@ export type SettingsTab = {
+ 	feature?: keyof Features;
+ };
+ 
+-/** What this instance has switched on, from `/config`. */
+-export type Features = { lifecycle: boolean; email: boolean };
+-
+ /**
+  * Each tab is a route of its own, so a tab loads only what it shows - the old
+  * dashboard mounted all seven at once and fetched for every one of them.
+diff --git a/frontend/src/routes/(app)/settings/+layout.server.ts b/frontend/src/routes/(app)/settings/+layout.server.ts
+index 32615a0235..5f6ee86a5a 100644
+--- a/frontend/src/routes/(app)/settings/+layout.server.ts
++++ b/frontend/src/routes/(app)/settings/+layout.server.ts
+@@ -1,12 +1,7 @@
+-import { fetchFeatures } from '$lib/server/config';
++import { readFeatures } from '$lib/server/config';
+ import { requireToken } from '$lib/server/guard';
+-import { optional } from '$lib/server/optional';
+ import type { LayoutServerLoad } from './$types';
+ 
+-// Unreadable config shows the tab: its own page reports what is wrong.
+ export const load: LayoutServerLoad = async ({ locals }) => ({
+-	features: await optional(fetchFeatures(await requireToken(locals)), {
+-		lifecycle: true,
+-		email: true
+-	})
++	features: await readFeatures(await requireToken(locals))
+ });
+diff --git a/frontend/src/routes/(app)/webhooks/+page.server.ts b/frontend/src/routes/(app)/webhooks/+page.server.ts
+index 1722361798..b8e3104d26 100644
+--- a/frontend/src/routes/(app)/webhooks/+page.server.ts
++++ b/frontend/src/routes/(app)/webhooks/+page.server.ts
+@@ -1,3 +1,4 @@
++import { readFeatures } from '$lib/server/config';
+ import { attempt } from '$lib/server/form';
+ import { requireToken } from '$lib/server/guard';
+ import {
+@@ -14,12 +15,16 @@ import type { Actions, PageServerLoad } from './$types';
+ export const load: PageServerLoad = async ({ locals }) => {
+ 	const accessToken = await requireToken(locals);
+ 
++	if (!(await readFeatures(accessToken)).webhooks) {
++		return { enabled: false, subscriptions: [], types: [] };
++	}
++
+ 	const [subscriptions, types] = await Promise.all([
+ 		listSubscriptions(accessToken),
+ 		listEventTypes(accessToken)
+ 	]);
+ 
+-	return { subscriptions, types };
++	return { enabled: true, subscriptions, types };
+ };
+ 
+ /**
+diff --git a/frontend/src/routes/(app)/webhooks/+page.svelte b/frontend/src/routes/(app)/webhooks/+page.svelte
+index c239a3e997..ef5a1b34fb 100644
+--- a/frontend/src/routes/(app)/webhooks/+page.svelte
++++ b/frontend/src/routes/(app)/webhooks/+page.svelte
+@@ -1,6 +1,7 @@
+ <script lang="ts">
+ 	import Plus from '@lucide/svelte/icons/plus';
+ 	import Webhook from '@lucide/svelte/icons/webhook';
++	import Alert from '$lib/components/ui/Alert.svelte';
+ 	import Button from '$lib/components/ui/Button.svelte';
+ 	import Card from '$lib/components/ui/Card.svelte';
+ 	import ConfirmDialog from '$lib/components/ui/ConfirmDialog.svelte';
+@@ -14,6 +15,8 @@
+ 
+ 	let { data, form }: { data: PageData; form: ActionData } = $props();
+ 
++	const WEBHOOKS_DOCS = 'https://openwearables.io/docs/api-reference/guides/webhooks';
++
+ 	// One dialog of each kind for the page, not one per row, and the subject is
+ 	// separate from openness so closing does not have to null it.
+ 	let editing = $state<Subscription | null>(null);
+@@ -37,14 +40,24 @@
+ 		description="Each one asks us to POST events to a URL of yours as they happen."
+ 	>
+ 		{#snippet actions()}
+-			<Button onclick={() => open(null)}>
++			<Button onclick={() => open(null)} disabled={!data.enabled}>
+ 				<Plus size={15} aria-hidden="true" />
+ 				New subscription
+ 			</Button>
+ 		{/snippet}
+ 	</PageHeader>
+ 
+-	{#if data.subscriptions.length === 0}
++	{#if !data.enabled}
++		<Alert tone="warning">
++			<span>
++				Outgoing webhooks are not enabled on this instance. Set
++				<code>OUTGOING_WEBHOOKS_ENABLED=true</code> in the backend environment, as the
++				<a href={WEBHOOKS_DOCS} target="_blank" rel="noopener noreferrer" class="underline"
++					>webhooks guide</a
++				> describes.
++			</span>
++		</Alert>
++	{:else if data.subscriptions.length === 0}
+ 		<Card>
+ 			<EmptyState
+ 				icon={Webhook}
+diff --git a/frontend/src/routes/(app)/webhooks/[id]/deliveries/+page.server.ts b/frontend/src/routes/(app)/webhooks/[id]/deliveries/+page.server.ts
+index 688879bed4..f672cf207d 100644
+--- a/frontend/src/routes/(app)/webhooks/[id]/deliveries/+page.server.ts
++++ b/frontend/src/routes/(app)/webhooks/[id]/deliveries/+page.server.ts
+@@ -1,10 +1,13 @@
+-import { error } from '@sveltejs/kit';
++import { error, redirect } from '@sveltejs/kit';
++import { resolve } from '$app/paths';
++import { readFeatures } from '$lib/server/config';
+ import { requireToken } from '$lib/server/guard';
+ import { listDeliveries, listEventTypes, listSubscriptions } from '$lib/server/webhooks';
+ import type { PageServerLoad } from './$types';
+ 
+ export const load: PageServerLoad = async ({ params, url, locals }) => {
+ 	const accessToken = await requireToken(locals);
++	if (!(await readFeatures(accessToken)).webhooks) redirect(303, resolve('/webhooks'));
+ 
+ 	const limit = 20;
+ 	const status = url.searchParams.get('status') ?? '';

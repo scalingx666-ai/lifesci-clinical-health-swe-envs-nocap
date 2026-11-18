@@ -1,0 +1,1133 @@
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchGenerator.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchGenerator.kt
+index 1a52da87c8..6dfda6e191 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchGenerator.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchGenerator.kt
+@@ -20,8 +20,8 @@ import com.google.android.fhir.LocalChange
+ import com.google.android.fhir.db.Database
+ 
+ /**
+- * Generates [Patch]es from [LocalChange]s and output [List<[PatchMapping]>] to keep a mapping of
+- * the [LocalChange]s to their corresponding generated [Patch]
++ * Generates [Patch]es from [LocalChange]s and output [List<[StronglyConnectedPatchMappings]>] to
++ * keep a mapping of the [LocalChange]s to their corresponding generated [Patch]
+  *
+  * INTERNAL ONLY. This interface should NEVER been exposed as an external API because it works
+  * together with other components in the upload package to fulfill a specific upload strategy.
+@@ -35,7 +35,7 @@ internal interface PatchGenerator {
+    * NOTE: different implementations may have requirements on the size of [localChanges] and output
+    * certain numbers of [Patch]es.
+    */
+-  suspend fun generate(localChanges: List<LocalChange>): List<PatchMapping>
++  suspend fun generate(localChanges: List<LocalChange>): List<StronglyConnectedPatchMappings>
+ }
+ 
+ internal object PatchGeneratorFactory {
+@@ -67,3 +67,14 @@ internal data class PatchMapping(
+   val localChanges: List<LocalChange>,
+   val generatedPatch: Patch,
+ )
++
++/**
++ * Structure to describe the cyclic nature of [PatchMapping].
++ * - A single value in [patchMappings] signifies the acyclic nature of the node.
++ * - Multiple values in [patchMappings] signifies the cyclic nature of the nodes among themselves.
++ *
++ * [StronglyConnectedPatchMappings] is used by the engine to make sure that related resources get
++ * uploaded to the server in the same request to maintain the referential integrity of resources
++ * during creation.
++ */
++internal data class StronglyConnectedPatchMappings(val patchMappings: List<PatchMapping>)
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchOrdering.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchOrdering.kt
+index c76fb46751..d0bfb5f364 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchOrdering.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PatchOrdering.kt
+@@ -20,7 +20,26 @@ import androidx.annotation.VisibleForTesting
+ import com.google.android.fhir.db.Database
+ import com.google.android.fhir.db.LocalChangeResourceReference
+ 
+-private typealias Node = String
++/** Represents a resource e.g. 'Patient/123' , 'Encounter/123'. */
++internal typealias Node = String
++
++/**
++ * Represents a collection of resources with reference to other resource represented as an edge.
++ * e.g. Two Patient resources p1 and p2, each with an encounter and subsequent observation will be
++ * represented as follows
++ *
++ * ```
++ * [
++ *   'Patient/p1' : [],
++ *   'Patient/p2' : [],
++ *   'Encounter/e1' : ['Patient/p1'],  // Encounter.subject
++ *   'Encounter/e2' : ['Patient/p2'],  // Encounter.subject
++ *   'Observation/o1' : ['Patient/p1', 'Encounter/e1'], // Observation.subject, Observation.encounter
++ *   'Observation/o2' : ['Patient/p2', 'Encounter/e2'], // Observation.subject, Observation.encounter
++ *  ]
++ *  ```
++ */
++internal typealias Graph = Map<Node, List<Node>>
+ 
+ /**
+  * Orders the [PatchMapping]s to maintain referential integrity during upload.
+@@ -53,15 +72,16 @@ internal object PatchOrdering {
+    * {D} (UPDATE), then B,C needs to go before the resource A so that referential integrity is
+    * retained. Order of D shouldn't matter for the purpose of referential integrity.
+    *
+-   * @return - A ordered list of the [PatchMapping]s based on the references to other [PatchMapping]
+-   *   if the mappings are acyclic
+-   * - throws [IllegalStateException] otherwise
++   * @return A ordered list of the [StronglyConnectedPatchMappings] containing:
++   * - [StronglyConnectedPatchMappings] with single value for the [PatchMapping] based on the
++   *   references to other [PatchMapping] if the mappings are acyclic
++   * - [StronglyConnectedPatchMappings] with multiple values for [PatchMapping]s based on the
++   *   references to other [PatchMapping]s if the mappings are cyclic.
+    */
+-  suspend fun List<PatchMapping>.orderByReferences(
++  suspend fun List<PatchMapping>.sccOrderByReferences(
+     database: Database,
+-  ): List<PatchMapping> {
++  ): List<StronglyConnectedPatchMappings> {
+     val resourceIdToPatchMapping = associateBy { patchMapping -> patchMapping.resourceTypeAndId }
+-
+     /* Get LocalChangeResourceReferences for all the local changes. A single LocalChange may have
+     multiple LocalChangeResourceReference, one for each resource reference in the
+     LocalChange.payload.*/
+@@ -71,7 +91,10 @@ internal object PatchOrdering {
+         .groupBy { it.localChangeId }
+ 
+     val adjacencyList = createAdjacencyListForCreateReferences(localChangeIdToResourceReferenceMap)
+-    return createTopologicalOrderedList(adjacencyList).mapNotNull { resourceIdToPatchMapping[it] }
++
++    return StronglyConnectedPatches.scc(adjacencyList).map {
++      StronglyConnectedPatchMappings(it.mapNotNull { resourceIdToPatchMapping[it] })
++    }
+   }
+ 
+   /**
+@@ -121,22 +144,4 @@ internal object PatchOrdering {
+     }
+     return references
+   }
+-
+-  private fun createTopologicalOrderedList(adjacencyList: Map<Node, List<Node>>): List<Node> {
+-    val stack = ArrayDeque<String>()
+-    val visited = mutableSetOf<String>()
+-    val currentPath = mutableSetOf<String>()
+-
+-    fun dfs(key: String) {
+-      check(currentPath.add(key)) { "Detected a cycle." }
+-      if (visited.add(key)) {
+-        adjacencyList[key]?.forEach { dfs(it) }
+-        stack.addFirst(key)
+-      }
+-      currentPath.remove(key)
+-    }
+-
+-    adjacencyList.keys.forEach { dfs(it) }
+-    return stack.reversed()
+-  }
+ }
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerChangePatchGenerator.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerChangePatchGenerator.kt
+index 8c787f644e..c208e8c6ea 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerChangePatchGenerator.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerChangePatchGenerator.kt
+@@ -25,19 +25,23 @@ import com.google.android.fhir.LocalChange
+  * maintain an audit trail.
+  */
+ internal object PerChangePatchGenerator : PatchGenerator {
+-  override suspend fun generate(localChanges: List<LocalChange>): List<PatchMapping> =
+-    localChanges.map {
+-      PatchMapping(
+-        localChanges = listOf(it),
+-        generatedPatch =
+-          Patch(
+-            resourceType = it.resourceType,
+-            resourceId = it.resourceId,
+-            versionId = it.versionId,
+-            timestamp = it.timestamp,
+-            type = it.type.toPatchType(),
+-            payload = it.payload,
+-          ),
+-      )
+-    }
++  override suspend fun generate(
++    localChanges: List<LocalChange>,
++  ): List<StronglyConnectedPatchMappings> =
++    localChanges
++      .map {
++        PatchMapping(
++          localChanges = listOf(it),
++          generatedPatch =
++            Patch(
++              resourceType = it.resourceType,
++              resourceId = it.resourceId,
++              versionId = it.versionId,
++              timestamp = it.timestamp,
++              type = it.type.toPatchType(),
++              payload = it.payload,
++            ),
++        )
++      }
++      .map { StronglyConnectedPatchMappings(listOf(it)) }
+ }
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGenerator.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGenerator.kt
+index 0eaa944008..c524b32302 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGenerator.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGenerator.kt
+@@ -23,7 +23,7 @@ import com.github.fge.jsonpatch.JsonPatch
+ import com.google.android.fhir.LocalChange
+ import com.google.android.fhir.LocalChange.Type
+ import com.google.android.fhir.db.Database
+-import com.google.android.fhir.sync.upload.patch.PatchOrdering.orderByReferences
++import com.google.android.fhir.sync.upload.patch.PatchOrdering.sccOrderByReferences
+ 
+ /**
+  * Generates a [Patch] for all [LocalChange]es made to a single FHIR resource.
+@@ -35,8 +35,10 @@ import com.google.android.fhir.sync.upload.patch.PatchOrdering.orderByReferences
+ internal class PerResourcePatchGenerator private constructor(val database: Database) :
+   PatchGenerator {
+ 
+-  override suspend fun generate(localChanges: List<LocalChange>): List<PatchMapping> {
+-    return generateSquashedChangesMapping(localChanges).orderByReferences(database)
++  override suspend fun generate(
++    localChanges: List<LocalChange>,
++  ): List<StronglyConnectedPatchMappings> {
++    return generateSquashedChangesMapping(localChanges).sccOrderByReferences(database)
+   }
+ 
+   @androidx.annotation.VisibleForTesting
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/patch/StronglyConnectedPatches.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/StronglyConnectedPatches.kt
+new file mode 100644
+index 0000000000..216229492b
+--- /dev/null
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/patch/StronglyConnectedPatches.kt
+@@ -0,0 +1,96 @@
++/*
++ * Copyright 2024 Google LLC
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.google.android.fhir.sync.upload.patch
++
++import kotlin.math.min
++
++internal object StronglyConnectedPatches {
++
++  /**
++   * Takes a [directedGraph] and computes all the strongly connected components in the graph.
++   *
++   * @return An ordered List of strongly connected components of the [directedGraph]. The SCCs are
++   *   topologically ordered which may change based on the ordering algorithm and the [Node]s inside
++   *   a SSC may be ordered randomly depending on the path taken by algorithm to discover the nodes.
++   */
++  fun scc(directedGraph: Graph): List<List<Node>> {
++    return findSCCWithTarjan(directedGraph)
++  }
++
++  /**
++   * Finds strongly connected components in topological order. See
++   * https://en.wikipedia.org/wiki/Tarjan%27s_strongly_connected_components_algorithm.
++   */
++  private fun findSCCWithTarjan(diGraph: Graph): List<List<Node>> {
++    // Ideally the graph.keys should have all the nodes in the graph. But use values as well in case
++    // the input graph looks something like [ N1: [N2] ].
++    val nodeToIndex =
++      (diGraph.keys + diGraph.values.flatten().toSet())
++        .mapIndexed { index, s -> s to index }
++        .toMap()
++
++    val sccs = mutableListOf<List<Node>>()
++    val lowLinks = IntArray(nodeToIndex.size)
++    var exploringCounter = 0
++    val discoveryTimes = IntArray(nodeToIndex.size)
++
++    val visitedNodes = BooleanArray(nodeToIndex.size)
++    val nodesCurrentlyInStack = BooleanArray(nodeToIndex.size)
++    val stack = ArrayDeque<Node>()
++
++    fun Node.index() = nodeToIndex[this]!!
++
++    fun dfs(at: Node) {
++      lowLinks[at.index()] = exploringCounter
++      discoveryTimes[at.index()] = exploringCounter
++      visitedNodes[at.index()] = true
++      exploringCounter++
++      stack.addFirst(at)
++      nodesCurrentlyInStack[at.index()] = true
++
++      diGraph[at]?.forEach {
++        if (!visitedNodes[it.index()]) {
++          dfs(it)
++        }
++
++        if (nodesCurrentlyInStack[it.index()]) {
++          lowLinks[at.index()] = min(lowLinks[at.index()], lowLinks[it.index()])
++        }
++      }
++
++      // We have found the head node in the scc.
++      if (lowLinks[at.index()] == discoveryTimes[at.index()]) {
++        val connected = mutableListOf<Node>()
++        var node: Node
++        do {
++          node = stack.removeFirst()
++          connected.add(node)
++          nodesCurrentlyInStack[node.index()] = false
++        } while (node != at && stack.isNotEmpty())
++        sccs.add(connected.reversed())
++      }
++    }
++
++    diGraph.keys.forEach {
++      if (!visitedNodes[it.index()]) {
++        dfs(it)
++      }
++    }
++
++    return sccs
++  }
++}
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/request/TransactionBundleGenerator.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/request/TransactionBundleGenerator.kt
+index fa4fc5bc31..d622eee5d9 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/upload/request/TransactionBundleGenerator.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/request/TransactionBundleGenerator.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2023 Google LLC
++ * Copyright 2023-2024 Google LLC
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -19,6 +19,7 @@ package com.google.android.fhir.sync.upload.request
+ import com.google.android.fhir.LocalChange
+ import com.google.android.fhir.sync.upload.patch.Patch
+ import com.google.android.fhir.sync.upload.patch.PatchMapping
++import com.google.android.fhir.sync.upload.patch.StronglyConnectedPatchMappings
+ import org.hl7.fhir.r4.model.Bundle
+ 
+ /** Generates list of [BundleUploadRequest] of type Transaction [Bundle] from the [Patch]es */
+@@ -29,10 +30,38 @@ internal class TransactionBundleGenerator(
+     (patch: Patch, useETagForUpload: Boolean) -> BundleEntryComponentGenerator,
+ ) : UploadRequestGenerator {
+ 
++  /**
++   * In order to accommodate cyclic dependencies between [PatchMapping]s and maintain referential
++   * integrity on the server, the [PatchMapping]s in a [StronglyConnectedPatchMappings] are all put
++   * in a single [BundleUploadRequestMapping]. Based on the [generatedBundleSize], the remaining
++   * space of the [BundleUploadRequestMapping] maybe filled with other
++   * [StronglyConnectedPatchMappings] mappings.
++   *
++   * In case a single [StronglyConnectedPatchMappings] has more [PatchMapping]s than the
++   * [generatedBundleSize], [generatedBundleSize] will be ignored so that all of the dependent
++   * mappings in [StronglyConnectedPatchMappings] can be sent in a single [Bundle].
++   */
+   override fun generateUploadRequests(
+-    mappedPatches: List<PatchMapping>,
++    mappedPatches: List<StronglyConnectedPatchMappings>,
+   ): List<BundleUploadRequestMapping> {
+-    return mappedPatches.chunked(generatedBundleSize).map { patchList ->
++    val mappingsPerBundle = mutableListOf<List<PatchMapping>>()
++
++    var bundle = mutableListOf<PatchMapping>()
++    mappedPatches.forEach {
++      if ((bundle.size + it.patchMappings.size) <= generatedBundleSize) {
++        bundle.addAll(it.patchMappings)
++      } else {
++        if (bundle.isNotEmpty()) {
++          mappingsPerBundle.add(bundle)
++          bundle = mutableListOf()
++        }
++        bundle.addAll(it.patchMappings)
++      }
++    }
++
++    if (bundle.isNotEmpty()) mappingsPerBundle.add(bundle)
++
++    return mappingsPerBundle.map { patchList ->
+       generateBundleRequest(patchList).let { mappedBundleRequest ->
+         BundleUploadRequestMapping(
+           splitLocalChanges = mappedBundleRequest.first,
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/request/UploadRequestGenerator.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/request/UploadRequestGenerator.kt
+index 51ae7711ff..86af7a4b64 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/upload/request/UploadRequestGenerator.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/request/UploadRequestGenerator.kt
+@@ -19,19 +19,20 @@ package com.google.android.fhir.sync.upload.request
+ import com.google.android.fhir.LocalChange
+ import com.google.android.fhir.sync.upload.patch.Patch
+ import com.google.android.fhir.sync.upload.patch.PatchMapping
++import com.google.android.fhir.sync.upload.patch.StronglyConnectedPatchMappings
+ import org.hl7.fhir.r4.model.Bundle
+ import org.hl7.fhir.r4.model.codesystems.HttpVerb
+ 
+ /**
+  * Generator that generates [UploadRequest]s from the [Patch]es present in the
+- * [List<[PatchMapping]>]. Any implementation of this generator is expected to output
+- * [List<[UploadRequestMapping]>] which maps [UploadRequest] to the corresponding [LocalChange]s it
+- * was generated from.
++ * [List<[StronglyConnectedPatchMappings]>]. Any implementation of this generator is expected to
++ * output [List<[UploadRequestMapping]>] which maps [UploadRequest] to the corresponding
++ * [LocalChange]s it was generated from.
+  */
+ internal interface UploadRequestGenerator {
+   /** Generates a list of [UploadRequestMapping] from the [PatchMapping]s */
+   fun generateUploadRequests(
+-    mappedPatches: List<PatchMapping>,
++    mappedPatches: List<StronglyConnectedPatchMappings>,
+   ): List<UploadRequestMapping>
+ }
+ 
+diff --git a/engine/src/main/java/com/google/android/fhir/sync/upload/request/UrlRequestGenerator.kt b/engine/src/main/java/com/google/android/fhir/sync/upload/request/UrlRequestGenerator.kt
+index 5fbb174e8a..8e576760c3 100644
+--- a/engine/src/main/java/com/google/android/fhir/sync/upload/request/UrlRequestGenerator.kt
++++ b/engine/src/main/java/com/google/android/fhir/sync/upload/request/UrlRequestGenerator.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2023 Google LLC
++ * Copyright 2023-2024 Google LLC
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -21,6 +21,7 @@ import ca.uhn.fhir.context.FhirVersionEnum
+ import com.google.android.fhir.ContentTypes
+ import com.google.android.fhir.sync.upload.patch.Patch
+ import com.google.android.fhir.sync.upload.patch.PatchMapping
++import com.google.android.fhir.sync.upload.patch.StronglyConnectedPatchMappings
+ import org.hl7.fhir.r4.model.Binary
+ import org.hl7.fhir.r4.model.Resource
+ import org.hl7.fhir.r4.model.codesystems.HttpVerb
+@@ -30,15 +31,30 @@ internal class UrlRequestGenerator(
+   private val getUrlRequestForPatch: (patch: Patch) -> UrlUploadRequest,
+ ) : UploadRequestGenerator {
+ 
++  /**
++   * Since a [UrlUploadRequest] can only handle a single resource request, the
++   * [StronglyConnectedPatchMappings.patchMappings] are flattened and handled as acyclic mapping to
++   * generate [UrlUploadRequestMapping] for each [PatchMapping].
++   *
++   * **NOTE**
++   *
++   * Since the referential integrity on the sever may get violated if the subsequent requests have
++   * cyclic dependency on each other, We may introduce configuration for application to provide
++   * server's referential integrity settings and make it illegal to generate [UrlUploadRequest] when
++   * server has strict referential integrity and the requests have cyclic dependency amongst itself.
++   */
+   override fun generateUploadRequests(
+-    mappedPatches: List<PatchMapping>,
++    mappedPatches: List<StronglyConnectedPatchMappings>,
+   ): List<UrlUploadRequestMapping> =
+-    mappedPatches.map {
+-      UrlUploadRequestMapping(
+-        localChanges = it.localChanges,
+-        generatedRequest = getUrlRequestForPatch(it.generatedPatch),
+-      )
+-    }
++    mappedPatches
++      .map { it.patchMappings }
++      .flatten()
++      .map {
++        UrlUploadRequestMapping(
++          localChanges = it.localChanges,
++          generatedRequest = getUrlRequestForPatch(it.generatedPatch),
++        )
++      }
+ 
+   companion object Factory {
+ 
+diff --git a/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PatchOrderingTest.kt b/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PatchOrderingTest.kt
+index 44f8889dc8..f6bcae7883 100644
+--- a/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PatchOrderingTest.kt
++++ b/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PatchOrderingTest.kt
+@@ -28,8 +28,6 @@ import com.google.android.fhir.versionId
+ import com.google.common.truth.Truth.assertThat
+ import java.time.Instant
+ import java.util.LinkedList
+-import kotlin.random.Random
+-import kotlin.test.assertFailsWith
+ import kotlinx.coroutines.test.runTest
+ import org.hl7.fhir.r4.model.Encounter
+ import org.hl7.fhir.r4.model.Group
+@@ -185,7 +183,7 @@ class PatchOrderingTest {
+     // This order is based on the current implementation of the topological sort in [PatchOrdering],
+     // it's entirely possible to generate different order here which is acceptable/correct, should
+     // we have a different implementation of the topological sort.
+-    assertThat(result.map { it.generatedPatch.resourceId })
++    assertThat(result.map { it.patchMappings.single().generatedPatch.resourceId })
+       .containsExactly(
+         "patient-1",
+         "patient-2",
+@@ -202,53 +200,46 @@ class PatchOrderingTest {
+   }
+ 
+   @Test
+-  fun `generate with cyclic references should throw exception`() = runTest {
+-    val localChanges = LinkedList<LocalChange>()
+-    val localChangeResourceReferences = mutableListOf<LocalChangeResourceReference>()
++  fun `generate with cyclic and acyclic references should generate both Individual and Combined mappings`() =
++    runTest {
++      val helper = LocalChangeHelper()
+ 
+-    Patient()
+-      .apply {
+-        id = "patient-1"
+-        addLink(
+-          Patient.PatientLinkComponent().apply { other = Reference("RelatedPerson/related-1") },
+-        )
+-      }
+-      .also {
+-        localChanges.add(createInsertLocalChange(it, Random.nextLong()))
+-        localChangeResourceReferences.add(
+-          LocalChangeResourceReference(
+-            localChanges.last().token.ids.first(),
+-            "RelatedPerson/related-1",
+-            "Patient.other",
+-          ),
+-        )
+-      }
+-
+-    RelatedPerson()
+-      .apply {
+-        id = "related-1"
+-        patient = Reference("Patient/patient-1")
+-      }
+-      .also {
+-        localChanges.add(createInsertLocalChange(it))
+-        localChangeResourceReferences.add(
+-          LocalChangeResourceReference(
+-            localChanges.last().token.ids.first(),
+-            "Patient/patient-1",
+-            "RelatedPerson.patient",
+-          ),
+-        )
+-      }
++      // Patient and RelatedPerson have cyclic dependency
++      helper.createPatient("patient-1", 1, "related-1")
++      helper.createRelatedPerson("related-1", 2, "Patient/patient-1")
+ 
+-    whenever(database.getLocalChangeResourceReferences(any()))
+-      .thenReturn(localChangeResourceReferences)
++      // Patient, RelatedPerson have cyclic dependency. Observation, Encounter and Patient have
++      // acyclic dependency and order doesn't matter since they all go in same bundle.
++      helper.createPatient("patient-2", 3, "related-2")
++      helper.createRelatedPerson("related-2", 4, "Patient/patient-2")
++      helper.createObservation("observation-1", 5, "Patient/patient-2", "Encounter/encounter-1")
++      helper.createEncounter("encounter-1", 6, "Patient/patient-2")
+ 
+-    val errorMessage =
+-      assertFailsWith<IllegalStateException> { patchGenerator.generate(localChanges) }
+-        .localizedMessage
++      // observation , encounter and Patient have acyclic dependency with each other, hence order is
++      // important here.
++      helper.createObservation("observation-2", 7, "Patient/patient-3", "Encounter/encounter-2")
++      helper.createEncounter("encounter-2", 8, "Patient/patient-3")
++      helper.createPatient("patient-3", 9)
+ 
+-    assertThat(errorMessage).isEqualTo("Detected a cycle.")
+-  }
++      whenever(database.getLocalChangeResourceReferences(any()))
++        .thenReturn(helper.localChangeResourceReferences)
++
++      val result = patchGenerator.generate(helper.localChanges)
++
++      assertThat(
++          result.map { it.patchMappings.map { it.generatedPatch.resourceId } },
++        )
++        .containsExactly(
++          listOf("patient-1", "related-1"),
++          listOf("patient-2", "related-2"),
++          listOf("encounter-1"),
++          listOf("observation-1"),
++          listOf("patient-3"),
++          listOf("encounter-2"),
++          listOf("observation-2"),
++        )
++        .inOrder()
++    }
+ 
+   companion object {
+ 
+@@ -319,10 +310,29 @@ class PatchOrderingTest {
+     fun createPatient(
+       id: String,
+       changeId: Long,
++      relatedPersonId: String? = null,
+     ) =
+       Patient()
+-        .apply { this.id = id }
+-        .also { localChanges.add(createInsertLocalChange(it, changeId)) }
++        .apply {
++          this.id = id
++          relatedPersonId?.let {
++            addLink(
++              Patient.PatientLinkComponent().apply { other = Reference("RelatedPerson/$it") },
++            )
++          }
++        }
++        .also {
++          localChanges.add(createInsertLocalChange(it, changeId))
++          relatedPersonId?.let {
++            localChangeResourceReferences.add(
++              LocalChangeResourceReference(
++                localChanges.last().token.ids.first(),
++                "RelatedPerson/$relatedPersonId",
++                "Patient.other",
++              ),
++            )
++          }
++        }
+ 
+     fun updatePatient(
+       patient: Patient,
+@@ -383,5 +393,26 @@ class PatchOrderingTest {
+             ),
+           )
+         }
++
++    fun createRelatedPerson(
++      id: String,
++      changeId: Long,
++      patient: String,
++    ) =
++      RelatedPerson()
++        .apply {
++          this.id = id
++          this.patient = Reference(patient)
++        }
++        .also {
++          localChanges.add(createInsertLocalChange(it, changeId))
++          localChangeResourceReferences.add(
++            LocalChangeResourceReference(
++              localChanges.last().token.ids.first(),
++              patient,
++              "RelatedPerson.patient",
++            ),
++          )
++        }
+   }
+ }
+diff --git a/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGeneratorTest.kt b/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGeneratorTest.kt
+index 4860b66cdc..38811c581d 100644
+--- a/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGeneratorTest.kt
++++ b/engine/src/test/java/com/google/android/fhir/sync/upload/patch/PerResourcePatchGeneratorTest.kt
+@@ -69,7 +69,8 @@ class PerResourcePatchGeneratorTest {
+     val patient: Patient = readFromFile(Patient::class.java, "/date_test_patient.json")
+     val insertionLocalChange = createInsertLocalChange(patient)
+ 
+-    val patches = patchGenerator.generate(listOf(insertionLocalChange))
++    val patches =
++      patchGenerator.generate(listOf(insertionLocalChange)).map { it.patchMappings.single() }
+ 
+     with(patches.single()) {
+       with(generatedPatch) {
+@@ -100,7 +101,8 @@ class PerResourcePatchGeneratorTest {
+     val updateLocalChange1 = createUpdateLocalChange(remotePatient, updatedPatient1, 1L)
+     val updatePatch = readJsonArrayFromFile("/update_patch_1.json")
+ 
+-    val patches = patchGenerator.generate(listOf(updateLocalChange1))
++    val patches =
++      patchGenerator.generate(listOf(updateLocalChange1)).map { it.patchMappings.single() }
+ 
+     with(patches.single()) {
+       with(generatedPatch) {
+@@ -129,7 +131,8 @@ class PerResourcePatchGeneratorTest {
+     remotePatient.meta = remoteMeta
+     val deleteLocalChange = createDeleteLocalChange(remotePatient, 3L)
+ 
+-    val patches = patchGenerator.generate(listOf(deleteLocalChange))
++    val patches =
++      patchGenerator.generate(listOf(deleteLocalChange)).map { it.patchMappings.single() }
+ 
+     with(patches.single()) {
+       with(generatedPatch) {
+@@ -155,7 +158,10 @@ class PerResourcePatchGeneratorTest {
+     val updateLocalChange = createUpdateLocalChange(patient, updatedPatient, 1L)
+     val patientString = jsonParser.encodeResourceToString(updatedPatient)
+ 
+-    val patches = patchGenerator.generate(listOf(insertionLocalChange, updateLocalChange))
++    val patches =
++      patchGenerator.generate(listOf(insertionLocalChange, updateLocalChange)).map {
++        it.patchMappings.single()
++      }
+ 
+     with(patches.single()) {
+       with(generatedPatch) {
+@@ -312,7 +318,10 @@ class PerResourcePatchGeneratorTest {
+     val updateLocalChange2 = createUpdateLocalChange(updatedPatient1, updatedPatient2, 2L)
+     val updatePatch = readJsonArrayFromFile("/update_patch_2.json")
+ 
+-    val patches = patchGenerator.generate(listOf(updateLocalChange1, updateLocalChange2))
++    val patches =
++      patchGenerator.generate(listOf(updateLocalChange1, updateLocalChange2)).map {
++        it.patchMappings.single()
++      }
+ 
+     with(patches.single()) {
+       with(generatedPatch) {
+@@ -357,7 +366,10 @@ class PerResourcePatchGeneratorTest {
+           token = LocalChangeToken(listOf(1)),
+         )
+ 
+-      val patches = patchGenerator.generate(listOf(updatedLocalChange1, updatedLocalChange2))
++      val patches =
++        patchGenerator.generate(listOf(updatedLocalChange1, updatedLocalChange2)).map {
++          it.patchMappings.single()
++        }
+ 
+       with(patches.single().generatedPatch) {
+         assertThat(type).isEqualTo(Patch.Type.UPDATE)
+@@ -385,9 +397,11 @@ class PerResourcePatchGeneratorTest {
+     val deleteLocalChange = createDeleteLocalChange(updatedPatient2, 3L)
+ 
+     val patches =
+-      patchGenerator.generate(
+-        listOf(updateLocalChange1, updateLocalChange2, deleteLocalChange),
+-      )
++      patchGenerator
++        .generate(
++          listOf(updateLocalChange1, updateLocalChange2, deleteLocalChange),
++        )
++        .map { it.patchMappings.single() }
+ 
+     with(patches.single()) {
+       with(generatedPatch) {
+diff --git a/engine/src/test/java/com/google/android/fhir/sync/upload/patch/StronglyConnectedPatchesTest.kt b/engine/src/test/java/com/google/android/fhir/sync/upload/patch/StronglyConnectedPatchesTest.kt
+new file mode 100644
+index 0000000000..382dd65e71
+--- /dev/null
++++ b/engine/src/test/java/com/google/android/fhir/sync/upload/patch/StronglyConnectedPatchesTest.kt
+@@ -0,0 +1,104 @@
++/*
++ * Copyright 2024 Google LLC
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *       http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.google.android.fhir.sync.upload.patch
++
++import com.google.common.truth.Truth.assertThat
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++
++@RunWith(RobolectricTestRunner::class)
++class StronglyConnectedPatchesTest {
++
++  @Test
++  fun `sscOrdered should return strongly connected components in order`() {
++    val graph = mutableMapOf<String, MutableList<String>>()
++
++    graph.addEdge("0", "1")
++    graph.addEdge("1", "2")
++    graph.addEdge("2", "1")
++
++    graph.addEdge("3", "4")
++    graph.addEdge("4", "5")
++    graph.addEdge("5", "3")
++
++    graph.addEdge("6", "7")
++    graph.addEdge("7", "8")
++
++    val result = StronglyConnectedPatches.scc(graph)
++
++    assertThat(result)
++      .containsExactly(
++        listOf("1", "2"),
++        listOf("0"),
++        listOf("3", "4", "5"),
++        listOf("8"),
++        listOf("7"),
++        listOf("6"),
++      )
++      .inOrder()
++  }
++
++  @Test
++  fun `sscOrdered empty graph should return empty result`() {
++    val graph = mutableMapOf<String, MutableList<String>>()
++    val result = StronglyConnectedPatches.scc(graph)
++    assertThat(result).isEmpty()
++  }
++
++  @Test
++  fun `sscOrdered  graph with single node should return single scc`() {
++    val graph = mutableMapOf<String, MutableList<String>>()
++    graph.addNode("0")
++    val result = StronglyConnectedPatches.scc(graph)
++    assertThat(result).containsExactly(listOf("0"))
++  }
++
++  @Test
++  fun `sscOrdered  graph with two node should return two scc`() {
++    val graph = mutableMapOf<String, MutableList<String>>()
++    graph.addNode("0")
++    graph.addNode("1")
++    val result = StronglyConnectedPatches.scc(graph)
++    assertThat(result).containsExactly(listOf("0"), listOf("1"))
++  }
++
++  @Test
++  fun `sscOrdered  graph with two acyclic node should return two scc in order`() {
++    val graph = mutableMapOf<String, MutableList<String>>()
++    graph.addEdge("1", "0")
++    val result = StronglyConnectedPatches.scc(graph)
++    assertThat(result).containsExactly(listOf("0"), listOf("1")).inOrder()
++  }
++
++  @Test
++  fun `sscOrdered  graph with two cyclic node should return single scc`() {
++    val graph = mutableMapOf<String, MutableList<String>>()
++    graph.addEdge("0", "1")
++    graph.addEdge("1", "0")
++    val result = StronglyConnectedPatches.scc(graph)
++    assertThat(result).containsExactly(listOf("0", "1"))
++  }
++}
++
++private fun Graph.addEdge(node: Node, dependsOn: Node) {
++  (this as MutableMap).getOrPut(node) { mutableListOf() }.let { (it as MutableList).add(dependsOn) }
++}
++
++private fun Graph.addNode(node: Node) {
++  (this as MutableMap)[node] = mutableListOf()
++}
+diff --git a/engine/src/test/java/com/google/android/fhir/sync/upload/request/IndividualGeneratorTest.kt b/engine/src/test/java/com/google/android/fhir/sync/upload/request/IndividualGeneratorTest.kt
+index 0e02b6261a..92cded4e1d 100644
+--- a/engine/src/test/java/com/google/android/fhir/sync/upload/request/IndividualGeneratorTest.kt
++++ b/engine/src/test/java/com/google/android/fhir/sync/upload/request/IndividualGeneratorTest.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2023 Google LLC
++ * Copyright 2023-2024 Google LLC
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -17,6 +17,7 @@
+ package com.google.android.fhir.sync.upload.request
+ 
+ import com.google.android.fhir.sync.upload.patch.PatchMapping
++import com.google.android.fhir.sync.upload.patch.StronglyConnectedPatchMappings
+ import com.google.android.fhir.sync.upload.request.RequestGeneratorTestUtils.deleteLocalChange
+ import com.google.android.fhir.sync.upload.request.RequestGeneratorTestUtils.insertionLocalChange
+ import com.google.android.fhir.sync.upload.request.RequestGeneratorTestUtils.toPatch
+@@ -49,7 +50,7 @@ class IndividualGeneratorTest {
+       )
+     val requests =
+       generator.generateUploadRequests(
+-        listOf(patchOutput),
++        listOf(StronglyConnectedPatchMappings(listOf(patchOutput))),
+       )
+ 
+     with(requests.single()) {
+@@ -72,7 +73,7 @@ class IndividualGeneratorTest {
+       )
+     val requests =
+       generator.generateUploadRequests(
+-        listOf(patchOutput),
++        listOf(StronglyConnectedPatchMappings(listOf(patchOutput))),
+       )
+ 
+     with(requests.single()) {
+@@ -92,7 +93,10 @@ class IndividualGeneratorTest {
+         generatedPatch = updateLocalChange.toPatch(),
+       )
+     val generator = UrlRequestGenerator.Factory.getDefault()
+-    val requests = generator.generateUploadRequests(listOf(patchOutput))
++    val requests =
++      generator.generateUploadRequests(
++        listOf(StronglyConnectedPatchMappings(listOf(patchOutput))),
++      )
+     with(requests.single()) {
+       with(generatedRequest) {
+         assertThat(requests.size).isEqualTo(1)
+@@ -115,7 +119,10 @@ class IndividualGeneratorTest {
+         generatedPatch = deleteLocalChange.toPatch(),
+       )
+     val generator = UrlRequestGenerator.Factory.getDefault()
+-    val requests = generator.generateUploadRequests(listOf(patchOutput))
++    val requests =
++      generator.generateUploadRequests(
++        listOf(StronglyConnectedPatchMappings(listOf(patchOutput))),
++      )
+     with(requests.single()) {
+       with(generatedRequest) {
+         assertThat(httpVerb).isEqualTo(HttpVerb.DELETE)
+@@ -132,7 +139,10 @@ class IndividualGeneratorTest {
+         PatchMapping(listOf(it), it.toPatch())
+       }
+     val generator = UrlRequestGenerator.Factory.getDefault()
+-    val result = generator.generateUploadRequests(patchOutputList)
++    val result =
++      generator.generateUploadRequests(
++        patchOutputList.map { StronglyConnectedPatchMappings(listOf(it)) },
++      )
+     assertThat(result).hasSize(3)
+     assertThat(result.map { it.generatedRequest.httpVerb })
+       .containsExactly(HttpVerb.PUT, HttpVerb.PATCH, HttpVerb.DELETE)
+diff --git a/engine/src/test/java/com/google/android/fhir/sync/upload/request/TransactionBundleGeneratorTest.kt b/engine/src/test/java/com/google/android/fhir/sync/upload/request/TransactionBundleGeneratorTest.kt
+index 6319ac0eee..998ffcb4e5 100644
+--- a/engine/src/test/java/com/google/android/fhir/sync/upload/request/TransactionBundleGeneratorTest.kt
++++ b/engine/src/test/java/com/google/android/fhir/sync/upload/request/TransactionBundleGeneratorTest.kt
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2023 Google LLC
++ * Copyright 2023-2024 Google LLC
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -16,11 +16,10 @@
+ 
+ package com.google.android.fhir.sync.upload.request
+ 
+-import ca.uhn.fhir.context.FhirContext
+-import ca.uhn.fhir.context.FhirVersionEnum
+ import com.google.android.fhir.LocalChange
+ import com.google.android.fhir.LocalChangeToken
+ import com.google.android.fhir.sync.upload.patch.PatchMapping
++import com.google.android.fhir.sync.upload.patch.StronglyConnectedPatchMappings
+ import com.google.android.fhir.sync.upload.request.RequestGeneratorTestUtils.deleteLocalChange
+ import com.google.android.fhir.sync.upload.request.RequestGeneratorTestUtils.insertionLocalChange
+ import com.google.android.fhir.sync.upload.request.RequestGeneratorTestUtils.toPatch
+@@ -50,9 +49,10 @@ class TransactionBundleGeneratorTest {
+   fun `generateUploadRequests() should return single Transaction Bundle with 3 entries`() =
+     runBlocking {
+       val patches =
+-        listOf(insertionLocalChange, updateLocalChange, deleteLocalChange).map {
+-          PatchMapping(listOf(it), it.toPatch())
+-        }
++        listOf(insertionLocalChange, updateLocalChange, deleteLocalChange)
++          .map { PatchMapping(listOf(it), it.toPatch()) }
++          .map { StronglyConnectedPatchMappings(listOf(it)) }
++
+       val generator = TransactionBundleGenerator.Factory.getDefault()
+       val result = generator.generateUploadRequests(patches)
+ 
+@@ -72,11 +72,10 @@ class TransactionBundleGeneratorTest {
+   @Test
+   fun `generateUploadRequests() should return 3 Transaction Bundle with single entry each`() =
+     runBlocking {
+-      val jsonParser = FhirContext.forCached(FhirVersionEnum.R4).newJsonParser()
+       val patches =
+-        listOf(insertionLocalChange, updateLocalChange, deleteLocalChange).map {
+-          PatchMapping(listOf(it), it.toPatch())
+-        }
++        listOf(insertionLocalChange, updateLocalChange, deleteLocalChange)
++          .map { PatchMapping(listOf(it), it.toPatch()) }
++          .map { StronglyConnectedPatchMappings(listOf(it)) }
+       val generator =
+         TransactionBundleGenerator.Factory.getGenerator(
+           Bundle.HTTPVerb.PUT,
+@@ -119,11 +118,12 @@ class TransactionBundleGeneratorTest {
+         )
+       val patches =
+         listOf(
+-          PatchMapping(
+-            localChanges = listOf(localChange),
+-            generatedPatch = localChange.toPatch(),
+-          ),
+-        )
++            PatchMapping(
++              localChanges = listOf(localChange),
++              generatedPatch = localChange.toPatch(),
++            ),
++          )
++          .map { StronglyConnectedPatchMappings(listOf(it)) }
+       val generator = TransactionBundleGenerator.Factory.getDefault(useETagForUpload = false)
+       val result = generator.generateUploadRequests(patches)
+ 
+@@ -147,11 +147,12 @@ class TransactionBundleGeneratorTest {
+         )
+       val patches =
+         listOf(
+-          PatchMapping(
+-            localChanges = listOf(localChange),
+-            generatedPatch = localChange.toPatch(),
+-          ),
+-        )
++            PatchMapping(
++              localChanges = listOf(localChange),
++              generatedPatch = localChange.toPatch(),
++            ),
++          )
++          .map { StronglyConnectedPatchMappings(listOf(it)) }
+       val generator = TransactionBundleGenerator.Factory.getDefault(useETagForUpload = true)
+       val result = generator.generateUploadRequests(patches)
+ 
+@@ -185,7 +186,10 @@ class TransactionBundleGeneratorTest {
+             token = LocalChangeToken(listOf(2L)),
+           ),
+         )
+-      val patches = localChanges.map { PatchMapping(listOf(it), it.toPatch()) }
++      val patches =
++        localChanges
++          .map { PatchMapping(listOf(it), it.toPatch()) }
++          .map { StronglyConnectedPatchMappings(listOf(it)) }
+       val generator = TransactionBundleGenerator.Factory.getDefault(useETagForUpload = true)
+       val result = generator.generateUploadRequests(patches)
+ 
+@@ -334,4 +338,146 @@ class TransactionBundleGeneratorTest {
+       }
+     assertThat(exception.localizedMessage).isEqualTo("Update using PUT is not supported.")
+   }
++
++  @Test
++  fun `generate() should not split changes in multiple bundle if combined mapping group has more patches than the permitted size`() =
++    runBlocking {
++      val localChange =
++        LocalChange(
++          resourceType = ResourceType.Patient.name,
++          resourceId = "Patient-00",
++          type = LocalChange.Type.UPDATE,
++          payload = "[]",
++          versionId = "patient-002-version-",
++          timestamp = Instant.now(),
++          token = LocalChangeToken(listOf(1L)),
++        )
++      val patchGroups =
++        List(10) {
++            PatchMapping(
++              localChanges =
++                listOf(
++                  localChange.copy(
++                    resourceId = "Patient-00-$it",
++                    versionId = "patient-002-version-$it",
++                  ),
++                ),
++              generatedPatch = localChange.toPatch(),
++            )
++          }
++          .let { StronglyConnectedPatchMappings(it) }
++      val generator =
++        TransactionBundleGenerator.Factory.getDefault(useETagForUpload = false, bundleSize = 5)
++      val result = generator.generateUploadRequests(listOf(patchGroups))
++
++      assertThat(result).hasSize(1)
++      assertThat(result.single().localChanges.size).isEqualTo(10)
++    }
++
++  @Test
++  fun `generate() should put group mappings in respective bundles`() = runBlocking {
++    val localChange =
++      LocalChange(
++        resourceType = ResourceType.Patient.name,
++        resourceId = "Patient-00",
++        type = LocalChange.Type.UPDATE,
++        payload = "[]",
++        versionId = "patient-002-version-",
++        timestamp = Instant.now(),
++        token = LocalChangeToken(listOf(1L)),
++      )
++
++    val firstGroup =
++      StronglyConnectedPatchMappings(
++        mutableListOf<PatchMapping>().apply {
++          for (i in 1..5) {
++            add(
++              PatchMapping(
++                localChanges =
++                  listOf(
++                    localChange.copy(
++                      resourceId = "Patient-00-$i",
++                      versionId = "patient-002-version-$i",
++                    ),
++                  ),
++                generatedPatch = localChange.toPatch(),
++              ),
++            )
++          }
++        },
++      )
++
++    val secondGroup =
++      StronglyConnectedPatchMappings(
++        listOf(
++          PatchMapping(
++            localChanges =
++              listOf(
++                localChange.copy(resourceId = "Patient-00-6", versionId = "patient-002-version-7"),
++              ),
++            generatedPatch = localChange.toPatch(),
++          ),
++        ),
++      )
++
++    val thirdGroup =
++      StronglyConnectedPatchMappings(
++        listOf(
++          PatchMapping(
++            localChanges =
++              listOf(
++                localChange.copy(resourceId = "Patient-00-7", versionId = "patient-002-version-8"),
++              ),
++            generatedPatch = localChange.toPatch(),
++          ),
++        ),
++      )
++    val fourthGroup =
++      StronglyConnectedPatchMappings(
++        mutableListOf<PatchMapping>().apply {
++          for (i in 9..13) {
++            add(
++              PatchMapping(
++                localChanges =
++                  listOf(
++                    localChange.copy(
++                      resourceId = "Patient-00-$i",
++                      versionId = "patient-002-version-$i",
++                    ),
++                  ),
++                generatedPatch = localChange.toPatch(),
++              ),
++            )
++          }
++        },
++      )
++
++    val patchGroups = listOf(firstGroup, secondGroup, thirdGroup, fourthGroup)
++    val generator =
++      TransactionBundleGenerator.Factory.getDefault(useETagForUpload = false, bundleSize = 5)
++    val result = generator.generateUploadRequests(patchGroups)
++
++    assertThat(result).hasSize(3)
++    assertThat(result[0].localChanges.map { it.resourceId })
++      .containsExactly(
++        "Patient-00-1",
++        "Patient-00-2",
++        "Patient-00-3",
++        "Patient-00-4",
++        "Patient-00-5",
++      )
++      .inOrder()
++    assertThat(result[1].localChanges.map { it.resourceId })
++      .containsExactly("Patient-00-6", "Patient-00-7")
++      .inOrder()
++    assertThat(result[2].localChanges.map { it.resourceId })
++      .containsExactly(
++        "Patient-00-9",
++        "Patient-00-10",
++        "Patient-00-11",
++        "Patient-00-12",
++        "Patient-00-13",
++      )
++      .inOrder()
++  }
+ }

@@ -1,0 +1,351 @@
+diff --git a/packages/server/src/ws/subscriptions.test.ts b/packages/server/src/ws/subscriptions.test.ts
+index 3eedff35d03..4cca9c05976 100644
+--- a/packages/server/src/ws/subscriptions.test.ts
++++ b/packages/server/src/ws/subscriptions.test.ts
+@@ -1,7 +1,14 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+ import type { WithId } from '@medplum/core';
+-import { ContentType, OperationOutcomeError, badRequest, getReferenceString, sleep } from '@medplum/core';
++import {
++  ContentType,
++  OperationOutcomeError,
++  badRequest,
++  createReference,
++  getReferenceString,
++  sleep,
++} from '@medplum/core';
+ import type {
+   Binary,
+   Bundle,
+@@ -12,6 +19,7 @@ import type {
+   Patient,
+   Project,
+   ProjectMembership,
++  Resource,
+   Subscription,
+   SubscriptionStatus,
+ } from '@medplum/fhirtypes';
+@@ -754,6 +762,151 @@ describe('WebSocket Subscription', () => {
+       ]);
+     }));
+ 
++  test.each<[string, Parameters<typeof addTestUser>[1], 'Patient' | 'Binary']>([
++    [
++      'access policy',
++      { accessPolicy: { resourceType: 'AccessPolicy', resource: [{ resourceType: 'Subscription' }] } },
++      'Patient',
++    ],
++    ['token scope', { scope: 'openid user/Subscription.cruds' }, 'Patient'],
++    ['token scope criteria', { scope: 'openid user/Patient.rs?gender=male user/Subscription.cruds' }, 'Patient'],
++    ['Binary security context', { scope: 'openid user/Binary.rs user/Subscription.cruds' }, 'Binary'],
++  ])('Does not notify a subscriber whose %s does not permit reading the resource', (_, userOptions, resourceType) =>
++    withTestContext(async () => {
++      const patient = await repo.createResource<Patient>({
++        resourceType: 'Patient',
++        name: [{ given: ['Not'], family: 'Readable' }],
++        gender: 'female',
++      });
++      const resource: WithId<Resource> =
++        resourceType === 'Binary'
++          ? await repo.createResource<Binary>({
++              resourceType: 'Binary',
++              contentType: ContentType.TEXT,
++              securityContext: createReference(patient),
++            })
++          : patient;
++
++      const subscription = await repo.createResource<Subscription>({
++        resourceType: 'Subscription',
++        reason: 'test',
++        status: 'active',
++        criteria: resourceType,
++        channel: { type: 'websocket' },
++      });
++
++      const bindingTokenFor = async (userToken: string): Promise<string> => {
++        const res = await request(server)
++          .get(`/fhir/R4/Subscription/${subscription.id}/$get-ws-binding-token`)
++          .set('Authorization', 'Bearer ' + userToken);
++        expect(res.status).toBe(200);
++        return (res.body as FhirParameters).parameter?.[0]?.valueString as string;
++      };
++
++      // Baseline: the restricted user cannot read the resource over HTTP
++      const restrictedUser = await addTestUser(project, userOptions);
++      const restrictedRead = await request(server)
++        .get(`/fhir/R4/${resourceType}/${resource.id}`)
++        .set('Authorization', 'Bearer ' + restrictedUser.accessToken);
++      expect([403, 404]).toContain(restrictedRead.status);
++
++      const restrictedToken = await bindingTokenFor(restrictedUser.accessToken);
++      const permittedToken = await bindingTokenFor(accessToken);
++
++      const expectHandshake = (actual: Bundle): void => {
++        expect(actual).toMatchObject({
++          resourceType: 'Bundle',
++          entry: [{ resource: { resourceType: 'SubscriptionStatus', type: 'handshake' } }],
++        });
++      };
++
++      // Sockets are notified in bind order, so with the restricted socket bound first, its next message
++      // after the permitted socket is notified must be the pong rather than a notification.
++      let restrictedBound = false;
++      let permittedNotified = false;
++
++      await Promise.all([
++        request(server)
++          .ws('/ws/subscriptions-r4')
++          .sendJson({ type: 'bind-with-token', payload: { token: restrictedToken } })
++          .expectJson(expectHandshake)
++          .exec(() => {
++            restrictedBound = true;
++          })
++          .exec(() => waitFor(async () => expect(permittedNotified).toStrictEqual(true)))
++          .sendJson({ type: 'ping' })
++          .expectJson({ type: 'pong' })
++          .close()
++          .expectClosed(),
++        request(server)
++          .ws('/ws/subscriptions-r4')
++          .exec(() => waitFor(async () => expect(restrictedBound).toStrictEqual(true)))
++          .sendJson({ type: 'bind-with-token', payload: { token: permittedToken } })
++          .expectJson(expectHandshake)
++          .exec(() =>
++            publish(
++              WEBSOCKET_SUB_PUBLISH_CHANNEL,
++              JSON.stringify({ resource, events: [[subscription.id, { includeResource: true }]] })
++            )
++          )
++          .expectJson((msg: Bundle) => {
++            expect(msg.entry?.[1]?.resource?.id).toStrictEqual(resource.id);
++          })
++          .exec(() => {
++            permittedNotified = true;
++          })
++          .close()
++          .expectClosed(),
++      ]);
++    })
++  );
++
++  test('Notifies a subscriber whose token scope permits reading the resource', () =>
++    withTestContext(async () => {
++      const patient = await repo.createResource<Patient>({
++        resourceType: 'Patient',
++        name: [{ given: ['Readable'], family: 'ByScope' }],
++        gender: 'female',
++      });
++
++      const subscription = await repo.createResource<Subscription>({
++        resourceType: 'Subscription',
++        reason: 'test',
++        status: 'active',
++        criteria: 'Patient',
++        channel: { type: 'websocket' },
++      });
++
++      const { accessToken: userToken } = await addTestUser(project, {
++        scope: 'openid user/Patient.rs?gender=female user/Subscription.cruds',
++      });
++      const res = await request(server)
++        .get(`/fhir/R4/Subscription/${subscription.id}/$get-ws-binding-token`)
++        .set('Authorization', 'Bearer ' + userToken);
++      const token = (res.body as FhirParameters).parameter?.[0]?.valueString as string;
++
++      await request(server)
++        .ws('/ws/subscriptions-r4')
++        .sendJson({ type: 'bind-with-token', payload: { token } })
++        .expectJson((actual) => {
++          expect(actual).toMatchObject({
++            resourceType: 'Bundle',
++            entry: [{ resource: { resourceType: 'SubscriptionStatus', type: 'handshake' } }],
++          });
++        })
++        .exec(() =>
++          publish(
++            WEBSOCKET_SUB_PUBLISH_CHANNEL,
++            JSON.stringify({ resource: patient, events: [[subscription.id, { includeResource: true }]] })
++          )
++        )
++        .expectJson((msg: Bundle) => {
++          expect((msg.entry?.[1] as BundleEntry<Patient> | undefined)?.resource?.id).toStrictEqual(patient.id);
++        })
++        .close()
++        .expectClosed();
++    }));
++
+   test('Payload with multiple subscriptions fires all events', () =>
+     withTestContext(async () => {
+       const patient = await repo.createResource<Patient>({
+diff --git a/packages/server/src/ws/subscriptions.ts b/packages/server/src/ws/subscriptions.ts
+index 66e7fe09cfc..bab65d15fae 100644
+--- a/packages/server/src/ws/subscriptions.ts
++++ b/packages/server/src/ws/subscriptions.ts
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ import type { WithId } from '@medplum/core';
+ import {
++  AccessPolicyInteraction,
+   badRequest,
+   createReference,
+   deepClone,
+@@ -21,6 +22,7 @@ import type { RawData, WebSocket } from 'ws';
+ import { getConfig } from '../config/loader';
+ import { WEBSOCKET_SUB_PUBLISH_CHANNEL } from '../constants';
+ import type { AdditionalWsBindingClaims } from '../fhir/operations/getwsbindingtoken';
++import type { Repository } from '../fhir/repo';
+ import type { CacheEntry } from '../fhir/repository/resource-cache';
+ import { getFullUrl } from '../fhir/response';
+ import { rewriteAttachments, RewriteMode } from '../fhir/rewrite';
+@@ -148,46 +150,117 @@ async function sendSubscriptionEventNotifications(
+   const deadSubscriptionIds: string[] = [];
+   for (const [subscriptionId, options] of subEventArgsArr) {
+     for (const socket of subToWsLookup.get(subscriptionId) ?? EMPTY) {
+-      // Get the repo for this socket in the context of the subscription
+-      const subMetadataMap = wsToSubLookup.get(socket);
+-      if (!subMetadataMap) {
+-        // We should really never hit this log, this is a true error
+-        globalLogger.error('[WS] Unable to find sub metadata map for WebSocket');
+-        continue;
+-      }
+-      const subMetadata = subMetadataMap.get(subscriptionId);
+-      if (!subMetadata) {
+-        // We should really never hit this log, this is a true error
+-        globalLogger.error('[WS] Unable to find sub metadata entry for WebSocket', { subscriptionId });
+-        continue;
+-      }
+-
+-      let rewrittenBundle: Bundle;
+-      try {
+-        const repo = (await getLoginForAccessToken(undefined, subMetadata.rawToken))?.repo;
+-        if (!repo) {
+-          globalLogger.info('[WS] Unable to get login for the given access token', { subscriptionId });
+-          deadSubscriptionIds.push(subscriptionId);
+-          continue;
+-        }
+-        // removeHiddenFields mutates its input, and one published resource is shared by every
+-        // socket on this event, so each subscriber filters its own copy.
+-        const visible = repo.removeHiddenFields(deepClone(resource));
+-        const bundle = createSubEventNotification(visible, subscriptionId, options);
+-        rewrittenBundle = await rewriteAttachments(RewriteMode.PRESIGNED_URL, repo, bundle);
+-      } catch (err) {
+-        globalLogger.error('[WS] Error occurred while preparing subscription notification', { err });
+-        continue;
++      if (!(await notifySubscriber(socket, resource, subscriptionId, options))) {
++        deadSubscriptionIds.push(subscriptionId);
+       }
+-
+-      socket.send(JSON.stringify(rewrittenBundle), { binary: false });
+-      subscriptionMessagesSent++;
+     }
+     subscriptionEventsFired++;
+   }
+   return deadSubscriptionIds;
+ }
+ 
++/**
++ * Sends a subscription event notification to one subscriber socket.
++ * @param socket - The subscriber socket.
++ * @param resource - The resource of the subscription event.
++ * @param subscriptionId - The subscription ID.
++ * @param options - The subscription event options.
++ * @returns False if the access token bound to the subscription is no longer valid.
++ */
++async function notifySubscriber(
++  socket: WebSocket,
++  resource: WithId<Resource>,
++  subscriptionId: string,
++  options: SubEventsOptions
++): Promise<boolean> {
++  const subMetadata = getSubMetadata(socket, subscriptionId);
++  if (!subMetadata) {
++    return true;
++  }
++
++  let notification: Bundle | undefined;
++  try {
++    const repo = (await getLoginForAccessToken(undefined, subMetadata.rawToken))?.repo;
++    if (!repo) {
++      globalLogger.info('[WS] Unable to get login for the given access token', { subscriptionId });
++      return false;
++    }
++    notification = await buildSubscriberNotification(repo, resource, subscriptionId, options);
++  } catch (err) {
++    globalLogger.error('[WS] Error occurred while preparing subscription notification', { err });
++    return true;
++  }
++
++  if (notification) {
++    socket.send(JSON.stringify(notification), { binary: false });
++    subscriptionMessagesSent++;
++  }
++  return true;
++}
++
++function getSubMetadata(socket: WebSocket, subscriptionId: string): WebSocketSubMetadata | undefined {
++  const subMetadataMap = wsToSubLookup.get(socket);
++  if (!subMetadataMap) {
++    // We should really never hit this log, this is a true error
++    globalLogger.error('[WS] Unable to find sub metadata map for WebSocket');
++    return undefined;
++  }
++  const subMetadata = subMetadataMap.get(subscriptionId);
++  if (!subMetadata) {
++    // We should really never hit this log, this is a true error
++    globalLogger.error('[WS] Unable to find sub metadata entry for WebSocket', { subscriptionId });
++  }
++  return subMetadata;
++}
++
++/**
++ * Builds the notification for one subscriber, with the resource as that subscriber may read it.
++ * @param repo - The repository of the subscriber's login.
++ * @param resource - The resource of the subscription event.
++ * @param subscriptionId - The subscription ID.
++ * @param options - The subscription event options.
++ * @returns The notification bundle, or undefined if the subscriber cannot read the resource.
++ */
++async function buildSubscriberNotification(
++  repo: Repository,
++  resource: WithId<Resource>,
++  subscriptionId: string,
++  options: SubEventsOptions
++): Promise<Bundle | undefined> {
++  if (!(await canSubscriberReadResource(repo, resource, subscriptionId))) {
++    return undefined;
++  }
++  // removeHiddenFields mutates its input, and one published resource is shared by every
++  // socket on this event, so each subscriber filters its own copy.
++  const visible = repo.removeHiddenFields(deepClone(resource));
++  const bundle = createSubEventNotification(visible, subscriptionId, options);
++  return rewriteAttachments(RewriteMode.PRESIGNED_URL, repo, bundle);
++}
++
++async function canSubscriberReadResource(
++  repo: Repository,
++  resource: WithId<Resource>,
++  subscriptionId: string
++): Promise<boolean> {
++  // The worker checks a single membership's stored access policy; each bound token, which may carry
++  // narrower SMART scopes, must itself be able to read the resource.
++  if (!repo.canPerformInteraction(AccessPolicyInteraction.READ, resource)) {
++    globalLogger.debug('[WS] Subscriber cannot read resource, skipping notification', { subscriptionId });
++    return false;
++  }
++  if (resource.resourceType === 'Binary' && resource.securityContext) {
++    try {
++      await repo.readReference(resource.securityContext);
++    } catch {
++      globalLogger.debug('[WS] Subscriber cannot read Binary security context, skipping notification', {
++        subscriptionId,
++      });
++      return false;
++    }
++  }
++  return true;
++}
++
+ async function handleDeadSubscriptions(deadSubscriptionIds: string[]): Promise<void> {
+   if (deadSubscriptionIds.length === 0) {
+     return;

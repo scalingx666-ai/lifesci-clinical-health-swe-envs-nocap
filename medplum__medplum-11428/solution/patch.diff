@@ -1,0 +1,208 @@
+diff --git a/packages/server/src/fhir/operations/getwsbindingtoken.test.ts b/packages/server/src/fhir/operations/getwsbindingtoken.test.ts
+index 0673eb6ee0e..f4e11b9b7e4 100644
+--- a/packages/server/src/fhir/operations/getwsbindingtoken.test.ts
++++ b/packages/server/src/fhir/operations/getwsbindingtoken.test.ts
+@@ -7,7 +7,9 @@ import request from 'supertest';
+ import { initApp, shutdownApp } from '../../app';
+ import { loadTestConfig } from '../../config/loader';
+ import { verifyJwt } from '../../oauth/keys';
++import { getLoginForAccessToken } from '../../oauth/utils';
+ import { addTestUser, createTestProject, initTestAuth, withTestContext } from '../../test.setup';
++import { getWsBindingTokenAudience } from './getwsbindingtoken';
+ 
+ const app = express();
+ let accessToken: string;
+@@ -64,10 +66,20 @@ describe('Get WebSocket binding token', () => {
+       const { payload } = await verifyJwt(token);
+       expect(payload?.sub).toBeDefined();
+       expect(payload?.exp).toBeDefined();
+-      expect(payload?.aud).toBeDefined();
++      expect(payload?.aud).toStrictEqual(getWsBindingTokenAudience());
+       expect(payload?.username).toBeDefined();
+       expect(payload?.subscription_id).toBeDefined();
+ 
++      // The binding token is only for WebSocket binding, not for HTTP requests
++      const res3 = await request(app)
++        .get('/fhir/R4/Patient')
++        .set('Authorization', 'Bearer ' + token);
++      expect(res3).toHaveStatus(401);
++
++      // Nor for other WebSocket endpoints, which pass no request
++      expect(await getLoginForAccessToken(undefined, token)).toBeUndefined();
++      expect(await getLoginForAccessToken(undefined, token, { audience: getWsBindingTokenAudience() })).toBeDefined();
++
+       expect(params.parameter?.[1]).toBeDefined();
+       expect(params.parameter?.[1]?.name).toStrictEqual('expiration');
+       expect(params.parameter?.[1]?.valueDateTime).toBeDefined();
+diff --git a/packages/server/src/fhir/operations/getwsbindingtoken.ts b/packages/server/src/fhir/operations/getwsbindingtoken.ts
+index 27d5d639bdb..ce70770ac6a 100644
+--- a/packages/server/src/fhir/operations/getwsbindingtoken.ts
++++ b/packages/server/src/fhir/operations/getwsbindingtoken.ts
+@@ -1,6 +1,14 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+-import { allOk, badRequest, forbidden, isResourceType, normalizeErrorString, resolveId } from '@medplum/core';
++import {
++  allOk,
++  badRequest,
++  forbidden,
++  getWebSocketUrl,
++  isResourceType,
++  normalizeErrorString,
++  resolveId,
++} from '@medplum/core';
+ import type { FhirRequest, FhirResponse } from '@medplum/fhir-router';
+ import type { OperationDefinition, Subscription } from '@medplum/fhirtypes';
+ import { getConfig } from '../../config/loader';
+@@ -15,6 +23,15 @@ export type AdditionalWsBindingClaims = {
+   membership_id: string;
+ };
+ 
++/**
++ * Returns the audience of WebSocket binding tokens, which is the WebSocket subscriptions endpoint.
++ * General access tokens are audienced to the issuer, so binding tokens are rejected everywhere else.
++ * @returns The WebSocket subscriptions URL.
++ */
++export function getWsBindingTokenAudience(): string {
++  return getWebSocketUrl(getConfig().baseUrl, 'ws/subscriptions-r4');
++}
++
+ // Source (for backport version): https://build.fhir.org/ig/HL7/fhir-subscription-backport-ig/OperationDefinition-backport-subscription-get-ws-binding-token.json.html
+ // R5 definition: https://build.fhir.org/operation-subscription-get-ws-binding-token.json.html
+ const operation: OperationDefinition = {
+@@ -141,7 +158,6 @@ const operation: OperationDefinition = {
+  */
+ export async function getWsBindingTokenHandler(req: FhirRequest): Promise<FhirResponse> {
+   const { authState, login, profile, repo, project, membership } = getAuthenticatedContext();
+-  const { baseUrl } = getConfig();
+ 
+   // The token is issued for the caller's own login, which cannot represent an On-Behalf-Of member
+   if (authState.onBehalfOfMembership) {
+@@ -193,6 +209,7 @@ export async function getWsBindingTokenHandler(req: FhirRequest): Promise<FhirRe
+       username: userId,
+       scope: login.scope as string,
+       profile: profile.reference as string,
++      aud: getWsBindingTokenAudience(),
+     },
+     {
+       additionalClaims: {
+@@ -207,7 +224,7 @@ export async function getWsBindingTokenHandler(req: FhirRequest): Promise<FhirRe
+     token,
+     expiration: new Date(Date.now() + ONE_HOUR).toISOString(),
+     subscription: subscriptionId,
+-    'websocket-url': `${baseUrl.replace('http://', 'ws://').replace('https://', 'wss://')}ws/subscriptions-r4`,
++    'websocket-url': getWsBindingTokenAudience(),
+   };
+ 
+   return [allOk, buildOutputParameters(operation, output)];
+diff --git a/packages/server/src/oauth/utils.ts b/packages/server/src/oauth/utils.ts
+index e777c5325cb..4cedc6890e8 100644
+--- a/packages/server/src/oauth/utils.ts
++++ b/packages/server/src/oauth/utils.ts
+@@ -1183,11 +1183,14 @@ export async function verifyMultipleMatchingException(
+  * Handles "on behalf of" requests if the "x-medplum-on-behalf-of" header is present.
+  * @param req - The incoming HTTP request.
+  * @param accessToken - The access token as provided by the client.
++ * @param options - Optional verification options.
++ * @param options.audience - The expected audience, for tokens issued to a specific endpoint. Defaults to the (project-scoped) issuer.
+  * @returns On success, returns the login, membership, and project. On failure, throws an error.
+  */
+ export async function getLoginForAccessToken(
+   req: Request | undefined,
+-  accessToken: string
++  accessToken: string,
++  options?: { audience?: string }
+ ): Promise<AuthenticationResult | undefined> {
+   const globalSystemRepo = getGlobalSystemRepo();
+   let verifyResult: Awaited<ReturnType<typeof verifyJwt>>;
+@@ -1211,7 +1214,8 @@ export async function getLoginForAccessToken(
+   // ID tokens are audienced to the client rather than to the issuer, and refresh tokens carry a refresh secret.
+   // Without these checks, either one is accepted as an access token. See RFC 8725 sections 3.9 and 3.12.
+   const config = getConfig();
+-  const expectedAudience = req ? getProjectScopedUrl(req.originalUrl, config.issuer) : config.issuer;
++  const expectedAudience =
++    options?.audience ?? (req ? getProjectScopedUrl(req.originalUrl, config.issuer) : config.issuer);
+   if (claims.aud !== expectedAudience || claims.refresh_secret !== undefined) {
+     return undefined;
+   }
+diff --git a/packages/server/src/ws/subscriptions.test.ts b/packages/server/src/ws/subscriptions.test.ts
+index 4cca9c05976..6e1f4881d8e 100644
+--- a/packages/server/src/ws/subscriptions.test.ts
++++ b/packages/server/src/ws/subscriptions.test.ts
+@@ -1181,6 +1181,40 @@ describe('WebSocket Subscription', () => {
+       verifyJwtSpy.mockRestore();
+     }));
+ 
++  test('Token with a different audience', () =>
++    withTestContext(async () => {
++      const verifyJwtSpy = vi.spyOn(keysModule, 'verifyJwt').mockImplementation(async () => ({
++        payload: {
++          subscription_id: randomUUID(),
++          login_id: randomUUID(),
++          membership_id: randomUUID(),
++          aud: config.issuer,
++        },
++        protectedHeader: { alg: 'RS256' },
++      }));
++
++      await request(server)
++        .ws('/ws/subscriptions-r4')
++        .sendJson({ type: 'bind-with-token', payload: { token: 'issuer-audience-token' } })
++        .expectJson({
++          resourceType: 'OperationOutcome',
++          issue: [
++            {
++              severity: 'error',
++              code: 'invalid',
++              details: { text: 'Token is not a WebSocket binding token. Get a new one from $get-ws-binding-token.' },
++            },
++          ],
++        })
++        .close()
++        .expectClosed()
++        .exec(async () => {
++          await sleep(0);
++        });
++
++      verifyJwtSpy.mockRestore();
++    }));
++
+   test('Token failed to validate', () =>
+     withTestContext(async () => {
+       // Mock verifyJwt to throw an error
+diff --git a/packages/server/src/ws/subscriptions.ts b/packages/server/src/ws/subscriptions.ts
+index bab65d15fae..78fc1617509 100644
+--- a/packages/server/src/ws/subscriptions.ts
++++ b/packages/server/src/ws/subscriptions.ts
+@@ -22,6 +22,7 @@ import type { RawData, WebSocket } from 'ws';
+ import { getConfig } from '../config/loader';
+ import { WEBSOCKET_SUB_PUBLISH_CHANNEL } from '../constants';
+ import type { AdditionalWsBindingClaims } from '../fhir/operations/getwsbindingtoken';
++import { getWsBindingTokenAudience } from '../fhir/operations/getwsbindingtoken';
+ import type { Repository } from '../fhir/repo';
+ import type { CacheEntry } from '../fhir/repository/resource-cache';
+ import { getFullUrl } from '../fhir/response';
+@@ -180,7 +181,9 @@ async function notifySubscriber(
+ 
+   let notification: Bundle | undefined;
+   try {
+-    const repo = (await getLoginForAccessToken(undefined, subMetadata.rawToken))?.repo;
++    const repo = (
++      await getLoginForAccessToken(undefined, subMetadata.rawToken, { audience: getWsBindingTokenAudience() })
++    )?.repo;
+     if (!repo) {
+       globalLogger.info('[WS] Unable to get login for the given access token', { subscriptionId });
+       return false;
+@@ -453,6 +456,12 @@ export async function handleR4SubscriptionConnection(socket: WebSocket, request:
+         return undefined;
+       }
+     }
++    if (tokenPayload.aud !== getWsBindingTokenAudience()) {
++      socket.send(
++        JSON.stringify(badRequest('Token is not a WebSocket binding token. Get a new one from $get-ws-binding-token.'))
++      );
++      return undefined;
++    }
+     return tokenPayload as WebSocketSubToken;
+   };
+ 

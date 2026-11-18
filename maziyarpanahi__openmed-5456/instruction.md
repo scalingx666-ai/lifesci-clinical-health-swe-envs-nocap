@@ -1,0 +1,21 @@
+# Issue
+
+**Title:** Support zero-downtime service upgrades with mixed-version compatibility windows
+
+## Description
+
+.
+
+Adds `openmed/service/compatibility.py`, which declares this build's contract generation (1) with an N/N-1 peer window, read and write schema ranges for the job store and both Journey stores, worker capabilities and digests of the served model generations. Every surface gets one fail-closed decision from it: `negotiate_peer` and `peer_contract_decision` for peers, `check_work` before a worker claims work, `evaluate_persisted_state` for readiness and `rollback_decision` for rollbacks. Unknown or partial compatibility always blocks, and every output is a controlled reason code, an integer or a SHA-256 digest.
+
+The REST service publishes the descriptor at `GET /v1/compatibility` (scope `compatibility:read`, left out of the OpenAPI schema like `/metrics`). `/readyz` now also checks the persisted job-store schema and returns `503 incompatible_state` when it is outside the window. A peer that sends an out-of-window `X-OpenMed-Peer-Contract` header gets `409 peer_incompatible` before any processing, and a malformed header gets `400 peer_contract_malformed`. gRPC does the same through `x-openmed-peer-contract` metadata, returning `FAILED_PRECONDITION` or `INVALID_ARGUMENT`. `LocalJobStore` now writes `schema_version` and reads the old unversioned layout as version 1. It never loads or overwrites a file from outside the window, including when another process replaces the file while it runs. `DeidentifyJobQueue` stamps each record with a `compatibility` work envelope (generation, schema versions, required capabilities, pinned model generation) and checks it before marking a job running.
+
+`tests/integration/test_mixed_version_upgrade.py` runs the shipped generation as N-1 alongside a synthetic expand generation and a synthetic contract generation, all sharing versioned fakes of the job store and Journey store. It covers every supported API/worker combination in both directions, a rolling upgrade with drain and checkpoint handoff, lease fencing, idempotency keys and webhook replay, capability and model-generation refusals, a rollback inside the window followed by a roll-forward, and a rollback outside the window that is refused until a backup is restored. A test fails if the published matrix lists a supported combination the harness does not run. `docs/deploy/upgrades.md` is the runbook: rolling order, hold points, abort conditions, rollback steps and reason codes. It also describes how the drain coordinator (#3576), the durable-schema registry (#3578), durable jobs (#3574) and backup/restore (#3577) plug in.
+
+Not covered: the harness uses in-process versioned fakes, not installed artifacts or separate processes. Only one real contract generation exists, so N and N+1 in the harness are synthetic. Leases, fencing tokens, checkpoints and webhook replay are modelled in the fakes; real enforcement comes with #3574 and #3576. Schema ranges are a static table, pinned to the store migration chains by a drift test, until the #3578 registry replaces it. The Journey worker health in `openmed.deploy.journey` is unchanged (it already reports a newer store as `schema_unsupported`), and the Helm and operator manifests are unchanged.
+
+Validation: `pytest tests/unit/service/test_compatibility.py tests/integration/test_mixed_version_upgrade.py` (65 passed), `pytest tests/unit/service` (all passed), `pytest tests/unit -k "docs or publication or mkdocs or docstring or troubleshooting"` (passed), `ruff check .` and `ruff format --check .` (clean), `scripts/security/check_effect_paths.py --check` (verified), `mypy` (clean), full suite `pytest tests/ -m "not slow and not fuzz" --ignore=tests/unit/training/synthetic/test_dicom_overlays.py` (27931 passed, 263 skipped, 298 deselected; `test_dicom_overlays.py` is ignored because `pydicom` is not installed in the local venv, which is a known master-side gap). The strict MkDocs build is left to CI because `mkdocs` is not installed locally.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `f8969c5b0f1a`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

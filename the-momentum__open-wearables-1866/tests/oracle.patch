@@ -1,0 +1,385 @@
+diff --git a/backend/app/repositories/data_point_series_repository.py b/backend/app/repositories/data_point_series_repository.py
+index 0b6852ec4f..0f8a2dd1e6 100644
+--- a/backend/app/repositories/data_point_series_repository.py
++++ b/backend/app/repositories/data_point_series_repository.py
+@@ -143,6 +143,20 @@ def __add__(self, other: int) -> "WriteCounts":
+ }
+ 
+ 
++# Rows per avg HR query; 5 bind parameters each keeps a query far below PostgreSQL's 65535
++_MAX_WINDOW_ROWS = 2000
++
++
++class WorkoutWindow(NamedTuple):
++    """A workout's time window, its own data source and the sources to fall back on for samples."""
++
++    record_id: UUID
++    data_source_id: UUID
++    start_time: datetime
++    end_time: datetime
++    fallback_source_ids: tuple[UUID, ...] = ()
++
++
+ class AggregatedSample(NamedTuple):
+     """One resolution bucket for a single (data source, series type) pair."""
+ 
+@@ -803,54 +817,72 @@ def get_count_by_source(self, db_session: DbSession) -> list[tuple[str | None, i
+     def get_avg_hr_for_workout_batch(
+         self,
+         db_session: DbSession,
+-        workouts: list[tuple[UUID, UUID, datetime, datetime]],
++        workouts: list[WorkoutWindow],
+     ) -> dict[UUID, int]:
+         """Batch-compute average HR from series data for multiple workout windows.
+ 
+-        Issues a single query using a VALUES CTE joined against data_point_series.
+-        Filters by data_source_id so HR data comes from the same device as the workout.
+-
+-        Args:
+-            workouts: List of (record_id, data_source_id, start_time, end_time) tuples.
++        One query per chunk of workouts, a VALUES CTE joined against data_point_series with one
++        index range scan per (workout, source). HR from the workout's own source wins; the fallback
++        sources are used only when it has none in the window.
+ 
+         Returns:
+             Dict mapping record_id to rounded avg HR. Workouts with no HR data are omitted.
+         """
+-        if not workouts:
+-            return {}
+-
+-        hr_type_id = get_series_type_id(SeriesType.heart_rate)
+-
+-        values_parts = []
+-        params: dict[str, object] = {"hr_type_id": hr_type_id}
+-        for i, (record_id, data_source_id, start_time, end_time) in enumerate(workouts):
+-            values_parts.append(f"""(
+-                CAST(:record_id_{i} AS uuid),
+-                CAST(:ds_id_{i} AS uuid),
+-                CAST(:start_{i} AS timestamptz),
+-                CAST(:end_{i} AS timestamptz)
+-            )""")
+-            params[f"record_id_{i}"] = str(record_id)
+-            params[f"ds_id_{i}"] = str(data_source_id)
+-            params[f"start_{i}"] = start_time
+-            params[f"end_{i}"] = end_time
++        result: dict[UUID, int] = {}
++        chunk: list[WorkoutWindow] = []
++        rows = 0
++        for workout in workouts:
++            # A workout's sources stay in one chunk, so its fallback average covers all of them
++            workout_rows = 1 + len(workout.fallback_source_ids)
++            if chunk and rows + workout_rows > _MAX_WINDOW_ROWS:
++                result |= self._avg_hr_for_windows(db_session, chunk)
++                chunk, rows = [], 0
++            chunk.append(workout)
++            rows += workout_rows
++        if chunk:
++            result |= self._avg_hr_for_windows(db_session, chunk)
++        return result
++
++    def _avg_hr_for_windows(self, db_session: DbSession, workouts: list[WorkoutWindow]) -> dict[UUID, int]:
++        # Windows are passed as literals: computed in SQL, the planner loses the time bounds on the index
++        values_parts: list[str] = []
++        params: dict[str, object] = {"hr_type_id": get_series_type_id(SeriesType.heart_rate)}
++        for workout in workouts:
++            sources = [(workout.data_source_id, True), *((source, False) for source in workout.fallback_source_ids)]
++            for data_source_id, is_own in sources:
++                i = len(values_parts)
++                values_parts.append(f"""(
++                    CAST(:record_id_{i} AS uuid),
++                    CAST(:ds_id_{i} AS uuid),
++                    CAST(:is_own_{i} AS boolean),
++                    CAST(:start_{i} AS timestamptz),
++                    CAST(:end_{i} AS timestamptz)
++                )""")
++                params[f"record_id_{i}"] = str(workout.record_id)
++                params[f"ds_id_{i}"] = str(data_source_id)
++                params[f"is_own_{i}"] = is_own
++                params[f"start_{i}"] = workout.start_time
++                params[f"end_{i}"] = workout.end_time
+ 
+         sql = text(f"""
+-            WITH workout_windows(record_id, data_source_id, start_time, end_time) AS (
++            WITH workout_windows(record_id, data_source_id, is_own, start_time, end_time) AS (
+                 VALUES {", ".join(values_parts)}
+             )
+-            SELECT ww.record_id, ROUND(AVG(dps.value))::int
++            SELECT ww.record_id, ww.is_own, ROUND(AVG(dps.value))::int
+             FROM workout_windows ww
+             JOIN data_point_series dps
+                 ON dps.data_source_id = ww.data_source_id
+                 AND dps.series_type_definition_id = :hr_type_id
+                 AND dps.recorded_at >= ww.start_time
+                 AND dps.recorded_at < ww.end_time
+-            GROUP BY ww.record_id
++            GROUP BY ww.record_id, ww.is_own
+         """)
+ 
+-        rows = db_session.execute(sql, params).fetchall()
+-        return {UUID(str(record_id)): int(avg) for record_id, avg in rows}
++        own_avg: dict[UUID, int] = {}
++        fallback_avg: dict[UUID, int] = {}
++        for record_id, is_own, avg in db_session.execute(sql, params).fetchall():
++            (own_avg if is_own else fallback_avg)[UUID(str(record_id))] = int(avg)
++        return fallback_avg | own_avg
+ 
+     def _local_day_window(
+         self, local_date: ColumnElement, start_date: datetime, end_date: datetime
+diff --git a/backend/app/repositories/data_source_repository.py b/backend/app/repositories/data_source_repository.py
+index aaef385b6d..d9ec23c757 100644
+--- a/backend/app/repositories/data_source_repository.py
++++ b/backend/app/repositories/data_source_repository.py
+@@ -1,9 +1,10 @@
+ import contextlib
++from collections import defaultdict
+ from collections.abc import Sequence
+ from typing import NamedTuple, cast
+ from uuid import UUID, uuid4
+ 
+-from sqlalchemy import CursorResult, and_, asc, delete, text
++from sqlalchemy import CursorResult, and_, asc, delete, select, text
+ from sqlalchemy.dialects.postgresql import insert
+ 
+ from app.constants.devices_map import infer_device_type, is_host_model
+@@ -422,6 +423,27 @@ def get_user_data_sources(
+             .all()
+         )
+ 
++    def get_writer_siblings(self, db_session: DbSession, data_source_ids: set[UUID]) -> dict[UUID, tuple[UUID, ...]]:
++        """Other sources of the same user, provider and writer (app id, else source) for each given source.
++
++        One writer can be split across sources by its device model (Health Connect apps reporting the model
++        on some records only, Garmin dailies vs workouts), so its samples may sit next to its events.
++        """
++        if not data_source_ids:
++            return {}
++        owners = select(self.model.user_id).where(self.model.id.in_(data_source_ids))
++        rows = db_session.query(self.model).filter(self.model.user_id.in_(owners)).all()
++        writers = {row.id: (row.user_id, row.provider, row.source_app_id or row.source) for row in rows}
++        by_writer: dict[tuple[UUID, str, str | None], list[UUID]] = defaultdict(list)
++        for source_id, writer in writers.items():
++            by_writer[writer].append(source_id)
++        # A source with neither an app id nor a source name has no writer to share
++        return {
++            source_id: tuple(i for i in by_writer[writer] if i != source_id) if writer[2] else ()
++            for source_id, writer in writers.items()
++            if source_id in data_source_ids
++        }
++
+     def delete_user_provider_data(
+         self,
+         db_session: DbSession,
+diff --git a/backend/app/services/event_record_service.py b/backend/app/services/event_record_service.py
+index 0b9d296d47..b9e4ca7b70 100644
+--- a/backend/app/services/event_record_service.py
++++ b/backend/app/services/event_record_service.py
+@@ -30,6 +30,7 @@
+     HealthScoreRepository,
+     ProviderPriorityRepository,
+ )
++from app.repositories.data_point_series_repository import WorkoutWindow
+ from app.repositories.device_type_priority_repository import DeviceTypePriorityRepository
+ from app.schemas.enums import HealthScoreCategory, SeriesType, get_series_type_unit
+ from app.schemas.model_crud.activities import (
+@@ -131,7 +132,8 @@ def _resolve_avg_hr(
+         """Return avg HR for each workout record.
+ 
+         Uses stored heart_rate_avg where available, falls back to a single batch query
+-        against data_point_series for records that don't have it.
++        against data_point_series for records that don't have it: the workout's own source
++        first, then the other sources of the same writer.
+         """
+         result: dict[UUID, int | None] = {}
+         missing = []
+@@ -142,11 +144,17 @@ def _resolve_avg_hr(
+                 result[r.id] = round(details.heart_rate_avg)
+             else:
+                 result[r.id] = None
+-                missing.append((r.id, r.data_source_id, r.start_datetime, r.end_datetime))
++                missing.append(r)
+ 
+         if missing:
+-            computed = self.data_point_series_repo.get_avg_hr_for_workout_batch(db_session, missing)
+-            result.update(computed)
++            siblings = self.data_source_repo.get_writer_siblings(db_session, {r.data_source_id for r in missing})
++            windows = [
++                WorkoutWindow(
++                    r.id, r.data_source_id, r.start_datetime, r.end_datetime, siblings.get(r.data_source_id, ())
++                )
++                for r in missing
++            ]
++            result.update(self.data_point_series_repo.get_avg_hr_for_workout_batch(db_session, windows))
+ 
+         return result
+ 
+diff --git a/backend/app/services/priority_service.py b/backend/app/services/priority_service.py
+index 49aeed4c38..5ab0ffc5de 100644
+--- a/backend/app/services/priority_service.py
++++ b/backend/app/services/priority_service.py
+@@ -121,41 +121,6 @@ def bulk_update_device_type_priorities(
+         db_session.commit()
+         return DeviceTypePriorityListResponse(items=[DeviceTypePriorityResponse.model_validate(p) for p in results])
+ 
+-    def get_priority_data_source_ids(
+-        self,
+-        db_session: DbSession,
+-        user_id: UUID,
+-    ) -> list[UUID]:
+-        """Get data source IDs for a user, ordered by global priority."""
+-        provider_order = self.priority_repo.get_priority_order(db_session)
+-        device_type_order = self.device_type_priority_repo.get_priority_order(db_session)
+-        sources = self.data_source_repo.get_user_data_sources(db_session, user_id)
+-
+-        if not sources:
+-            return []
+-
+-        def sort_key(ds: DataSource) -> tuple[int, int, str]:
+-            provider_priority = provider_order.get(ds.provider, 99)
+-            device_type_priority = 99
+-            if ds.device_type:
+-                try:
+-                    dt = DeviceType(ds.device_type)
+-                    device_type_priority = device_type_order.get(dt, 99)
+-                except ValueError:
+-                    pass
+-            return (provider_priority, device_type_priority, ds.device_model or "")
+-
+-        sorted_sources = sorted(sources, key=sort_key)
+-        return [ds.id for ds in sorted_sources]
+-
+-    def get_best_data_source_id(
+-        self,
+-        db_session: DbSession,
+-        user_id: UUID,
+-    ) -> UUID | None:
+-        ids = self.get_priority_data_source_ids(db_session, user_id)
+-        return ids[0] if ids else None
+-
+     def _build_display_name(self, ds: DataSource) -> str:
+         parts = []
+         if ds.provider:
+diff --git a/backend/tests/services/test_event_record_service.py b/backend/tests/services/test_event_record_service.py
+index c8ad7beeb2..1babc9494b 100644
+--- a/backend/tests/services/test_event_record_service.py
++++ b/backend/tests/services/test_event_record_service.py
+@@ -13,9 +13,11 @@
+ from unittest.mock import patch
+ from uuid import UUID, uuid4
+ 
++import pytest
+ from sqlalchemy.orm import Session
+ 
+ from app.models import DataSource, EventRecord, HealthScore
++from app.repositories import data_point_series_repository
+ from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType
+ from app.schemas.model_crud.activities import (
+     EventRecordCreate,
+@@ -28,6 +30,7 @@
+ from app.schemas.responses.activity import Meal, NutrientValue
+ from app.services.event_record_service import event_record_service
+ from tests.factories import (
++    DataPointSeriesFactory,
+     DataSourceFactory,
+     EventRecordFactory,
+     SleepDetailsFactory,
+@@ -1363,3 +1366,100 @@ def test_filter_by_priority_keeps_only_best_source_per_date(self, db: Session) -
+         ids = {s.id for s in response.data}
+         assert garmin_record.id in ids
+         assert oura_record.id not in ids
++
++
++class TestResolveAvgHr:
++    """Workout avg HR falls back to HR samples of the same writer when the workout's own source has none."""
++
++    START = datetime(2026, 9, 1, 7, tzinfo=timezone.utc)
++
++    def _workout(self, data_source: DataSource) -> EventRecord:
++        return EventRecordFactory(
++            data_source=data_source,
++            category="workout",
++            start_datetime=self.START,
++            end_datetime=self.START + timedelta(hours=1),
++        )
++
++    def _hr(self, data_source: DataSource, value: int) -> None:
++        for minute in (10, 20):
++            DataPointSeriesFactory(
++                data_source=data_source, recorded_at=self.START + timedelta(minutes=minute), value=value
++            )
++
++    def _avg_hr(self, db: Session, workout: EventRecord) -> int | None:
++        db.flush()
++        return event_record_service._resolve_avg_hr(db, [workout])[workout.id]
++
++    def test_own_source_wins_over_writer_siblings(self, db: Session) -> None:
++        user = UserFactory()
++        app = {"user": user, "provider": ProviderName.HEALTH_CONNECT, "source_app_id": "com.fitbit.FitbitMobile"}
++        tracker = DataSourceFactory(**app, device_model="Fitbit Air", source="com.fitbit.FitbitMobile")
++        unknown = DataSourceFactory(**app, device_model=None, source="com.fitbit.FitbitMobile")
++        self._hr(tracker, 100)
++        self._hr(unknown, 150)
++
++        assert self._avg_hr(db, self._workout(tracker)) == 100
++
++    def test_falls_back_to_the_same_app_split_by_model(self, db: Session) -> None:
++        user = UserFactory()
++        app = {"user": user, "provider": ProviderName.HEALTH_CONNECT, "source_app_id": "com.fitbit.FitbitMobile"}
++        tracker = DataSourceFactory(**app, device_model="Fitbit Air", source="com.fitbit.FitbitMobile")
++        unknown = DataSourceFactory(**app, device_model=None, source="com.fitbit.FitbitMobile")
++        self._hr(unknown, 150)
++
++        assert self._avg_hr(db, self._workout(tracker)) == 150
++
++    def test_falls_back_to_cloud_dailies_of_the_same_provider(self, db: Session) -> None:
++        user = UserFactory()
++        watch = DataSourceFactory(
++            user=user, provider=ProviderName.GARMIN, device_model="Garmin fenix 8", source="garmin"
++        )
++        dailies = DataSourceFactory(user=user, provider=ProviderName.GARMIN, device_model=None, source="garmin")
++        self._hr(dailies, 140)
++
++        assert self._avg_hr(db, self._workout(watch)) == 140
++
++    def test_other_writer_is_not_used(self, db: Session) -> None:
++        user = UserFactory()
++        tracker = DataSourceFactory(
++            user=user,
++            provider=ProviderName.HEALTH_CONNECT,
++            source_app_id="com.fitbit.FitbitMobile",
++            device_model="Fitbit Air",
++            source="com.fitbit.FitbitMobile",
++        )
++        other_app = DataSourceFactory(
++            user=user,
++            provider=ProviderName.HEALTH_CONNECT,
++            source_app_id="com.google.android.apps.fitness",
++            device_model=None,
++            source="com.google.android.apps.fitness",
++        )
++        self._hr(other_app, 150)
++
++        assert self._avg_hr(db, self._workout(tracker)) is None
++
++    def test_workouts_are_split_into_chunks_without_splitting_a_writer(
++        self, db: Session, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        monkeypatch.setattr(data_point_series_repository, "_MAX_WINDOW_ROWS", 3)
++        user = UserFactory()
++        watch = DataSourceFactory(
++            user=user, provider=ProviderName.GARMIN, device_model="Garmin fenix 8", source="garmin"
++        )
++        dailies = DataSourceFactory(user=user, provider=ProviderName.GARMIN, device_model=None, source="garmin")
++        workouts = []
++        for day in range(3):
++            start = self.START + timedelta(days=day)
++            workouts.append(
++                EventRecordFactory(
++                    data_source=watch, category="workout", start_datetime=start, end_datetime=start + timedelta(hours=1)
++                )
++            )
++            DataPointSeriesFactory(data_source=dailies, recorded_at=start + timedelta(minutes=10), value=130 + day)
++        db.flush()
++
++        result = event_record_service._resolve_avg_hr(db, workouts)
++
++        assert [result[w.id] for w in workouts] == [130, 131, 132]

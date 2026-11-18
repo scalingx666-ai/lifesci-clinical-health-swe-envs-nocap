@@ -1,0 +1,219 @@
+diff --git a/grails-app/domain/org/pih/warehouse/receiving/ReceiptV2Marker.groovy b/grails-app/domain/org/pih/warehouse/receiving/ReceiptV2Marker.groovy
+index 1c961b683da..92e85985673 100644
+--- a/grails-app/domain/org/pih/warehouse/receiving/ReceiptV2Marker.groovy
++++ b/grails-app/domain/org/pih/warehouse/receiving/ReceiptV2Marker.groovy
+@@ -14,8 +14,9 @@ import java.time.Instant
+  * the data lives forever. So the workflow is recorded explicitly when the receipt is started - as a standalone marker
+  * row rather than a column, keeping the legacy {@link Receipt} domain untouched.
+  *
+- * Rows are insert-only and are removed by the database itself when their receipt is deleted (the foreign key
+- * cascades on delete), so the legacy receipt-deletion flows (receiving rollbacks) stay unaware of this table.
++ * Rows are insert-only: they are never updated, and are deleted only together with their receipt. Their foreign key
++ * restricts deletes rather than cascading, so every flow that deletes a receipt (the receiving rollbacks) has to
++ * delete its marker first - see ReceiptV2Service.deleteMarkersForReceipts.
+  */
+ class ReceiptV2Marker {
+ 
+diff --git a/grails-app/services/org/pih/warehouse/api/receiving/v2/ReceiptV2Service.groovy b/grails-app/services/org/pih/warehouse/api/receiving/v2/ReceiptV2Service.groovy
+index a1aae1481db..7052a1123bf 100644
+--- a/grails-app/services/org/pih/warehouse/api/receiving/v2/ReceiptV2Service.groovy
++++ b/grails-app/services/org/pih/warehouse/api/receiving/v2/ReceiptV2Service.groovy
+@@ -154,6 +154,31 @@ class ReceiptV2Service {
+         }
+     }
+ 
++    /**
++     * Deletes the markers of the given receipts, for those that have one. Must be called before deleting a receipt,
++     * and before detaching it from its shipment: a marker's foreign key blocks the deletion of the receipt it points
++     * at, and the deletion of a receipt detached from its shipment can be flushed by any query that follows.
++     */
++    @Transactional
++    void deleteMarkersForReceipts(Collection<Receipt> receipts) {
++        if (!receipts) {
++            return
++        }
++        List<ReceiptV2Marker> receiptV2Markers = ReceiptV2Marker.findAllByReceiptInList(receipts.toList())
++        for (ReceiptV2Marker marker : receiptV2Markers) {
++            marker.delete()
++        }
++    }
++
++    /**
++     * Deletes the marker of the given receipt, if it has one. See {@link #deleteMarkersForReceipts} for when to
++     * call it.
++     */
++    @Transactional
++    void deleteMarkerForReceipt(Receipt receipt) {
++        deleteMarkersForReceipts([receipt])
++    }
++
+     @Transactional
+     ReceiptSaveResponseDto updateItemsBatch(ReceiptItemsBatchRequest request) {
+         // The receipt is bound and validated (as existing and pending) by the request, so this assumes a validated
+diff --git a/grails-app/services/org/pih/warehouse/receiving/ReceiptService.groovy b/grails-app/services/org/pih/warehouse/receiving/ReceiptService.groovy
+index 0b0981cfb8c..3e953375820 100644
+--- a/grails-app/services/org/pih/warehouse/receiving/ReceiptService.groovy
++++ b/grails-app/services/org/pih/warehouse/receiving/ReceiptService.groovy
+@@ -16,6 +16,7 @@ import grails.validation.ValidationException
+ import org.pih.warehouse.api.PartialReceipt
+ import org.pih.warehouse.api.PartialReceiptContainer
+ import org.pih.warehouse.api.PartialReceiptItem
++import org.pih.warehouse.api.receiving.v2.ReceiptV2Service
+ import org.pih.warehouse.auth.AuthService
+ import org.pih.warehouse.core.ActivityCode
+ import org.pih.warehouse.core.Constants
+@@ -47,6 +48,7 @@ class ReceiptService {
+     InventoryService inventoryService
+     LocationService locationService
+     ReceiptIdentifierService receiptIdentifierService
++    ReceiptV2Service receiptV2Service
+     TransactionIdentifierService transactionIdentifierService
+     GrailsApplication grailsApplication
+     ProductAvailabilityService productAvailabilityService
+@@ -415,6 +417,7 @@ class ReceiptService {
+         rollbackInboundTransactions(shipment)
+ 
+         if (shipment.receipts) {
++            receiptV2Service.deleteMarkersForReceipts(shipment.receipts)
+             shipment.receipts.toArray().each { Receipt receipt ->
+                 shipment.removeFromReceipts(receipt)
+                 receipt.delete()
+@@ -443,6 +446,7 @@ class ReceiptService {
+                 shipment.removeFromIncomingTransactions(transaction)
+                 transaction.delete()
+             }
++            receiptV2Service.deleteMarkerForReceipt(lastReceipt)
+             shipment.removeFromReceipts(lastReceipt)
+             lastReceipt.delete()
+ 
+diff --git a/grails-app/services/org/pih/warehouse/shipping/ShipmentService.groovy b/grails-app/services/org/pih/warehouse/shipping/ShipmentService.groovy
+index 6cc9dc2b8cd..cf441ea9cb9 100644
+--- a/grails-app/services/org/pih/warehouse/shipping/ShipmentService.groovy
++++ b/grails-app/services/org/pih/warehouse/shipping/ShipmentService.groovy
+@@ -19,6 +19,7 @@ import org.apache.poi.ss.usermodel.Row
+ import org.hibernate.FetchMode
+ import org.hibernate.ObjectNotFoundException
+ import org.pih.warehouse.api.StockTransfer
++import org.pih.warehouse.api.receiving.v2.ReceiptV2Service
+ import org.pih.warehouse.core.ActivityCode
+ import org.pih.warehouse.core.Comment
+ import org.pih.warehouse.core.Constants
+@@ -58,6 +59,7 @@ class ShipmentService {
+     def inventoryService
+     TransactionIdentifierService transactionIdentifierService
+     ShipmentIdentifierService shipmentIdentifierService
++    ReceiptV2Service receiptV2Service
+     def documentService
+     def personService
+     def productAvailabilityService
+@@ -1730,6 +1732,7 @@ class ShipmentService {
+ 
+     void deleteReceipts(Shipment shipment) {
+         if (shipment?.receipts) {
++            receiptV2Service.deleteMarkersForReceipts(shipment.receipts)
+             shipment?.receipts.toArray().each { Receipt receipt ->
+                 shipment.removeFromReceipts(receipt)
+                 receipt.delete()
+diff --git a/src/test/groovy/org/pih/warehouse/receiving/ReceiptServiceSpec.groovy b/src/test/groovy/org/pih/warehouse/receiving/ReceiptServiceSpec.groovy
+index 5206be09fc3..4bdd318a1ba 100644
+--- a/src/test/groovy/org/pih/warehouse/receiving/ReceiptServiceSpec.groovy
++++ b/src/test/groovy/org/pih/warehouse/receiving/ReceiptServiceSpec.groovy
+@@ -3,6 +3,7 @@ package org.pih.warehouse.receiving
+ import grails.testing.gorm.DataTest
+ import grails.testing.services.ServiceUnitTest
+ import org.pih.warehouse.api.PartialReceipt
++import org.pih.warehouse.api.receiving.v2.ReceiptV2Service
+ import org.pih.warehouse.core.ActivityCode
+ import org.pih.warehouse.core.EventCode
+ import org.pih.warehouse.core.Location
+@@ -10,6 +11,7 @@ import org.pih.warehouse.receiving.Receipt
+ import org.pih.warehouse.receiving.ReceiptService
+ import org.pih.warehouse.shipping.Shipment
+ import org.pih.warehouse.shipping.ShipmentService
++import org.pih.warehouse.shipping.ShipmentType
+ import spock.lang.Shared
+ import spock.lang.Specification
+ import spock.lang.Unroll
+@@ -21,7 +23,7 @@ class ReceiptServiceSpec extends Specification implements ServiceUnitTest<Receip
+     ShipmentService shipmentService
+ 
+     void setupSpec() {
+-        mockDomains(Receipt, Shipment)
++        mockDomains(Receipt, ReceiptV2Marker, Shipment, ShipmentType, Location)
+     }
+ 
+     void setup() {
+@@ -29,6 +31,8 @@ class ReceiptServiceSpec extends Specification implements ServiceUnitTest<Receip
+             createShipmentEvent(_, _, _, _) >> void
+         }
+         service.shipmentService = shipmentService
++        // The real service, not a mock: the rollbacks are expected to actually delete the markers.
++        service.receiptV2Service = new ReceiptV2Service()
+     }
+ 
+     void 'savePartialReceiptEvent should create RECEIVED event when partial receiving is not supported'() {
+@@ -151,4 +155,64 @@ class ReceiptServiceSpec extends Specification implements ServiceUnitTest<Receip
+         0 * shipmentService.createShipmentEvent(_, _, EventCode.RECEIVED, _)
+         0 * shipmentService.createShipmentEvent(_, _, EventCode.PARTIALLY_RECEIVED, _)
+     }
++
++    void 'rollbackLastReceipt should delete the v2 marker of the receipt it rolls back'() {
++        given: 'a received receipt created by the v2 workflow'
++        Shipment shipment = buildShipmentWithReceipts(ReceiptStatusCode.RECEIVED)
++        Receipt receipt = shipment.receipts.first()
++        new ReceiptV2Marker(receipt: receipt).save(failOnError: true, flush: true)
++
++        when:
++        service.rollbackLastReceipt(shipment)
++
++        then: 'the marker goes with it - its foreign key would otherwise block the deletion of the receipt'
++        assert ReceiptV2Marker.count() == 0
++        assert Receipt.count() == 0
++    }
++
++    void 'rollbackLastReceipt should roll back a receipt of the old workflow, which carries no marker'() {
++        given:
++        Shipment shipment = buildShipmentWithReceipts(ReceiptStatusCode.RECEIVED)
++
++        when:
++        service.rollbackLastReceipt(shipment)
++
++        then:
++        assert Receipt.count() == 0
++    }
++
++    void 'rollbackPartialReceipts should delete the v2 marker of every receipt it rolls back'() {
++        given: 'a completed and a pending receipt, both created by the v2 workflow'
++        Shipment shipment = buildShipmentWithReceipts(ReceiptStatusCode.RECEIVED, ReceiptStatusCode.PENDING)
++        shipment.receipts.each { Receipt receipt ->
++            new ReceiptV2Marker(receipt: receipt).save(failOnError: true, flush: true)
++        }
++
++        when:
++        service.rollbackPartialReceipts(shipment)
++
++        then:
++        assert ReceiptV2Marker.count() == 0
++        assert Receipt.count() == 0
++    }
++
++    /**
++     * A saved shipment carrying one receipt per given status - the minimal graph the rollbacks walk.
++     */
++    private static Shipment buildShipmentWithReceipts(ReceiptStatusCode... statusCodes) {
++        Shipment shipment = new Shipment(
++                name: "Test shipment",
++                origin: new Location(name: "Origin"),
++                destination: new Location(name: "Destination"),
++                expectedShippingDate: new Date() - 7,
++                shipmentType: new ShipmentType(name: "Default"),
++        )
++        // The rollbacks walk this collection, which the domain declares (as a SortedSet) without initializing it.
++        shipment.events = new TreeSet()
++        statusCodes.each { ReceiptStatusCode statusCode ->
++            shipment.addToReceipts(new Receipt(receiptStatusCode: statusCode, actualDeliveryDate: new Date() - 1))
++        }
++        shipment.save(failOnError: true, flush: true)
++        return shipment
++    }
+ }

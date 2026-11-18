@@ -1,0 +1,255 @@
+diff --git a/backend/app/services/sdk/import_service.py b/backend/app/services/sdk/import_service.py
+index d114851f09..e80c27bcba 100644
+--- a/backend/app/services/sdk/import_service.py
++++ b/backend/app/services/sdk/import_service.py
+@@ -9,6 +9,7 @@
+ from uuid import UUID, uuid4
+ 
+ import sentry_sdk
++from packaging.version import InvalidVersion, Version
+ from pydantic import ValidationError
+ 
+ from app.constants.entry_source import get_unified_sdk_entry_source
+@@ -65,9 +66,39 @@
+     {st for st in SeriesType if st.value.startswith("dietary_")} | {SeriesType.hydration}
+ )
+ 
++# First iOS SDK release that sends every `HKUnit.percent()` value on a 0-100 scale.
++# Older builds scale only SpO2 and send the series below as a 0-1 fraction,
++# which the backend scales x100.
++APPLE_SDK_PERCENT_SCALE_MIN_VERSION = Version("0.17.0")
++
++_FRACTION_PERCENT_SERIES = frozenset(
++    {
++        SeriesType.body_fat_percentage,
++        SeriesType.walking_double_support_percentage,
++        SeriesType.walking_asymmetry_percentage,
++        SeriesType.walking_steadiness,
++    }
++)
++
+ _SDK_ITEM_MODELS = (("records", MetricRecord), ("sleep", SleepRecord), ("workouts", Workout))
+ 
+ 
++def _sends_fraction_percentages(provider: str | None, sdk_version: str | None) -> bool:
++    """Whether percentage values from this SDK arrive as a 0-1 fraction.
++
++    Only iOS SDK builds older than `APPLE_SDK_PERCENT_SCALE_MIN_VERSION` do. A missing or
++    unparseable version is treated as an old build. Pre-releases of the min version count
++    as new, since they are cut after the change.
++    """
++    if provider != "apple":
++        return False
++    try:
++        version = Version(sdk_version or "")
++    except InvalidVersion:
++        return True
++    return version.release < APPLE_SDK_PERCENT_SCALE_MIN_VERSION.release
++
++
+ class InvalidRecord(TypedDict):
+     """A single record dropped by per-record validation (PII-free — only the location, no values)."""
+ 
+@@ -268,21 +299,19 @@ def _build_meal_bundles(
+ 
+             yield record, detail
+ 
+-    def _normalize_unit(self, series_type: SeriesType, value: Decimal, provider: str | None = None) -> Decimal:
++    def _normalize_unit(
++        self,
++        series_type: SeriesType,
++        value: Decimal,
++        provider: str | None = None,
++        sdk_version: str | None = None,
++    ) -> Decimal:
+         match series_type:
+             # meters → cm
+             case SeriesType.height | SeriesType.walking_step_length:
+                 return value * 100
+-            # 0-1 fraction → percent (body_fat only for Apple; Health Connect already reports percent)
+-            case SeriesType.body_fat_percentage if provider == "apple":
+-                return value * 100
+-            # HealthKit walking metrics returned as 0-1 fraction, DB stores percent
+-            # apple-only metrics, so no need to check if provider is apple
+-            case (
+-                SeriesType.walking_double_support_percentage
+-                | SeriesType.walking_asymmetry_percentage
+-                | SeriesType.walking_steadiness
+-            ):
++            # 0-1 fraction → percent (older iOS SDKs only; Health Connect and newer iOS SDKs send percent)
++            case _ if series_type in _FRACTION_PERCENT_SERIES and _sends_fraction_percentages(provider, sdk_version):
+                 return value * 100
+             case _:
+                 return value
+@@ -292,6 +321,7 @@ def _build_statistic_bundles(
+         records: list[MetricRecord],
+         provider: str,
+         user_id: str,
++        sdk_version: str | None = None,
+     ) -> list[HeartRateSampleCreate | StepSampleCreate | TimeSeriesSampleCreate]:
+         time_series_samples: list[HeartRateSampleCreate | StepSampleCreate | TimeSeriesSampleCreate] = []
+         user_uuid = UUID(user_id)
+@@ -305,7 +335,7 @@ def _build_statistic_bundles(
+ 
+             if not series_type:
+                 continue
+-            value = self._normalize_unit(series_type, value, provider)
++            value = self._normalize_unit(series_type, value, provider, sdk_version)
+ 
+             # Health Connect reports blood glucose in mmol/L; the series unit is mg/dL.
+             if series_type == SeriesType.blood_glucose and unit.startswith("mmol"):
+@@ -522,7 +552,7 @@ def load_data(
+                 types.update(sample.series_type.value for sample in time_series_samples)
+ 
+         # Process time series samples (records)
+-        samples = self._build_statistic_bundles(records, request.provider, user_id)
++        samples = self._build_statistic_bundles(records, request.provider, user_id, request.sdkVersion)
+         if samples:
+             counts = self.timeseries_service.bulk_create_samples(db_session, samples)
+             records_saved += len(samples)
+diff --git a/backend/tests/integrations/test_sdk_import.py b/backend/tests/integrations/test_sdk_import.py
+index b795c6aec9..41dc93daa0 100644
+--- a/backend/tests/integrations/test_sdk_import.py
++++ b/backend/tests/integrations/test_sdk_import.py
+@@ -896,6 +896,114 @@ def test_healthkit_blood_glucose_not_scaled(
+         assert samples[0].value == Decimal("105")
+ 
+ 
++class TestSDKImportPercentageScale:
++    """Percentage metrics: iOS SDK builds before `APPLE_SDK_PERCENT_SCALE_MIN_VERSION` send a
++    0-1 fraction labelled "%", newer builds send 0-100 like Health Connect does. Unknown versions
++    keep the legacy x100, so old app builds stay correct.
++    """
++
++    BODY_FAT = "HKQuantityTypeIdentifierBodyFatPercentage"
++    WALKING_TYPES = (
++        ("HKQuantityTypeIdentifierWalkingDoubleSupportPercentage", SeriesType.walking_double_support_percentage),
++        ("HKQuantityTypeIdentifierWalkingAsymmetryPercentage", SeriesType.walking_asymmetry_percentage),
++        ("HKQuantityTypeIdentifierAppleWalkingSteadiness", SeriesType.walking_steadiness),
++    )
++
++    @pytest.fixture
++    def import_service(self) -> ImportService:
++        return ImportService(log=logging.getLogger("test"))
++
++    @staticmethod
++    def _record(metric_type: str, value: float) -> dict[str, Any]:
++        return {
++            "id": f"test-{metric_type}",
++            "type": metric_type,
++            "unit": "%",
++            "value": value,
++            "startDate": "2025-04-10T12:00:00Z",
++            "endDate": "2025-04-10T12:00:00Z",
++            "source": {"name": "Test Device", "bundleIdentifier": "test"},
++        }
++
++    def _samples(
++        self, import_service: ImportService, provider: str, sdk_version: str | None, records: list[dict[str, Any]]
++    ) -> dict[SeriesType, Decimal]:
++        request = SDKSyncRequest(
++            provider=provider,
++            sdkVersion=sdk_version or "",
++            syncTimestamp="2025-04-10T12:00:00Z",
++            data={"records": records},
++        )
++        samples = import_service._build_statistic_bundles(
++            request.data.records, request.provider, str(uuid4()), sdk_version
++        )
++        return {sample.series_type: sample.value for sample in samples}
++
++    @pytest.mark.parametrize(
++        "sdk_version",
++        [
++            "0.14.0",
++            "0.16.0",
++            "0.1.0",  # reported by iOS SDK 0.3.0 / 0.4.0
++            "0.13.0",  # reported by iOS SDK 0.14.0
++            None,
++            "",
++            "n/a",
++            "not-a-version",
++        ],
++    )
++    def test_old_or_unknown_apple_sdk_scales_fraction(
++        self, import_service: ImportService, sdk_version: str | None
++    ) -> None:
++        values = self._samples(
++            import_service,
++            "apple",
++            sdk_version,
++            [self._record(self.BODY_FAT, 0.304)] + [self._record(t, 0.12) for t, _ in self.WALKING_TYPES],
++        )
++
++        assert values[SeriesType.body_fat_percentage] == Decimal("30.400")
++        for _, series_type in self.WALKING_TYPES:
++            assert values[series_type] == Decimal("12.00")
++
++    @pytest.mark.parametrize("sdk_version", ["0.17.0", "0.17.0-beta.1", "0.18.2", "1.0.0"])
++    def test_new_apple_sdk_value_kept_as_is(self, import_service: ImportService, sdk_version: str) -> None:
++        values = self._samples(
++            import_service,
++            "apple",
++            sdk_version,
++            [self._record(self.BODY_FAT, 30.4)] + [self._record(t, 12) for t, _ in self.WALKING_TYPES],
++        )
++
++        assert values[SeriesType.body_fat_percentage] == Decimal("30.4")
++        for _, series_type in self.WALKING_TYPES:
++            assert values[series_type] == Decimal("12")
++
++    @pytest.mark.parametrize("provider", ["health_connect", "samsung"])
++    @pytest.mark.parametrize("sdk_version", ["0.1.0", "1.0.0", None])
++    def test_android_body_fat_never_scaled(
++        self, import_service: ImportService, provider: str, sdk_version: str | None
++    ) -> None:
++        values = self._samples(import_service, provider, sdk_version, [self._record("BODY_FAT", 30.4)])
++
++        assert values[SeriesType.body_fat_percentage] == Decimal("30.4")
++
++    @pytest.mark.parametrize(
++        ("sdk_version", "sent", "expected"),
++        [("0.16.0", 0.304, Decimal("30.400")), ("0.17.0", 30.4, Decimal("30.400"))],
++    )
++    def test_sdk_version_from_envelope_reaches_stored_value(
++        self, db: Session, import_service: ImportService, sdk_version: str, sent: float, expected: Decimal
++    ) -> None:
++        user = UserFactory()
++        payload = {**SDK_ENVELOPE, "sdkVersion": sdk_version, "data": {"records": [self._record(self.BODY_FAT, sent)]}}
++
++        import_service.import_data_from_request(db, json.dumps(payload), "application/json", str(user.id))
++
++        stored = db.query(DataPointSeries).join(DataSource).filter(DataSource.user_id == user.id).one()
++        assert stored.value == expected
++
++
+ class TestSDKImportNutrition:
+     """Dietary/nutrition metric types map to per-nutrient SeriesType samples."""
+ 
+diff --git a/docs/sdk/integration.mdx b/docs/sdk/integration.mdx
+index 290605be8a..5b21dcd853 100644
+--- a/docs/sdk/integration.mdx
++++ b/docs/sdk/integration.mdx
+@@ -174,6 +174,14 @@ The native iOS SDK sends optional headers with its requests. The backend copies
+ 
+ `app_state` and `sync_trigger` are sent only with sync uploads. Together they show whether background sync works on users' devices. The values come from the client, so treat them as diagnostics, not as trusted data.
+ 
++## Upgrading the SDK
++
++Some SDK releases need a minimum Open Wearables version, for example when they add a data type or change how a value is sent. Before upgrading the SDK in your app, read its changelog for a required Open Wearables version and upgrade Open Wearables first. An older backend may drop data from a newer SDK or store it incorrectly, and a later backend upgrade does not fix data already stored.
++
++- [iOS SDK changelog](https://github.com/the-momentum/open_wearables_ios_sdk/blob/master/CHANGELOG.md)
++- [Android SDK changelog](https://github.com/the-momentum/open_wearables_android_sdk/blob/main/CHANGELOG.md)
++- [Flutter SDK changelog](https://github.com/the-momentum/open_wearables_health_sdk/blob/main/CHANGELOG.md)
++
+ ## Production Checklist
+ 
+ <AccordionGroup>
+@@ -191,6 +199,7 @@ The native iOS SDK sends optional headers with its requests. The backend copies
+     - For Samsung Health, see [Samsung Health production requirements](/sdk/android/integration#samsung-health-production-requirements).
+   </Accordion>
+   <Accordion title="Backend">
++    - Before shipping an app with a newer SDK version, check that your Open Wearables version meets the SDK's requirement. See [Upgrading the SDK](#upgrading-the-sdk).
+     - If your app runs a historical backfill, especially over a long period, consider enabling [SDK payload offload](/dev-guides/raw-payload-storage#sdk-payload-offload) so sync payloads are kept out of Redis.
+   </Accordion>
+ </AccordionGroup>

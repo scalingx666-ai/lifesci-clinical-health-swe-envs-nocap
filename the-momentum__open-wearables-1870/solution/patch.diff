@@ -1,0 +1,633 @@
+diff --git a/backend/app/services/providers/polar/data_247.py b/backend/app/services/providers/polar/data_247.py
+index 6accb8cf8e..814e909287 100644
+--- a/backend/app/services/providers/polar/data_247.py
++++ b/backend/app/services/providers/polar/data_247.py
+@@ -246,11 +246,11 @@ def normalize_sleep(
+         for raw in raw_items:
+             if (parsed := self._parse(raw, SleepJSON, user_id, "sleep")) is None:
+                 continue
+-            if not parsed.sleep_start_time or not parsed.sleep_end_time:
++            if not parsed.date or not parsed.sleep_start_time or not parsed.sleep_end_time:
+                 log_structured(
+                     self.logger,
+                     "warning",
+-                    f"Polar sleep record missing start/end time: {parsed.date}",
++                    f"Polar sleep record missing date or start/end time: {parsed.date}",
+                     provider="polar",
+                     user_id=str(user_id),
+                 )
+@@ -276,6 +276,7 @@ def normalize_sleep(
+                 duration_seconds=duration_seconds,
+                 start_datetime=start_dt,
+                 end_datetime=end_dt,
++                external_id=f"sleep-{parsed.date}",
+                 provider=ProviderName.POLAR,
+                 user_id=user_id,
+             )
+@@ -937,6 +938,19 @@ def normalize_wrist_ecg(
+     # Persistence helpers
+     # -------------------------------------------------------------------------
+ 
++    @staticmethod
++    def _claim_night_stored_without_id(db: DbSession, user_id: UUID, record: EventRecordCreate) -> None:
++        """Give the record's id to the Polar night stored without one that it overlaps, so the save replaces it.
++
++        Polar keeps one sleep per date, so an overlapping night is this one, moved or not. Nights stored before
++        Polar sleep carried an id, by an old pod during a deploy, or without stages by dedupe_polar_sleep have none.
++        """
++        stored = event_record_service.find_adjacent_sleep_record(
++            db, user_id, record.start_datetime, record.end_datetime, 0, source=record.source, provider=record.provider
++        )
++        if stored is not None and stored.external_id is None:
++            stored.external_id = record.external_id
++
+     def _save_timeseries(self, db: DbSession, samples: list[TimeSeriesSampleCreate]) -> WriteCounts:
+         counts = WriteCounts(0, 0)
+         if samples:
+@@ -965,12 +979,13 @@ def fetch_and_save_from_webhook(
+             case PolarWebhookEventType.SLEEP:
+                 count = 0
+                 for record, detail, score, hr_samples in self.normalize_sleep([raw], user_id):
+-                    event_record_service.create_or_merge_sleep(
++                    self._claim_night_stored_without_id(db, user_id, record)
++                    stored = event_record_service.create_or_merge_sleep(
+                         db, user_id, record, detail, settings.sleep_end_gap_minutes
+                     )
+                     count += 1
+                     if score:
+-                        health_score_service.bulk_create(db, [score])
++                        health_score_service.bulk_create(db, [score.model_copy(update={"event_record_id": stored.id})])
+                     if hr_samples:
+                         timeseries_service.bulk_create_samples(db, hr_samples)
+                 return {"sleep": count}
+@@ -1030,10 +1045,14 @@ def _save_sleep(
+ 
+         for record, detail, score, hr in normalized:
+             try:
+-                event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
++                self._claim_night_stored_without_id(db, user_id, record)
++                stored = event_record_service.create_or_merge_sleep(
++                    db, user_id, record, detail, settings.sleep_end_gap_minutes
++                )
+                 count += 1
++                # A re-sync keeps the stored night, not the id normalize_sleep drew for it
+                 if score:
+-                    scores.append(score)
++                    scores.append(score.model_copy(update={"event_record_id": stored.id}))
+                 hr_samples.extend(hr)
+             except Exception as e:
+                 log_and_capture_error(
+diff --git a/backend/scripts/data_migrations/dedupe_polar_sleep.py b/backend/scripts/data_migrations/dedupe_polar_sleep.py
+new file mode 100644
+index 0000000000..16c05a2145
+--- /dev/null
++++ b/backend/scripts/data_migrations/dedupe_polar_sleep.py
+@@ -0,0 +1,171 @@
++#!/usr/bin/env python3
++"""Remove the copies that Polar sleep re-syncs appended to a night (#1539).
++
++Polar sleep had no external_id, so each re-sync of a night still inside the sync window
++went through the adjacent-session merge instead of replacing the session. The merge added
++the night again: another copy of the stage timeline in sleep_details.sleep_stages, the time
++in bed again, and, for a night without stages, its sleep and stage minutes again (a night
++with stages has those recomputed from the merged timeline, so they are not inflated).
++Polar sleep now carries external_id "sleep-<date>"; this script repairs the nights stored
++before that:
++
++- keeps one copy of each stage interval and sets sleep_time_in_bed_minutes back to the
++  session length, which is what Polar sleep stores it as;
++- for a night without stages, divides the sleep and stage minutes by the number of copies,
++  read from how many times the session length its time in bed holds;
++- sets external_id to "sleep-<local wake-up date>", the date Polar keys the night by, so a
++  later re-sync replaces the night instead of merging into it. zone_offset isn't stored for
++  Polar sleep, so the local date uses the offset of the stage timestamps. A night without
++  stages has no offset to read, so it keeps no id: a re-sync of the night replaces it and
++  gives it Polar's id, moved or not.
++
++Not changed: internal sleep scores of the repaired nights, and stage timelines whose copies
++differ (Polar moved the night between syncs), which are not exact duplicates.
++
++The ids of the Polar nights are collected first, through the data source index, so the run
++reads only Polar rows and not the whole event_record table. The nights are then read in batches
++and each batch is committed. A night whose data can't be read is skipped and reported to Sentry,
++so one bad row doesn't stop the rest. The run is still recorded: a row that can't be read now
++won't be readable on the next startup either, and retrying would repeat the whole run each time.
++
++Idempotent: a repaired night no longer matches or needs no change, so re-runs are no-ops.
++Loading every Polar night to find there's nothing left is not free, so it runs once per
++instance through data_migration_service. A copy an old pod appends during a rolling deploy, or
++a night it writes without an id, needs no second run: the next re-sync of that night replaces
++it.
++
++Usage (inside Docker), with --dry-run to preview without changes:
++    docker compose exec app uv run python scripts/data_migrations/dedupe_polar_sleep.py
++"""
++
++import argparse
++from datetime import datetime, timezone
++from logging import getLogger
++from typing import Any
++
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from app.database import engine
++from app.models import DataSource, EventRecord, SleepDetails
++from app.schemas.enums import ProviderName
++from app.services.data_migration_service import data_migration_service
++from app.utils.sentry_helpers import log_and_capture_error
++
++logger = getLogger(__name__)
++
++BATCH_SIZE = 200
++MINUTE_FIELDS = (
++    "sleep_total_duration_minutes",
++    "sleep_deep_minutes",
++    "sleep_light_minutes",
++    "sleep_rem_minutes",
++    "sleep_awake_minutes",
++)
++
++
++def _repaired_values(record: EventRecord, detail: SleepDetails) -> tuple[dict[str, Any], str | None]:
++    """The detail fields to overwrite (empty when the night wasn't appended to) and the external_id to set, if any."""
++    # A night without stages can hold a JSON null rather than a list.
++    stages = detail.sleep_stages if isinstance(detail.sleep_stages, list) else []
++    session_minutes = int((record.end_datetime - record.start_datetime).total_seconds()) // 60
++    in_bed = detail.sleep_time_in_bed_minutes or 0
++    unique_stages = sorted(
++        {(s["stage"], s["start_time"], s["end_time"]): s for s in stages}.values(),
++        key=lambda s: datetime.fromisoformat(s["start_time"]),
++    )
++
++    fields: dict[str, Any] = {}
++    if len(unique_stages) < len(stages) or in_bed > session_minutes:
++        fields["sleep_time_in_bed_minutes"] = session_minutes
++        if stages:
++            fields["sleep_stages"] = unique_stages
++        elif session_minutes > 0 and (copies := round(in_bed / session_minutes)) > 1:
++            for name in MINUTE_FIELDS:
++                if (value := getattr(detail, name)) is not None:
++                    fields[name] = round(value / copies)
++
++    # Without stages there is no local offset to read the wake-up date with; a re-sync gives the id
++    if not stages:
++        return fields, None
++    offset = datetime.fromisoformat(stages[0]["start_time"]).tzinfo
++    wake_up = record.end_datetime.astimezone(offset or timezone.utc)
++    return fields, f"sleep-{wake_up.date().isoformat()}"
++
++
++def dedupe_polar_sleep(db: Session, *, dry_run: bool, batch_size: int = BATCH_SIZE) -> dict[str, int]:
++    """Repair the Polar nights a re-sync appended to, committing after each batch unless dry_run."""
++    counts = {"sessions_repaired": 0, "external_ids_set": 0, "sessions_skipped": 0}
++    polar_nights = (
++        select(EventRecord.id)
++        .join(DataSource, DataSource.id == EventRecord.data_source_id)
++        # Nights written since the fix carry an external_id and are replaced on re-sync
++        .where(
++            DataSource.provider == ProviderName.POLAR,
++            EventRecord.category == "sleep",
++            EventRecord.external_id.is_(None),
++        )
++        .order_by(EventRecord.id)
++    )
++    ids = list(db.scalars(polar_nights))
++    for start in range(0, len(ids), batch_size):
++        batch = (
++            db.query(EventRecord, SleepDetails)
++            .join(SleepDetails, SleepDetails.record_id == EventRecord.id)
++            .filter(EventRecord.id.in_(ids[start : start + batch_size]))
++            .all()
++        )
++
++        for record, detail in batch:
++            try:
++                fields, external_id = _repaired_values(record, detail)
++            except (KeyError, TypeError, ValueError) as exc:
++                counts["sessions_skipped"] += 1
++                print(f"Skipped unreadable Polar sleep {record.id}")
++                log_and_capture_error(
++                    exc, logger, "Skipped unreadable Polar sleep", extra={"event_record_id": str(record.id)}
++                )
++                continue
++            counts["sessions_repaired"] += bool(fields)
++            counts["external_ids_set"] += external_id is not None
++            if not dry_run:
++                for name, value in fields.items():
++                    setattr(detail, name, value)
++                if external_id is not None:
++                    record.external_id = external_id
++
++        if not dry_run:
++            db.commit()
++        # Keeps memory flat: a night can hold thousands of stage copies
++        for record, detail in batch:
++            db.expunge(record)
++            db.expunge(detail)
++
++    verb = "Would repair" if dry_run else "Repaired"
++    print(
++        f"{verb} {counts['sessions_repaired']} Polar sleep session(s) and set {counts['external_ids_set']} "
++        f"external id(s); skipped {counts['sessions_skipped']} unreadable session(s)"
++    )
++    if dry_run:
++        print("\nDry run - no changes made.")
++    return counts
++
++
++def _migrate(db: Session, dry_run: bool) -> bool:
++    dedupe_polar_sleep(db, dry_run=dry_run)
++    if dry_run:
++        return False
++    print("Done.")
++    return True
++
++
++def main(dry_run: bool) -> None:
++    with engine.connect() as connection, Session(bind=connection) as db:
++        data_migration_service.run(db, "dedupe_polar_sleep", lambda: _migrate(db, dry_run), dry_run=dry_run)
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--dry-run", action="store_true", help="Preview affected rows without modifying data")
++    args = parser.parse_args()
++    main(dry_run=args.dry_run)
+diff --git a/backend/scripts/start/app.sh b/backend/scripts/start/app.sh
+index 031093e608..f98aa727d5 100755
+--- a/backend/scripts/start/app.sh
++++ b/backend/scripts/start/app.sh
+@@ -126,6 +126,13 @@ echo 'Running SDK unreported sleep stages cleanup...'
+ uv run python scripts/data_migrations/clear_sdk_unreported_sleep_stages.py \
+     || echo "Warning: SDK sleep stages cleanup failed — will retry on next startup."
+ 
++# TODO: Remove this after ~2027-01-01 once all deployments have migrated.
++# Removes the stage and time-in-bed copies that Polar sleep re-syncs appended, and keys the
++# nights by date so later re-syncs replace them. Runs once per instance (data_migration).
++echo 'Running Polar sleep dedupe...'
++uv run python scripts/data_migrations/dedupe_polar_sleep.py \
++    || echo "Warning: Polar sleep dedupe failed — will retry on next startup."
++
+ # Initialize archival settings
+ echo 'Initializing archival settings...'
+ uv run python scripts/init/seed_archival_settings.py
+diff --git a/backend/tests/providers/polar/test_polar_247.py b/backend/tests/providers/polar/test_polar_247.py
+index 07f674cedc..5dd612558a 100644
+--- a/backend/tests/providers/polar/test_polar_247.py
++++ b/backend/tests/providers/polar/test_polar_247.py
+@@ -2,15 +2,19 @@
+ 
+ from datetime import date, datetime, timezone
+ from unittest.mock import MagicMock, patch
+-from uuid import uuid4
++from uuid import UUID, uuid4
+ 
+ import pytest
++from sqlalchemy.orm import Session
+ 
++from app.models import DataSource, EventRecord, HealthScore
+ from app.repositories.data_point_series_repository import WriteCounts
+ from app.schemas.enums import HealthScoreCategory, SeriesType
+ from app.schemas.model_crud.activities import CalendarPeriod
++from app.schemas.providers.polar import PolarWebhookEventType
+ from app.services.providers.polar.data_247 import Polar247Data
+ from app.services.providers.polar.strategy import PolarStrategy
++from tests.factories import UserFactory
+ 
+ 
+ @pytest.fixture
+@@ -62,6 +66,11 @@ def test_timestamps(self, data_247: Polar247Data, sample_sleep: dict) -> None:
+         assert record.end_datetime.isoformat() == "2024-01-15T07:00:00+02:00"
+         assert record.duration_seconds == 8 * 3600
+ 
++    def test_external_id_is_the_sleep_date(self, data_247: Polar247Data, sample_sleep: dict) -> None:
++        record, _, _, _ = data_247.normalize_sleep([sample_sleep], uuid4())[0]
++
++        assert record.external_id == "sleep-2024-01-15"
++
+     def test_sleep_stage_minutes(self, data_247: Polar247Data, sample_sleep: dict) -> None:
+         user_id = uuid4()
+         _, detail, _, _ = data_247.normalize_sleep([sample_sleep], user_id)[0]
+@@ -147,10 +156,107 @@ def test_missing_end_time_skipped(self, data_247: Polar247Data, sample_sleep: di
+         user_id = uuid4()
+         assert data_247.normalize_sleep([sample_sleep], user_id) == []
+ 
++    def test_missing_date_skipped(self, data_247: Polar247Data, sample_sleep: dict) -> None:
++        sample_sleep.pop("date")
++        user_id = uuid4()
++        assert data_247.normalize_sleep([sample_sleep], user_id) == []
++
+     def test_empty_input(self, data_247: Polar247Data) -> None:
+         assert data_247.normalize_sleep([], uuid4()) == []
+ 
+ 
++class TestPolar247SleepSave:
++    NIGHT = {
++        "polar_user": "https://www.polaraccesslink.com/v3/users/123",
++        "date": "2024-01-15",
++        "sleep_start_time": "2024-01-14T23:00:00+02:00",
++        "sleep_end_time": "2024-01-15T07:00:00+02:00",
++        "light_sleep": 14400,
++        "deep_sleep": 5400,
++        "rem_sleep": 7200,
++        "hypnogram": {"23:00": 0, "23:30": 2, "00:30": 4, "02:30": 1, "04:00": 2},
++    }
++
++    WINDOW = (datetime(2024, 1, 14, tzinfo=timezone.utc), datetime(2024, 1, 16, tzinfo=timezone.utc))
++    # Polar moved the night's start between syncs
++    MOVED = {**NIGHT, "sleep_start_time": "2024-01-14T23:10:00+02:00"}
++
++    @staticmethod
++    def _sleep_records(db: Session, user_id: UUID) -> list[EventRecord]:
++        return (
++            db.query(EventRecord)
++            .join(DataSource, EventRecord.data_source_id == DataSource.id)
++            .filter(DataSource.user_id == user_id, EventRecord.category == "sleep")
++            .all()
++        )
++
++    def test_resync_keeps_one_copy_of_the_night(self, db: Session, data_247: Polar247Data) -> None:
++        user = UserFactory()
++        with patch.object(data_247, "get_sleep_data", return_value=[self.NIGHT]):
++            for _ in range(3):
++                assert data_247._save_sleep(db, user.id, *self.WINDOW) == 1
++
++        records = self._sleep_records(db, user.id)
++        assert len(records) == 1
++        assert len(records[0].sleep_detail.sleep_stages) == 5
++        assert records[0].sleep_detail.sleep_time_in_bed_minutes == 8 * 60
++
++    def test_a_night_stored_without_an_id_takes_it_on_the_next_resync(
++        self, db: Session, data_247: Polar247Data
++    ) -> None:
++        user = UserFactory()
++        with patch.object(data_247, "get_sleep_data", return_value=[self.NIGHT]):
++            assert data_247._save_sleep(db, user.id, *self.WINDOW) == 1
++            # As an old pod writes it during a deploy, before Polar sleep carried an id
++            self._sleep_records(db, user.id)[0].external_id = None
++            db.commit()
++            for _ in range(2):
++                assert data_247._save_sleep(db, user.id, *self.WINDOW) == 1
++
++        (record,) = self._sleep_records(db, user.id)
++        assert record.external_id == "sleep-2024-01-15"
++        assert len(record.sleep_detail.sleep_stages) == 5
++
++    def test_a_moved_night_stored_without_an_id_takes_it_and_is_replaced(
++        self, db: Session, data_247: Polar247Data
++    ) -> None:
++        user = UserFactory()
++        with patch.object(data_247, "get_sleep_data", return_value=[self.NIGHT]):
++            assert data_247._save_sleep(db, user.id, *self.WINDOW) == 1
++        # As dedupe_polar_sleep leaves a night without stages, or an old pod writes one
++        self._sleep_records(db, user.id)[0].external_id = None
++        db.commit()
++        with patch.object(data_247, "get_sleep_data", return_value=[self.MOVED]):
++            for _ in range(2):
++                assert data_247._save_sleep(db, user.id, *self.WINDOW) == 1
++
++        (record,) = self._sleep_records(db, user.id)
++        assert record.external_id == "sleep-2024-01-15"
++        assert record.start_datetime == datetime(2024, 1, 14, 21, 10, tzinfo=timezone.utc)
++        assert len(record.sleep_detail.sleep_stages) == 5
++        assert record.sleep_detail.sleep_time_in_bed_minutes == 7 * 60 + 50
++
++    def test_a_moved_resync_links_its_score_to_the_stored_night(self, db: Session, data_247: Polar247Data) -> None:
++        user = UserFactory()
++        for night in (self.NIGHT, self.MOVED):
++            with patch.object(data_247, "get_sleep_data", return_value=[{**night, "sleep_score": 80}]):
++                assert data_247._save_sleep(db, user.id, *self.WINDOW) == 1
++
++        (record,) = self._sleep_records(db, user.id)
++        assert {score.event_record_id for score in db.query(HealthScore).filter_by(user_id=user.id)} == {record.id}
++
++    def test_a_moved_webhook_resync_links_its_score_to_the_stored_night(
++        self, db: Session, data_247: Polar247Data
++    ) -> None:
++        user = UserFactory()
++        for night in (self.NIGHT, self.MOVED):
++            with patch.object(data_247, "_make_api_request", return_value={**night, "sleep_score": 80}):
++                data_247.fetch_and_save_from_webhook(db, user.id, PolarWebhookEventType.SLEEP, "/sleep/2024-01-15")
++
++        (record,) = self._sleep_records(db, user.id)
++        assert {score.event_record_id for score in db.query(HealthScore).filter_by(user_id=user.id)} == {record.id}
++
++
+ # ---------------------------------------------------------------------------
+ # Daily Activity
+ # ---------------------------------------------------------------------------
+diff --git a/backend/tests/scripts/test_dedupe_polar_sleep.py b/backend/tests/scripts/test_dedupe_polar_sleep.py
+new file mode 100644
+index 0000000000..bda37b7cfd
+--- /dev/null
++++ b/backend/tests/scripts/test_dedupe_polar_sleep.py
+@@ -0,0 +1,208 @@
++"""Tests for the one-off data migration that removes what Polar sleep re-syncs appended (#1539).
++
++See scripts/data_migrations/dedupe_polar_sleep.py.
++"""
++
++import importlib.util
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++from types import ModuleType
++from uuid import UUID
++
++from sqlalchemy.orm import Session
++
++from app.models import EventRecord, SleepDetails
++from app.schemas.enums.provider import ProviderName
++from tests.factories import DataSourceFactory, EventRecordFactory, SleepDetailsFactory
++
++_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "data_migrations" / "dedupe_polar_sleep.py"
++
++
++def _load_module() -> ModuleType:
++    spec = importlib.util.spec_from_file_location("dedupe_polar_sleep", _SCRIPT_PATH)
++    assert spec is not None
++    assert spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++_module = _load_module()
++dedupe_polar_sleep = _module.dedupe_polar_sleep
++migrate = _module._migrate
++
++# A night in UTC+10: the user wakes up on 24 September, which is still 23 September in UTC.
++TZ = timezone(timedelta(hours=10))
++START = datetime(2026, 9, 23, 22, 0, tzinfo=TZ)
++END = datetime(2026, 9, 24, 6, 30, tzinfo=TZ)
++SESSION_MINUTES = 510
++# What one sync of the night stores
++MINUTES = {
++    "sleep_total_duration_minutes": 450,
++    "sleep_deep_minutes": 60,
++    "sleep_light_minutes": 180,
++    "sleep_rem_minutes": 210,
++    "sleep_awake_minutes": 60,
++}
++NOTHING_DONE = {"sessions_repaired": 0, "external_ids_set": 0, "sessions_skipped": 0}
++
++
++def _stages(end: datetime = END) -> list[dict[str, str]]:
++    bounds = [START, START + timedelta(hours=1), START + timedelta(hours=4), end]
++    return [
++        {"stage": stage, "start_time": start.isoformat(), "end_time": stop.isoformat()}
++        for stage, start, stop in zip(["light", "deep", "rem"], bounds, bounds[1:])
++    ]
++
++
++def _sleep(
++    provider: ProviderName = ProviderName.POLAR,
++    *,
++    copies: int = 1,
++    stages: list[dict[str, str]] | None = None,
++    with_stages: bool = True,
++    end: datetime = END,
++) -> UUID:
++    """Id of a sleep session as `copies` syncs of the same night left it.
++
++    The merge adds up the minutes of a night without stages and recomputes them from the timeline otherwise.
++    """
++    session_minutes = int((end - START).total_seconds()) // 60
++    timeline = (stages or _stages(end)) if with_stages else None
++    record = EventRecordFactory(
++        data_source=DataSourceFactory(provider=provider),
++        category="sleep",
++        type="sleep_session",
++        start_datetime=START,
++        end_datetime=end,
++        duration_seconds=session_minutes * 60,
++    )
++    SleepDetailsFactory(
++        event_record=record,
++        sleep_stages=timeline * copies if timeline else None,
++        sleep_time_in_bed_minutes=session_minutes * copies,
++        **{name: minutes * (1 if timeline else copies) for name, minutes in MINUTES.items()},
++    )
++    return record.id
++
++
++def _stored(db: Session, record_id: UUID) -> tuple[EventRecord, SleepDetails]:
++    db.expire_all()
++    return db.get(EventRecord, record_id), db.query(SleepDetails).filter_by(record_id=record_id).one()
++
++
++def test_keeps_one_copy_of_stages_and_time_in_bed(db: Session) -> None:
++    record = _sleep(copies=3)
++
++    result = dedupe_polar_sleep(db, dry_run=False)
++
++    _, detail = _stored(db, record)
++    assert result["sessions_repaired"] == 1
++    assert detail.sleep_stages == _stages()
++    assert detail.sleep_time_in_bed_minutes == SESSION_MINUTES
++    assert {name: getattr(detail, name) for name in MINUTES} == MINUTES
++
++
++def test_divides_the_added_up_minutes_of_a_night_without_stages(db: Session) -> None:
++    record = _sleep(copies=3, with_stages=False)
++
++    dedupe_polar_sleep(db, dry_run=False)
++
++    _, detail = _stored(db, record)
++    assert detail.sleep_time_in_bed_minutes == SESSION_MINUTES
++    assert {name: getattr(detail, name) for name in MINUTES} == MINUTES
++
++
++def test_night_without_stages_keeps_no_id(db: Session) -> None:
++    """Without stages there is no offset to read its local date with; a re-sync gives it Polar's id."""
++    record = _sleep(copies=3, with_stages=False)
++
++    result = dedupe_polar_sleep(db, dry_run=False)
++
++    assert result["external_ids_set"] == 0
++    assert _stored(db, record)[0].external_id is None
++
++
++def test_keys_the_night_by_its_local_wake_up_date(db: Session) -> None:
++    record = _sleep()
++
++    result = dedupe_polar_sleep(db, dry_run=False)
++
++    stored, _ = _stored(db, record)
++    assert result["external_ids_set"] == 1
++    assert stored.external_id == "sleep-2026-09-24"
++
++
++def test_wake_up_date_comes_from_the_session_end_not_the_last_stage(db: Session) -> None:
++    """Polar's last hypnogram block can end past the session: here after midnight, while the user woke before it."""
++    end = datetime(2026, 9, 23, 23, 59, 30, tzinfo=TZ)
++    record = _sleep(end=end, stages=_stages(end=datetime(2026, 9, 24, 0, 0, tzinfo=TZ)))
++
++    dedupe_polar_sleep(db, dry_run=False)
++
++    stored, _ = _stored(db, record)
++    assert stored.external_id == "sleep-2026-09-23"
++
++
++def test_skips_a_night_it_cannot_read_and_repairs_the_rest(db: Session) -> None:
++    unreadable = _sleep(copies=2, stages=[{"stage": "light", "start_time": START.isoformat()}])
++    readable = _sleep(copies=3)
++
++    result = dedupe_polar_sleep(db, dry_run=False)
++
++    assert result == {"sessions_repaired": 1, "external_ids_set": 1, "sessions_skipped": 1}
++    assert _stored(db, unreadable)[1].sleep_time_in_bed_minutes == 2 * SESSION_MINUTES
++    assert _stored(db, readable)[1].sleep_time_in_bed_minutes == SESSION_MINUTES
++
++
++def test_run_with_a_skipped_night_is_still_recorded_as_done(db: Session) -> None:
++    """A night that can't be read won't be readable on a retry either; retrying would repeat the run every startup."""
++    _sleep(copies=2, stages=[{"stage": "light", "start_time": START.isoformat()}])
++
++    assert migrate(db, dry_run=False) is True
++
++
++def test_clean_run_is_recorded_as_done(db: Session) -> None:
++    _sleep(copies=2)
++
++    assert migrate(db, dry_run=False) is True
++
++
++def test_repairs_every_batch(db: Session) -> None:
++    records = [_sleep(copies=2) for _ in range(3)]
++
++    result = dedupe_polar_sleep(db, dry_run=False, batch_size=2)
++
++    assert result == {"sessions_repaired": 3, "external_ids_set": 3, "sessions_skipped": 0}
++    assert all(len(_stored(db, record)[1].sleep_stages) == 3 for record in records)
++
++
++def test_leaves_other_providers_untouched(db: Session) -> None:
++    record = _sleep(ProviderName.OURA, copies=3)
++
++    result = dedupe_polar_sleep(db, dry_run=False)
++
++    stored, detail = _stored(db, record)
++    assert result == NOTHING_DONE
++    assert len(detail.sleep_stages) == 9
++    assert stored.external_id is None
++
++
++def test_dry_run_makes_no_changes(db: Session) -> None:
++    record = _sleep(copies=3)
++
++    result = dedupe_polar_sleep(db, dry_run=True)
++
++    stored, detail = _stored(db, record)
++    assert result == {"sessions_repaired": 1, "external_ids_set": 1, "sessions_skipped": 0}
++    assert len(detail.sleep_stages) == 9
++    assert stored.external_id is None
++
++
++def test_second_run_is_a_noop(db: Session) -> None:
++    _sleep(copies=3)
++    _sleep(copies=3, with_stages=False)
++
++    dedupe_polar_sleep(db, dry_run=False)
++
++    assert dedupe_polar_sleep(db, dry_run=False) == NOTHING_DONE

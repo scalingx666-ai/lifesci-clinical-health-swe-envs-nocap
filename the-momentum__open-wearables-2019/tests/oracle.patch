@@ -1,0 +1,610 @@
+diff --git a/backend/app/services/providers/polar/workouts.py b/backend/app/services/providers/polar/workouts.py
+index 1aa5bd0b01..c67b3abc4b 100644
+--- a/backend/app/services/providers/polar/workouts.py
++++ b/backend/app/services/providers/polar/workouts.py
+@@ -66,10 +66,10 @@ def _extract_dates_with_offset(
+         start_time_utc_offset: int,
+         duration: str,
+     ) -> tuple[datetime, datetime]:
+-        """Extract start and end dates from timestamps with UTC offset."""
+-        start_date = isodate.parse_datetime(start_time)
++        """Start and end in UTC: ``start_time`` is naive local time, ``start_time_utc_offset`` its offset in minutes."""
++        local_start = isodate.parse_datetime(start_time)
+         offset = timedelta(minutes=start_time_utc_offset)
+-        start_date = start_date + offset
++        start_date = local_start - offset
+         duration_td = isodate.parse_duration(duration)
+         end_date = start_date + duration_td
+         return start_date, end_date
+diff --git a/backend/scripts/data_migrations/fix_polar_workout_utc_offset.py b/backend/scripts/data_migrations/fix_polar_workout_utc_offset.py
+new file mode 100644
+index 0000000000..26a96c550f
+--- /dev/null
++++ b/backend/scripts/data_migrations/fix_polar_workout_utc_offset.py
+@@ -0,0 +1,193 @@
++#!/usr/bin/env python3
++"""Move stored Polar workouts to the UTC time they happened at.
++
++Polar sends a workout's ``start_time`` as naive local time plus ``start_time_utc_offset`` in
++minutes. Ingestion added the offset instead of subtracting it, so every stored workout sits
++twice its offset in the future.
++
++Each connected user's exercise list is read once, the list the sync reads (``/v3/exercises``),
++which keeps the calls far below Polar's instance-wide rate limit. A workout on it gets its start
++recomputed from Polar's JSON, so a row the fixed ingestion already wrote stays where it is. One
++not on it, or whose user has no active connection or a token Polar refuses (401/403), can't have
++been written by the fixed ingestion, since the sync only stores what that list returns: it is
++moved back by twice its stored ``zone_offset``. One without a ``zone_offset`` (stored before
++#608) is left alone and reported.
++
++``event_record`` is unique on ``(data_source_id, start_datetime, end_datetime)``, not on
++``external_id``, so a sync on the fixed code may already have stored the corrected copy. The
++stale row is then deleted rather than moved onto it; a different workout on that slot is never
++deleted, only reported.
++
++Moved and deleted workouts have their old and new local days queued for the rollup, which
++recomputes their session statistics, and their data type coverage refreshed.
++
++Runs once per instance (``data_migration``), in one transaction with the record of the run:
++moving by the offset is not idempotent, so a run that fails commits nothing and the next
++startup tries again. Polar is read before anything is written, since a token refresh commits
++the session. Any Polar failure other than 401/403 aborts the run.
++
++Usage (inside Docker):
++    docker compose exec app uv run python scripts/data_migrations/fix_polar_workout_utc_offset.py --dry-run
++    docker compose exec app uv run python scripts/data_migrations/fix_polar_workout_utc_offset.py
++"""
++
++import argparse
++from datetime import date, datetime, timedelta, timezone
++from typing import Any
++from uuid import UUID
++
++from fastapi import HTTPException, status
++from sqlalchemy import Row, text
++from sqlalchemy.orm import Session
++
++from app.database import engine
++from app.integrations.rollup_queue import mark_dirty_days
++from app.repositories.data_type_coverage_repository import EventKey, data_type_coverage_repository
++from app.repositories.event_record_repository import local_days
++from app.schemas.enums import EventCategory
++from app.services.data_migration_service import data_migration_service
++from app.services.providers.factory import ProviderFactory
++from app.services.providers.polar.workouts import PolarWorkouts
++from app.utils.dates import iso_to_timezone
++
++PROVIDER = "polar"
++
++_EXERCISE_FIELDS = {"id", "start_time", "start_time_utc_offset", "duration"}
++
++# A token Polar refuses: the sync gets these too, so it can't have stored the workouts on the fixed code
++_REFUSED = {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN}
++
++_SELECT_WORKOUTS = text("""
++    SELECT er.id, er.external_id, er.data_source_id, ds.user_id, er.start_datetime, er.end_datetime,
++           er.zone_offset,
++           EXISTS (
++               SELECT 1 FROM user_connection uc
++               WHERE uc.user_id = ds.user_id AND uc.provider = :provider AND uc.status = 'active'
++           ) AS connected
++    FROM event_record er
++    JOIN data_source ds ON ds.id = er.data_source_id
++    WHERE er.category = :category AND ds.provider = :provider
++    ORDER BY er.start_datetime DESC
++""")
++
++# Whatever already sits on the corrected unique key, if anything
++_OCCUPANT = text("""
++    SELECT id, external_id FROM event_record
++    WHERE data_source_id = :data_source_id AND start_datetime = :start AND end_datetime = :end
++""")
++
++_UPDATE_TIMES = text("UPDATE event_record SET start_datetime = :start, end_datetime = :end WHERE id = :id")
++# Its detail, health scores and aggregates go with it (ON DELETE CASCADE)
++_DELETE_ROW = text("DELETE FROM event_record WHERE id = :id")
++
++
++def fix_polar_workout_times(db: Session, workouts_api: PolarWorkouts, *, dry_run: bool) -> dict[str, int]:
++    """Correct every stored Polar workout. Does not commit; the caller owns the transaction."""
++    counts = {
++        "corrected": 0,
++        "corrected_from_offset": 0,
++        "duplicate_dropped": 0,
++        "already_correct": 0,
++        "no_offset": 0,
++        "blocked": 0,
++    }
++    rows = db.execute(_SELECT_WORKOUTS, {"provider": PROVIDER, "category": EventCategory.WORKOUT}).all()
++    # Read before any write: a token refresh commits the session
++    served = {
++        user_id: _served_exercises(workouts_api, db, user_id) for user_id in {r.user_id for r in rows if r.connected}
++    }
++
++    days: list[tuple[UUID, date]] = []
++    coverage: set[EventKey] = set()
++    for row in rows:
++        exercise = served.get(row.user_id, {}).get(row.external_id)
++        corrected = _times_from_exercise(workouts_api, exercise) if exercise else None
++        from_offset = corrected is None
++        if from_offset:
++            corrected = _times_from_offset(row)
++        if corrected is None:
++            counts["no_offset"] += 1
++            continue
++
++        start, end = corrected
++        if start == row.start_datetime:
++            counts["already_correct"] += 1
++            continue
++
++        occupant = db.execute(_OCCUPANT, {"data_source_id": row.data_source_id, "start": start, "end": end}).first()
++        if occupant is not None and occupant.external_id != row.external_id:
++            print(f"  {row.external_id}: {start} is taken by {occupant.external_id}, left alone")
++            counts["blocked"] += 1
++            continue
++
++        if occupant is not None:
++            # A sync on the fixed code already stored the corrected copy
++            counts["duplicate_dropped"] += 1
++            if not dry_run:
++                db.execute(_DELETE_ROW, {"id": row.id})
++        else:
++            counts["corrected_from_offset" if from_offset else "corrected"] += 1
++            if not dry_run:
++                db.execute(_UPDATE_TIMES, {"id": row.id, "start": start, "end": end})
++        days += local_days(row.data_source_id, row.start_datetime, row.end_datetime, row.zone_offset)
++        days += local_days(row.data_source_id, start, end, row.zone_offset)
++        coverage.add((row.user_id, PROVIDER, EventCategory.WORKOUT))
++
++    if not dry_run:
++        mark_dirty_days(db, days)
++        data_type_coverage_repository.refresh_events(db, coverage)
++    print(f"{len(rows)} {PROVIDER} workouts: " + "  ".join(f"{k}={v}" for k, v in counts.items()))
++    return counts
++
++
++def _served_exercises(workouts_api: PolarWorkouts, db: Session, user_id: UUID) -> dict[str, dict]:
++    """The exercises Polar still lists for the user, by id; none if it refuses the token."""
++    try:
++        exercises = workouts_api.get_workouts_from_api(db, user_id) or []
++    except HTTPException as exc:
++        if exc.status_code in _REFUSED:
++            return {}
++        raise
++    # One the sync couldn't parse either counts as not listed
++    return {str(exercise["id"]): exercise for exercise in exercises if exercise.keys() >= _EXERCISE_FIELDS}
++
++
++def _times_from_exercise(workouts_api: PolarWorkouts, exercise: dict) -> tuple[datetime, datetime]:
++    """Start and end recomputed from Polar's exercise JSON."""
++    start, end = workouts_api._extract_dates_with_offset(
++        exercise["start_time"],
++        int(exercise["start_time_utc_offset"]),
++        exercise["duration"],
++    )
++    return start.replace(tzinfo=timezone.utc), end.replace(tzinfo=timezone.utc)
++
++
++def _times_from_offset(row: Row[Any]) -> tuple[datetime, datetime] | None:
++    """Start and end moved back by twice the stored offset; None without one."""
++    if row.zone_offset is None:
++        return None
++    shift = 2 * (iso_to_timezone(row.zone_offset).utcoffset(None) or timedelta(0))
++    return row.start_datetime - shift, row.end_datetime - shift
++
++
++def _migrate(db: Session, workouts_api: PolarWorkouts, dry_run: bool) -> bool:
++    fix_polar_workout_times(db, workouts_api, dry_run=dry_run)
++    if dry_run:
++        print("Dry run, no changes made.")
++    return not dry_run
++
++
++def main(dry_run: bool) -> None:
++    workouts_api = ProviderFactory().get_provider(PROVIDER).workouts
++    if not isinstance(workouts_api, PolarWorkouts):
++        raise RuntimeError("Polar strategy has no PolarWorkouts template")
++    with engine.connect() as connection, Session(bind=connection) as db:
++        data_migration_service.run(
++            db, "fix_polar_workout_utc_offset", lambda: _migrate(db, workouts_api, dry_run), dry_run=dry_run
++        )
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--dry-run", action="store_true", help="Preview affected rows without modifying data")
++    main(dry_run=parser.parse_args().dry_run)
+diff --git a/backend/scripts/start/app.sh b/backend/scripts/start/app.sh
+index f98aa727d5..a108444984 100755
+--- a/backend/scripts/start/app.sh
++++ b/backend/scripts/start/app.sh
+@@ -106,6 +106,13 @@ echo 'Running data source merge...'
+ uv run python scripts/data_migrations/merge_duplicate_data_sources.py \
+     || echo "Warning: data source merge failed — will retry on next startup."
+ 
++# TODO: Remove this after ~2027-03-01 once all deployments have migrated.
++# Moves Polar workouts stored twice their UTC offset in the future to their real time, before the
++# aggregate backfill reads them. Runs once per instance (data_migration).
++echo 'Running Polar workout time fix...'
++uv run python scripts/data_migrations/fix_polar_workout_utc_offset.py \
++    || echo "Warning: Polar workout time fix failed — will retry on next startup."
++
+ # Queues the one-off copy of the history into the aggregate tables; it runs in Celery, not here.
+ # A run waits for the data source merge's data_migration row, since beat queues it too.
+ echo 'Queueing aggregate backfill...'
+diff --git a/backend/tests/providers/polar/test_polar_workouts.py b/backend/tests/providers/polar/test_polar_workouts.py
+index e9576b7375..59a5866c50 100644
+--- a/backend/tests/providers/polar/test_polar_workouts.py
++++ b/backend/tests/providers/polar/test_polar_workouts.py
+@@ -92,11 +92,9 @@ def test_extract_dates_with_offset_positive_offset(self, db: Session) -> None:
+             duration="PT1H0M0S",  # 1 hour
+         )
+ 
+-        # Assert
+-        assert isinstance(start_date, datetime)
+-        assert isinstance(end_date, datetime)
+-        assert end_date > start_date
+-        assert (end_date - start_date).total_seconds() == 3600  # 1 hour
++        # Assert: 08:00 local at +1 is 07:00 UTC
++        assert start_date == datetime(2024, 1, 15, 7, 0, 0)
++        assert end_date == datetime(2024, 1, 15, 8, 0, 0)
+ 
+     def test_extract_dates_with_offset_negative_offset(self, db: Session) -> None:
+         """Test extracting dates with negative UTC offset."""
+@@ -131,10 +129,9 @@ def test_extract_dates_with_offset_negative_offset(self, db: Session) -> None:
+             duration="PT30M0S",  # 30 minutes
+         )
+ 
+-        # Assert
+-        assert isinstance(start_date, datetime)
+-        assert isinstance(end_date, datetime)
+-        assert (end_date - start_date).total_seconds() == 1800  # 30 minutes
++        # Assert: 08:00 local at -5 is 13:00 UTC
++        assert start_date == datetime(2024, 1, 15, 13, 0, 0)
++        assert end_date == datetime(2024, 1, 15, 13, 30, 0)
+ 
+     def test_extract_dates_not_implemented_fallback(self, db: Session) -> None:
+         """Test that _extract_dates raises NotImplementedError for Polar."""
+diff --git a/backend/tests/scripts/test_fix_polar_workout_utc_offset.py b/backend/tests/scripts/test_fix_polar_workout_utc_offset.py
+new file mode 100644
+index 0000000000..c84389c4a8
+--- /dev/null
++++ b/backend/tests/scripts/test_fix_polar_workout_utc_offset.py
+@@ -0,0 +1,336 @@
++"""Tests for the correction of Polar workout times, see scripts/data_migrations/fix_polar_workout_utc_offset.py."""
++
++import importlib.util
++from datetime import date, datetime, timedelta, timezone
++from pathlib import Path
++from types import ModuleType
++from typing import Any
++from unittest.mock import MagicMock, patch
++from uuid import UUID
++
++import pytest
++from fastapi import HTTPException
++from sqlalchemy.orm import Session
++
++from app.integrations.rollup_queue import pop_dirty_days
++from app.models import EventRecord
++from app.schemas.auth import ConnectionStatus
++from app.schemas.enums.provider import ProviderName
++from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
++
++_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "data_migrations" / "fix_polar_workout_utc_offset.py"
++
++
++def _load_module() -> ModuleType:
++    spec = importlib.util.spec_from_file_location("fix_polar_workout_utc_offset", _SCRIPT_PATH)
++    assert spec is not None
++    assert spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++_module = _load_module()
++fix = _module.fix_polar_workout_times
++migrate = _module._migrate
++
++# Polar says 09:20 local at +2, so the truth is 07:20 UTC. The old code stored 11:20.
++_LOCAL = "2026-09-12T09:20:47"
++_OFFSET = 120
++_DURATION = timedelta(seconds=4412)
++_STALE_START = datetime(2026, 9, 12, 11, 20, 47, tzinfo=timezone.utc)
++_TRUE_START = datetime(2026, 9, 12, 7, 20, 47, tzinfo=timezone.utc)
++
++
++def _workouts_api(exercises: dict[str, dict], refused: dict[UUID, Exception] | None = None) -> MagicMock:
++    """A PolarWorkouts stand-in: real offset maths, Polar's exercise list as canned JSON by exercise id."""
++    from app.services.providers.polar.workouts import PolarWorkouts
++
++    api = MagicMock()
++    api._extract_dates_with_offset = PolarWorkouts._extract_dates_with_offset.__get__(api)
++
++    def exercise_list(_db: Session, user_id: UUID, **_kwargs: Any) -> list[dict]:
++        if refused and user_id in refused:
++            raise refused[user_id]
++        return [{**exercise, "id": exercise_id} for exercise_id, exercise in exercises.items()]
++
++    api.get_workouts_from_api.side_effect = exercise_list
++    return api
++
++
++def _polar_json() -> dict:
++    return {"start_time": _LOCAL, "start_time_utc_offset": _OFFSET, "duration": "PT4412S"}
++
++
++def _stale_workout(
++    db: Session,
++    external_id: str,
++    *,
++    active: bool = True,
++    zone_offset: str | None = "+02:00",
++    start: datetime = _STALE_START,
++    duration: timedelta = _DURATION,
++    source: Any = None,
++) -> tuple[EventRecord, Any]:
++    if source is None:
++        user = UserFactory()
++        UserConnectionFactory(
++            user=user,
++            provider="polar",
++            status=ConnectionStatus.ACTIVE if active else ConnectionStatus.REVOKED,
++        )
++        source = DataSourceFactory(user=user, provider=ProviderName.POLAR, source="polar")
++    record = EventRecordFactory(
++        data_source=source,
++        external_id=external_id,
++        start_datetime=start,
++        end_datetime=start + duration,
++        zone_offset=zone_offset,
++    )
++    return record, source
++
++
++def _start_of(db: Session, record_id: UUID) -> datetime | None:
++    row = db.get(EventRecord, record_id)
++    return row.start_datetime if row else None
++
++
++class TestCorrection:
++    def test_moves_the_row_to_its_true_utc_time(self, db: Session) -> None:
++        # Arrange
++        record, _ = _stale_workout(db, "EX1")
++
++        # Act
++        counts = fix(db, _workouts_api({"EX1": _polar_json()}), dry_run=False)
++
++        # Assert
++        db.expire_all()
++        assert _start_of(db, record.id) == _TRUE_START
++        assert counts["corrected"] == 1
++
++    def test_dry_run_changes_nothing(self, db: Session) -> None:
++        # Arrange
++        record, _ = _stale_workout(db, "EX1")
++
++        # Act
++        fix(db, _workouts_api({"EX1": _polar_json()}), dry_run=True)
++
++        # Assert
++        db.expire_all()
++        assert _start_of(db, record.id) == _STALE_START
++
++    def test_is_idempotent(self, db: Session) -> None:
++        # Arrange
++        record, _ = _stale_workout(db, "EX1")
++        api = _workouts_api({"EX1": _polar_json()})
++
++        # Act
++        fix(db, api, dry_run=False)
++        db.expire_all()
++        second = fix(db, api, dry_run=False)
++
++        # Assert
++        assert second["corrected"] == 0
++        assert second["already_correct"] == 1
++
++
++class TestAlreadySyncedCopy:
++    """A sync on the fixed code ran before the script: the corrected copy exists."""
++
++    def test_drops_the_stale_row_instead_of_colliding(self, db: Session) -> None:
++        # Arrange
++        stale, source = _stale_workout(db, "EX1")
++        copy = EventRecordFactory(
++            data_source=source,
++            external_id="EX1",
++            start_datetime=_TRUE_START,
++            end_datetime=_TRUE_START + _DURATION,
++        )
++        stale_id, copy_id = stale.id, copy.id
++
++        # Act — moving the stale row onto the copy's key would raise a unique violation
++        counts = fix(db, _workouts_api({"EX1": _polar_json()}), dry_run=False)
++
++        # Assert
++        db.expire_all()
++        assert db.get(EventRecord, stale_id) is None
++        assert _start_of(db, copy_id) == _TRUE_START
++        assert counts["duplicate_dropped"] == 1
++
++    def test_never_deletes_a_different_workout_in_the_way(self, db: Session) -> None:
++        # Arrange
++        stale, source = _stale_workout(db, "EX1")
++        other = EventRecordFactory(
++            data_source=source,
++            external_id="SOMETHING_ELSE",
++            start_datetime=_TRUE_START,
++            end_datetime=_TRUE_START + _DURATION,
++        )
++
++        # Act — the other workout is Polar too, and already at its true time
++        counts = fix(db, _workouts_api({"EX1": _polar_json(), "SOMETHING_ELSE": _polar_json()}), dry_run=False)
++
++        # Assert — both survive untouched
++        db.expire_all()
++        assert _start_of(db, stale.id) == _STALE_START
++        assert _start_of(db, other.id) == _TRUE_START
++        assert counts["blocked"] == 1
++
++
++class TestFailures:
++    def test_a_workout_no_longer_on_polars_list_moves_by_its_stored_offset(self, db: Session) -> None:
++        """The sync reads the same list, so the fixed code can't have written it."""
++        # Arrange
++        listed, source = _stale_workout(db, "EX1")
++        gone, _ = _stale_workout(db, "GONE", source=source, start=_STALE_START + timedelta(days=1))
++
++        # Act
++        counts = fix(db, _workouts_api({"EX1": _polar_json()}), dry_run=False)
++
++        # Assert
++        db.expire_all()
++        assert _start_of(db, listed.id) == _TRUE_START
++        assert _start_of(db, gone.id) == _TRUE_START + timedelta(days=1)
++        assert (counts["corrected"], counts["corrected_from_offset"]) == (1, 1)
++
++    @pytest.mark.parametrize("status_code", [401, 403])
++    def test_a_token_polar_refuses_moves_its_workouts_by_the_stored_offset(self, db: Session, status_code: int) -> None:
++        # Arrange
++        refused, refused_source = _stale_workout(db, "GONE")
++        fetched, _ = _stale_workout(db, "EX1")
++        api = _workouts_api({"EX1": _polar_json()}, {refused_source.user_id: HTTPException(status_code=status_code)})
++
++        # Act
++        counts = fix(db, api, dry_run=False)
++
++        # Assert
++        db.expire_all()
++        assert _start_of(db, refused.id) == _TRUE_START
++        assert _start_of(db, fetched.id) == _TRUE_START
++        assert (counts["corrected"], counts["corrected_from_offset"]) == (1, 1)
++
++    def test_any_other_failure_aborts(self, db: Session) -> None:
++        """Skipping a row the next sync CAN fetch would leave it to be duplicated."""
++        # Arrange
++        _, source = _stale_workout(db, "FLAKY")
++        api = _workouts_api({}, {source.user_id: HTTPException(status_code=502)})
++
++        # Act / Assert
++        with pytest.raises(HTTPException):
++            fix(db, api, dry_run=False)
++
++    def test_a_user_without_an_active_connection_moves_by_the_stored_offset_without_a_call(self, db: Session) -> None:
++        # Arrange
++        record, _ = _stale_workout(db, "EX1", active=False)
++        api = _workouts_api({})
++
++        # Act
++        counts = fix(db, api, dry_run=False)
++
++        # Assert
++        api.get_workouts_from_api.assert_not_called()
++        db.expire_all()
++        assert _start_of(db, record.id) == _TRUE_START
++        assert counts["corrected_from_offset"] == 1
++
++    def test_a_workout_without_a_stored_offset_is_left_alone(self, db: Session) -> None:
++        """Stored before zone_offset was (#608): there is nothing to move it by."""
++        # Arrange
++        record, _ = _stale_workout(db, "EX1", active=False, zone_offset=None)
++
++        # Act
++        counts = fix(db, _workouts_api({}), dry_run=False)
++
++        # Assert
++        db.expire_all()
++        assert _start_of(db, record.id) == _STALE_START
++        assert counts["no_offset"] == 1
++
++
++class TestPolarCalls:
++    def test_reads_each_users_exercise_list_once(self, db: Session) -> None:
++        """Polar's rate limit is shared by the whole instance: one call per user, not per workout."""
++        # Arrange
++        _, source = _stale_workout(db, "EX1")
++        _stale_workout(db, "EX2", source=source, start=_STALE_START + timedelta(days=1))
++        api = _workouts_api({"EX1": _polar_json()})
++
++        # Act
++        fix(db, api, dry_run=False)
++
++        # Assert
++        assert api.get_workouts_from_api.call_count == 1
++
++    def test_reads_polar_before_writing_anything(self, db: Session) -> None:
++        """A token refresh commits the session, so a write before a later failing call would stick."""
++        # Arrange: the first user's workout comes first in the run, the second user's call fails
++        first, first_source = _stale_workout(db, "EX1", start=_STALE_START + timedelta(days=1))
++        _, second_source = _stale_workout(db, "EX2")
++        api = _workouts_api({}, {second_source.user_id: HTTPException(status_code=502)})
++        listed = api.get_workouts_from_api.side_effect
++
++        def refreshing(db_session: Session, user_id: UUID, **kwargs: Any) -> list[dict]:
++            db_session.commit()
++            return listed(db_session, user_id, **kwargs)
++
++        api.get_workouts_from_api.side_effect = refreshing
++
++        # Act
++        with pytest.raises(HTTPException):
++            fix(db, api, dry_run=False)
++
++        # Assert
++        db.rollback()
++        db.expire_all()
++        assert _start_of(db, first.id) == _STALE_START + timedelta(days=1)
++
++    def test_an_exercise_missing_its_offset_moves_by_the_stored_one(self, db: Session) -> None:
++        # Arrange
++        record, _ = _stale_workout(db, "EX1")
++        incomplete = {"start_time": _LOCAL, "duration": "PT4412S"}
++
++        # Act
++        counts = fix(db, _workouts_api({"EX1": incomplete}), dry_run=False)
++
++        # Assert
++        db.expire_all()
++        assert _start_of(db, record.id) == _TRUE_START
++        assert counts["corrected_from_offset"] == 1
++
++
++class TestRollupAndCoverage:
++    def test_queues_the_old_and_new_local_days_for_the_rollup(self, db: Session) -> None:
++        # Arrange: 23:00 local at +2 on 12 September; the old code stored 01:00 UTC on the 13th.
++        pop_dirty_days(100)
++        record, source = _stale_workout(
++            db, "EX1", start=datetime(2026, 9, 13, 1, 0, tzinfo=timezone.utc), duration=timedelta(minutes=30)
++        )
++        late = {"start_time": "2026-09-12T23:00:00", "start_time_utc_offset": _OFFSET, "duration": "PT30M"}
++
++        # Act
++        fix(db, _workouts_api({"EX1": late}), dry_run=False)
++        db.commit()
++
++        # Assert
++        assert set(pop_dirty_days(100)) == {(source.id, date(2026, 9, 12)), (source.id, date(2026, 9, 13))}
++
++    def test_refreshes_the_coverage_of_the_moved_workouts(self, db: Session) -> None:
++        # Arrange
++        _, source = _stale_workout(db, "EX1")
++
++        # Act
++        with patch.object(_module, "data_type_coverage_repository") as coverage:
++            fix(db, _workouts_api({"EX1": _polar_json()}), dry_run=False)
++
++        # Assert
++        [keys] = [call.args[1] for call in coverage.refresh_events.call_args_list]
++        assert set(keys) == {(source.user_id, "polar", "workout")}
++
++
++class TestRecording:
++    def test_a_run_is_recorded_as_done_unless_dry(self, db: Session) -> None:
++        _stale_workout(db, "EX1")
++        api = _workouts_api({"EX1": _polar_json()})
++
++        assert migrate(db, api, dry_run=True) is False
++        assert migrate(db, api, dry_run=False) is True

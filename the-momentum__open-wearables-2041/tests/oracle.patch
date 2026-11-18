@@ -1,0 +1,822 @@
+diff --git a/backend/app/services/providers/api_client.py b/backend/app/services/providers/api_client.py
+index 183b8a737b..7b993e9d3f 100644
+--- a/backend/app/services/providers/api_client.py
++++ b/backend/app/services/providers/api_client.py
+@@ -160,8 +160,10 @@ def _note_auth_success(db: DbSession, user_id: UUID, provider_name: str) -> None
+         seen.add((user_id, provider_name))
+ 
+ 
+-def _note_auth_failure(db: DbSession, user_id: UUID, provider_name: str, oauth: BaseOAuthTemplate) -> None:
+-    """Revoke the grant and raise ReauthRequiredError once it has failed without a success for DEAD_GRANT_AFTER."""
++def _note_auth_failure(
++    db: DbSession, user_id: UUID, provider_name: str, oauth: BaseOAuthTemplate, *, revoke_on_failure: bool = True
++) -> None:
++    """Raise ReauthRequiredError once the grant has failed for DEAD_GRANT_AFTER, revoking it unless the caller does."""
+     db.info.setdefault(_AUTH_OK_KEY, set()).discard((user_id, provider_name))
+     redis_client = get_redis_client()
+     key = _failing_since_key(provider_name, user_id)
+@@ -170,7 +172,8 @@ def _note_auth_failure(db: DbSession, user_id: UUID, provider_name: str, oauth:
+     if now - float(redis_client.get(key) or now) < DEAD_GRANT_AFTER.total_seconds():
+         return
+     redis_client.delete(key)
+-    oauth.revoke_connection(db, user_id, reason="auth_failing")
++    if revoke_on_failure:
++        oauth.revoke_connection(db, user_id, reason="auth_failing")
+     raise ReauthRequiredError(
+         provider_name, user_id, f"{provider_name} rejected every request for a day; reconnection required"
+     )
+@@ -190,12 +193,15 @@ def _reload_token_after_401(
+     connection_repo: UserConnectionRepository,
+     oauth: BaseOAuthTemplate,
+     rejected_token: str,
++    *,
++    revoke_on_failure: bool = True,
+ ) -> str | None:
+     """A token to retry with after the provider rejected one, or None when there is none.
+ 
+     Another worker may have refreshed the connection since, which voids the old token at some
+     providers. Otherwise the token is refreshed early: a grant the user revoked at the provider
+-    rejects its refresh token as well, which revokes the connection and raises ReauthRequiredError.
++    rejects its refresh token as well, which raises ReauthRequiredError and, unless
++    ``revoke_on_failure`` is False, revokes the connection.
+     """
+     invalidate_cached_token(db, user_id, provider_name)
+     cache_key = (user_id, provider_name)
+@@ -209,7 +215,9 @@ def _reload_token_after_401(
+         # Without a refresh token the grant can't be told apart from an endpoint the user didn't consent to
+         if not connection.refresh_token:
+             return None
+-        token_response = oauth.refresh_access_token(db, user_id, connection.refresh_token)
++        token_response = oauth.refresh_access_token(
++            db, user_id, connection.refresh_token, revoke_on_failure=revoke_on_failure
++        )
+         return _cache_token(db, cache_key, token_response.access_token, connection.token_expires_at)
+ 
+ 
+@@ -229,6 +237,7 @@ def make_authenticated_request(
+     expect_json: bool = True,
+     http2: bool = False,
+     check_body_errors: bool = True,
++    revoke_on_failure: bool = True,
+ ) -> Any:
+     """Make authenticated request to provider API.
+ 
+@@ -256,6 +265,9 @@ def make_authenticated_request(
+         check_body_errors: Raise when a 200 body carries an ``error`` or a non-200 ``code``
+             (default True). Set to False for providers whose envelope carries its own
+             status, e.g. Withings, so the caller can tell a throttle from a failure.
++        revoke_on_failure: Revoke the connection when the grant turns out to be dead (default
++            True). Set to False when the caller revokes it itself with a more specific reason;
++            ReauthRequiredError is raised either way.
+ 
+     Returns:
+         Any: API response JSON, or dict with status_code if expect_json=False
+@@ -269,7 +281,9 @@ def make_authenticated_request(
+         raise ValueError("form_data and json_data are mutually exclusive")
+ 
+     # Get valid token (will auto-refresh if needed)
+-    access_token = get_valid_token(db, user_id, provider_name, connection_repo, oauth)
++    access_token = get_valid_token(
++        db, user_id, provider_name, connection_repo, oauth, revoke_on_failure=revoke_on_failure
++    )
+ 
+     # Prepare headers
+     request_headers = {
+@@ -374,13 +388,19 @@ def make_authenticated_request(
+             if e.response.status_code == 401 and not token_reloaded and attempt < MAX_RETRIES:
+                 token_reloaded = True
+                 if new_token := _reload_token_after_401(
+-                    db, user_id, provider_name, connection_repo, oauth, access_token
++                    db,
++                    user_id,
++                    provider_name,
++                    connection_repo,
++                    oauth,
++                    access_token,
++                    revoke_on_failure=revoke_on_failure,
+                 ):
+                     access_token = new_token
+                     request_headers["Authorization"] = f"Bearer {access_token}"
+                     continue
+             if e.response.status_code in (401, 403):
+-                _note_auth_failure(db, user_id, provider_name, oauth)
++                _note_auth_failure(db, user_id, provider_name, oauth, revoke_on_failure=revoke_on_failure)
+ 
+             logger.error(
+                 "API error",
+diff --git a/backend/app/services/providers/strava/webhook_handler.py b/backend/app/services/providers/strava/webhook_handler.py
+index 01d71fee98..afde43bf4a 100644
+--- a/backend/app/services/providers/strava/webhook_handler.py
++++ b/backend/app/services/providers/strava/webhook_handler.py
+@@ -4,12 +4,11 @@
+ ID, object ID, and aspect type. Full activity data must be fetched via
+ GET /activities/{id}.
+ 
+-Signature scheme
+-----------------
+-  Header   : X-Strava-Signature: t=<unix_ts>,v1=<hex_digest>
+-  Message  : {t}.{raw_request_body}
+-  Algorithm: HMAC-SHA256(strava_client_secret, message)
+-  Tolerance: settings.strava_webhook_signature_tolerance_seconds (default 300)
++Authenticity
++------------
++  X-Strava-Signature can't be verified (Strava doesn't expose its signing key), so only its
++  timestamp is checked, against replays. A delete or a deauthorization is confirmed in the
++  Strava API with the athlete's token before anything is removed.
+ 
+ Challenge verification
+ -----------------------
+@@ -25,7 +24,8 @@
+ 
+ Supported event types
+ ---------------------
+-  activity create / update / delete + athlete deauthorize (delete)
++  activity create / update / delete, and athlete deauthorization (an athlete update
++  with updates == {"authorized": "false"})
+ 
+ See: https://developers.strava.com/docs/webhooks/
+ """
+@@ -50,7 +50,13 @@
+ from app.services.providers.strava.workouts import StravaWorkouts
+ from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
+ from app.services.raw_payload_storage import store_raw_payload
+-from app.utils.exceptions import InvalidInputError, PermissionDeniedError, is_unique_violation
++from app.utils.exceptions import (
++    InvalidInputError,
++    PermissionDeniedError,
++    ProviderError,
++    ReauthRequiredError,
++    is_unique_violation,
++)
+ from app.utils.structured_logging import get_logger
+ 
+ logger = get_logger(__name__)
+@@ -71,11 +77,7 @@ def __init__(self, workouts: StravaWorkouts) -> None:
+     # ------------------------------------------------------------------
+ 
+     def verify_signature(self, request: Request, body: bytes) -> bool:
+-        """Validate timestamp from X-Strava-Signature; skip HMAC.
+-
+-        Security relies on the hub.challenge handshake at subscription time.
+-        Replays are rejected using the timestamp in X-Strava-Signature.
+-        """
++        """Check the X-Strava-Signature timestamp only; its HMAC can't be verified (see the module docstring)."""
+         header = request.headers.get("X-Strava-Signature", "")
+         if not header:
+             return False
+@@ -162,9 +164,37 @@ def handle_challenge(self, request: Request) -> dict[str, Any]:
+         return {"hub.challenge": hub_challenge}
+ 
+     def supported_event_types(self) -> list[str]:
+-        return ["activity_create", "activity_update", "activity_delete", "athlete_delete"]
++        return ["activity_create", "activity_update", "activity_delete", "athlete_update"]
+ 
+     def _handle_activity_delete(self, db: DbSession, user_id: UUID, activity_id: int, trace_id: str) -> dict[str, Any]:
++        # Nothing to delete: a forged event must not spend the app-wide Strava rate limit
++        if not event_record_service.crud.get_by_external_ids(db, user_id, [str(activity_id)], provider="strava"):
++            logger.info(
++                "Strava activity not stored, ignoring delete event",
++                provider="strava",
++                trace_id=trace_id,
++                action="webhook_activity_delete_not_stored",
++                activity_id=activity_id,
++                user_id=str(user_id),
++            )
++            return {"status": "ignored", "reason": "activity_not_stored", "activity_id": activity_id}
++
++        try:
++            self.workouts.get_workout_detail_from_api(db, user_id, str(activity_id))
++        except ProviderError as exc:
++            if exc.upstream_status != 404:
++                raise
++        else:
++            logger.warning(
++                "Strava still has the activity, ignoring delete event",
++                provider="strava",
++                trace_id=trace_id,
++                action="webhook_activity_delete_unconfirmed",
++                activity_id=activity_id,
++                user_id=str(user_id),
++            )
++            return {"status": "ignored", "reason": "activity_still_exists", "activity_id": activity_id}
++
+         deleted = event_record_service.crud.delete_by_external_id(db, user_id, str(activity_id), provider="strava")
+         logger.info(
+             "Strava activity deleted",
+@@ -177,6 +207,15 @@ def _handle_activity_delete(self, db: DbSession, user_id: UUID, activity_id: int
+         )
+         return {"status": "deleted", "activity_id": activity_id, "records_deleted": deleted}
+ 
++    @staticmethod
++    def _is_deauthorization(event: StravaWebhookEvent) -> bool:
++        """Strava reports a deauthorization as an athlete update with authorized == "false"."""
++        return (
++            event.object_type == "athlete"
++            and event.aspect_type == "update"
++            and event.updates.get("authorized") in ("false", False)
++        )
++
+     def _handle_athlete_deauthorize(self, db: DbSession, owner_id: int, trace_id: str) -> dict[str, Any]:
+         connection = self.connection_repo.get_by_provider_user_id(db, "strava", str(owner_id))
+         if not connection:
+@@ -189,16 +228,23 @@ def _handle_athlete_deauthorize(self, db: DbSession, owner_id: int, trace_id: st
+             )
+             return {"status": "user_not_found", "strava_athlete_id": owner_id}
+ 
+-        self.connection_repo.disconnect(db, connection.user_id, "strava")
+-        logger.info(
+-            "Strava athlete deauthorized",
++        user_id = connection.user_id
++        # Strava rejects both tokens of a deauthorized grant; we revoke, so the reason is "deregistration"
++        try:
++            self.workouts.get_athlete_from_api(db, user_id, revoke_on_failure=False)
++        except ReauthRequiredError:
++            self.workouts.oauth.revoke_connection(db, user_id, reason="deregistration")
++            return {"status": "deauthorized", "strava_athlete_id": owner_id}
++
++        logger.warning(
++            "Strava still authorizes the athlete, ignoring deauthorization event",
+             provider="strava",
+             trace_id=trace_id,
+-            action="webhook_athlete_deauthorized",
++            action="webhook_athlete_deauth_unconfirmed",
+             strava_athlete_id=owner_id,
+-            user_id=str(connection.user_id),
++            user_id=str(user_id),
+         )
+-        return {"status": "deauthorized", "strava_athlete_id": owner_id}
++        return {"status": "ignored", "reason": "athlete_still_authorized", "strava_athlete_id": owner_id}
+ 
+     def process_payload(self, db: DbSession, payload: dict[str, Any], trace_id: str) -> dict[str, Any]:
+         """Process a Strava notify-only payload.
+@@ -222,7 +268,7 @@ def process_payload(self, db: DbSession, payload: dict[str, Any], trace_id: str)
+         object_id = event.object_id
+         owner_id = event.owner_id
+ 
+-        if object_type == "athlete" and aspect_type == "delete":
++        if self._is_deauthorization(event):
+             return self._handle_athlete_deauthorize(db, owner_id, trace_id)
+ 
+         if object_type != "activity":
+diff --git a/backend/app/services/providers/strava/workouts.py b/backend/app/services/providers/strava/workouts.py
+index 4eedf1dbb4..1c6c7a7492 100644
+--- a/backend/app/services/providers/strava/workouts.py
++++ b/backend/app/services/providers/strava/workouts.py
+@@ -21,6 +21,7 @@
+     StravaStreamSet,
+ )
+ from app.services.event_record_service import event_record_service
++from app.services.providers.api_client import make_authenticated_request
+ from app.services.providers.strava.coverage import STREAM_KEY_SERIES_TYPE, STREAM_KEYS_PARAM
+ from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
+ from app.services.timeseries_service import timeseries_service
+@@ -133,6 +134,20 @@ def get_workout_detail_from_api(self, db: DbSession, user_id: UUID, workout_id:
+         # hard-coded value - update with base template changes
+         return self._make_api_request(db, user_id, f"/api/v3/activities/{workout_id}")
+ 
++    def get_athlete_from_api(self, db: DbSession, user_id: UUID, *, revoke_on_failure: bool = True) -> Any:
++        """The authenticated athlete; ReauthRequiredError once the athlete deauthorized the app."""
++        return make_authenticated_request(
++            db=db,
++            user_id=user_id,
++            connection_repo=self.connection_repo,
++            oauth=self.oauth,
++            api_base_url=self.api_base_url,
++            provider_name=self.provider_name,
++            # hard-coded value - update with base template changes
++            endpoint="/api/v3/athlete",
++            revoke_on_failure=revoke_on_failure,
++        )
++
+     def _extract_dates_from_iso(self, start_iso: str, elapsed_time: int) -> tuple[datetime, datetime]:
+         """Extract start and end dates from ISO string and elapsed time."""
+         start_date = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+diff --git a/backend/tests/providers/strava/test_strava_webhook_last_synced.py b/backend/tests/providers/strava/test_strava_webhook_last_synced.py
+index 6e62114e88..9448d28efc 100644
+--- a/backend/tests/providers/strava/test_strava_webhook_last_synced.py
++++ b/backend/tests/providers/strava/test_strava_webhook_last_synced.py
+@@ -8,7 +8,8 @@
+ from sqlalchemy.orm import Session
+ 
+ from app.services.providers.factory import ProviderFactory
+-from tests.factories import UserConnectionFactory
++from app.utils.exceptions import ProviderError
++from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
+ 
+ ATHLETE_ID = 424242
+ 
+@@ -18,8 +19,9 @@ def handler() -> Any:
+     return ProviderFactory().get_provider("strava").webhooks
+ 
+ 
+-def _connection() -> Any:
++def _connection(user: Any = None) -> Any:
+     return UserConnectionFactory(
++        user=user or UserFactory(),
+         provider="strava",
+         provider_user_id=str(ATHLETE_ID),
+         last_synced_at=datetime.now(timezone.utc) - timedelta(days=3),
+@@ -38,14 +40,19 @@ def _payload(aspect_type: str) -> dict[str, Any]:
+ 
+ 
+ def test_delete_keeps_last_synced_at(db: Session, handler: Any) -> None:
+-    connection = _connection()
++    user = UserFactory()
++    connection = _connection(user)
++    source = DataSourceFactory(user=user, provider="strava", source="strava")
++    EventRecordFactory(data_source=source, external_id="1001")
+     before = connection.last_synced_at
+ 
+-    with patch.object(handler.workouts, "get_workout_detail_from_api") as api:
++    with patch.object(
++        handler.workouts, "get_workout_detail_from_api", side_effect=ProviderError("strava", upstream_status=404)
++    ) as api:
+         result = handler.process_payload(db, _payload("delete"), "trace-1")
+     db.refresh(connection)
+ 
+-    api.assert_not_called()
++    api.assert_called_once()
+     assert result["status"] == "deleted"
+     assert connection.last_synced_at == before
+ 
+diff --git a/backend/tests/providers/strava/test_strava_webhook_reverify.py b/backend/tests/providers/strava/test_strava_webhook_reverify.py
+new file mode 100644
+index 0000000000..36948e0e5d
+--- /dev/null
++++ b/backend/tests/providers/strava/test_strava_webhook_reverify.py
+@@ -0,0 +1,381 @@
++"""Strava webhook events are unauthenticated, so destructive ones are confirmed in the Strava API first.
++
++Strava signs events with a key it does not expose, so anyone can send a well-formed event.
++Each scenario runs a real Strava payload through the real ``process_webhook_push`` task
++(handler -> api_client -> token refresh -> revoke) against the test DB. Only the HTTP
++calls to Strava and the outgoing connection.revoked webhook are replaced.
++
++- activity delete: deleted only when GET /activities/{id} answers 404. Activities we
++  do not store are ignored without an API call.
++- deauthorization (athlete update, authorized "false"): the connection is revoked, with
++  reason "deregistration", only when Strava rejects both the access token and the
++  refresh token.
++- Any other API failure leaves the data alone and reaches the task, which retries.
++"""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from datetime import datetime, timedelta, timezone
++from typing import Any
++from unittest.mock import MagicMock, patch
++
++import httpx
++import pytest
++from sqlalchemy.orm import Session
++
++import app.integrations.celery.tasks.webhook_push_task as task
++from app.models import EventRecord
++from app.schemas.auth import ConnectionStatus
++from app.services.providers.factory import ProviderFactory
++from app.utils.exceptions import ProviderError
++from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
++
++ATHLETE_ID = 315693644
++ACTIVITY_ID = 20853903452
++CREATE_TIME = 1793785587
++
++# Captured from Strava on 2026-11-04 (test app 293960).
++CREATE_EVENT = {
++    "aspect_type": "create",
++    "event_time": CREATE_TIME,
++    "object_id": ACTIVITY_ID,
++    "object_type": "activity",
++    "owner_id": ATHLETE_ID,
++    "subscription_id": 382914,
++    "updates": {},
++}
++CREATE_SIGNATURE = "t=1793785587,v1=4bace6d8848993ba7485901de535bfa71d1b4b7708cacba069ed48241dd99765"
++DELETE_EVENT = {
++    "aspect_type": "delete",
++    "event_time": 1793786072,
++    "object_id": ACTIVITY_ID,
++    "object_type": "activity",
++    "owner_id": ATHLETE_ID,
++    "subscription_id": 382914,
++    "updates": {},
++}
++DEAUTH_EVENT = {
++    "aspect_type": "update",
++    "event_time": 1793786378,
++    "object_id": ATHLETE_ID,
++    "object_type": "athlete",
++    "owner_id": ATHLETE_ID,
++    "subscription_id": 382914,
++    "updates": {"authorized": "false"},
++}
++
++API_URL = "https://www.strava.com/api/v3/x"
++TOKEN_URL = "https://www.strava.com/oauth/token"
++RECORD_NOT_FOUND = {"message": "Record Not Found", "errors": [{"resource": "Activity", "code": "not found"}]}
++AUTHORIZATION_ERROR = {
++    "message": "Authorization Error",
++    "errors": [{"resource": "Athlete", "field": "access_token", "code": "invalid"}],
++}
++REFRESH_TOKEN_INVALID = {
++    "message": "Bad Request",
++    "errors": [{"resource": "RefreshToken", "field": "refresh_token", "code": "invalid"}],
++}
++REFRESHED_TOKEN = {
++    "token_type": "Bearer",
++    "access_token": "refreshed-access",
++    "refresh_token": "refreshed-refresh",
++    "expires_in": 21600,
++}
++
++
++@pytest.fixture
++def handler() -> Any:
++    return ProviderFactory().get_provider("strava").webhooks
++
++
++@pytest.fixture
++def user() -> Any:
++    return UserFactory()
++
++
++@pytest.fixture
++def connection(user: Any) -> Any:
++    return UserConnectionFactory(user=user, provider="strava", provider_user_id=str(ATHLETE_ID))
++
++
++@pytest.fixture
++def activity(user: Any, connection: Any) -> Any:
++    source = DataSourceFactory(user=user, provider="strava", source="strava")
++    return EventRecordFactory(data_source=source, external_id=str(ACTIVITY_ID), source_name="Strava")
++
++
++def _response(status_code: int, body: dict[str, Any], url: str = API_URL) -> httpx.Response:
++    method = "POST" if url == TOKEN_URL else "GET"
++    return httpx.Response(status_code, json=body, request=httpx.Request(method, url))
++
++
++@dataclass
++class Delivery:
++    result: dict[str, Any]
++    requested: MagicMock  # Strava API calls
++    revoked: MagicMock  # connection.revoked sent by the Strava handler
++
++
++def _run_webhook(
++    db: Session,
++    payload: dict[str, Any],
++    api: list[httpx.Response | Exception],
++    refresh: httpx.Response | None = None,
++    *,
++    refresh_may_revoke: bool = False,
++) -> Delivery:
++    """Run one delivery through process_webhook_push; ``api`` answers the Strava API calls in order."""
++    client = MagicMock()
++    client.__enter__.return_value.request.side_effect = api
++    with (
++        patch.object(task, "SessionLocal") as session_local,
++        patch("app.services.providers.api_client.httpx.Client", return_value=client),
++        patch("app.services.providers.templates.base_oauth.httpx.post", return_value=refresh) as token_post,
++        patch("app.services.providers.templates.base_oauth.on_connection_revoked") as revoked,
++        patch.object(task.sync_status_service, "emit_webhook_delivered"),
++    ):
++        session_local.return_value.__enter__.return_value = db
++        result = task.process_webhook_push.run("strava", payload, "trace-1868")
++    assert token_post.called == (refresh is not None)
++    # A rejected refresh token must not revoke with another reason before the handler does.
++    if not refresh_may_revoke:
++        assert all(call.kwargs["reason"] == "deregistration" for call in revoked.call_args_list)
++    return Delivery(result, client.__enter__.return_value.request, revoked)
++
++
++def _activity_exists(db: Session, record: EventRecord) -> bool:
++    return db.query(EventRecord).filter(EventRecord.id == record.id).one_or_none() is not None
++
++
++class TestActivityDelete:
++    def test_confirmed_delete_removes_activity(self, db: Session, activity: EventRecord) -> None:
++        delivery = _run_webhook(db, DELETE_EVENT, [_response(404, RECORD_NOT_FOUND)])
++
++        assert delivery.requested.call_args.kwargs["url"].endswith(f"/api/v3/activities/{ACTIVITY_ID}")
++        assert delivery.result["status"] == "deleted"
++        assert delivery.result["records_deleted"] == 1
++        assert not _activity_exists(db, activity)
++
++    def test_forged_delete_keeps_activity(self, db: Session, activity: EventRecord) -> None:
++        delivery = _run_webhook(db, DELETE_EVENT, [_response(200, {"id": ACTIVITY_ID})])
++
++        assert delivery.result == {"status": "ignored", "reason": "activity_still_exists", "activity_id": ACTIVITY_ID}
++        assert _activity_exists(db, activity)
++
++    def test_delete_of_unstored_activity_skips_api(self, db: Session, connection: Any) -> None:
++        delivery = _run_webhook(db, DELETE_EVENT, [])
++
++        delivery.requested.assert_not_called()
++        assert delivery.result == {"status": "ignored", "reason": "activity_not_stored", "activity_id": ACTIVITY_ID}
++
++    @pytest.mark.parametrize(
++        "failure",
++        [_response(503, {"message": "Service Unavailable"}), httpx.ReadTimeout("timed out")],
++        ids=["5xx", "timeout"],
++    )
++    def test_api_failure_keeps_activity_and_retries(
++        self, db: Session, activity: EventRecord, failure: httpx.Response | Exception
++    ) -> None:
++        # Called directly, Task.retry re-raises the error instead of scheduling a retry.
++        with pytest.raises(ProviderError) as exc_info:
++            _run_webhook(db, DELETE_EVENT, [failure])
++
++        assert exc_info.value.status_code >= 500
++        assert _activity_exists(db, activity)
++
++    @pytest.mark.parametrize("token_status", [503, 429])
++    def test_token_endpoint_failure_keeps_activity_and_retries(self, db: Session, user: Any, token_status: int) -> None:
++        """Strava tokens live 6 h, so a delete usually refreshes first; a transient failure must be retried."""
++        UserConnectionFactory(
++            user=user,
++            provider="strava",
++            provider_user_id=str(ATHLETE_ID),
++            token_expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
++        )
++        source = DataSourceFactory(user=user, provider="strava", source="strava")
++        activity: Any = EventRecordFactory(data_source=source, external_id=str(ACTIVITY_ID), source_name="Strava")
++
++        with pytest.raises(ProviderError) as exc_info:
++            _run_webhook(db, DELETE_EVENT, [], refresh=_response(token_status, {"message": "x"}, url=TOKEN_URL))
++
++        assert exc_info.value.upstream_status == token_status
++        assert _activity_exists(db, activity)
++
++    def test_dead_grant_keeps_activity(self, db: Session, connection: Any, activity: EventRecord) -> None:
++        """Strava answers 401 for a deauthorized athlete, not 404: that is no proof of deletion."""
++        delivery = _run_webhook(
++            db,
++            DELETE_EVENT,
++            [_response(401, AUTHORIZATION_ERROR)],
++            refresh=_response(400, REFRESH_TOKEN_INVALID, url=TOKEN_URL),
++            refresh_may_revoke=True,
++        )
++        db.refresh(connection)
++
++        assert delivery.result["status"] == "error"
++        assert delivery.result["error"] == "reauth_required"
++        assert _activity_exists(db, activity)
++        assert connection.status == ConnectionStatus.REVOKED
++
++
++def _assert_revoked(db: Session, connection: Any, delivery: Delivery) -> None:
++    db.refresh(connection)
++    assert delivery.result == {"status": "deauthorized", "strava_athlete_id": ATHLETE_ID}
++    assert connection.status == ConnectionStatus.REVOKED
++    delivery.revoked.assert_called_once()
++    assert delivery.revoked.call_args.kwargs["provider"] == "strava"
++    assert delivery.revoked.call_args.kwargs["reason"] == "deregistration"
++
++
++def _assert_kept(db: Session, connection: Any, delivery: Delivery) -> None:
++    db.refresh(connection)
++    assert delivery.result == {
++        "status": "ignored",
++        "reason": "athlete_still_authorized",
++        "strava_athlete_id": ATHLETE_ID,
++    }
++    assert connection.status == ConnectionStatus.ACTIVE
++    delivery.revoked.assert_not_called()
++
++
++class TestDeauthorization:
++    def test_confirmed_deauthorization_revokes_connection(self, db: Session, connection: Any) -> None:
++        delivery = _run_webhook(
++            db,
++            DEAUTH_EVENT,
++            [_response(401, AUTHORIZATION_ERROR)],
++            refresh=_response(400, REFRESH_TOKEN_INVALID, url=TOKEN_URL),
++        )
++
++        assert delivery.requested.call_args.kwargs["url"].endswith("/api/v3/athlete")
++        _assert_revoked(db, connection, delivery)
++
++    def test_forged_deauthorization_keeps_connection(self, db: Session, connection: Any) -> None:
++        delivery = _run_webhook(db, DEAUTH_EVENT, [_response(200, {"id": ATHLETE_ID})])
++
++        _assert_kept(db, connection, delivery)
++
++    def test_rejected_token_with_working_refresh_keeps_connection(self, db: Session, connection: Any) -> None:
++        """A 401 alone is no proof: the refreshed token still works, so the grant is alive."""
++        delivery = _run_webhook(
++            db,
++            DEAUTH_EVENT,
++            [_response(401, AUTHORIZATION_ERROR), _response(200, {"id": ATHLETE_ID})],
++            refresh=_response(200, REFRESHED_TOKEN, url=TOKEN_URL),
++        )
++
++        assert delivery.requested.call_count == 2
++        assert delivery.requested.call_args.kwargs["headers"]["Authorization"] == "Bearer refreshed-access"
++        _assert_kept(db, connection, delivery)
++
++    def test_expired_token_with_rejected_refresh_revokes_connection(self, db: Session, user: Any) -> None:
++        connection = UserConnectionFactory(
++            user=user,
++            provider="strava",
++            provider_user_id=str(ATHLETE_ID),
++            token_expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
++        )
++
++        delivery = _run_webhook(db, DEAUTH_EVENT, [], refresh=_response(400, REFRESH_TOKEN_INVALID, url=TOKEN_URL))
++
++        delivery.requested.assert_not_called()
++        _assert_revoked(db, connection, delivery)
++
++    def test_expired_token_with_working_refresh_keeps_connection(self, db: Session, user: Any) -> None:
++        connection = UserConnectionFactory(
++            user=user,
++            provider="strava",
++            provider_user_id=str(ATHLETE_ID),
++            token_expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
++        )
++
++        delivery = _run_webhook(
++            db,
++            DEAUTH_EVENT,
++            [_response(200, {"id": ATHLETE_ID})],
++            refresh=_response(200, REFRESHED_TOKEN, url=TOKEN_URL),
++        )
++
++        assert delivery.requested.call_args.kwargs["headers"]["Authorization"] == "Bearer refreshed-access"
++        _assert_kept(db, connection, delivery)
++
++    def test_deauthorization_without_connection_skips_api(self, db: Session) -> None:
++        delivery = _run_webhook(db, DEAUTH_EVENT, [])
++
++        delivery.requested.assert_not_called()
++        assert delivery.result == {"status": "user_not_found", "strava_athlete_id": ATHLETE_ID}
++
++    @pytest.mark.parametrize(
++        "failure",
++        [_response(503, {"message": "Service Unavailable"}), httpx.ReadTimeout("timed out")],
++        ids=["5xx", "timeout"],
++    )
++    def test_api_failure_keeps_connection_and_retries(
++        self, db: Session, connection: Any, failure: httpx.Response | Exception
++    ) -> None:
++        with pytest.raises(ProviderError) as exc_info:
++            _run_webhook(db, DEAUTH_EVENT, [failure])
++        db.refresh(connection)
++
++        assert exc_info.value.status_code >= 500
++        assert connection.status == ConnectionStatus.ACTIVE
++
++    @pytest.mark.parametrize("token_status", [503, 429])
++    def test_token_endpoint_failure_keeps_connection_and_retries(
++        self, db: Session, connection: Any, token_status: int
++    ) -> None:
++        """A 401 followed by a failing token endpoint proves nothing yet: retry instead of dropping the event."""
++        with pytest.raises(ProviderError) as exc_info:
++            _run_webhook(
++                db,
++                DEAUTH_EVENT,
++                [_response(401, AUTHORIZATION_ERROR)],
++                refresh=_response(token_status, {"message": "x"}, url=TOKEN_URL),
++            )
++        db.refresh(connection)
++
++        assert exc_info.value.upstream_status == token_status
++        assert connection.status == ConnectionStatus.ACTIVE
++
++    @pytest.mark.parametrize(
++        "event",
++        [
++            {**DEAUTH_EVENT, "aspect_type": "delete", "updates": {}},
++            {**DEAUTH_EVENT, "updates": {"authorized": "true"}},
++            {**DEAUTH_EVENT, "updates": {}},
++        ],
++        ids=["athlete-delete", "authorized-true", "no-updates"],
++    )
++    def test_other_athlete_events_are_ignored(self, db: Session, connection: Any, event: dict[str, Any]) -> None:
++        delivery = _run_webhook(db, event, [])
++        db.refresh(connection)
++
++        delivery.requested.assert_not_called()
++        assert delivery.result["status"] == "ignored"
++        assert connection.status == ConnectionStatus.ACTIVE
++
++
++class TestVerifySignature:
++    """The header is required and its timestamp bounds replays; ``v1`` is not checked."""
++
++    @staticmethod
++    def _request(signature: str | None) -> MagicMock:
++        request = MagicMock()
++        request.headers = {"X-Strava-Signature": signature} if signature is not None else {}
++        return request
++
++    def _verify(self, handler: Any, signature: str | None, now: float) -> bool:
++        with patch("app.services.providers.strava.webhook_handler.time.time", return_value=now):
++            return handler.verify_signature(self._request(signature), json.dumps(CREATE_EVENT).encode())
++
++    def test_real_event_within_tolerance_passes(self, handler: Any) -> None:
++        assert self._verify(handler, CREATE_SIGNATURE, now=CREATE_TIME + 10) is True
++
++    def test_stale_event_is_rejected(self, handler: Any) -> None:
++        assert self._verify(handler, CREATE_SIGNATURE, now=CREATE_TIME + 301) is False
++
++    @pytest.mark.parametrize("signature", [None, "", "v1=abc", "t=soon,v1=abc"])
++    def test_missing_or_malformed_header_is_rejected(self, handler: Any, signature: str | None) -> None:
++        assert self._verify(handler, signature, now=CREATE_TIME) is False
+diff --git a/backend/tests/providers/test_api_client_reauth.py b/backend/tests/providers/test_api_client_reauth.py
+index 13e818b88a..bc48537967 100644
+--- a/backend/tests/providers/test_api_client_reauth.py
++++ b/backend/tests/providers/test_api_client_reauth.py
+@@ -1,14 +1,22 @@
+-"""get_valid_token treats an expired token with no refresh token as a dead grant."""
++"""Dead grants raise ReauthRequiredError, and revoke the connection unless the caller does it itself."""
+ 
++import time
+ from datetime import datetime, timedelta, timezone
+ from typing import Any
+-from unittest.mock import MagicMock
++from unittest.mock import MagicMock, patch
+ 
++import httpx
+ import pytest
+ from sqlalchemy.orm import Session
+ 
++from app.integrations.redis_client import get_redis_client
+ from app.repositories import UserConnectionRepository
+-from app.services.providers.api_client import get_valid_token
++from app.services.providers.api_client import (
++    DEAD_GRANT_AFTER,
++    _failing_since_key,
++    get_valid_token,
++    make_authenticated_request,
++)
+ from app.utils.exceptions import ReauthRequiredError
+ from tests.factories import UserConnectionFactory
+ 
+@@ -56,3 +64,50 @@ def test_no_refresh_token_within_buffer_returns_still_valid_token(db: Session) -
+     assert token == connection.access_token
+     oauth.revoke_connection.assert_not_called()
+     oauth.refresh_access_token.assert_not_called()
++
++
++def _request(db: Session, connection: Any, oauth: MagicMock, status_code: int, *, revoke_on_failure: bool) -> None:
++    response = httpx.Response(status_code, json={}, request=httpx.Request("GET", "https://api.example.com/x"))
++    client = MagicMock()
++    client.__enter__.return_value.request.return_value = response
++    with patch("app.services.providers.api_client.httpx.Client", return_value=client):
++        make_authenticated_request(
++            db,
++            connection.user_id,
++            UserConnectionRepository(),
++            oauth,
++            "https://api.example.com",
++            "whoop",
++            "/x",
++            revoke_on_failure=revoke_on_failure,
++        )
++
++
++@pytest.mark.parametrize("revoke_on_failure", [True, False])
++def test_rejected_token_refreshes_with_callers_revoke_choice(db: Session, revoke_on_failure: bool) -> None:
++    connection: Any = UserConnectionFactory(provider="whoop")
++    oauth = MagicMock()
++    oauth.refresh_access_token.side_effect = ReauthRequiredError("whoop", connection.user_id, "reconnection required")
++
++    with pytest.raises(ReauthRequiredError):
++        _request(db, connection, oauth, 401, revoke_on_failure=revoke_on_failure)
++
++    oauth.refresh_access_token.assert_called_once_with(
++        db, connection.user_id, connection.refresh_token, revoke_on_failure=revoke_on_failure
++    )
++
++
++@pytest.mark.parametrize("revoke_on_failure", [True, False])
++def test_grant_failing_for_a_day_raises_reauth_required(db: Session, revoke_on_failure: bool) -> None:
++    connection: Any = UserConnectionFactory(provider="whoop")
++    failing_since = time.time() - DEAD_GRANT_AFTER.total_seconds() - 60
++    get_redis_client().set(_failing_since_key("whoop", connection.user_id), failing_since)
++    oauth = MagicMock()
++
++    with pytest.raises(ReauthRequiredError):
++        _request(db, connection, oauth, 403, revoke_on_failure=revoke_on_failure)
++
++    if revoke_on_failure:
++        oauth.revoke_connection.assert_called_once_with(db, connection.user_id, reason="auth_failing")
++    else:
++        oauth.revoke_connection.assert_not_called()
+diff --git a/docs/api-reference/guides/webhooks.mdx b/docs/api-reference/guides/webhooks.mdx
+index 3d66a5b80c..5647bbfb5a 100644
+--- a/docs/api-reference/guides/webhooks.mdx
++++ b/docs/api-reference/guides/webhooks.mdx
+@@ -275,7 +275,7 @@ Every payload envelope has `type` (the event name as a string) and `data`.
+ | `user_disconnected` | The connection was disconnected via the API. |
+ | `sdk_sign_out` | The user signed out of the mobile app; the SDK reported it with its own token. |
+ | `refresh_failed` | The OAuth refresh token was rejected by the provider. |
+-| `deregistration` | The user deregistered on the provider side (Garmin). |
++| `deregistration` | The user deregistered on the provider side (Garmin) or deauthorized the app (Strava). A Strava request that hits the dead grant before the deauthorization event is processed revokes the connection with `refresh_failed` instead. |
+ 
+ ```json
+ {

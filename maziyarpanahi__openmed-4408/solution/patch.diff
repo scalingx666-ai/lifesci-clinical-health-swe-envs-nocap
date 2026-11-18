@@ -1,0 +1,3031 @@
+diff --git a/.github/workflows/vuln-scan.yml b/.github/workflows/vuln-scan.yml
+index 130d907785..7ed9c1dd2a 100644
+--- a/.github/workflows/vuln-scan.yml
++++ b/.github/workflows/vuln-scan.yml
+@@ -71,7 +71,23 @@ jobs:
+           uv sync --frozen --python 3.11
+ 
+       - name: Set up Trivy
+-        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
++        env:
++          TRIVY_VERSION: "0.76.1"
++          TRIVY_SHA256: "c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0"
++        run: |
++          # Pin the scanner binary; vulnerability databases still refresh normally.
++          # Download from the release directly, without an extra redirect service.
++          trivy_dir="$(mktemp -d "$RUNNER_TEMP/openmed-trivy.XXXXXX")"
++          archive="$trivy_dir/trivy.tar.gz"
++          curl --fail --silent --show-error --location \
++            --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 \
++            --output "$archive" \
++            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
++          echo "$TRIVY_SHA256  $archive" | sha256sum --check --status
++          tar --extract --gzip --file "$archive" --directory "$trivy_dir" trivy
++          chmod 755 "$trivy_dir/trivy"
++          "$trivy_dir/trivy" --version
++          echo "$trivy_dir" >> "$GITHUB_PATH"
+ 
+       - name: Build service image
+         run: |
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9dd92f4507..1602f5ec4b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,8 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Add deterministic DICOM series sampling with acquisition-aware geometry coverage, bounded native previews, source-bound manifests, and local VLM drafts that distinguish selected evidence from unexamined frames (#2793).
++
+ - Add a bounded Python session for injected local image, PDF and streaming-audio providers, with preflighted immutable snapshots, explicit ownership, cooperative cancellation and metadata-only ordered results (#3677).
+ 
++- Added a bounded, dependency-free DICOM transfer-syntax preflight that classifies
++  declared file-meta transfer syntaxes into closed native, optional-decoder,
++  review, and unsupported outcomes with stable reason codes, and reports no
++  patient tags, non-transfer-syntax UIDs, pixels, or paths, plus offline tests
++  (#3089).
++
+ - Plan bounded multiresolution whole-slide tiles with explicit source transforms, overlap, conservative tissue-mask filtering, auditable exclusions and declared concurrent buffer ceilings (#2794).
+ 
+ - Measure bounded image resolution, exposure, contrast, sharpness and optional blank-margin quality before local visual extraction, with explicit reacquisition or review reasons and inference suppression on failure (#2800).
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index a530129dd0..2c97425bc3 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -548,6 +548,8 @@ classification:
+     - multimodal/page-rotation.md
+     - evaluation/ocr-routing.md
+     - multimodal/dicom-sr-provenance.md
++    - multimodal/dicom-transfer-syntax-preflight.md
++    - multimodal/vision/dicom-series-sampling.md
+     - evaluation/model-provenance-diff.md
+     - evaluation/nli-calibration.md
+     - service/outbound-privacy-filter.md
+diff --git a/docs/javascripts/openmed-docs.js b/docs/javascripts/openmed-docs.js
+index 532b7a00b6..0917d09292 100644
+--- a/docs/javascripts/openmed-docs.js
++++ b/docs/javascripts/openmed-docs.js
+@@ -54,9 +54,58 @@
+       }
+     };
+ 
++    let scheduled = false;
++    const scheduleUpdate = () => {
++      if (scheduled) return;
++      scheduled = true;
++      window.requestAnimationFrame(() => {
++        scheduled = false;
++        update();
++      });
++    };
++    const searchResults = document.querySelector(
++      '[data-md-component="search-result"]',
++    );
++    if (searchResults) {
++      // Search snippets arrive after page initialization and change per query.
++      // Observe content only: our tabindex updates must not trigger this observer.
++      new MutationObserver(scheduleUpdate).observe(searchResults, {
++        childList: true,
++        subtree: true,
++      });
++      searchResults.addEventListener("toggle", scheduleUpdate, true);
++      searchResults.addEventListener("keydown", (event) => {
++        const region = event.target;
++        if (
++          !(region instanceof HTMLElement)
++          || region.dataset.openmedScrollable !== "true"
++          || event.altKey || event.ctrlKey || event.metaKey
++        ) {
++          return;
++        }
++        // Search's global result shortcuts intercept these keys. Handle them
++        // on the focused region, including WebKit's nested-link scroll case.
++        const movement = {
++          ArrowLeft: [-40, 0],
++          ArrowRight: [40, 0],
++          ArrowUp: [0, -40],
++          ArrowDown: [0, 40],
++          PageUp: [0, -region.clientHeight],
++          PageDown: [0, region.clientHeight],
++          Home: [-region.scrollWidth, -region.scrollHeight],
++          End: [region.scrollWidth, region.scrollHeight],
++        }[event.key];
++        if (!movement) return;
++        region.scrollLeft += movement[0];
++        region.scrollTop += movement[1];
++        event.preventDefault();
++        event.stopPropagation();
++      });
++    }
++    document.querySelector("#__search")?.addEventListener("change", scheduleUpdate);
+     update();
+-    document.fonts?.ready.then(update);
+-    window.addEventListener("resize", update, { passive: true });
++    document.fonts?.ready.then(scheduleUpdate);
++    window.addEventListener("resize", scheduleUpdate, { passive: true });
+   }
+ 
+   function initializeDrawer() {
+diff --git a/docs/multimodal/dicom-transfer-syntax-preflight.md b/docs/multimodal/dicom-transfer-syntax-preflight.md
+new file mode 100644
+index 0000000000..e18f1a16e8
+--- /dev/null
++++ b/docs/multimodal/dicom-transfer-syntax-preflight.md
+@@ -0,0 +1,106 @@
++# DICOM transfer-syntax preflight
++
++A compressed or retired DICOM transfer syntax changes what a pipeline must load
++before it can touch pixel data. The File Meta Information group declares that
++choice in the first bytes of the file, so it can be classified before an imaging
++library or a pixel-data codec is imported.
++
++`openmed.multimodal.dicom_transfer_syntax` reads only that bounded header. It
++returns a routing outcome for the declared syntax and never decodes pixels,
++installs or exercises a codec, validates clinical image content, or fetches
++anything over the network. No patient tag, non-transfer-syntax UID, file path,
++or pixel byte appears in a report.
++
++```python
++from openmed.multimodal import read_dicom_transfer_syntax
++
++report = read_dicom_transfer_syntax(header_bytes)
++print(report.outcome.value, report.reason)
++# optional_decoder transfer_syntax_jpeg_baseline
++```
++
++## Outcomes
++
++| Outcome | Meaning |
++| --- | --- |
++| `native` | Uncompressed little-endian syntaxes a reader can handle without extra codecs. |
++| `optional_decoder` | Compressed syntaxes that need an installed pixel-data codec before decoding. |
++| `review` | Retired syntaxes or syntaxes that need an extra parsing decision before decoding. |
++| `unsupported` | Missing, malformed, private, or unknown declarations. |
++
++## Transfer-syntax catalog
++
++The catalog is closed: a declared UID either matches an entry below or is
++reported as `transfer_syntax_unknown` / `transfer_syntax_private`.
++
++| UID | Name | Outcome | Codec required | Retired |
++| --- | --- | --- | --- | --- |
++| `1.2.840.10008.1.2` | Implicit VR Little Endian | `native` | no | no |
++| `1.2.840.10008.1.2.1` | Explicit VR Little Endian | `native` | no | no |
++| `1.2.840.10008.1.2.1.99` | Deflated Explicit VR Little Endian | `review` | no | no |
++| `1.2.840.10008.1.2.2` | Explicit VR Big Endian | `review` | no | yes |
++| `1.2.840.10008.1.2.4.50` | JPEG Baseline (Process 1) | `optional_decoder` | yes | no |
++| `1.2.840.10008.1.2.4.51` | JPEG Extended (Process 2 and 4) | `optional_decoder` | yes | no |
++| `1.2.840.10008.1.2.4.57` | JPEG Lossless, Non-Hierarchical (Process 14) | `optional_decoder` | yes | no |
++| `1.2.840.10008.1.2.4.70` | JPEG Lossless, Non-Hierarchical, First-Order Prediction | `optional_decoder` | yes | no |
++| `1.2.840.10008.1.2.4.80` | JPEG-LS Lossless | `optional_decoder` | yes | no |
++| `1.2.840.10008.1.2.4.81` | JPEG-LS Lossy (Near-Lossless) | `optional_decoder` | yes | no |
++| `1.2.840.10008.1.2.4.90` | JPEG 2000 Image Compression (Lossless Only) | `optional_decoder` | yes | no |
++| `1.2.840.10008.1.2.4.91` | JPEG 2000 Image Compression | `optional_decoder` | yes | no |
++| `1.2.840.10008.1.2.4.92` | JPEG 2000 Part 2 Multi-component (Lossless Only) | `optional_decoder` | yes | no |
++| `1.2.840.10008.1.2.4.93` | JPEG 2000 Part 2 Multi-component | `optional_decoder` | yes | no |
++| `1.2.840.10008.1.2.5` | RLE Lossless | `optional_decoder` | yes | no |
++
++## Reading only the file-meta group
++
++The reader accepts `bytes`, `bytearray`, or `memoryview` and stops at the end of
++group `0002` (or at the first element that belongs to another group). It checks
++the 128-byte preamble, the `DICM` magic, then parses explicit-VR little-endian
++elements through the bounded group end, including after `(0002,0010) TransferSyntaxUID`. Duplicate or out-of-order tags, invalid reserved bytes and invalid UID padding are rejected. A declared group length
++that disagrees with the parsed group end is reported instead of trusted.
++
++Bounds are explicit keyword-only arguments and default to
++`DEFAULT_MAX_FILE_META_BYTES` (64 KiB), `DEFAULT_MAX_FILE_META_ELEMENTS` (64),
++and `DEFAULT_MAX_TRANSFER_SYNTAX_UID_BYTES` (128). Arguments that cannot be used
++raise `TransferSyntaxError` with a stable category such as `max_bytes_invalid`
++or `source_invalid`; unusable *content* is never raised.
++
++## Reason codes
++
++| Group | Reason codes |
++| --- | --- |
++| File-meta structure | `file_meta_missing`, `file_meta_truncated`, `file_meta_malformed`, `file_meta_group_length_mismatch`, `file_meta_element_limit` |
++| Declaration | `transfer_syntax_missing`, `transfer_syntax_malformed`, `transfer_syntax_unknown`, `transfer_syntax_private` |
++| Catalog results | `transfer_syntax_implicit_little_endian`, `transfer_syntax_explicit_little_endian`, `transfer_syntax_deflated`, `transfer_syntax_big_endian_retired`, `transfer_syntax_jpeg_baseline`, `transfer_syntax_jpeg_extended`, `transfer_syntax_jpeg_lossless`, `transfer_syntax_jpeg_lossless_sv1`, `transfer_syntax_jpeg_ls_lossless`, `transfer_syntax_jpeg_ls_near_lossless`, `transfer_syntax_jpeg2000_lossless`, `transfer_syntax_jpeg2000_lossy`, `transfer_syntax_jpeg2000_multi_lossless`, `transfer_syntax_jpeg2000_multi`, `transfer_syntax_rle_lossless` |
++
++`TRANSFER_SYNTAX_REASON_CODES` lists all of them and
++`TRANSFER_SYNTAX_OUTCOMES` the four outcome values.
++
++## Determinism and privacy
++
++Reports are frozen dataclasses. `to_dict()` returns a fixed key order and
++`to_json()` is compact JSON with sorted keys, so byte-stable output can be
++diffed across runs. A report carries the declared transfer-syntax UID, the
++catalog name, the outcome, the reason codes, and two counts — the bytes consumed
++by the parsed file-meta group and the number of elements read. It never carries
++pixels, paths, patient tags, or any other UID, and the reader imports no imaging
++library.
++
++Buffer limits are enforced on the bytes handed in: an oversized buffer is read
++up to the bound **before copying**, and a truncated group is reported as
++`file_meta_truncated` rather than parsed optimistically. Finding an early readable UID never overrides a later truncation or element-limit failure. Contiguous memory views are supported; released or strided views raise a value-free argument error.
++
++## Not in scope
++
++Decoding pixels, installing or probing codecs, validating clinical image
++content, and retrieving files are out of scope. This module is a standalone
++preflight: it does not change `openmed.multimodal.preflight_asset` or the media
++type detection catalog.
++
++## Verification
++
++```bash
++uv run --frozen --extra dev pytest tests/unit/multimodal/test_dicom_transfer_syntax.py -q
++```
++
++The file-meta boundary and element encoding checks follow [DICOM PS3.10 section 7](https://dicom.nema.org/medical/dicom/current/output/chtml/part10/chapter_7.html) and [PS3.5 section 7](https://dicom.nema.org/medical/dicom/current/output/chtml/part05/chapter_7.html). This bounded preflight does not establish full-file conformance.
+diff --git a/docs/multimodal/vision/dicom-series-sampling.md b/docs/multimodal/vision/dicom-series-sampling.md
+new file mode 100644
+index 0000000000..76c3fb94fc
+--- /dev/null
++++ b/docs/multimodal/vision/dicom-series-sampling.md
+@@ -0,0 +1,96 @@
++# DICOM series sampling
++
++`sample_dicom_series` selects frames from caller-supplied DICOM bytes before local VLM inference. Selection uses the decoded image's signal range and a small appearance preview, patient-space geometry, and acquisition metadata. The manifest lists every supplied frame as selected or unexamined. It never implies that the supplied objects form a complete study or that sampled frames exclude a finding elsewhere.
++
++This Python orchestration module uses the existing optional `multimodal` dependencies: pydicom, NumPy, and Pillow. It does not download models, install codecs, open a network connection, or write patient material to disk. Native OpenMedKit model execution remains a separate integration.
++
++## Supported input and coverage
++
++Supply a tuple of complete in-memory objects belonging to one series. This implementation accepts native implicit/explicit VR little-endian, 8/16-bit, single-sample MONOCHROME1/2 images. It handles classic instances and enhanced multi-frame objects with explicit per-frame functional groups. Compressed, deflated, retired, color, malformed, or ambiguous objects are rejected before VLM dispatch. The [transfer-syntax preflight](../dicom-transfer-syntax-preflight.md) classifies other formats; this sampler does not silently decode or convert them.
++
++Positions, orthonormal orientation vectors, pixel spacing, unique instance identifiers, and a frame of reference are required. Enhanced images use per-frame and shared functional groups; no slice position is invented from an instance number. Geometry follows the [DICOM Image Plane Module](https://dicom.nema.org/medical/dicom/current/output/chtml/part03/sect_C.7.6.2.html). Identifiers are checked against [DICOM UID encoding rules](https://dicom.nema.org/medical/dicom/current/output/chtml/part05/chapter_9.html), even when application parser warnings are disabled.
++
++Frames with different coordinate systems, orientations, grids, or explicit acquisition/temporal/echo values cannot cover each other. The default requires at least one numeric acquisition discriminator. If a caller explicitly sets `require_acquisition=False`, each frame with no discriminator forms a separate group and must be selected; `unknown_acquisition` records those frames. Missing temporal metadata is never a guarantee that all acquisition phases are present.
++
++Within each group, the sampler starts with the eligible frame having the largest display signal range, then adds frames until every supplied position is within `max_gap_mm` of a selected position. Distance is Euclidean in patient-space millimeters between corresponding pixel origins, not a measure of anatomical or diagnostic coverage. Stable source/frame digests break ties, so reordering the input tuple does not change the result. The deterministic greedy selection rejects a budget it cannot satisfy; it does not claim to find the mathematically smallest covering set.
++
++Remaining slots may add frames whose 16-by-16 preview differs by at least `min_diversity_distance` in mean absolute 8-bit intensity. `min_signal_range` and preview diversity are selection heuristics, not image-quality certification or lesion detection. Low-signal frames remain explicitly unexamined and still count toward geometric coverage. If an acquisition has no eligible frame or the selected-frame budget cannot cover it, the operation raises `SeriesSamplingError`.
++
++## Synthetic, offline example
++
++The following creates only synthetic pixels and identifiers in memory. It does not read or write a clinical file.
++
++```python
++import io
++import json
++
++import numpy as np
++import pydicom
++from pydicom.dataset import Dataset, FileMetaDataset
++from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian
++
++from openmed.multimodal.vision.dicom.series_sampler import (
++    DisplayWindow,
++    SamplingPolicy,
++    sample_dicom_series,
++)
++
++objects = []
++for index in range(6):
++    ds = Dataset()
++    ds.file_meta = FileMetaDataset()
++    ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
++    ds.SOPClassUID = CTImageStorage
++    ds.SOPInstanceUID = f"1.2.826.0.1.3680043.10.543.{index + 1}"
++    ds.SeriesInstanceUID = "1.2.826.0.1.3680043.10.543.1000"
++    ds.FrameOfReferenceUID = "1.2.826.0.1.3680043.10.543.2000"
++    ds.Modality = "CT"
++    ds.AcquisitionNumber = 1
++    ds.Rows = ds.Columns = 16
++    ds.SamplesPerPixel = 1
++    ds.BitsAllocated = ds.BitsStored = 16
++    ds.HighBit = 15
++    ds.PixelRepresentation = 0
++    ds.PhotometricInterpretation = "MONOCHROME2"
++    ds.ImagePositionPatient = [0, 0, index * 2]
++    ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
++    ds.PixelSpacing = [1, 1]
++    ds.PixelData = np.arange(256, dtype="<u2").tobytes()
++    stream = io.BytesIO()
++    pydicom.dcmwrite(stream, ds, enforce_file_format=True)
++    objects.append(stream.getvalue())
++
++sources = tuple(objects)
++window = DisplayWindow(center=128, width=256)
++policy = SamplingPolicy(max_selected=4, max_gap_mm=4)
++plan = sample_dicom_series(sources, window=window, policy=policy)
++assert plan == sample_dicom_series(
++    tuple(reversed(sources)), window=window, policy=policy
++)
++assert len(plan.selected) + len(plan.unexamined) == 6
++assert plan.maximum_gap_mm <= 4
++report = json.loads(plan.to_json())
++print(report["schema_version"], len(plan.selected), len(plan.unexamined))
++```
++
++`DisplayWindow` is an explicit clipped linear transform after the declared rescale slope/intercept, with MONOCHROME1 inversion when required. The same transform produces previews and selected model images. It is not automatic clinical window selection or a complete DICOM VOI/presentation-state implementation. Choose and qualify the display window for the task; a saturated window can reject useful images.
++
++Each entry in `plan.frames` maps a frame reference to its complete source SHA-256, zero-based frame index, and opaque coverage group. A reviewer can resolve selected or unexamined references against the original caller-owned bytes without placing filenames, UIDs, or patient coordinates in the manifest. `groups` records the frame count for each group; `frames_digest` binds the inspected geometry and preview signals for reproducible revalidation.
++
++## Local inference and evidence scope
++
++Pass the same sources, window, policy, and manifest to `run_sampled_dicom_vlm`, together with an already loaded local `EdgeVLMProvider` and a frame-scoped `Prompt`. The runner recalculates the complete selection and all bindings before making a provider call. Changing any source bytes, geometry, window, policy, or manifest invalidates the prior plan. The original prompt and generation limits are retained for each selected frame.
++
++The runner decodes each selected frame to a fresh metadata-free PNG in memory and calls the existing [local VLM contract](edge-vlm-provider-contract.md). It never sends the original DICOM object to the provider. Pixel content can still contain burned-in identifiers: sampling is not de-identification. Apply and verify the appropriate image privacy processing before passing clinical material to a model.
++
++`SampledSeriesInference.frames` holds protected generated drafts linked to exact frame references. `require_evidence(reference)` returns only a successful selected-frame result; an unselected frame or provider abstention raises a fixed-code error. `to_json()` includes examined and unexamined references, a manifest digest, and the mandatory selected-only, non-diagnostic human-review notice. Provider abstentions stay unexamined. A failure during inference withholds the entire returned result bundle, although already executed provider calls cannot be undone.
++
++Display the scope notice with every downstream draft. Do not convert a frame-level statement into a whole-series conclusion. These APIs do not validate clinical accuracy or authorize autonomous decisions.
++
++## Resource and privacy boundaries
++
++`SamplingPolicy` bounds instance count, total frames, bytes per source and across all sources, metadata parsing, pixels per frame, and selected-frame count. Defaults allow 128 objects, 512 source frames, 64 MiB per object, 256 MiB total encoded input, a 1 MiB metadata boundary, 4 million pixels per frame, and at most 16 selected frames. Previews inspect all supplied native frames one at a time; only the selected set reaches the VLM. Inference revalidation repeats preview inspection intentionally.
++
++These cooperative limits are not a process memory sandbox or a hostile-decoder isolation boundary. Full native pixel arrays and intermediate transforms occupy memory; use deployment isolation and the [VLM resource planner](vlm-resource-planning.md) for device/model admission. Parser calls are serialized internally while this thread's pydicom diagnostics are suppressed. Application code must not concurrently mutate pydicom or Python warning settings. Providers are trusted local code and must honor their own logging and network contracts.
++
++Source bytes, pixels, raw UIDs, patient-space coordinates, acquisition values, prompts, and generated text are protected in-memory data. Public JSON reports contain only digests, opaque references, counts, policy-independent scope wording, and relative coverage. Digests remain linkable audit material, not anonymization. Keep source inputs and model drafts out of logs; serialize through `to_json()` rather than generic object dumping. Errors discard backend text and chained exception context. No patient tags, filenames, or pixel buffers are added to reports.
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 7aae3c193a..08960cf784 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -488,6 +488,8 @@ nav:
+       - OCR page-rotation transforms: multimodal/page-rotation.md
+       - OCR document-routing evaluation: evaluation/ocr-routing.md
+       - DICOM-SR provenance mapping: multimodal/dicom-sr-provenance.md
++      - DICOM transfer-syntax preflight: multimodal/dicom-transfer-syntax-preflight.md
++      - DICOM series sampling: multimodal/vision/dicom-series-sampling.md
+       - Model-provenance diff reports: evaluation/model-provenance-diff.md
+       - Clinical NLI threshold calibration: evaluation/nli-calibration.md
+       - Outbound request privacy filter: service/outbound-privacy-filter.md
+diff --git a/openmed/multimodal/__init__.py b/openmed/multimodal/__init__.py
+index de1b65db01..16ab5c22ea 100644
+--- a/openmed/multimodal/__init__.py
++++ b/openmed/multimodal/__init__.py
+@@ -130,6 +130,21 @@
+     render_dicom_sr_provenance,
+     serialize_dicom_sr_provenance,
+ )
++from .dicom_transfer_syntax import (
++    DEFAULT_MAX_FILE_META_BYTES,
++    DEFAULT_MAX_FILE_META_ELEMENTS,
++    DEFAULT_MAX_TRANSFER_SYNTAX_UID_BYTES,
++    TRANSFER_SYNTAX_CATALOG,
++    TRANSFER_SYNTAX_OUTCOMES,
++    TRANSFER_SYNTAX_REASON_CODES,
++    TRANSFER_SYNTAX_SCHEMA_VERSION,
++    TransferSyntaxCapability,
++    TransferSyntaxError,
++    TransferSyntaxOutcome,
++    TransferSyntaxReport,
++    describe_transfer_syntax,
++    read_dicom_transfer_syntax,
++)
+ from .document_graph import (
+     BBox,
+     BoundingBox,
+@@ -725,4 +740,17 @@
+     "map_dicom_sr_provenance",
+     "render_dicom_sr_provenance",
+     "serialize_dicom_sr_provenance",
++    "DEFAULT_MAX_FILE_META_BYTES",
++    "DEFAULT_MAX_FILE_META_ELEMENTS",
++    "DEFAULT_MAX_TRANSFER_SYNTAX_UID_BYTES",
++    "TRANSFER_SYNTAX_CATALOG",
++    "TRANSFER_SYNTAX_OUTCOMES",
++    "TRANSFER_SYNTAX_REASON_CODES",
++    "TRANSFER_SYNTAX_SCHEMA_VERSION",
++    "TransferSyntaxCapability",
++    "TransferSyntaxError",
++    "TransferSyntaxOutcome",
++    "TransferSyntaxReport",
++    "describe_transfer_syntax",
++    "read_dicom_transfer_syntax",
+ ]
+diff --git a/openmed/multimodal/dicom_transfer_syntax.py b/openmed/multimodal/dicom_transfer_syntax.py
+new file mode 100644
+index 0000000000..4e0a550b41
+--- /dev/null
++++ b/openmed/multimodal/dicom_transfer_syntax.py
+@@ -0,0 +1,674 @@
++"""Bounded, dependency-free DICOM transfer-syntax preflight.
++
++The DICOM File Meta Information group declares how pixel data is encoded. A
++pipeline can size and route work from those declared bytes alone, before a
++pixel decoder or an imaging library is imported. This module parses only the
++bounded file-meta header: the 128-byte preamble, the ``DICM`` magic, and the
++group ``0002`` elements needed to read ``(0002,0010) TransferSyntaxUID``.
++
++Nothing else is returned. Patient tags, other UIDs, pixel bytes, file paths,
++and text metadata never appear in a report, and no codec is imported, loaded,
++or exercised.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++from dataclasses import dataclass
++from enum import Enum
++from typing import Any, Final
++
++__all__ = [
++    "DEFAULT_MAX_FILE_META_BYTES",
++    "DEFAULT_MAX_FILE_META_ELEMENTS",
++    "DEFAULT_MAX_TRANSFER_SYNTAX_UID_BYTES",
++    "TRANSFER_SYNTAX_CATALOG",
++    "TRANSFER_SYNTAX_OUTCOMES",
++    "TRANSFER_SYNTAX_REASON_CODES",
++    "TRANSFER_SYNTAX_SCHEMA_VERSION",
++    "TransferSyntaxCapability",
++    "TransferSyntaxError",
++    "TransferSyntaxOutcome",
++    "TransferSyntaxReport",
++    "describe_transfer_syntax",
++    "read_dicom_transfer_syntax",
++]
++
++TRANSFER_SYNTAX_SCHEMA_VERSION: Final[str] = (
++    "openmed.multimodal.dicom_transfer_syntax.v1"
++)
++
++DEFAULT_MAX_FILE_META_BYTES: Final[int] = 64 * 1024
++DEFAULT_MAX_FILE_META_ELEMENTS: Final[int] = 64
++DEFAULT_MAX_TRANSFER_SYNTAX_UID_BYTES: Final[int] = 128
++
++_DICOM_PREAMBLE_BYTES: Final[int] = 128
++_DICOM_MAGIC: Final[bytes] = b"DICM"
++_FILE_META_GROUP: Final[int] = 0x0002
++_GROUP_LENGTH_TAG: Final[tuple[int, int]] = (0x0002, 0x0000)
++_TRANSFER_SYNTAX_TAG: Final[tuple[int, int]] = (0x0002, 0x0010)
++_EXPLICIT_VR_SHORT: Final[frozenset[bytes]] = frozenset(
++    {
++        b"AE",
++        b"AS",
++        b"AT",
++        b"CS",
++        b"DA",
++        b"DS",
++        b"DT",
++        b"FD",
++        b"FL",
++        b"IS",
++        b"LO",
++        b"LT",
++        b"PN",
++        b"SH",
++        b"SL",
++        b"SS",
++        b"ST",
++        b"TM",
++        b"UI",
++        b"UL",
++        b"US",
++    }
++)
++_EXPLICIT_VR_LONG: Final[frozenset[bytes]] = frozenset(
++    {
++        b"OB",
++        b"OD",
++        b"OF",
++        b"OL",
++        b"OV",
++        b"OW",
++        b"SQ",
++        b"SV",
++        b"UC",
++        b"UN",
++        b"UR",
++        b"UT",
++        b"UV",
++    }
++)
++_UID_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
++_UID_ROOT: Final[str] = "1.2.840.10008."
++
++
++class TransferSyntaxOutcome(str, Enum):
++    """Closed set of routing outcomes for a declared transfer syntax.
++
++    Values:
++        NATIVE: Uncompressed little-endian syntaxes the pipeline can read with
++            built-in decoders.
++        OPTIONAL_DECODER: Compressed syntaxes that need an installed codec
++            before pixel data can be decoded.
++        REVIEW: Syntaxes that are retired or need an extra parsing decision
++            before decoding is attempted.
++        UNSUPPORTED: Unusable, unknown, private, or malformed declarations.
++    """
++
++    NATIVE = "native"
++    OPTIONAL_DECODER = "optional_decoder"
++    REVIEW = "review"
++    UNSUPPORTED = "unsupported"
++
++
++TRANSFER_SYNTAX_OUTCOMES: Final[frozenset[str]] = frozenset(
++    outcome.value for outcome in TransferSyntaxOutcome
++)
++
++TRANSFER_SYNTAX_REASON_CODES: Final[tuple[str, ...]] = (
++    "file_meta_element_limit",
++    "file_meta_group_length_mismatch",
++    "file_meta_malformed",
++    "file_meta_missing",
++    "file_meta_truncated",
++    "transfer_syntax_big_endian_retired",
++    "transfer_syntax_deflated",
++    "transfer_syntax_explicit_little_endian",
++    "transfer_syntax_implicit_little_endian",
++    "transfer_syntax_jpeg2000_lossless",
++    "transfer_syntax_jpeg2000_lossy",
++    "transfer_syntax_jpeg2000_multi",
++    "transfer_syntax_jpeg2000_multi_lossless",
++    "transfer_syntax_jpeg_baseline",
++    "transfer_syntax_jpeg_extended",
++    "transfer_syntax_jpeg_lossless",
++    "transfer_syntax_jpeg_lossless_sv1",
++    "transfer_syntax_jpeg_ls_lossless",
++    "transfer_syntax_jpeg_ls_near_lossless",
++    "transfer_syntax_malformed",
++    "transfer_syntax_missing",
++    "transfer_syntax_private",
++    "transfer_syntax_rle_lossless",
++    "transfer_syntax_unknown",
++)
++
++
++@dataclass(frozen=True, slots=True)
++class TransferSyntaxCapability:
++    """Catalog entry describing one declared transfer syntax.
++
++    Attributes:
++        uid: The transfer-syntax identifier this entry describes.
++        name: Human-readable DICOM name of the syntax.
++        outcome: Routing outcome reported when the syntax is declared.
++        reason: Stable reason code paired with the outcome.
++        decoder_required: Whether an optional pixel-data codec is needed.
++        retired: Whether DICOM has retired the syntax.
++    """
++
++    uid: str
++    name: str
++    outcome: TransferSyntaxOutcome
++    reason: str
++    decoder_required: bool
++    retired: bool = False
++
++    def __post_init__(self) -> None:
++        if not _valid_uid(self.uid):
++            raise ValueError("uid must be a DICOM UID")
++        if type(self.name) is not str or not self.name:
++            raise ValueError("name must be a non-empty string")
++        if not isinstance(self.outcome, TransferSyntaxOutcome):
++            raise ValueError("outcome must be a TransferSyntaxOutcome")
++        if self.reason not in TRANSFER_SYNTAX_REASON_CODES:
++            raise ValueError("reason must be a known reason code")
++        if type(self.decoder_required) is not bool or type(self.retired) is not bool:
++            raise ValueError("decoder_required and retired must be booleans")
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return a deterministic JSON-ready mapping for this entry."""
++
++        return {
++            "decoder_required": self.decoder_required,
++            "name": self.name,
++            "outcome": self.outcome.value,
++            "reason": self.reason,
++            "retired": self.retired,
++            "uid": self.uid,
++        }
++
++
++@dataclass(frozen=True, slots=True)
++class TransferSyntaxReport:
++    """Bounded file-meta preflight result without pixels, paths, or patient tags.
++
++    Attributes:
++        outcome: Routing outcome for the declared transfer syntax.
++        reason: Primary stable reason code for the outcome.
++        reason_codes: All stable reason codes, in insertion order.
++        transfer_syntax_uid: Declared ``(0002,0010)`` value, if readable.
++        transfer_syntax_name: Catalog name for the declared value, if known.
++        decoder_required: Whether an optional codec is needed before decoding.
++        file_meta_bytes: Bytes consumed by the parsed file-meta group.
++        element_count: Number of group ``0002`` elements parsed.
++        schema_version: Version of the report schema.
++    """
++
++    outcome: TransferSyntaxOutcome
++    reason: str
++    reason_codes: tuple[str, ...]
++    transfer_syntax_uid: str | None
++    transfer_syntax_name: str | None
++    decoder_required: bool
++    file_meta_bytes: int
++    element_count: int
++    schema_version: str = TRANSFER_SYNTAX_SCHEMA_VERSION
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.outcome, TransferSyntaxOutcome):
++            raise ValueError("outcome must be a TransferSyntaxOutcome")
++        if not self.reason_codes:
++            raise ValueError("reason_codes must not be empty")
++        for code in self.reason_codes:
++            if code not in TRANSFER_SYNTAX_REASON_CODES:
++                raise ValueError("reason_codes must be known reason codes")
++        if self.reason != self.reason_codes[0]:
++            raise ValueError("reason must be the first reason code")
++        if self.transfer_syntax_uid is not None and not _valid_uid(
++            self.transfer_syntax_uid
++        ):
++            raise ValueError("transfer_syntax_uid must be a DICOM UID")
++        if type(self.decoder_required) is not bool:
++            raise ValueError("decoder_required must be a boolean")
++        for count in (self.file_meta_bytes, self.element_count):
++            if type(count) is not int or count < 0:
++                raise ValueError("counts must be non-negative integers")
++        if self.schema_version != TRANSFER_SYNTAX_SCHEMA_VERSION:
++            raise ValueError("schema_version is unsupported")
++
++    @property
++    def ok(self) -> bool:
++        """Whether the declaration is readable without an extra decision."""
++
++        return self.outcome is TransferSyntaxOutcome.NATIVE
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return a deterministic JSON-ready mapping for this report.
++
++        The mapping is limited to transfer-syntax metadata: no patient tags,
++        no UIDs other than the declared transfer syntax, no pixel bytes, and
++        no file paths.
++        """
++
++        return {
++            "schema_version": self.schema_version,
++            "outcome": self.outcome.value,
++            "reason": self.reason,
++            "reason_codes": list(self.reason_codes),
++            "transfer_syntax_uid": self.transfer_syntax_uid,
++            "transfer_syntax_name": self.transfer_syntax_name,
++            "decoder_required": self.decoder_required,
++            "file_meta_bytes": self.file_meta_bytes,
++            "element_count": self.element_count,
++        }
++
++    def to_json(self) -> str:
++        """Return compact JSON with sorted keys."""
++
++        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
++
++
++class TransferSyntaxError(ValueError):
++    """Value-free failure for invalid reader arguments.
++
++    Content problems are reported through :class:`TransferSyntaxReport`; this
++    error is raised only when a caller-supplied argument cannot be used.
++    """
++
++    def __init__(self, category: str) -> None:
++        self.category = category
++        super().__init__(category)
++
++
++def _valid_uid(value: object, *, max_bytes: int = 64) -> bool:
++    if type(value) is not str or not value or len(value) > max_bytes:
++        return False
++    if _UID_RE.fullmatch(value) is None:
++        return False
++    for component in value.split("."):
++        if len(component) > 1 and component.startswith("0"):
++            return False
++    return True
++
++
++def _capability(
++    uid: str,
++    name: str,
++    outcome: TransferSyntaxOutcome,
++    reason: str,
++    *,
++    decoder_required: bool = False,
++    retired: bool = False,
++) -> TransferSyntaxCapability:
++    return TransferSyntaxCapability(
++        uid=uid,
++        name=name,
++        outcome=outcome,
++        reason=reason,
++        decoder_required=decoder_required,
++        retired=retired,
++    )
++
++
++TRANSFER_SYNTAX_CATALOG: Final[dict[str, TransferSyntaxCapability]] = {
++    "1.2.840.10008.1.2": _capability(
++        "1.2.840.10008.1.2",
++        "Implicit VR Little Endian",
++        TransferSyntaxOutcome.NATIVE,
++        "transfer_syntax_implicit_little_endian",
++    ),
++    "1.2.840.10008.1.2.1": _capability(
++        "1.2.840.10008.1.2.1",
++        "Explicit VR Little Endian",
++        TransferSyntaxOutcome.NATIVE,
++        "transfer_syntax_explicit_little_endian",
++    ),
++    "1.2.840.10008.1.2.1.99": _capability(
++        "1.2.840.10008.1.2.1.99",
++        "Deflated Explicit VR Little Endian",
++        TransferSyntaxOutcome.REVIEW,
++        "transfer_syntax_deflated",
++    ),
++    "1.2.840.10008.1.2.2": _capability(
++        "1.2.840.10008.1.2.2",
++        "Explicit VR Big Endian",
++        TransferSyntaxOutcome.REVIEW,
++        "transfer_syntax_big_endian_retired",
++        retired=True,
++    ),
++    "1.2.840.10008.1.2.4.50": _capability(
++        "1.2.840.10008.1.2.4.50",
++        "JPEG Baseline (Process 1)",
++        TransferSyntaxOutcome.OPTIONAL_DECODER,
++        "transfer_syntax_jpeg_baseline",
++        decoder_required=True,
++    ),
++    "1.2.840.10008.1.2.4.51": _capability(
++        "1.2.840.10008.1.2.4.51",
++        "JPEG Extended (Process 2 and 4)",
++        TransferSyntaxOutcome.OPTIONAL_DECODER,
++        "transfer_syntax_jpeg_extended",
++        decoder_required=True,
++    ),
++    "1.2.840.10008.1.2.4.57": _capability(
++        "1.2.840.10008.1.2.4.57",
++        "JPEG Lossless, Non-Hierarchical (Process 14)",
++        TransferSyntaxOutcome.OPTIONAL_DECODER,
++        "transfer_syntax_jpeg_lossless",
++        decoder_required=True,
++    ),
++    "1.2.840.10008.1.2.4.70": _capability(
++        "1.2.840.10008.1.2.4.70",
++        "JPEG Lossless, Non-Hierarchical, First-Order Prediction",
++        TransferSyntaxOutcome.OPTIONAL_DECODER,
++        "transfer_syntax_jpeg_lossless_sv1",
++        decoder_required=True,
++    ),
++    "1.2.840.10008.1.2.4.80": _capability(
++        "1.2.840.10008.1.2.4.80",
++        "JPEG-LS Lossless",
++        TransferSyntaxOutcome.OPTIONAL_DECODER,
++        "transfer_syntax_jpeg_ls_lossless",
++        decoder_required=True,
++    ),
++    "1.2.840.10008.1.2.4.81": _capability(
++        "1.2.840.10008.1.2.4.81",
++        "JPEG-LS Lossy (Near-Lossless)",
++        TransferSyntaxOutcome.OPTIONAL_DECODER,
++        "transfer_syntax_jpeg_ls_near_lossless",
++        decoder_required=True,
++    ),
++    "1.2.840.10008.1.2.4.90": _capability(
++        "1.2.840.10008.1.2.4.90",
++        "JPEG 2000 Image Compression (Lossless Only)",
++        TransferSyntaxOutcome.OPTIONAL_DECODER,
++        "transfer_syntax_jpeg2000_lossless",
++        decoder_required=True,
++    ),
++    "1.2.840.10008.1.2.4.91": _capability(
++        "1.2.840.10008.1.2.4.91",
++        "JPEG 2000 Image Compression",
++        TransferSyntaxOutcome.OPTIONAL_DECODER,
++        "transfer_syntax_jpeg2000_lossy",
++        decoder_required=True,
++    ),
++    "1.2.840.10008.1.2.4.92": _capability(
++        "1.2.840.10008.1.2.4.92",
++        "JPEG 2000 Part 2 Multi-component (Lossless Only)",
++        TransferSyntaxOutcome.OPTIONAL_DECODER,
++        "transfer_syntax_jpeg2000_multi_lossless",
++        decoder_required=True,
++    ),
++    "1.2.840.10008.1.2.4.93": _capability(
++        "1.2.840.10008.1.2.4.93",
++        "JPEG 2000 Part 2 Multi-component",
++        TransferSyntaxOutcome.OPTIONAL_DECODER,
++        "transfer_syntax_jpeg2000_multi",
++        decoder_required=True,
++    ),
++    "1.2.840.10008.1.2.5": _capability(
++        "1.2.840.10008.1.2.5",
++        "RLE Lossless",
++        TransferSyntaxOutcome.OPTIONAL_DECODER,
++        "transfer_syntax_rle_lossless",
++        decoder_required=True,
++    ),
++}
++
++
++def describe_transfer_syntax(uid: str) -> TransferSyntaxCapability | None:
++    """Look up a transfer-syntax UID in the closed capability catalog.
++
++    Returns ``None`` for a syntactically valid UID the catalog does not
++    describe, and raises :class:`TransferSyntaxError` for a non-string or
++    malformed identifier.
++    """
++
++    if not _valid_uid(uid):
++        raise TransferSyntaxError("uid_invalid")
++    return TRANSFER_SYNTAX_CATALOG.get(uid)
++
++
++def read_dicom_transfer_syntax(
++    source: bytes | bytearray | memoryview,
++    *,
++    max_bytes: int = DEFAULT_MAX_FILE_META_BYTES,
++    max_elements: int = DEFAULT_MAX_FILE_META_ELEMENTS,
++    max_uid_bytes: int = DEFAULT_MAX_TRANSFER_SYNTAX_UID_BYTES,
++) -> TransferSyntaxReport:
++    """Read the declared DICOM transfer syntax from bounded file-meta bytes.
++
++    Only the preamble, the magic, and the group ``0002`` elements up to the end
++    of the file-meta group are inspected. Truncated, malformed, unknown, and
++    private declarations are reported as outcomes rather than raised, so an
++    orchestrator can route them without catching content errors. Invalid
++    arguments raise :class:`TransferSyntaxError`.
++    """
++
++    for name, bound in (
++        ("max_bytes", max_bytes),
++        ("max_elements", max_elements),
++        ("max_uid_bytes", max_uid_bytes),
++    ):
++        if type(bound) is not int or bound <= 0:
++            raise TransferSyntaxError(f"{name}_invalid")
++    if not isinstance(source, (bytes, bytearray, memoryview)):
++        raise TransferSyntaxError("source_invalid")
++
++    bounded = None
++    source_bytes = 0
++    try:
++        view = memoryview(source).cast("B")
++        source_bytes = view.nbytes
++        # Slice before copying: a caller may supply a very large pixel buffer.
++        bounded = bytes(view[:max_bytes])
++    except (TypeError, ValueError):
++        pass
++    if bounded is None:
++        raise TransferSyntaxError("source_invalid")
++    if len(bounded) < _DICOM_PREAMBLE_BYTES + len(_DICOM_MAGIC):
++        return _unsupported("file_meta_missing", file_meta_bytes=len(bounded))
++    if bounded[_DICOM_PREAMBLE_BYTES : _DICOM_PREAMBLE_BYTES + 4] != _DICOM_MAGIC:
++        return _unsupported(
++            "file_meta_missing", file_meta_bytes=_DICOM_PREAMBLE_BYTES + 4
++        )
++
++    offset = _DICOM_PREAMBLE_BYTES + 4
++    parsed_bytes = offset
++    element_count = 0
++    declared_uid: str | None = None
++    group_length: int | None = None
++    group_length_end: int | None = None
++    element_limit_hit = False
++    group_terminated = False
++    truncated = False
++    previous_element = -1
++
++    while offset < len(bounded):
++        if (
++            group_length is not None
++            and group_length_end is not None
++            and offset == group_length_end + group_length
++            and offset + 4 > len(bounded)
++        ):
++            # A byte bound may cut the following dataset tag. The already
++            # complete meta group does not require any dataset body bytes.
++            group_terminated = True
++            break
++        if offset + 4 > len(bounded):
++            truncated = True
++            break
++        group = int.from_bytes(bounded[offset : offset + 2], "little")
++        element = int.from_bytes(bounded[offset + 2 : offset + 4], "little")
++        if group != _FILE_META_GROUP:
++            group_terminated = True
++            break
++        if element_count >= max_elements:
++            element_limit_hit = True
++            break
++        if offset + 8 > len(bounded):
++            truncated = True
++            break
++        if element <= previous_element:
++            return _unsupported(
++                "file_meta_malformed",
++                file_meta_bytes=parsed_bytes,
++                element_count=element_count,
++            )
++        previous_element = element
++        vr = bounded[offset + 4 : offset + 6]
++        if vr in _EXPLICIT_VR_SHORT:
++            length = int.from_bytes(bounded[offset + 6 : offset + 8], "little")
++            value_start = offset + 8
++        elif vr in _EXPLICIT_VR_LONG:
++            if offset + 12 > len(bounded):
++                truncated = True
++                break
++            if bounded[offset + 6 : offset + 8] != b"\x00\x00":
++                return _unsupported(
++                    "file_meta_malformed",
++                    file_meta_bytes=parsed_bytes,
++                    element_count=element_count,
++                )
++            length = int.from_bytes(bounded[offset + 8 : offset + 12], "little")
++            value_start = offset + 12
++        else:
++            return _unsupported(
++                "file_meta_malformed",
++                file_meta_bytes=parsed_bytes,
++                element_count=element_count,
++            )
++        if length % 2:
++            return _unsupported(
++                "file_meta_malformed",
++                file_meta_bytes=parsed_bytes,
++                element_count=element_count,
++            )
++        value_end = value_start + length
++        if value_end > len(bounded):
++            truncated = True
++            break
++        tag = (group, element)
++        value = bounded[value_start:value_end]
++        if tag == _GROUP_LENGTH_TAG:
++            if vr != b"UL" or length != 4:
++                return _unsupported(
++                    "file_meta_malformed",
++                    file_meta_bytes=parsed_bytes,
++                    element_count=element_count,
++                )
++            group_length = int.from_bytes(value, "little")
++            group_length_end = value_end
++        elif tag == _TRANSFER_SYNTAX_TAG:
++            if vr != b"UI":
++                return _unsupported(
++                    "file_meta_malformed",
++                    file_meta_bytes=parsed_bytes,
++                    element_count=element_count,
++                )
++            if len(value) > max_uid_bytes:
++                return _unsupported(
++                    "transfer_syntax_malformed",
++                    file_meta_bytes=parsed_bytes,
++                    element_count=element_count,
++                )
++            text = value.removesuffix(b"\x00").decode("ascii", errors="replace")
++            if not _valid_uid(text):
++                return _unsupported(
++                    "transfer_syntax_malformed",
++                    file_meta_bytes=parsed_bytes,
++                    element_count=element_count,
++                )
++            declared_uid = text
++        element_count += 1
++        parsed_bytes = value_end
++        offset = value_end
++
++    declared_end = (
++        group_length_end + group_length
++        if group_length is not None and group_length_end is not None
++        else None
++    )
++    if element_limit_hit:
++        return _unsupported(
++            "file_meta_element_limit",
++            file_meta_bytes=parsed_bytes,
++            element_count=element_count,
++        )
++    if not group_terminated and (
++        truncated
++        or (declared_end is not None and declared_end > len(bounded))
++        or (source_bytes > len(bounded) and offset != declared_end)
++    ):
++        return _unsupported(
++            "file_meta_truncated",
++            file_meta_bytes=parsed_bytes,
++            element_count=element_count,
++        )
++    if declared_uid is None:
++        if element_limit_hit:
++            reason = "file_meta_element_limit"
++        elif group_terminated:
++            reason = "transfer_syntax_missing"
++        elif truncated:
++            reason = "file_meta_truncated"
++        else:
++            reason = "transfer_syntax_missing"
++        return _unsupported(
++            reason, file_meta_bytes=parsed_bytes, element_count=element_count
++        )
++
++    if group_length is not None and group_length_end is not None:
++        if offset != group_length_end + group_length:
++            return _unsupported(
++                "file_meta_group_length_mismatch",
++                file_meta_bytes=parsed_bytes,
++                element_count=element_count,
++                uid=declared_uid,
++            )
++
++    capability = TRANSFER_SYNTAX_CATALOG.get(declared_uid)
++    if capability is None:
++        reason = (
++            "transfer_syntax_private"
++            if not declared_uid.startswith(_UID_ROOT)
++            else "transfer_syntax_unknown"
++        )
++        return _unsupported(
++            reason,
++            file_meta_bytes=parsed_bytes,
++            element_count=element_count,
++            uid=declared_uid,
++        )
++    return TransferSyntaxReport(
++        outcome=capability.outcome,
++        reason=capability.reason,
++        reason_codes=(capability.reason,),
++        transfer_syntax_uid=capability.uid,
++        transfer_syntax_name=capability.name,
++        decoder_required=capability.decoder_required,
++        file_meta_bytes=parsed_bytes,
++        element_count=element_count,
++    )
++
++
++def _unsupported(
++    reason: str,
++    *,
++    file_meta_bytes: int,
++    element_count: int = 0,
++    uid: str | None = None,
++) -> TransferSyntaxReport:
++    capability = TRANSFER_SYNTAX_CATALOG.get(uid) if uid is not None else None
++    return TransferSyntaxReport(
++        outcome=TransferSyntaxOutcome.UNSUPPORTED,
++        reason=reason,
++        reason_codes=(reason,),
++        transfer_syntax_uid=uid,
++        transfer_syntax_name=capability.name if capability is not None else None,
++        decoder_required=False,
++        file_meta_bytes=file_meta_bytes,
++        element_count=element_count,
++    )
+diff --git a/openmed/multimodal/vision/dicom/series_sampler.py b/openmed/multimodal/vision/dicom/series_sampler.py
+new file mode 100644
+index 0000000000..f9fedd49bc
+--- /dev/null
++++ b/openmed/multimodal/vision/dicom/series_sampler.py
+@@ -0,0 +1,865 @@
++"""Deterministic DICOM frame selection with explicit unexamined coverage.
++
++Native pixel previews are selection signals, not clinical quality assessments.
++Encoded source objects and model outputs are protected in-memory payloads.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import io
++import json
++import logging
++import math
++import re
++import threading
++import warnings
++from collections.abc import Callable
++from contextlib import contextmanager
++from dataclasses import asdict, dataclass, field, replace
++from typing import Any, TypeVar, cast
++
++from openmed.multimodal.dicom_transfer_syntax import read_dicom_transfer_syntax
++from openmed.multimodal.vision.providers.base import (
++    EdgeVLMProvider,
++    ImageInput,
++    Prompt,
++    VLMRequest,
++    VLMResult,
++    run_local_vlm,
++)
++
++T = TypeVar("T")
++_PARSER_LOCK = threading.RLock()
++_SCHEMA = "openmed.dicom.series_sampling.v1"
++_NOTICE = (
++    "Evidence covers only the successfully inferred selected frames. Unexamined "
++    "frames may contain relevant findings. Non-diagnostic; human review required."
++)
++_TAGS = [
++    "SOPInstanceUID",
++    "SeriesInstanceUID",
++    "FrameOfReferenceUID",
++    "Modality",
++    "Rows",
++    "Columns",
++    "NumberOfFrames",
++    "SamplesPerPixel",
++    "BitsAllocated",
++    "BitsStored",
++    "HighBit",
++    "PixelRepresentation",
++    "PhotometricInterpretation",
++    "ImagePositionPatient",
++    "ImageOrientationPatient",
++    "PixelSpacing",
++    "AcquisitionNumber",
++    "TemporalPositionIdentifier",
++    "EchoNumbers",
++    "RescaleSlope",
++    "RescaleIntercept",
++    "SharedFunctionalGroupsSequence",
++    "PerFrameFunctionalGroupsSequence",
++]
++
++
++class SeriesSamplingError(ValueError):
++    """Fixed-code rejection without source tags, filenames or backend context."""
++
++
++def _require(value: bool) -> None:
++    if not value:
++        raise SeriesSamplingError("dicom_series_sampling_rejected")
++
++
++def _integer(value: object, minimum: int, maximum: int) -> None:
++    _require(type(value) is int and minimum <= value <= maximum)
++
++
++def _header_integer(value: object, minimum: int, maximum: int) -> int:
++    # pydicom can expose an ISfloat when application validation is disabled.
++    # Never silently truncate fractional acquisition or frame-count metadata.
++    encoded = str(value).strip()
++    _require(len(encoded) <= 16 and re.fullmatch(r"[+-]?[0-9]+", encoded) is not None)
++    number = int(encoded)
++    _integer(number, minimum, maximum)
++    return number
++
++
++def _uid(value: str) -> None:
++    _require(
++        0 < len(value) <= 64
++        and re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))+", value)
++        is not None
++    )
++
++
++def _finite(value: object, minimum: float, maximum: float) -> None:
++    _require(type(value) in (int, float))
++    number = cast("int | float", value)
++    _require(minimum <= number <= maximum and math.isfinite(number))
++
++
++def _digest(value: object) -> None:
++    _require(
++        type(value) is str
++        and len(value) == 64
++        and all(c in "0123456789abcdef" for c in value)
++    )
++
++
++def _hash(value: Any) -> str:
++    return hashlib.sha256(
++        json.dumps(
++            value, sort_keys=True, separators=(",", ":"), allow_nan=False
++        ).encode()
++    ).hexdigest()
++
++
++def _protected(call: Callable[[], T]) -> T:
++    failed = False
++    result: T | None = None
++    try:
++        result = call()
++    except Exception:
++        failed = True
++    if failed:
++        raise SeriesSamplingError("dicom_series_sampling_rejected")
++    return result  # type: ignore[return-value]
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class SamplingPolicy:
++    """Bound work and require spatial/acquisition coverage before diversity.
++
++    Args:
++        max_instances: Maximum caller-supplied DICOM objects.
++        max_frames: Maximum total source frames inspected.
++        max_source_bytes: Per-object encoded byte limit.
++        max_total_bytes: Total encoded source limit.
++        max_header_bytes: Maximum header position during metadata parsing.
++        max_frame_pixels: Per-frame allocation ceiling before native decoding.
++        max_selected: Hard VLM frame count ceiling.
++        max_gap_mm: Maximum distance to a selected frame in the same acquisition.
++        min_signal_range: Minimum 8-bit preview range, not clinical quality.
++        min_diversity_distance: Minimum mean 8-bit preview difference for extra slots.
++        require_acquisition: Require an explicit numeric acquisition discriminator.
++            If false, each frame without one forms its own coverage group.
++    """
++
++    max_instances: int = 128
++    max_frames: int = 512
++    max_source_bytes: int = 64 * 1024 * 1024
++    max_total_bytes: int = 256 * 1024 * 1024
++    max_header_bytes: int = 1024 * 1024
++    max_frame_pixels: int = 4_000_000
++    max_selected: int = 16
++    max_gap_mm: float = 10
++    min_signal_range: int = 4
++    min_diversity_distance: float = 8
++    require_acquisition: bool = True
++
++    def __post_init__(self) -> None:
++        for value, ceiling in (
++            (self.max_instances, 1024),
++            (self.max_frames, 4096),
++            (self.max_source_bytes, 256 * 1024 * 1024),
++            (self.max_total_bytes, 1024 * 1024 * 1024),
++            (self.max_header_bytes, 8 * 1024 * 1024),
++            (self.max_frame_pixels, 16_000_000),
++            (self.max_selected, 128),
++        ):
++            _integer(value, 1, ceiling)
++        _require(self.max_header_bytes >= 132)
++        _require(self.max_selected <= self.max_frames)
++        _finite(self.max_gap_mm, 0, 100_000)
++        _integer(self.min_signal_range, 0, 255)
++        _finite(self.min_diversity_distance, 1e-6, 255)
++        _require(type(self.require_acquisition) is bool)
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class DisplayWindow:
++    """Explicit physical-value window shared by previews and selected VLM images.
++
++    Args:
++        center: Center after the declared rescale slope/intercept.
++        width: Positive width of the linear clipped display interval.
++
++    This is a caller-qualified display transform, not automatic lesion-aware
++    windowing or a full DICOM VOI presentation-state implementation.
++    """
++
++    center: float
++    width: float
++
++    def __post_init__(self) -> None:
++        _finite(self.center, -1e9, 1e9)
++        _finite(self.width, 1e-6, 1e9)
++
++
++@dataclass(frozen=True, slots=True)
++class _Frame:
++    source_digest: str
++    index: int
++    reference: str
++    group: str
++    unknown_acquisition: bool
++    position: tuple[float, ...] = field(repr=False)
++    projection: float = field(repr=False)
++    orientation: tuple[float, ...] = field(repr=False)
++    spacing: tuple[float, ...] = field(repr=False)
++    rows: int
++    columns: int
++    slope: float = field(repr=False)
++    intercept: float = field(repr=False)
++    monochrome_one: bool
++    signal_range: int
++    preview: bytes = field(repr=False)
++
++
++@dataclass(frozen=True, slots=True)
++class SourceFrame:
++    """Resolve an opaque frame reference against protected caller-owned sources.
++
++    Args:
++        reference: Stable digest derived from source bytes and frame index.
++        source_digest: SHA-256 of the complete encoded source object.
++        frame_index: Zero-based frame position within that object.
++        group: Opaque acquisition/geometry coverage group.
++    """
++
++    reference: str
++    source_digest: str
++    frame_index: int
++    group: str
++
++    def __post_init__(self) -> None:
++        for value in (self.reference, self.source_digest, self.group):
++            _digest(value)
++        _integer(self.frame_index, 0, 4095)
++        _require(self.reference == _hash([self.source_digest, self.frame_index]))
++
++
++@dataclass(frozen=True, slots=True)
++class SeriesSamplingPlan:
++    """Source-bound selection manifest; serialize only through ``to_json``.
++
++    Args:
++        source_digest: Digest of every complete supplied source, in sorted order.
++        policy_digest: Digest of the full policy and display window.
++        frames_digest: Digest of inspected geometry and computed preview signals.
++        frames: Source digest, frame index and coverage group for every reference.
++        selected: Deterministically ordered selected frame references.
++        unexamined: All other supplied frame references; never silently omitted.
++        low_signal: Frames rejected by the configured preview signal threshold.
++        unknown_acquisition: Frames lacking an explicit acquisition discriminator.
++        groups: Acquisition-group references and observed frame counts.
++        maximum_gap_mm: Maximum achieved within-group coverage distance.
++
++    A manifest is reproducible evidence, not authentication or clinical coverage.
++    """
++
++    source_digest: str
++    policy_digest: str
++    frames_digest: str
++    frames: tuple[SourceFrame, ...]
++    selected: tuple[str, ...]
++    unexamined: tuple[str, ...]
++    low_signal: tuple[str, ...]
++    unknown_acquisition: tuple[str, ...]
++    groups: tuple[tuple[str, int], ...]
++    maximum_gap_mm: float
++
++    def __post_init__(self) -> None:
++        for value in (self.source_digest, self.policy_digest, self.frames_digest):
++            _digest(value)
++        for values in (
++            self.selected,
++            self.unexamined,
++            self.low_signal,
++            self.unknown_acquisition,
++        ):
++            _require(type(values) is tuple and len(values) <= 4096)
++            for value in values:
++                _digest(value)
++            _require(tuple(sorted(set(values))) == values)
++        _require(0 < len(self.selected) <= 128)
++        _require(not set(self.selected) & set(self.unexamined))
++        _require(type(self.frames) is tuple and len(self.frames) <= 4096)
++        counts: dict[str, int] = {}
++        for frame in self.frames:
++            _require(type(frame) is SourceFrame)
++            frame.__post_init__()
++            counts[frame.group] = counts.get(frame.group, 0) + 1
++        _require(
++            tuple(f.reference for f in self.frames)
++            == tuple(sorted((*self.selected, *self.unexamined)))
++        )
++        _require(tuple(sorted(counts.items())) == self.groups)
++        _require(set(self.low_signal) <= set(self.unexamined))
++        _require(set(self.unknown_acquisition) <= set(self.selected))
++        _require(type(self.groups) is tuple and 0 < len(self.groups) <= 128)
++        for group, count in self.groups:
++            _digest(group)
++            _integer(count, 1, 4096)
++        _require(tuple(sorted(self.groups)) == self.groups)
++        _require(len({group for group, _ in self.groups}) == len(self.groups))
++        _require(
++            sum(n for _, n in self.groups) == len(self.selected) + len(self.unexamined)
++        )
++        _finite(self.maximum_gap_mm, 0, 1e6)
++
++    @property
++    def digest(self) -> str:
++        """Bind all selected and explicitly unexamined source frames."""
++        return hashlib.sha256(self.to_json().encode()).hexdigest()
++
++    def to_json(self) -> str:
++        """Return only digests, frame references, counts and relative coverage."""
++        return json.dumps(
++            {"schema_version": _SCHEMA, **asdict(self), "notice": _NOTICE},
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        )
++
++
++class _QuietParser(logging.Filter):
++    def __init__(self) -> None:
++        super().__init__()
++        self.thread = threading.get_ident()
++        self.warned = False
++
++    def filter(self, record: logging.LogRecord) -> bool:
++        if record.thread != self.thread:
++            return True
++        self.warned |= record.levelno >= logging.WARNING
++        return False
++
++
++@contextmanager
++def _quiet_parser():
++    # pydicom's config and warning helper both use this logger. Suppress this
++    # thread's diagnostics before they can reach any application log handler.
++    with _PARSER_LOCK:
++        logger = logging.getLogger("pydicom")
++        guard = _QuietParser()
++        logger.addFilter(guard)
++        try:
++            with warnings.catch_warnings(record=True) as caught:
++                warnings.simplefilter("always")
++                yield
++                _require(not caught and not guard.warned)
++        finally:
++            logger.removeFilter(guard)
++
++
++class _Header(io.BytesIO):
++    def __init__(self, data: bytes, limit: int) -> None:
++        super().__init__(data)
++        self.limit = limit
++
++    def read(self, size: int | None = -1) -> bytes:
++        _require(type(size) is int)
++        assert size is not None
++        _require(size >= 0 and self.tell() + size <= self.limit)
++        return super().read(size)
++
++    def seek(self, offset: int, whence: int = 0) -> int:
++        position = offset + (self.tell() if whence == 1 else 0)
++        _require(whence in (0, 1) and 0 <= position <= self.limit)
++        return super().seek(offset, whence)
++
++
++def _vector(value: Any, count: int, *, positive: bool = False) -> tuple[float, ...]:
++    _require(value is not None and len(value) == count)
++    result = tuple(float(v) for v in value)
++    for number in result:
++        _finite(number, 1e-9 if positive else -1e6, 1e6)
++    return result
++
++
++def _group_value(frame: Any, shared: Any, root: Any, sequence: str, key: str) -> Any:
++    for owner in (frame, shared):
++        items = getattr(owner, sequence, None)
++        if items is not None:
++            _require(len(items) == 1)
++            value = getattr(items[0], key, None)
++            if value is not None:
++                return value
++    return getattr(root, key, None)
++
++
++def _acquisition(frame: Any, root: Any, required: bool) -> tuple[int | None, ...]:
++    contents = getattr(frame, "FrameContentSequence", None)
++    if contents is not None:
++        _require(len(contents) == 1)
++        item = contents[0]
++    else:
++        item = frame
++    values = (
++        getattr(
++            item, "FrameAcquisitionNumber", getattr(root, "AcquisitionNumber", None)
++        ),
++        getattr(
++            item,
++            "TemporalPositionIndex",
++            getattr(root, "TemporalPositionIdentifier", None),
++        ),
++        getattr(root, "EchoNumbers", None),
++    )
++    result = tuple(
++        None if v is None else _header_integer(v, 0, (1 << 31) - 1) for v in values
++    )
++    _require(not required or any(v is not None for v in result))
++    return result
++
++
++def _display(data: bytes, frame: _Frame, window: DisplayWindow) -> Any:
++    import numpy as np
++    from pydicom.pixels import pixel_array
++
++    array = pixel_array(io.BytesIO(data), index=frame.index, raw=True)
++    _require(array.shape == (frame.rows, frame.columns))
++    _require(array.dtype.kind in ("i", "u") and array.dtype.itemsize <= 2)
++    physical = array.astype(np.float64) * frame.slope + frame.intercept
++    display = np.floor(
++        np.clip((physical - (window.center - window.width / 2)) / window.width, 0, 1)
++        * 255
++    ).astype(np.uint8)
++    if frame.monochrome_one:
++        display = 255 - display
++    return display
++
++
++def _inspect(
++    sources: tuple[bytes, ...], window: DisplayWindow, policy: SamplingPolicy
++) -> tuple[dict[str, bytes], tuple[_Frame, ...]]:
++    import numpy as np
++    from pydicom import dcmread
++    from pydicom.dataset import Dataset
++
++    _require(type(sources) is tuple and 0 < len(sources) <= policy.max_instances)
++    _require(
++        all(
++            type(data) is bytes and 0 < len(data) <= policy.max_source_bytes
++            for data in sources
++        )
++    )
++    _require(sum(map(len, sources)) <= policy.max_total_bytes)
++    by_digest = {hashlib.sha256(data).hexdigest(): data for data in sources}
++    _require(len(by_digest) == len(sources))
++    result: list[_Frame] = []
++    series: set[str] = set()
++    instances: set[str] = set()
++    with _quiet_parser():
++        for source_digest, data in sorted(by_digest.items()):
++            preflight = read_dicom_transfer_syntax(
++                data, max_bytes=policy.max_header_bytes
++            )
++            _require(preflight.ok)
++            ds = dcmread(
++                _Header(data, policy.max_header_bytes),
++                stop_before_pixels=True,
++                specific_tags=_TAGS,
++            )
++            _require(
++                str(ds.file_meta.TransferSyntaxUID) == preflight.transfer_syntax_uid
++            )
++            uid, series_uid, coordinate_uid = (
++                str(getattr(ds, key, ""))
++                for key in (
++                    "SOPInstanceUID",
++                    "SeriesInstanceUID",
++                    "FrameOfReferenceUID",
++                )
++            )
++            for value in (uid, series_uid, coordinate_uid):
++                _uid(value)
++            _require(uid not in instances)
++            instances.add(uid)
++            series.add(series_uid)
++            _require(len(series) == 1)
++            rows = _header_integer(ds.Rows, 1, 65535)
++            columns = _header_integer(ds.Columns, 1, 65535)
++            _require(0 < rows * columns <= policy.max_frame_pixels)
++            count = _header_integer(
++                getattr(ds, "NumberOfFrames", 1), 1, policy.max_frames
++            )
++            _require(len(result) + count <= policy.max_frames)
++            bits = _header_integer(ds.BitsAllocated, 8, 16)
++            _require(_header_integer(ds.SamplesPerPixel, 1, 1) == 1 and bits in (8, 16))
++            stored = _header_integer(ds.BitsStored, 1, bits)
++            _require(
++                _header_integer(ds.HighBit, 0, bits - 1) == stored - 1
++                and _header_integer(ds.PixelRepresentation, 0, 1) in (0, 1)
++            )
++            photometric = str(ds.PhotometricInterpretation)
++            _require(photometric in ("MONOCHROME1", "MONOCHROME2"))
++            shared_items = getattr(ds, "SharedFunctionalGroupsSequence", ())
++            _require(len(shared_items) <= 1)
++            shared = shared_items[0] if shared_items else Dataset()
++            per_frame = getattr(ds, "PerFrameFunctionalGroupsSequence", ())
++            _require(len(per_frame) in (0, count))
++            # Repeated top-level positions do not describe a multi-frame stack.
++            _require(count == 1 or len(per_frame) == count)
++            for index in range(count):
++                fg = per_frame[index] if per_frame else Dataset()
++                position = _vector(
++                    _group_value(
++                        fg,
++                        shared,
++                        ds if count == 1 else Dataset(),
++                        "PlanePositionSequence",
++                        "ImagePositionPatient",
++                    ),
++                    3,
++                )
++                orientation = _vector(
++                    _group_value(
++                        fg,
++                        shared,
++                        ds,
++                        "PlaneOrientationSequence",
++                        "ImageOrientationPatient",
++                    ),
++                    6,
++                )
++                spacing = _vector(
++                    _group_value(
++                        fg, shared, ds, "PixelMeasuresSequence", "PixelSpacing"
++                    ),
++                    2,
++                    positive=True,
++                )
++                row, col = np.array(orientation[:3]), np.array(orientation[3:])
++                _require(
++                    abs(float(row @ row) - 1) <= 1e-6
++                    and abs(float(col @ col) - 1) <= 1e-6
++                    and abs(float(row @ col)) <= 1e-6
++                )
++                normal = np.cross(row, col)
++                slope = _group_value(
++                    fg, shared, ds, "PixelValueTransformationSequence", "RescaleSlope"
++                )
++                intercept = _group_value(
++                    fg,
++                    shared,
++                    ds,
++                    "PixelValueTransformationSequence",
++                    "RescaleIntercept",
++                )
++                slope, intercept = (
++                    float(1 if slope is None else slope),
++                    float(0 if intercept is None else intercept),
++                )
++                _finite(slope, -1e6, 1e6)
++                _require(slope != 0)
++                _finite(intercept, -1e9, 1e9)
++                acquisition = _acquisition(fg, ds, policy.require_acquisition)
++                unknown_acquisition = all(v is None for v in acquisition)
++                reference = _hash([source_digest, index])
++                group = _hash(
++                    [
++                        coordinate_uid,
++                        str(getattr(ds, "Modality", "")),
++                        acquisition,
++                        reference if unknown_acquisition else None,
++                        rows,
++                        columns,
++                        orientation,
++                        spacing,
++                    ]
++                )
++                frame = _Frame(
++                    source_digest,
++                    index,
++                    reference,
++                    group,
++                    unknown_acquisition,
++                    position,
++                    float(np.array(position) @ normal),
++                    orientation,
++                    spacing,
++                    rows,
++                    columns,
++                    slope,
++                    intercept,
++                    photometric == "MONOCHROME1",
++                    0,
++                    b"",
++                )
++                display = _display(data, frame, window)
++                ys = np.linspace(0, rows - 1, 16, dtype=np.int64)
++                xs = np.linspace(0, columns - 1, 16, dtype=np.int64)
++                preview = display[np.ix_(ys, xs)].tobytes()
++                signal = int(display.max()) - int(display.min())
++                result.append(replace(frame, signal_range=signal, preview=preview))
++    return by_digest, tuple(sorted(result, key=lambda frame: frame.reference))
++
++
++def _distance(left: _Frame, right: _Frame) -> float:
++    return math.dist(left.position, right.position)
++
++
++def _appearance(left: _Frame, right: _Frame) -> float:
++    return (
++        sum(abs(a - b) for a, b in zip(left.preview, right.preview, strict=True)) / 256
++    )
++
++
++def _select(
++    frames: tuple[_Frame, ...], policy: SamplingPolicy
++) -> tuple[tuple[str, ...], float]:
++    groups: dict[str, list[_Frame]] = {}
++    for frame in frames:
++        groups.setdefault(frame.group, []).append(frame)
++    _require(len(groups) <= policy.max_selected)
++    chosen: dict[str, _Frame] = {}
++    eligible = [
++        frame for frame in frames if frame.signal_range >= policy.min_signal_range
++    ]
++    for group, members in sorted(groups.items()):
++        candidates = [f for f in eligible if f.group == group]
++        _require(bool(candidates))
++        first = min(candidates, key=lambda f: (-f.signal_range, f.reference))
++        local = [first]
++        chosen[first.reference] = first
++        _require(len(chosen) <= policy.max_selected)
++        while True:
++            target = max(
++                members,
++                key=lambda f: (min(_distance(f, s) for s in local), f.reference),
++            )
++            gap = min(_distance(target, s) for s in local)
++            if gap <= policy.max_gap_mm:
++                break
++            available = [f for f in candidates if f.reference not in chosen]
++            _require(bool(available) and len(chosen) < policy.max_selected)
++            candidate = min(
++                available,
++                key=lambda f: (_distance(f, target), -f.signal_range, f.reference),
++            )
++            _require(_distance(candidate, target) < gap)
++            local.append(candidate)
++            chosen[candidate.reference] = candidate
++    # Coverage always wins. Remaining slots add actual preview diversity only.
++    while len(chosen) < policy.max_selected:
++        available = [f for f in eligible if f.reference not in chosen]
++        if not available:
++            break
++
++        def novelty(frame: _Frame) -> float:
++            return min(
++                _appearance(frame, s) for s in chosen.values() if s.group == frame.group
++            )
++
++        candidate = min(
++            available, key=lambda f: (-novelty(f), -f.signal_range, f.reference)
++        )
++        if novelty(candidate) < policy.min_diversity_distance:
++            break
++        chosen[candidate.reference] = candidate
++    maximum = max(
++        min(_distance(f, s) for s in chosen.values() if s.group == f.group)
++        for f in frames
++    )
++    _require(maximum <= policy.max_gap_mm)
++    return tuple(sorted(chosen)), maximum
++
++
++def _plan(
++    sources: tuple[bytes, ...], window: DisplayWindow, policy: SamplingPolicy
++) -> tuple[SeriesSamplingPlan, dict[str, bytes], tuple[_Frame, ...]]:
++    _require(type(window) is DisplayWindow and type(policy) is SamplingPolicy)
++    window.__post_init__()
++    policy.__post_init__()
++    source_map, frames = _inspect(sources, window, policy)
++    selected, maximum_gap = _select(frames, policy)
++    group_counts: dict[str, int] = {}
++    for frame in frames:
++        group_counts[frame.group] = group_counts.get(frame.group, 0) + 1
++    records = []
++    for frame in frames:
++        record = asdict(frame)
++        record["preview"] = hashlib.sha256(frame.preview).hexdigest()
++        records.append(record)
++    plan = SeriesSamplingPlan(
++        _hash(sorted(source_map)),
++        _hash([asdict(policy), asdict(window)]),
++        _hash(records),
++        tuple(
++            SourceFrame(f.reference, f.source_digest, f.index, f.group) for f in frames
++        ),
++        selected,
++        tuple(f.reference for f in frames if f.reference not in selected),
++        tuple(f.reference for f in frames if f.signal_range < policy.min_signal_range),
++        tuple(f.reference for f in frames if f.unknown_acquisition),
++        tuple(sorted(group_counts.items())),
++        maximum_gap,
++    )
++    return plan, source_map, frames
++
++
++def sample_dicom_series(
++    sources: tuple[bytes, ...],
++    *,
++    window: DisplayWindow,
++    policy: SamplingPolicy | None = None,
++) -> SeriesSamplingPlan:
++    """Inspect actual native DICOM frames and produce a deterministic selection.
++
++    Args:
++        sources: Complete, bounded in-memory objects from one supplied series.
++        window: Explicit display transform for all preview/selected frame pixels.
++        policy: Resource, coverage and signal bounds; defaults are conservative.
++
++    Returns:
++        Manifest explicitly distinguishing selected and unexamined supplied frames.
++
++    Raises:
++        SeriesSamplingError: Missing/ambiguous metadata, unsupported native layout,
++            resource excess, insufficient eligible coverage or a parser failure.
++
++    Supports native 8/16-bit monochrome classic and enhanced multi-frame objects.
++    Compression, color, missing positions and ambiguous acquisition information
++    fail closed. All frames receive bounded preview inspection; only selected
++    frames are sent for VLM inference. This does not establish series completeness
++    beyond the supplied objects or clinically sufficient sampling.
++    """
++    active = policy if policy is not None else SamplingPolicy()
++    return _protected(lambda: _plan(sources, window, active)[0])
++
++
++@dataclass(frozen=True, slots=True)
++class SampledFrameInference:
++    """One original source-frame reference and its protected provider response."""
++
++    frame_reference: str
++    result: VLMResult = field(repr=False)
++
++    def __post_init__(self) -> None:
++        _digest(self.frame_reference)
++        _require(type(self.result) is VLMResult)
++
++
++@dataclass(frozen=True, slots=True)
++class SampledSeriesInference:
++    """Actual provider results whose evidence scope cannot include unseen frames."""
++
++    plan: SeriesSamplingPlan
++    frames: tuple[SampledFrameInference, ...] = field(repr=False)
++
++    def __post_init__(self) -> None:
++        _require(type(self.plan) is SeriesSamplingPlan and type(self.frames) is tuple)
++        self.plan.__post_init__()
++        _require(all(type(f) is SampledFrameInference for f in self.frames))
++        _require(tuple(f.frame_reference for f in self.frames) == self.plan.selected)
++
++    @property
++    def notice(self) -> str:
++        """Mandatory sampled-only, non-diagnostic scope for downstream displays."""
++        return _NOTICE
++
++    def require_evidence(self, frame_reference: str) -> VLMResult:
++        """Return evidence only for a successfully inferred selected frame.
++
++        Args:
++            frame_reference: Exact source-bound frame reference to cite.
++        """
++        for frame in self.frames:
++            if (
++                frame.frame_reference == frame_reference
++                and frame.result.abstention is None
++            ):
++                return frame.result
++        raise SeriesSamplingError("dicom_frame_not_examined")
++
++    def to_json(self) -> str:
++        """Report sampling scope without generated text, pixel data or DICOM tags."""
++        return json.dumps(
++            {
++                "schema_version": _SCHEMA,
++                "manifest_digest": self.plan.digest,
++                "evidence_scope": "selected_frames_only",
++                "examined": [
++                    f.frame_reference
++                    for f in self.frames
++                    if f.result.abstention is None
++                ],
++                "unexamined": sorted(
++                    (
++                        *self.plan.unexamined,
++                        *(
++                            f.frame_reference
++                            for f in self.frames
++                            if f.result.abstention is not None
++                        ),
++                    )
++                ),
++                "notice": self.notice,
++                "review_required": True,
++            },
++            sort_keys=True,
++            separators=(",", ":"),
++        )
++
++
++def run_sampled_dicom_vlm(
++    sources: tuple[bytes, ...],
++    plan: SeriesSamplingPlan,
++    provider: EdgeVLMProvider,
++    prompt: Prompt,
++    *,
++    window: DisplayWindow,
++    policy: SamplingPolicy | None = None,
++) -> SampledSeriesInference:
++    """Revalidate the entire sampling manifest and infer only its selected frames.
++
++    Args:
++        sources: The exact supplied DICOM objects, in any order.
++        plan: Previously returned source/policy-bound sampling manifest.
++        provider: Already loaded and qualified local VLM adapter.
++        prompt: Protected frame-scoped prompt and original generation limits.
++        window: Same explicit display window as the sampling operation.
++        policy: Same policy as the sampling operation.
++
++    Returns:
++        Protected per-frame drafts with a mandatory sampled-only scope. Provider
++        abstentions remain unexamined for evidence access and reporting.
++
++    Raises:
++        SeriesSamplingError: Any binding, decode or provider contract failure.
++            Partial result bundles are never returned on execution failure.
++    """
++
++    def run() -> SampledSeriesInference:
++        from PIL import Image
++
++        _require(type(plan) is SeriesSamplingPlan and type(prompt) is Prompt)
++        plan.__post_init__()
++        prompt.__post_init__()
++        active = policy if policy is not None else SamplingPolicy()
++        expected, source_map, frames = _plan(sources, window, active)
++        _require(expected == plan)
++        selected = {f.reference: f for f in frames}
++        results = []
++        for reference in plan.selected:
++            frame = selected[reference]
++            with _quiet_parser():
++                pixels = _display(source_map[frame.source_digest], frame, window)
++            buffer = io.BytesIO()
++            Image.fromarray(pixels).save(buffer, format="PNG")
++            image = ImageInput(
++                data=buffer.getvalue(),
++                media_type="image/png",
++                width=frame.columns,
++                height=frame.rows,
++            )
++            request = VLMRequest(image=image, prompt=prompt)
++            result = run_local_vlm(provider, request)
++            results.append(SampledFrameInference(reference, result))
++        return SampledSeriesInference(plan, tuple(results))
++
++    return _protected(run)
+diff --git a/pyproject.toml b/pyproject.toml
+index 280c1831f6..00810441ac 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -67,6 +67,8 @@ dev = [
+   "Pillow==13.0.0",
+   "duckdb>=1.0,<2",
+   "numpy>=1.26",
++  # Exercise real synthetic DICOM parsing in the offline CI suite.
++  "pydicom>=3.0",
+   "openpyxl>=3.1,<4",
+   "fastapi>=0.110",
+   "httpx>=0.27",
+diff --git a/tests/browser/brand/brand.spec.ts b/tests/browser/brand/brand.spec.ts
+index 59f880a852..1047dc135f 100644
+--- a/tests/browser/brand/brand.spec.ts
++++ b/tests/browser/brand/brand.spec.ts
+@@ -1345,6 +1345,32 @@ test("docs search, locale, theme, and code copy controls operate", async ({
+     { timeout: 20_000 },
+   );
+   await expect(page.locator(".md-search-result__link").first()).toBeVisible();
++  // Wait for the complete query, then exercise a newly inserted long snippet.
++  // Its width is independent of platform fonts and search-index ranking.
++  const resultArticle = page.locator(".md-search-result__article")
++    .filter({ hasText: "OpenMedSpan" }).first();
++  await expect(resultArticle).toBeVisible();
++  await resultArticle.evaluate((article) => {
++    const pre = document.createElement("pre");
++    const code = document.createElement("code");
++    code.id = "synthetic-search-overflow";
++    code.textContent = "synthetic_long_reference_".repeat(80);
++    pre.append(code);
++    article.append(pre);
++  });
++  const searchCode = page.locator("#synthetic-search-overflow");
++  await expect(searchCode).toBeVisible();
++  expect(await searchCode.evaluate((region) =>
++    region.scrollWidth > region.clientWidth + 1,
++  )).toBe(true);
++  await expect(searchCode).toHaveAttribute("tabindex", "0");
++  await searchCode.focus();
++  await expect(searchCode).toBeFocused();
++  await searchCode.press("ArrowRight");
++  await expect.poll(async () =>
++    searchCode.evaluate((region) => region.scrollLeft),
++  ).toBeGreaterThan(0);
++  await search.focus();
+   await expectAccessible(page);
+   await page.keyboard.press("Escape");
+   await expect(page.locator("#__search")).not.toBeChecked();
+diff --git a/tests/unit/multimodal/test_dicom_transfer_syntax.py b/tests/unit/multimodal/test_dicom_transfer_syntax.py
+new file mode 100644
+index 0000000000..5928ca4458
+--- /dev/null
++++ b/tests/unit/multimodal/test_dicom_transfer_syntax.py
+@@ -0,0 +1,568 @@
++"""Focused tests for bounded DICOM transfer-syntax preflight.
++
++Every payload is a small synthetic byte string built in this module: no fixture
++file, no imaging library, and no network access are involved.
++"""
++
++from __future__ import annotations
++
++import json
++import struct
++from dataclasses import FrozenInstanceError, replace
++
++import pytest
++
++from openmed.multimodal.dicom_transfer_syntax import (
++    DEFAULT_MAX_FILE_META_BYTES,
++    DEFAULT_MAX_FILE_META_ELEMENTS,
++    DEFAULT_MAX_TRANSFER_SYNTAX_UID_BYTES,
++    TRANSFER_SYNTAX_CATALOG,
++    TRANSFER_SYNTAX_OUTCOMES,
++    TRANSFER_SYNTAX_REASON_CODES,
++    TRANSFER_SYNTAX_SCHEMA_VERSION,
++    TransferSyntaxCapability,
++    TransferSyntaxError,
++    TransferSyntaxOutcome,
++    TransferSyntaxReport,
++    describe_transfer_syntax,
++    read_dicom_transfer_syntax,
++)
++
++_PREAMBLE = b"\x00" * 128
++_MAGIC = b"DICM"
++_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.1.7"
++_SOP_INSTANCE_UID = "1.2.3.4.5.6.7.8.9"
++_LOCAL_PATH = "C:\\data\\scan.dcm"
++_PATIENT_NAME = b"DOE^JOHN"
++_PRIVATE_UID = "1.3.6.1.4.1.5962.1"
++_UNKNOWN_STANDARD_UID = "1.2.840.10008.1.2.4.201"
++_JPEG_BASELINE_UID = "1.2.840.10008.1.2.4.50"
++
++_LONG_VRS = frozenset({b"OB", b"OD", b"OF", b"OL", b"OV", b"OW", b"SQ", b"SV"})
++_LONG_VRS |= frozenset({b"UC", b"UN", b"UR", b"UT", b"UV"})
++
++_EXPECTED_CATALOG = {
++    "1.2.840.10008.1.2": (TransferSyntaxOutcome.NATIVE, False, False),
++    "1.2.840.10008.1.2.1": (TransferSyntaxOutcome.NATIVE, False, False),
++    "1.2.840.10008.1.2.1.99": (TransferSyntaxOutcome.REVIEW, False, False),
++    "1.2.840.10008.1.2.2": (TransferSyntaxOutcome.REVIEW, False, True),
++    "1.2.840.10008.1.2.4.50": (TransferSyntaxOutcome.OPTIONAL_DECODER, True, False),
++    "1.2.840.10008.1.2.4.51": (TransferSyntaxOutcome.OPTIONAL_DECODER, True, False),
++    "1.2.840.10008.1.2.4.57": (TransferSyntaxOutcome.OPTIONAL_DECODER, True, False),
++    "1.2.840.10008.1.2.4.70": (TransferSyntaxOutcome.OPTIONAL_DECODER, True, False),
++    "1.2.840.10008.1.2.4.80": (TransferSyntaxOutcome.OPTIONAL_DECODER, True, False),
++    "1.2.840.10008.1.2.4.81": (TransferSyntaxOutcome.OPTIONAL_DECODER, True, False),
++    "1.2.840.10008.1.2.4.90": (TransferSyntaxOutcome.OPTIONAL_DECODER, True, False),
++    "1.2.840.10008.1.2.4.91": (TransferSyntaxOutcome.OPTIONAL_DECODER, True, False),
++    "1.2.840.10008.1.2.4.92": (TransferSyntaxOutcome.OPTIONAL_DECODER, True, False),
++    "1.2.840.10008.1.2.4.93": (TransferSyntaxOutcome.OPTIONAL_DECODER, True, False),
++    "1.2.840.10008.1.2.5": (TransferSyntaxOutcome.OPTIONAL_DECODER, True, False),
++}
++
++_REPORT_KEYS = (
++    "decoder_required",
++    "element_count",
++    "file_meta_bytes",
++    "outcome",
++    "reason",
++    "reason_codes",
++    "schema_version",
++    "transfer_syntax_name",
++    "transfer_syntax_uid",
++)
++
++_GOLDEN_REASON = "transfer_syntax_jpeg_baseline"
++_GOLDEN_JSON = '{"decoder_required":true,"element_count":6,"file_meta_bytes":272,"outcome":"optional_decoder","reason":"transfer_syntax_jpeg_baseline","reason_codes":["transfer_syntax_jpeg_baseline"],"schema_version":"openmed.multimodal.dicom_transfer_syntax.v1","transfer_syntax_name":"JPEG Baseline (Process 1)","transfer_syntax_uid":"1.2.840.10008.1.2.4.50"}'
++
++
++def _element(tag: tuple[int, int], vr: bytes, value: bytes) -> bytes:
++    assert len(value) % 2 == 0, (vr, value)
++    head = struct.pack("<HH", tag[0], tag[1]) + vr
++    if vr in _LONG_VRS:
++        return head + b"\x00\x00" + struct.pack("<I", len(value)) + value
++    return head + struct.pack("<H", len(value)) + value
++
++
++def _padded_uid(value: str) -> bytes:
++    raw = value.encode("ascii")
++    return raw + (b"\x00" if len(raw) % 2 else b"")
++
++
++def _file_meta(
++    ts_uid: str | None = None,
++    *,
++    group_length: int | None = None,
++    extra_body: bytes = b"",
++) -> bytes:
++    body = b""
++    body += _element((0x0002, 0x0001), b"OB", b"\x00\x01")
++    body += _element((0x0002, 0x0002), b"UI", _padded_uid(_SOP_CLASS_UID))
++    body += _element((0x0002, 0x0003), b"UI", _padded_uid(_SOP_INSTANCE_UID))
++    body += extra_body
++    if ts_uid is not None:
++        body += _element((0x0002, 0x0010), b"UI", _padded_uid(ts_uid))
++    body += _element((0x0002, 0x0016), b"AE", _LOCAL_PATH.encode("ascii"))
++    declared = len(body) if group_length is None else group_length
++    head = _element((0x0002, 0x0000), b"UL", struct.pack("<I", declared))
++    tail = _element((0x0008, 0x0005), b"CS", b"ISO_IR 100")
++    tail += _element((0x0010, 0x0010), b"PN", _PATIENT_NAME)
++    tail += b"\x00\xff" * 16
++    return _PREAMBLE + _MAGIC + head + body + tail
++
++
++def _read(payload: bytes | bytearray | memoryview, **kwargs: object):
++    return read_dicom_transfer_syntax(payload, **kwargs)  # type: ignore[arg-type]
++
++
++def test_default_bounds_are_stable() -> None:
++    assert DEFAULT_MAX_FILE_META_BYTES == 64 * 1024
++    assert DEFAULT_MAX_FILE_META_ELEMENTS == 64
++    assert DEFAULT_MAX_TRANSFER_SYNTAX_UID_BYTES == 128
++
++
++def test_schema_version_is_stable() -> None:
++    assert (
++        TRANSFER_SYNTAX_SCHEMA_VERSION == "openmed.multimodal.dicom_transfer_syntax.v1"
++    )
++
++
++def test_outcomes_and_reason_codes_are_closed_sets() -> None:
++    assert TRANSFER_SYNTAX_OUTCOMES == {
++        "native",
++        "optional_decoder",
++        "review",
++        "unsupported",
++    }
++    assert len(TRANSFER_SYNTAX_REASON_CODES) == 24
++    assert len(set(TRANSFER_SYNTAX_REASON_CODES)) == 24
++    assert list(TRANSFER_SYNTAX_REASON_CODES) == sorted(TRANSFER_SYNTAX_REASON_CODES)
++    assert set(TRANSFER_SYNTAX_OUTCOMES) == {
++        outcome.value for outcome in TransferSyntaxOutcome
++    }
++
++
++def test_catalog_matches_the_expected_transfer_syntaxes() -> None:
++    assert set(TRANSFER_SYNTAX_CATALOG) == set(_EXPECTED_CATALOG)
++    for uid, capability in TRANSFER_SYNTAX_CATALOG.items():
++        assert capability == describe_transfer_syntax(uid)
++        assert capability.uid == uid
++        assert capability.name
++        expected_outcome, decoder_required, retired = _EXPECTED_CATALOG[uid]
++        assert capability.outcome is expected_outcome
++        assert capability.decoder_required is decoder_required
++        assert capability.retired is retired
++        assert capability.reason in TRANSFER_SYNTAX_REASON_CODES
++        assert (capability.outcome is TransferSyntaxOutcome.OPTIONAL_DECODER) is (
++            capability.decoder_required
++        )
++
++
++@pytest.mark.parametrize("uid", sorted(_EXPECTED_CATALOG))
++def test_declared_catalog_syntax_is_routed(uid: str) -> None:
++    report = _read(_file_meta(uid))
++    capability = TRANSFER_SYNTAX_CATALOG[uid]
++    assert report.outcome is capability.outcome
++    assert report.reason == capability.reason
++    assert report.reason_codes == (capability.reason,)
++    assert report.transfer_syntax_uid == uid
++    assert report.transfer_syntax_name == capability.name
++    assert report.decoder_required is capability.decoder_required
++    assert report.element_count == 6
++    assert report.schema_version == TRANSFER_SYNTAX_SCHEMA_VERSION
++
++
++def test_only_native_syntaxes_report_ok() -> None:
++    native = _read(_file_meta("1.2.840.10008.1.2.1"))
++    compressed = _read(_file_meta(_JPEG_BASELINE_UID))
++    assert native.ok is True
++    assert compressed.ok is False
++    assert native.outcome is TransferSyntaxOutcome.NATIVE
++
++
++def test_catalog_report_json_is_byte_stable() -> None:
++    report = _read(_file_meta(_JPEG_BASELINE_UID))
++    assert report.to_json() == _GOLDEN_JSON
++    payload = json.loads(report.to_json())
++    assert list(payload) == sorted(_REPORT_KEYS)
++    assert payload["reason_codes"] == [_GOLDEN_REASON]
++
++
++def test_report_mapping_is_limited_to_transfer_syntax_metadata() -> None:
++    report = _read(_file_meta("1.2.840.10008.1.2.4.50"))
++    mapping = report.to_dict()
++    assert tuple(mapping) == (
++        "schema_version",
++        "outcome",
++        "reason",
++        "reason_codes",
++        "transfer_syntax_uid",
++        "transfer_syntax_name",
++        "decoder_required",
++        "file_meta_bytes",
++        "element_count",
++    )
++    blob = report.to_json()
++    for secret in (
++        _SOP_CLASS_UID,
++        _SOP_INSTANCE_UID,
++        _LOCAL_PATH,
++        "DOE",
++        "ISO_IR",
++    ):
++        assert secret not in blob
++    assert "ok" not in blob
++
++
++def test_catalog_capability_mapping_is_deterministic() -> None:
++    capability = TRANSFER_SYNTAX_CATALOG["1.2.840.10008.1.2.2"]
++    assert capability.to_dict() == {
++        "decoder_required": False,
++        "name": "Explicit VR Big Endian",
++        "outcome": "review",
++        "reason": "transfer_syntax_big_endian_retired",
++        "retired": True,
++        "uid": "1.2.840.10008.1.2.2",
++    }
++
++
++def test_report_and_capability_are_immutable() -> None:
++    report = _read(_file_meta("1.2.840.10008.1.2.1"))
++    with pytest.raises(FrozenInstanceError):
++        report.outcome = TransferSyntaxOutcome.UNSUPPORTED  # type: ignore[misc]
++    capability = TRANSFER_SYNTAX_CATALOG["1.2.840.10008.1.2.1"]
++    with pytest.raises(FrozenInstanceError):
++        capability.retired = True  # type: ignore[misc]
++
++
++def _group_end(payload: bytes) -> int:
++    return payload.index(b"ISO_IR") - 8
++
++
++def test_report_counts_describe_the_parsed_group() -> None:
++    payload = _file_meta("1.2.840.10008.1.2.1")
++    report = _read(payload)
++    assert report.element_count == 6
++    assert report.file_meta_bytes == _group_end(payload)
++
++
++def test_unknown_and_private_uids_are_unsupported() -> None:
++    unknown = _read(_file_meta(_UNKNOWN_STANDARD_UID))
++    assert unknown.outcome is TransferSyntaxOutcome.UNSUPPORTED
++    assert unknown.reason == "transfer_syntax_unknown"
++    assert unknown.transfer_syntax_uid == _UNKNOWN_STANDARD_UID
++    assert unknown.transfer_syntax_name is None
++    private = _read(_file_meta(_PRIVATE_UID))
++    assert private.reason == "transfer_syntax_private"
++    assert private.transfer_syntax_uid == _PRIVATE_UID
++    assert private.reason_codes == ("transfer_syntax_private",)
++
++
++def test_missing_transfer_syntax_element_is_reported() -> None:
++    report = _read(_file_meta())
++    assert report.reason == "transfer_syntax_missing"
++    assert report.transfer_syntax_uid is None
++    assert report.element_count == 5
++
++
++@pytest.mark.parametrize(
++    ("name", "reason"),
++    (
++        ("no-magic", "file_meta_missing"),
++        ("short", "file_meta_missing"),
++        ("malformed-uid", "transfer_syntax_malformed"),
++        ("odd-length", "file_meta_malformed"),
++        ("unknown-vr", "file_meta_malformed"),
++        ("wrong-vr", "file_meta_malformed"),
++        ("group-length", "file_meta_group_length_mismatch"),
++        ("truncated-value", "file_meta_truncated"),
++        ("truncated-header", "file_meta_truncated"),
++        ("element-limit", "file_meta_element_limit"),
++    ),
++)
++def test_malformed_declarations_return_stable_reasons(name: str, reason: str) -> None:
++    payloads = {
++        "no-magic": b"\x00" * 200,
++        "short": b"\x00" * 64,
++        "malformed-uid": _PREAMBLE
++        + _MAGIC
++        + _element((0x0002, 0x0010), b"UI", b"1.2.abc\x00"),
++        "odd-length": _PREAMBLE
++        + _MAGIC
++        + struct.pack("<HH", 0x0002, 0x0010)
++        + b"UI"
++        + struct.pack("<H", 5)
++        + b"1.2.4",
++        "unknown-vr": _PREAMBLE
++        + _MAGIC
++        + struct.pack("<HH", 0x0002, 0x0010)
++        + b"ZZ"
++        + struct.pack("<H", 4)
++        + b"1.2.",
++        "wrong-vr": _PREAMBLE
++        + _MAGIC
++        + _element((0x0002, 0x0010), b"LO", b"1.2.4\x00"),
++        "group-length": _file_meta("1.2.840.10008.1.2.1", group_length=4),
++        "truncated-value": _file_meta("1.2.840.10008.1.2.1")[:160],
++        "truncated-header": _file_meta("1.2.840.10008.1.2.1")[:137],
++        "element-limit": _file_meta("1.2.840.10008.1.2.1"),
++    }
++    kwargs = {"max_elements": 1} if name == "element-limit" else {}
++    report = _read(payloads[name], **kwargs)
++    assert report.outcome is TransferSyntaxOutcome.UNSUPPORTED
++    assert report.reason == reason
++    assert report.reason_codes == (reason,)
++    assert report.ok is False
++
++
++def test_group_length_mismatch_keeps_the_declared_uid() -> None:
++    report = _read(_file_meta("1.2.840.10008.1.2.1", group_length=4))
++    assert report.reason == "file_meta_group_length_mismatch"
++    assert report.transfer_syntax_uid == "1.2.840.10008.1.2.1"
++    assert report.transfer_syntax_name == "Explicit VR Little Endian"
++
++
++def test_truncation_before_the_uid_is_reported_not_raised() -> None:
++    payload = _file_meta("1.2.840.10008.1.2.1")
++    report = _read(payload, max_bytes=140)
++    assert report.reason == "file_meta_truncated"
++    assert report.transfer_syntax_uid is None
++
++
++def test_oversized_uid_value_is_malformed() -> None:
++    report = _read(_file_meta("1." + "2" * 70), max_uid_bytes=16)
++    assert report.reason == "transfer_syntax_malformed"
++
++
++def test_truncated_value_before_the_uid_is_counted() -> None:
++    payload = _file_meta("1.2.840.10008.1.2.1")
++    report = _read(payload[:160])
++    assert report.reason == "file_meta_truncated"
++    assert report.element_count == 2
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    (
++        {"max_bytes": 0},
++        {"max_bytes": -1},
++        {"max_bytes": True},
++        {"max_elements": 0},
++        {"max_elements": True},
++        {"max_uid_bytes": -1},
++        {"max_uid_bytes": True},
++    ),
++)
++def test_invalid_bounds_raise_categorized_errors(kwargs: dict[str, object]) -> None:
++    with pytest.raises(TransferSyntaxError) as excinfo:
++        _read(b"", **kwargs)
++    name = next(iter(kwargs))
++    assert excinfo.value.category == f"{name}_invalid"
++    assert str(excinfo.value) == f"{name}_invalid"
++
++
++@pytest.mark.parametrize("source", ("text", 3, None, ["bytes"]))
++def test_invalid_source_raises_categorized_error(source: object) -> None:
++    with pytest.raises(TransferSyntaxError) as excinfo:
++        read_dicom_transfer_syntax(source)  # type: ignore[arg-type]
++    assert excinfo.value.category == "source_invalid"
++
++
++def test_bytes_like_sources_are_accepted_without_mutation() -> None:
++    payload = _file_meta("1.2.840.10008.1.2.1")
++    mutable = bytearray(payload)
++    view = memoryview(payload)
++    for source in (payload, mutable, view):
++        report = _read(source)
++        assert report.transfer_syntax_uid == "1.2.840.10008.1.2.1"
++    assert bytes(mutable) == payload
++    assert view.obj is payload
++
++
++@pytest.mark.parametrize(
++    "uid",
++    ("", "1.2.", ".1.2", "01.2.3", "1.2.a", "1.2.3.4.", " 1.2.3", "1.2.3.4.5.6" * 12),
++)
++def test_describe_rejects_malformed_identifiers(uid: str) -> None:
++    with pytest.raises(TransferSyntaxError) as excinfo:
++        describe_transfer_syntax(uid)
++    assert excinfo.value.category == "uid_invalid"
++
++
++@pytest.mark.parametrize("uid", (b"1.2.840", 4, None))
++def test_describe_rejects_non_string_identifiers(uid: object) -> None:
++    with pytest.raises(TransferSyntaxError) as excinfo:
++        describe_transfer_syntax(uid)  # type: ignore[arg-type]
++    assert excinfo.value.category == "uid_invalid"
++
++
++def test_describe_returns_none_for_unknown_valid_identifiers() -> None:
++    assert describe_transfer_syntax(_UNKNOWN_STANDARD_UID) is None
++    assert describe_transfer_syntax("1.2.840.10008.1.2.1.98") is None
++
++
++@pytest.mark.parametrize(
++    ("override", "message"),
++    (
++        ({"reason": "unknown_reason"}, "reason"),
++        ({"outcome": "native"}, "outcome"),
++        ({"decoder_required": 1}, "booleans"),
++        ({"retired": "yes"}, "booleans"),
++        ({"uid": "1.2.a"}, "uid"),
++        ({"name": ""}, "name"),
++    ),
++)
++def test_capability_validation_rejects_bad_values(
++    override: dict[str, object], message: str
++) -> None:
++    fields = {
++        "uid": "1.2.840.10008.1.2.1",
++        "name": "Explicit VR Little Endian",
++        "outcome": TransferSyntaxOutcome.NATIVE,
++        "reason": "transfer_syntax_explicit_little_endian",
++        "decoder_required": False,
++    }
++    fields.update(override)
++    with pytest.raises(ValueError, match=message):
++        TransferSyntaxCapability(**fields)  # type: ignore[arg-type]
++
++
++def _report(**overrides: object) -> TransferSyntaxReport:
++    fields = {
++        "outcome": TransferSyntaxOutcome.NATIVE,
++        "reason": "transfer_syntax_explicit_little_endian",
++        "reason_codes": ("transfer_syntax_explicit_little_endian",),
++        "transfer_syntax_uid": "1.2.840.10008.1.2.1",
++        "transfer_syntax_name": "Explicit VR Little Endian",
++        "decoder_required": False,
++        "file_meta_bytes": 270,
++        "element_count": 6,
++    }
++    fields.update(overrides)
++    return TransferSyntaxReport(**fields)  # type: ignore[arg-type]
++
++
++@pytest.mark.parametrize(
++    ("override", "message"),
++    (
++        ({"reason_codes": ()}, "reason_codes must not be empty"),
++        ({"reason_codes": ("unknown",)}, "known reason codes"),
++        ({"reason": "transfer_syntax_deflated"}, "first reason code"),
++        ({"transfer_syntax_uid": "1.2.a"}, "DICOM UID"),
++        ({"decoder_required": "no"}, "boolean"),
++        ({"file_meta_bytes": -1}, "non-negative"),
++        ({"element_count": True}, "non-negative"),
++        ({"outcome": "native"}, "TransferSyntaxOutcome"),
++        ({"schema_version": "v2"}, "schema_version is unsupported"),
++    ),
++)
++def test_report_validation_rejects_bad_values(
++    override: dict[str, object], message: str
++) -> None:
++    with pytest.raises(ValueError, match=message):
++        _report(**override)
++
++
++def test_report_round_trips_through_replace() -> None:
++    report = _report()
++    assert report.to_dict()["reason_codes"] == [
++        "transfer_syntax_explicit_little_endian"
++    ]
++    assert replace(report, element_count=7).element_count == 7
++    assert json.loads(report.to_json())["outcome"] == "native"
++
++
++def test_reads_are_deterministic() -> None:
++    payload = _file_meta(_UNKNOWN_STANDARD_UID)
++    first = _read(payload)
++    second = _read(payload)
++    assert first.to_dict() == second.to_dict()
++    assert first.to_json() == second.to_json()
++
++
++def test_reads_run_without_network(monkeypatch: pytest.MonkeyPatch) -> None:
++    def _fail(*args: object, **kwargs: object) -> None:
++        raise AssertionError("network access is not allowed")
++
++    monkeypatch.setattr("socket.socket.connect", _fail)
++    monkeypatch.setattr("socket.create_connection", _fail)
++    for uid in (_JPEG_BASELINE_UID, _UNKNOWN_STANDARD_UID, _PRIVATE_UID):
++        report = _read(_file_meta(uid))
++        assert report.reason
++    assert _read(_file_meta()).reason == "transfer_syntax_missing"
++
++
++@pytest.mark.parametrize("case", ["truncated", "duplicate", "limited", "group_length"])
++def test_readable_uid_never_overrides_incomplete_or_conflicting_group(case):
++    uid = _element((2, 16), b"UI", _padded_uid("1.2.840.10008.1.2.1"))
++    prefix = _PREAMBLE + _MAGIC
++    kwargs = {}
++    if case == "truncated":
++        payload = prefix + uid + struct.pack("<HH2sH", 2, 18, b"UI", 60)
++    elif case == "duplicate":
++        payload = prefix + uid + uid
++    elif case == "limited":
++        payload = prefix + uid + _element((2, 18), b"UI", b"12")
++        kwargs = {"max_elements": 1}
++    else:
++        payload = (
++            prefix + _element((2, 0), b"UL", struct.pack("<I", len(uid) + 20)) + uid
++        )
++    report = _read(payload, **kwargs)
++    assert report.outcome is TransferSyntaxOutcome.UNSUPPORTED
++    assert report.ok is False
++
++
++def test_exact_element_limit_allows_complete_group_but_not_another_meta_element():
++    payload = _file_meta("1.2.840.10008.1.2.1")
++    assert _read(payload, max_elements=6).ok
++    assert _read(payload, max_elements=5).reason == "file_meta_element_limit"
++
++
++def test_exact_complete_meta_byte_boundary_does_not_copy_or_require_pixel_body():
++    payload = bytearray(_file_meta("1.2.840.10008.1.2.1"))
++    boundary = _group_end(payload)
++    for extra in range(4):
++        assert _read(payload, max_bytes=boundary + extra).ok
++    assert _read(payload, max_bytes=boundary - 1).reason == "file_meta_truncated"
++
++
++def test_bytes_conversion_receives_only_bounded_slice(monkeypatch):
++    import openmed.multimodal.dicom_transfer_syntax as module
++
++    payload = bytearray(_file_meta("1.2.840.10008.1.2.1"))
++    payload.extend(b"\x00" * 10_000)
++    seen = []
++
++    class RecordingBytes(bytes):
++        def __new__(cls, value):
++            seen.append(len(value))
++            return super().__new__(cls, value)
++
++    monkeypatch.setattr(module, "bytes", RecordingBytes, raising=False)
++    assert module.read_dicom_transfer_syntax(payload, max_bytes=512).ok
++    assert seen == [512]
++
++
++def test_noncontiguous_or_released_views_raise_value_free_argument_errors():
++    sources = [memoryview(b"abcdef")[::2], memoryview(b"abc")]
++    sources[1].release()
++    for source in sources:
++        with pytest.raises(TransferSyntaxError) as error:
++            _read(source)
++        assert error.value.category == "source_invalid"
++        assert error.value.__context__ is None
++
++
++@pytest.mark.parametrize("suffix", [b"  ", b"\x00\x00"])
++def test_uid_rejects_invalid_repeated_or_space_padding(suffix):
++    value = b"1.2.840.10008.1.2" + suffix + b"\x00"
++    assert (
++        _read(_PREAMBLE + _MAGIC + _element((2, 16), b"UI", value)).reason
++        == "transfer_syntax_malformed"
++    )
++
++
++def test_long_vr_reserved_bytes_must_be_zero():
++    payload = bytearray(_file_meta("1.2.840.10008.1.2.1"))
++    payload[150:152] = b"XY"
++    assert _read(payload).reason == "file_meta_malformed"
+diff --git a/tests/unit/multimodal/vision/dicom/test_series_sampler.py b/tests/unit/multimodal/vision/dicom/test_series_sampler.py
+new file mode 100644
+index 0000000000..ba101c2f53
+--- /dev/null
++++ b/tests/unit/multimodal/vision/dicom/test_series_sampler.py
+@@ -0,0 +1,431 @@
++"""Real synthetic DICOM bytes, coverage controls and sampled-only VLM evidence."""
++
++import hashlib
++import io
++import json
++import logging
++import socket
++from dataclasses import replace
++
++import pytest
++
++np = pytest.importorskip("numpy")
++pydicom = pytest.importorskip("pydicom")
++from pydicom.dataset import Dataset, FileMetaDataset
++from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, ImplicitVRLittleEndian
++
++from openmed.multimodal.abstention import (
++    AbstentionReason,
++    AbstentionRecord,
++    AbstentionStage,
++)
++from openmed.multimodal.vision.dicom.series_sampler import (
++    DisplayWindow,
++    SamplingPolicy,
++    SeriesSamplingError,
++    run_sampled_dicom_vlm,
++    sample_dicom_series,
++)
++from openmed.multimodal.vision.providers.base import (
++    LocalProviderMetadata,
++    Prompt,
++    RuntimeBackend,
++    RuntimeMetadata,
++    VLMResult,
++)
++
++PRIVATE = "SYNTHETIC-PRIVATE-987"
++WINDOW = DisplayWindow(center=128, width=256)
++POLICY = SamplingPolicy(max_selected=4, max_gap_mm=4)
++
++
++def encode(ds):
++    stream = io.BytesIO()
++    pydicom.dcmwrite(stream, ds, enforce_file_format=True)
++    return stream.getvalue()
++
++
++def dataset(
++    index, *, acquisition=1, z=None, pattern=None, syntax=ExplicitVRLittleEndian
++):
++    ds = Dataset()
++    ds.file_meta = FileMetaDataset()
++    ds.file_meta.TransferSyntaxUID = syntax
++    ds.SOPClassUID = CTImageStorage
++    ds.SOPInstanceUID = f"1.2.826.0.1.3680043.10.543.{index + 1}"
++    ds.SeriesInstanceUID = "1.2.826.0.1.3680043.10.543.1000"
++    ds.FrameOfReferenceUID = "1.2.826.0.1.3680043.10.543.2000"
++    ds.PatientName = PRIVATE
++    ds.PatientID = PRIVATE
++    ds.Modality = "CT"
++    ds.Rows = ds.Columns = 16
++    ds.SamplesPerPixel = 1
++    ds.BitsAllocated = ds.BitsStored = 16
++    ds.HighBit = 15
++    ds.PixelRepresentation = 0
++    ds.PhotometricInterpretation = "MONOCHROME2"
++    ds.ImagePositionPatient = [0, 0, index * 2 if z is None else z]
++    ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
++    ds.PixelSpacing = [1, 1]
++    ds.AcquisitionNumber = acquisition
++    pixels = np.arange(256, dtype="<u2").reshape(16, 16) if pattern is None else pattern
++    ds.PixelData = pixels.astype("<u2").tobytes()
++    return ds
++
++
++def sources(count=8, **kwargs):
++    return tuple(encode(dataset(i, **kwargs)) for i in range(count))
++
++
++def frame_ref(data, index=0):
++    payload = json.dumps(
++        [hashlib.sha256(data).hexdigest(), index], sort_keys=True, separators=(",", ":")
++    )
++    return hashlib.sha256(payload.encode()).hexdigest()
++
++
++def sample(data, **kwargs):
++    return sample_dicom_series(
++        data, window=WINDOW, policy=kwargs.pop("policy", POLICY), **kwargs
++    )
++
++
++class Provider:
++    metadata = LocalProviderMetadata(
++        backend=RuntimeBackend.SYNTHETIC,
++        model_digest="a" * 64,
++        preprocessing_digest="b" * 64,
++    )
++
++    def __init__(self):
++        self.requests = []
++        self.abstain = False
++        self.bad = False
++
++    def infer(self, request):
++        self.requests.append(request)
++        if self.bad:
++            raise RuntimeError(PRIVATE)
++        return VLMResult(
++            request_digest=request.digest,
++            runtime=RuntimeMetadata(
++                provider=self.metadata,
++                duration_ms=1,
++                output_tokens=0 if self.abstain else 1,
++            ),
++            text="" if self.abstain else PRIVATE,
++            abstention=AbstentionRecord(
++                AbstentionStage.INFERENCE, AbstentionReason.LOW_QUALITY
++            )
++            if self.abstain
++            else None,
++        )
++
++
++def test_actual_dicom_selection_is_order_independent_and_covers_every_frame():
++    data = sources()
++    first = sample(data)
++    assert first == sample(tuple(reversed(data)))
++    assert 0 < len(first.selected) <= POLICY.max_selected
++    assert set(first.selected) | set(first.unexamined) == {frame_ref(d) for d in data}
++    assert not set(first.selected) & set(first.unexamined)
++    assert first.maximum_gap_mm <= POLICY.max_gap_mm
++    selected_positions = [
++        i * 2 for i, d in enumerate(data) if frame_ref(d) in first.selected
++    ]
++    assert all(
++        min(abs(i * 2 - p) for p in selected_positions) <= POLICY.max_gap_mm
++        for i in range(len(data))
++    )
++    assert PRIVATE not in first.to_json() + repr(first)
++    assert "ImagePositionPatient" not in first.to_json()
++    assert {f.source_digest for f in first.frames} == {
++        hashlib.sha256(d).hexdigest() for d in data
++    }
++    assert all(f.frame_index == 0 for f in first.frames)
++    assert {f.reference for f in first.frames} == {frame_ref(d) for d in data}
++
++
++def test_distinct_acquisition_groups_cannot_be_covered_by_one_another():
++    data = tuple(
++        encode(dataset(i, acquisition=1 if i < 4 else 2, z=i % 4)) for i in range(8)
++    )
++    plan = sample(data, policy=replace(POLICY, max_gap_mm=20))
++    assert len(plan.groups) == 2
++    for group in (data[:4], data[4:]):
++        assert set(plan.selected) & {frame_ref(d) for d in group}
++    with pytest.raises(SeriesSamplingError):
++        sample(data, policy=replace(POLICY, max_selected=1))
++
++
++def test_diversity_adds_observed_different_pixels_after_spatial_coverage():
++    plain = np.arange(256, dtype="<u2").reshape(16, 16)
++    data = (encode(dataset(0, pattern=plain)), encode(dataset(1, pattern=255 - plain)))
++    plan = sample(data, policy=replace(POLICY, max_gap_mm=100, max_selected=2))
++    assert len(plan.selected) == 2
++    same = (encode(dataset(0, pattern=plain)), encode(dataset(1, pattern=plain)))
++    assert (
++        len(
++            sample(
++                same, policy=replace(POLICY, max_gap_mm=100, max_selected=2)
++            ).selected
++        )
++        == 1
++    )
++
++
++def test_low_signal_frames_remain_explicit_and_cannot_be_the_only_coverage():
++    data = (
++        encode(dataset(0)),
++        encode(dataset(1, pattern=np.zeros((16, 16), dtype="<u2"))),
++    )
++    plan = sample(data)
++    assert plan.low_signal == (frame_ref(data[1]),)
++    assert plan.low_signal[0] in plan.unexamined
++    with pytest.raises(SeriesSamplingError):
++        sample(data, policy=replace(POLICY, max_gap_mm=0))
++
++
++def test_insufficient_frame_budget_abstains_instead_of_omitting_distant_positions():
++    with pytest.raises(SeriesSamplingError):
++        sample(sources(), policy=replace(POLICY, max_selected=1, max_gap_mm=1))
++
++
++@pytest.mark.parametrize(
++    "change",
++    [
++        {"max_frames": 1, "max_selected": 1},
++        {"max_instances": 1},
++        {"max_source_bytes": 100},
++        {"max_total_bytes": 100},
++        {"max_header_bytes": 140},
++        {"max_frame_pixels": 1},
++    ],
++)
++def test_resource_bounds_reject_before_expensive_model_execution(change):
++    with pytest.raises(SeriesSamplingError):
++        sample(sources(2), policy=replace(POLICY, **change))
++
++
++@pytest.mark.parametrize(
++    "key",
++    [
++        "ImagePositionPatient",
++        "ImageOrientationPatient",
++        "PixelSpacing",
++        "FrameOfReferenceUID",
++        "SeriesInstanceUID",
++        "AcquisitionNumber",
++    ],
++)
++def test_missing_metadata_is_not_replaced_with_fabricated_geometry_or_acquisition(key):
++    ds = dataset(0)
++    delattr(ds, key)
++    with pytest.raises(SeriesSamplingError):
++        sample((encode(ds),))
++
++
++def test_duplicate_instances_and_mixed_series_are_rejected():
++    data = sources(2)
++    for invalid in ((data[0], data[0]),):
++        with pytest.raises(SeriesSamplingError):
++            sample(invalid)
++    ds = dataset(1)
++    ds.SeriesInstanceUID = "1.2.3.4.5"
++    with pytest.raises(SeriesSamplingError):
++        sample((data[0], encode(ds)))
++
++
++def test_unknown_acquisition_requires_explicit_policy_and_remains_distinct():
++    data = []
++    for index in range(2):
++        ds = dataset(index, z=0)
++        del ds.AcquisitionNumber
++        data.append(encode(ds))
++    policy = replace(POLICY, require_acquisition=False)
++    plan = sample(tuple(data), policy=policy)
++    assert len(plan.selected) == len(plan.groups) == 2
++    assert plan.unknown_acquisition == plan.selected
++    with pytest.raises(SeriesSamplingError):
++        sample(tuple(data), policy=replace(policy, max_selected=1))
++
++
++@pytest.mark.parametrize("uid", ["X.2.826", "1.02.26", "1..826"])
++def test_uid_validation_does_not_depend_on_application_warning_settings(uid):
++    original = b"1.2.826.0.1.3680043.10.543.1000"
++    replacement = (uid + "." + "1" * (len(original) - len(uid) - 1)).encode()
++    raw = sources(1)[0].replace(original, replacement)
++    with pydicom.config.disable_value_validation(), pytest.raises(SeriesSamplingError):
++        sample((raw,))
++
++
++def test_fractional_acquisition_cannot_be_truncated_to_an_integer():
++    ds = dataset(0, acquisition=123)
++    raw = encode(ds).replace(b"123 ", b"1.5 ")
++    with pydicom.config.disable_value_validation(), pytest.raises(SeriesSamplingError):
++        sample((raw,))
++
++
++@pytest.mark.parametrize("orientation", [[1, 0, 0, 1, 0, 0], [2, 0, 0, 0, 1, 0]])
++def test_degenerate_or_nonunit_direction_cosines_are_rejected(orientation):
++    ds = dataset(0)
++    ds.ImageOrientationPatient = orientation
++    with pytest.raises(SeriesSamplingError):
++        sample((encode(ds),))
++
++
++def test_implicit_native_syntax_is_supported():
++    assert sample(sources(3, syntax=ImplicitVRLittleEndian)).selected
++
++
++def test_enhanced_multiframe_uses_each_frames_actual_position_and_acquisition():
++    ds = dataset(0)
++    del ds.ImagePositionPatient
++    ds.NumberOfFrames = 4
++    groups = []
++    for index in range(4):
++        fg = Dataset()
++        plane = Dataset()
++        plane.ImagePositionPatient = [0, 0, index * 5]
++        fg.PlanePositionSequence = [plane]
++        content = Dataset()
++        content.FrameAcquisitionNumber = 1
++        content.TemporalPositionIndex = 1 if index < 2 else 2
++        fg.FrameContentSequence = [content]
++        groups.append(fg)
++    ds.PerFrameFunctionalGroupsSequence = groups
++    ds.PixelData = np.tile(np.arange(256, dtype="<u2"), (4, 1)).tobytes()
++    raw = encode(ds)
++    plan = sample((raw,), policy=replace(POLICY, max_gap_mm=6))
++    assert len(plan.groups) == 2
++    assert set(plan.selected) | set(plan.unexamined) == {
++        frame_ref(raw, i) for i in range(4)
++    }
++    assert {f.frame_index for f in plan.frames} == {0, 1, 2, 3}
++
++
++def test_multiframe_missing_per_frame_positions_cannot_invent_slice_spacing():
++    ds = dataset(0)
++    ds.NumberOfFrames = 2
++    ds.PixelData *= 2
++    with pytest.raises(SeriesSamplingError):
++        sample((encode(ds),))
++
++
++def test_multiframe_content_groups_do_not_promote_one_legacy_position_to_every_frame():
++    ds = dataset(0)
++    ds.NumberOfFrames = 2
++    groups = []
++    for index in range(2):
++        fg, content = Dataset(), Dataset()
++        content.FrameAcquisitionNumber = index + 1
++        fg.FrameContentSequence = [content]
++        groups.append(fg)
++    ds.PerFrameFunctionalGroupsSequence = groups
++    ds.PixelData *= 2
++    with pytest.raises(SeriesSamplingError):
++        sample((encode(ds),))
++
++
++def test_selected_vlm_inputs_are_actual_images_and_unexamined_frames_cannot_be_cited():
++    from PIL import Image
++
++    data = sources()
++    plan = sample(data)
++    provider = Provider()
++    result = run_sampled_dicom_vlm(
++        data,
++        plan,
++        provider,
++        Prompt(text="Review this selected frame"),
++        window=WINDOW,
++        policy=POLICY,
++    )
++    assert len(provider.requests) == len(plan.selected)
++    for item, request in zip(result.frames, provider.requests, strict=True):
++        with Image.open(io.BytesIO(request.image.data)) as image:
++            assert image.size == (16, 16) and image.mode == "L"
++            assert np.asarray(image).ravel().tolist() == [0, *range(255)]
++        assert item.result.request_digest == request.digest
++        assert result.require_evidence(item.frame_reference) is item.result
++    with pytest.raises(SeriesSamplingError):
++        result.require_evidence(plan.unexamined[0])
++    report = json.loads(result.to_json())
++    assert report["evidence_scope"] == "selected_frames_only"
++    assert set(report["unexamined"]) == set(plan.unexamined)
++    assert PRIVATE not in repr(result) + result.to_json()
++
++
++def test_provider_abstention_never_counts_as_examined_evidence():
++    data = sources(2)
++    plan = sample(data)
++    provider = Provider()
++    provider.abstain = True
++    result = run_sampled_dicom_vlm(
++        data,
++        plan,
++        provider,
++        Prompt(text="Review selected frame"),
++        window=WINDOW,
++        policy=POLICY,
++    )
++    assert json.loads(result.to_json())["examined"] == []
++    with pytest.raises(SeriesSamplingError):
++        result.require_evidence(plan.selected[0])
++
++
++@pytest.mark.parametrize("changed", ["source", "window", "policy", "manifest"])
++def test_stale_or_forged_bindings_never_reach_provider(changed):
++    data = sources(3)
++    plan = sample(data)
++    provider = Provider()
++    window = WINDOW
++    policy = POLICY
++    if changed == "source":
++        modified = dataset(0)
++        modified.PatientID = "SYNTHETIC-OTHER"
++        data = (encode(modified), *data[1:])
++    elif changed == "window":
++        window = DisplayWindow(center=0, width=256)
++    elif changed == "policy":
++        policy = replace(POLICY, max_gap_mm=5)
++    else:
++        plan = replace(plan, frames_digest="f" * 64)
++    with pytest.raises(SeriesSamplingError) as error:
++        run_sampled_dicom_vlm(
++            data, plan, provider, Prompt(text=PRIVATE), window=window, policy=policy
++        )
++    assert error.value.__context__ is None and not provider.requests
++
++
++def test_backend_errors_and_parser_warnings_never_escape_as_phi(caplog):
++    caplog.set_level(logging.DEBUG, logger="pydicom")
++    data = sources(2)
++    plan = sample(data)
++    caplog.clear()
++    provider = Provider()
++    provider.bad = True
++    with pytest.raises(SeriesSamplingError) as error:
++        run_sampled_dicom_vlm(
++            data, plan, provider, Prompt(text=PRIVATE), window=WINDOW, policy=POLICY
++        )
++    assert PRIVATE not in caplog.text + str(error.value)
++    assert error.value.__context__ is None
++    raw = data[0].replace(
++        b"1.2.826.0.1.3680043.10.543.1", b"X.2.826.0.1.3680043.10.543.1"
++    )
++    with pytest.raises(SeriesSamplingError):
++        sample((raw,))
++    assert "X.2.826" not in caplog.text
++
++
++def test_offline_execution_never_opens_a_socket(monkeypatch):
++    def forbidden(*args, **kwargs):
++        raise AssertionError("network forbidden")
++
++    monkeypatch.setattr(socket, "socket", forbidden)
++    data = sources(2)
++    plan = sample(data)
++    assert run_sampled_dicom_vlm(
++        data, plan, Provider(), Prompt(text="Synthetic"), window=WINDOW, policy=POLICY
++    ).frames
+diff --git a/uv.lock b/uv.lock
+index 0b97fe1f57..c145dc779e 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -13646,6 +13646,7 @@ dev = [
+     { name = "polars" },
+     { name = "pre-commit" },
+     { name = "protobuf" },
++    { name = "pydicom" },
+     { name = "pytest" },
+     { name = "pytest-cov" },
+     { name = "pytest-timeout" },
+@@ -14226,6 +14227,7 @@ requires-dist = [
+     { name = "pyasn1", marker = "extra == 'cloud'", specifier = ">=0.6.5" },
+     { name = "pycld2", marker = "extra == 'lid'", specifier = ">=0.41,<1" },
+     { name = "pydeid", marker = "extra == 'pydeid'", specifier = ">=0.0.1" },
++    { name = "pydicom", marker = "extra == 'dev'", specifier = ">=3.0" },
+     { name = "pydicom", marker = "extra == 'multimodal'", specifier = ">=3.0" },
+     { name = "pymdown-extensions", marker = "extra == 'docs'", specifier = ">=11.0.1,<12" },
+     { name = "pymongo", marker = "extra == 'beam'", specifier = ">=4.18.3" },

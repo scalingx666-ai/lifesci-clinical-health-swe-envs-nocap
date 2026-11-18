@@ -1,0 +1,19 @@
+# Issue
+
+**Title:** FHIR-55235 - fixed typos in PaymentNotice
+
+## Description
+
+## HL7 FHIR Pull Request
+
+_Note: No pull requests will be accepted against `./source` unless logged in the_ [HL7 Jira issue tracker](https://jira.hl7.org/projects/FHIR/issues/).
+
+If you made changes to any files within `./source` please indicate the Jira tracker number this pull request is associated with: `   `
+
+## Description
+
+FHIR-55235 - fixed typos in PaymentNotice
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `b148e5277d4a`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

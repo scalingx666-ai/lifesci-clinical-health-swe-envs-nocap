@@ -1,0 +1,592 @@
+diff --git a/backend/app/api/routes/v1/config.py b/backend/app/api/routes/v1/config.py
+index a257e68e2a..cfc98efae4 100644
+--- a/backend/app/api/routes/v1/config.py
++++ b/backend/app/api/routes/v1/config.py
+@@ -3,6 +3,7 @@
+ 
+ from app.config import settings
+ from app.services import DeveloperDep
++from app.utils.email_client import is_email_configured
+ 
+ router = APIRouter()
+ 
+@@ -12,8 +13,12 @@ class ConfigResponse(BaseModel):
+     never remove or repurpose, so the frontend stays backward compatible."""
+ 
+     outgoing_webhooks_enabled: bool
++    email_enabled: bool
+ 
+ 
+ @router.get("/config", response_model=ConfigResponse)
+ def get_config(_developer: DeveloperDep):
+-    return ConfigResponse(outgoing_webhooks_enabled=settings.outgoing_webhooks_enabled)
++    return ConfigResponse(
++        outgoing_webhooks_enabled=settings.outgoing_webhooks_enabled,
++        email_enabled=is_email_configured(),
++    )
+diff --git a/backend/app/integrations/celery/tasks/send_email_task.py b/backend/app/integrations/celery/tasks/send_email_task.py
+index a6db0da3a6..92f74e6a9c 100644
+--- a/backend/app/integrations/celery/tasks/send_email_task.py
++++ b/backend/app/integrations/celery/tasks/send_email_task.py
+@@ -9,7 +9,7 @@
+ from app.database import SessionLocal
+ from app.models import Invitation
+ from app.schemas.model_crud.user_management import InvitationStatus
+-from app.utils.email_client import _is_email_configured, send_invitation_email
++from app.utils.email_client import get_email_config_error, send_invitation_email
+ from app.utils.sentry_helpers import log_and_capture_error
+ from app.utils.structured_logging import log_structured
+ 
+@@ -139,11 +139,11 @@ def send_invitation_email_task(
+             raise ValueError(f"Invitation {invitation_id} has invalid status: {invitation.status}")
+ 
+         # Skip sending if email is not configured (allow manual invite links)
+-        if not _is_email_configured():
++        if config_error := get_email_config_error():
+             log_structured(
+                 logger,
+                 "warning",
+-                f"Email not configured, skipping send for invitation {invitation_id}",
++                f"{config_error}, skipping send for invitation {invitation_id}",
+                 provider="email",
+                 task="send_invitation_email_task",
+             )
+diff --git a/backend/app/utils/email_client.py b/backend/app/utils/email_client.py
+index b380b5114b..bc711e336e 100644
+--- a/backend/app/utils/email_client.py
++++ b/backend/app/utils/email_client.py
+@@ -32,45 +32,22 @@ def _get_from_address() -> str:
+     return formataddr((settings.email_from_name, cast(str, settings.email_from_address)))
+ 
+ 
+-def _is_email_configured() -> bool:
+-    """Check if email sending is properly configured."""
++def get_email_config_error() -> str | None:
++    """Return why email cannot be sent, or None when delivery is configured."""
+     if not settings.smtp_host and not settings.resend_api_key:
+-        log_structured(
+-            logger,
+-            "warning",
+-            "Neither SMTP_HOST nor RESEND_API_KEY configured, skipping email send",
+-            provider="email",
+-            task="is_email_configured",
+-        )
+-        return False
++        return "Neither SMTP_HOST nor RESEND_API_KEY configured"
+     if settings.smtp_host and settings.smtp_security == "none" and settings.smtp_username and settings.smtp_password:
+-        log_structured(
+-            logger,
+-            "warning",
+-            "SMTP_SECURITY=none does not allow sending SMTP_USERNAME/SMTP_PASSWORD unencrypted, skipping email send",
+-            provider="email",
+-            task="is_email_configured",
+-        )
+-        return False
++        return "SMTP_SECURITY=none does not allow sending SMTP_USERNAME/SMTP_PASSWORD unencrypted"
+     if not settings.email_from_address:
+-        log_structured(
+-            logger,
+-            "warning",
+-            "EMAIL_FROM_ADDRESS not configured, skipping email send",
+-            provider="email",
+-            task="is_email_configured",
+-        )
+-        return False
++        return "EMAIL_FROM_ADDRESS not configured"
+     if not settings.email_from_name:
+-        log_structured(
+-            logger,
+-            "warning",
+-            "EMAIL_FROM_NAME not configured, skipping email send",
+-            provider="email",
+-            task="is_email_configured",
+-        )
+-        return False
+-    return True
++        return "EMAIL_FROM_NAME not configured"
++    return None
++
++
++def is_email_configured() -> bool:
++    """Check if email sending is properly configured."""
++    return get_email_config_error() is None
+ 
+ 
+ def _send_via_resend(to_email: str, subject: str, html: str, text: str) -> None:
+@@ -136,7 +113,10 @@ def send_invitation_email(to_email: str, invite_url: str, invited_by_email: str
+             logger, "warning", "Invalid email address provided", provider="email", task="send_invitation_email"
+         )
+         return False
+-    if not _is_email_configured():
++    if config_error := get_email_config_error():
++        log_structured(
++            logger, "warning", f"{config_error}, skipping email send", provider="email", task="send_invitation_email"
++        )
+         return False
+ 
+     invited_by_text = f" by {invited_by_email}" if invited_by_email else ""
+diff --git a/backend/tests/api/v1/test_config.py b/backend/tests/api/v1/test_config.py
+new file mode 100644
+index 0000000000..78b2be5a95
+--- /dev/null
++++ b/backend/tests/api/v1/test_config.py
+@@ -0,0 +1,41 @@
++"""Tests for GET /api/v1/config."""
++
++from unittest.mock import patch
++
++from fastapi.testclient import TestClient
++from pydantic import SecretStr
++from sqlalchemy.orm import Session
++
++from app.config import settings
++from tests.factories import DeveloperFactory
++from tests.utils import developer_auth_headers
++
++
++class TestGetConfig:
++    def test_email_enabled_false_without_transport(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
++        headers = developer_auth_headers(DeveloperFactory().id)
++        with (
++            patch.object(settings, "smtp_host", None),
++            patch.object(settings, "resend_api_key", None),
++        ):
++            response = client.get(f"{api_v1_prefix}/config", headers=headers)
++
++        assert response.status_code == 200
++        assert response.json()["email_enabled"] is False
++
++    def test_email_enabled_true_with_resend(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
++        headers = developer_auth_headers(DeveloperFactory().id)
++        with (
++            patch.object(settings, "smtp_host", None),
++            patch.object(settings, "resend_api_key", SecretStr("re_test")),
++            patch.object(settings, "email_from_address", "invites@example.com"),
++        ):
++            response = client.get(f"{api_v1_prefix}/config", headers=headers)
++
++        assert response.status_code == 200
++        assert response.json()["email_enabled"] is True
++
++    def test_requires_auth(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
++        response = client.get(f"{api_v1_prefix}/config")
++
++        assert response.status_code == 401
+diff --git a/docs/openapi.json b/docs/openapi.json
+index 8349fb45e7..87f66c9ea7 100644
+--- a/docs/openapi.json
++++ b/docs/openapi.json
+@@ -11135,11 +11135,16 @@
+           "outgoing_webhooks_enabled": {
+             "type": "boolean",
+             "title": "Outgoing Webhooks Enabled"
++          },
++          "email_enabled": {
++            "type": "boolean",
++            "title": "Email Enabled"
+           }
+         },
+         "type": "object",
+         "required": [
+-          "outgoing_webhooks_enabled"
++          "outgoing_webhooks_enabled",
++          "email_enabled"
+         ],
+         "title": "ConfigResponse",
+         "description": "Instance feature flags for the admin panel. Additive-only: append new flags,\nnever remove or repurpose, so the frontend stays backward compatible."
+diff --git a/frontend/src/hooks/api/use-invitations.ts b/frontend/src/hooks/api/use-invitations.ts
+index 783a31fca6..47d72a3574 100644
+--- a/frontend/src/hooks/api/use-invitations.ts
++++ b/frontend/src/hooks/api/use-invitations.ts
+@@ -16,7 +16,7 @@ export function useInvitations() {
+   });
+ }
+ 
+-export function useCreateInvitation() {
++export function useCreateInvitation(emailEnabled = true) {
+   const queryClient = useQueryClient();
+ 
+   return useMutation({
+@@ -24,15 +24,20 @@ export function useCreateInvitation() {
+       invitationsService.createInvitation(data),
+     onSuccess: (createdInvitation) => {
+       // Optimistically set status to 'sent' since email sending usually succeeds
+-      // On page refresh, the real status will be fetched (sent or failed)
++      // On page refresh, the real status will be fetched (sent or failed).
++      // Without email delivery the invitation stays pending until accepted.
+       queryClient.setQueryData(
+         queryKeys.invitations.list(),
+         (old: Invitation[] = []) => [
+           ...old,
+-          { ...createdInvitation, status: 'sent' },
++          emailEnabled
++            ? { ...createdInvitation, status: 'sent' }
++            : createdInvitation,
+         ]
+       );
+-      toast.success('Invitation sent successfully');
++      toast.success(
++        emailEnabled ? 'Invitation sent successfully' : 'Invitation created'
++      );
+     },
+     onError: (error) => {
+       toast.error(`Failed to send invitation: ${getErrorMessage(error)}`);
+@@ -55,14 +60,18 @@ export function useRevokeInvitation() {
+   });
+ }
+ 
+-export function useResendInvitation() {
++export function useResendInvitation(emailEnabled = true) {
+   const queryClient = useQueryClient();
+ 
+   return useMutation({
+     mutationFn: (id: string) => invitationsService.resendInvitation(id),
+     onSuccess: () => {
+       queryClient.invalidateQueries({ queryKey: queryKeys.invitations.list() });
+-      toast.success('Invitation resent successfully');
++      toast.success(
++        emailEnabled
++          ? 'Invitation resent successfully'
++          : 'Invite link regenerated'
++      );
+     },
+     onError: (error) => {
+       toast.error(`Failed to resend invitation: ${getErrorMessage(error)}`);
+diff --git a/frontend/src/lib/api/services/config.service.ts b/frontend/src/lib/api/services/config.service.ts
+index ff43919bcc..4658b5badf 100644
+--- a/frontend/src/lib/api/services/config.service.ts
++++ b/frontend/src/lib/api/services/config.service.ts
+@@ -3,6 +3,7 @@ import { API_ENDPOINTS } from '../config';
+ 
+ export interface AppConfig {
+   outgoing_webhooks_enabled: boolean;
++  email_enabled: boolean;
+ }
+ 
+ export const configService = {
+diff --git a/frontend/src/routes/_authenticated/settings/-team-tab.tsx b/frontend/src/routes/_authenticated/settings/-team-tab.tsx
+index 60ac0201c9..276389f626 100644
+--- a/frontend/src/routes/_authenticated/settings/-team-tab.tsx
++++ b/frontend/src/routes/_authenticated/settings/-team-tab.tsx
+@@ -17,6 +17,7 @@ import {
+   useRevokeInvitation,
+   useResendInvitation,
+ } from '@/hooks/api/use-invitations';
++import { useConfig } from '@/hooks/api/use-config';
+ import type { Invitation } from '@/lib/api/types';
+ import { toast } from 'sonner';
+ import { useAuth } from '@/hooks/use-auth';
+@@ -39,6 +40,9 @@ import { Button } from '@/components/ui/button';
+ export function TeamTab() {
+   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
+   const [inviteEmail, setInviteEmail] = useState('');
++  const [createdInvitation, setCreatedInvitation] = useState<Invitation | null>(
++    null
++  );
+   const [copiedId, setCopiedId] = useState<string | null>(null);
+   const [copiedInviteId, setCopiedInviteId] = useState<string | null>(null);
+   const [deleteTarget, setDeleteTarget] = useState<{
+@@ -64,10 +68,15 @@ export function TeamTab() {
+     refetch: refetchInvitations,
+   } = useInvitations();
+ 
++  const config = useConfig();
++  // Treat "still loading" as enabled so the dialog doesn't flash the no-email variant;
++  // creating an invitation waits for the config, so the success flow matches the instance
++  const emailEnabled = config.data?.email_enabled !== false;
++
+   const deleteMutation = useDeleteDeveloper();
+-  const createInvitationMutation = useCreateInvitation();
++  const createInvitationMutation = useCreateInvitation(emailEnabled);
+   const revokeInvitationMutation = useRevokeInvitation();
+-  const resendInvitationMutation = useResendInvitation();
++  const resendInvitationMutation = useResendInvitation(emailEnabled);
+ 
+   const isLoading = isLoadingDevelopers || isLoadingInvitations;
+ 
+@@ -88,6 +97,7 @@ export function TeamTab() {
+   };
+ 
+   const handleInvite = () => {
++    if (config.isPending || createInvitationMutation.isPending) return;
+     const email = inviteEmail.trim();
+     if (!email || !isValidEmail(email)) {
+       toast.error('Invalid email address');
+@@ -97,14 +107,25 @@ export function TeamTab() {
+     createInvitationMutation.mutate(
+       { email },
+       {
+-        onSuccess: () => {
++        onSuccess: (invitation) => {
+           setInviteEmail('');
+-          setIsInviteModalOpen(false);
++          if (emailEnabled) {
++            setIsInviteModalOpen(false);
++          } else {
++            // No email goes out, so keep the dialog open to hand over the link
++            setCreatedInvitation(invitation);
++          }
+         },
+       }
+     );
+   };
+ 
++  const closeInviteModal = () => {
++    setIsInviteModalOpen(false);
++    setInviteEmail('');
++    setCreatedInvitation(null);
++  };
++
+   const handleRevokeInvitation = () => {
+     if (revokeTarget) {
+       revokeInvitationMutation.mutate(revokeTarget.id, {
+@@ -114,13 +135,16 @@ export function TeamTab() {
+   };
+ 
+   const handleResendInvitation = (id: string) => {
++    if (config.isPending) return;
+     resendInvitationMutation.mutate(id);
+   };
+ 
++  const getInviteUrl = (invitation: Invitation) =>
++    `${window.location.origin}${ROUTES.acceptInvite}?token=${encodeURIComponent(invitation.token)}`;
++
+   const handleCopyInviteLink = async (invitation: Invitation) => {
+-    const inviteUrl = `${window.location.origin}${ROUTES.acceptInvite}?token=${encodeURIComponent(invitation.token)}`;
+     const success = await copyToClipboard(
+-      inviteUrl,
++      getInviteUrl(invitation),
+       'Invite link copied to clipboard'
+     );
+     if (success) {
+@@ -205,7 +229,9 @@ export function TeamTab() {
+               Pending Invitations
+             </h3>
+             <p className="text-xs text-muted-foreground mt-1">
+-              Invitations that are waiting to be accepted
++              {emailEnabled
++                ? 'Invitations that are waiting to be accepted'
++                : 'Invitations that are waiting to be accepted. Email delivery is not configured, so share the invite link yourself.'}
+             </p>
+           </div>
+ 
+@@ -280,8 +306,15 @@ export function TeamTab() {
+                           variant="outline"
+                           size="icon"
+                           onClick={() => handleResendInvitation(invitation.id)}
+-                          disabled={resendInvitationMutation.isPending}
+-                          title="Resend invitation"
++                          disabled={
++                            config.isPending ||
++                            resendInvitationMutation.isPending
++                          }
++                          title={
++                            emailEnabled
++                              ? 'Resend invitation'
++                              : 'Regenerate invite link'
++                          }
+                         >
+                           <RotateCw className="h-4 w-4" />
+                         </Button>
+@@ -429,70 +462,140 @@ export function TeamTab() {
+       <Dialog
+         open={isInviteModalOpen}
+         onOpenChange={(open) => {
+-          setIsInviteModalOpen(open);
+-          if (!open) setInviteEmail('');
++          // Keep the dialog open until creation finishes, so its result lands in the dialog
++          if (!open && createInvitationMutation.isPending) return;
++          if (!open) closeInviteModal();
++          else setIsInviteModalOpen(true);
+         }}
+       >
+         <DialogContent className="max-w-md">
+-          <DialogHeader>
+-            <DialogTitle>Invite Team Member</DialogTitle>
+-            <DialogDescription>
+-              Send an invitation to join your team
+-            </DialogDescription>
+-          </DialogHeader>
+-          <div className="space-y-1.5 py-4">
+-            <Label
+-              htmlFor="invite_email"
+-              className="text-xs text-foreground/90"
+-            >
+-              Email Address
+-            </Label>
+-            <Input
+-              id="invite_email"
+-              type="email"
+-              placeholder="colleague@example.com"
+-              value={inviteEmail}
+-              onChange={(e) => setInviteEmail(e.target.value)}
+-              onKeyDown={(e) => {
+-                if (
+-                  e.key === 'Enter' &&
+-                  inviteEmail.trim() &&
+-                  isValidEmail(inviteEmail.trim())
+-                ) {
+-                  handleInvite();
+-                }
+-              }}
+-              className="bg-muted border-border"
+-            />
+-            <p className="text-[10px] text-muted-foreground/70">
+-              They will receive an email with instructions to join (or send
+-              invite link manually)
+-            </p>
+-          </div>
+-          <DialogFooter className="gap-3">
+-            <Button
+-              variant="outline"
+-              onClick={() => {
+-                setIsInviteModalOpen(false);
+-                setInviteEmail('');
+-              }}
+-              disabled={createInvitationMutation.isPending}
+-            >
+-              Cancel
+-            </Button>
+-            <Button
+-              onClick={handleInvite}
+-              disabled={
+-                createInvitationMutation.isPending ||
+-                !inviteEmail.trim() ||
+-                !isValidEmail(inviteEmail.trim())
+-              }
+-            >
+-              {createInvitationMutation.isPending
+-                ? 'Sending...'
+-                : 'Send Invitation'}
+-            </Button>
+-          </DialogFooter>
++          {createdInvitation ? (
++            <>
++              <DialogHeader>
++                <DialogTitle>Invitation Created</DialogTitle>
++                <DialogDescription>
++                  Share this link with{' '}
++                  <span className="font-medium text-foreground/90">
++                    {createdInvitation.email}
++                  </span>{' '}
++                  so they can create their account.
++                </DialogDescription>
++              </DialogHeader>
++              <div className="flex items-center gap-2 py-4">
++                <Input
++                  readOnly
++                  autoFocus
++                  value={getInviteUrl(createdInvitation)}
++                  onFocus={(e) => e.target.select()}
++                  className="bg-muted border-border font-mono text-xs"
++                />
++                <Button
++                  variant="outline"
++                  size="icon"
++                  onClick={() => handleCopyInviteLink(createdInvitation)}
++                  title="Copy invite link"
++                >
++                  {copiedInviteId === createdInvitation.id ? (
++                    <Check className="h-4 w-4 text-success-muted" />
++                  ) : (
++                    <Copy className="h-4 w-4" />
++                  )}
++                </Button>
++              </div>
++              <DialogFooter>
++                <Button onClick={closeInviteModal}>Done</Button>
++              </DialogFooter>
++            </>
++          ) : (
++            <>
++              <DialogHeader>
++                <DialogTitle>Invite Team Member</DialogTitle>
++                <DialogDescription>
++                  {emailEnabled
++                    ? 'Send an invitation to join your team'
++                    : 'Create an invite link to share with your teammate'}
++                </DialogDescription>
++              </DialogHeader>
++              {!emailEnabled && (
++                <div className="rounded-md border border-warning-muted/40 bg-warning-muted/8 p-3">
++                  <p className="text-xs font-medium text-warning-muted">
++                    Email delivery is not configured on this instance.
++                  </p>
++                  <p className="text-xs text-muted-foreground mt-1">
++                    No email will be sent. You will get a link to share
++                    yourself. To send invitations by email, configure SMTP or
++                    Resend in the backend environment. See the{' '}
++                    <a
++                      href="https://openwearables.io/docs/developer-portal/settings/team#email-delivery"
++                      target="_blank"
++                      rel="noopener noreferrer"
++                      className="text-primary underline underline-offset-2"
++                    >
++                      team settings guide
++                    </a>
++                    .
++                  </p>
++                </div>
++              )}
++              <div className="space-y-1.5 py-4">
++                <Label
++                  htmlFor="invite_email"
++                  className="text-xs text-foreground/90"
++                >
++                  Email Address
++                </Label>
++                <Input
++                  id="invite_email"
++                  type="email"
++                  placeholder="colleague@example.com"
++                  value={inviteEmail}
++                  onChange={(e) => setInviteEmail(e.target.value)}
++                  onKeyDown={(e) => {
++                    if (
++                      e.key === 'Enter' &&
++                      inviteEmail.trim() &&
++                      isValidEmail(inviteEmail.trim())
++                    ) {
++                      handleInvite();
++                    }
++                  }}
++                  className="bg-muted border-border"
++                />
++                {emailEnabled && (
++                  <p className="text-[10px] text-muted-foreground/70">
++                    They will receive an email with instructions to join (or
++                    send invite link manually)
++                  </p>
++                )}
++              </div>
++              <DialogFooter className="gap-3">
++                <Button
++                  variant="outline"
++                  onClick={closeInviteModal}
++                  disabled={createInvitationMutation.isPending}
++                >
++                  Cancel
++                </Button>
++                <Button
++                  onClick={handleInvite}
++                  disabled={
++                    config.isPending ||
++                    createInvitationMutation.isPending ||
++                    !inviteEmail.trim() ||
++                    !isValidEmail(inviteEmail.trim())
++                  }
++                >
++                  {emailEnabled
++                    ? createInvitationMutation.isPending
++                      ? 'Sending...'
++                      : 'Send Invitation'
++                    : createInvitationMutation.isPending
++                      ? 'Creating...'
++                      : 'Create Invitation'}
++                </Button>
++              </DialogFooter>
++            </>
++          )}
+         </DialogContent>
+       </Dialog>
+ 

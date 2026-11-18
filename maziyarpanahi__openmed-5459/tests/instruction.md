@@ -1,0 +1,23 @@
+# Issue
+
+**Title:** Preserve tamper-evident audit continuity through retention and signing-key rotation
+
+## Description
+
+.
+
+Adds `openmed/core/audit_continuity.py`, a versioned continuity manifest that sits beside the existing `openmed.core.audit_chain` chain. It is a hash-linked, signed event log bound to an opaque chain ID: genesis, periodic anchors (signed chain-head digests), rotations signed by both the outgoing and the incoming key, non-reversible pruning tombstones (first/last sequence, record count, boundary entry hashes, a digest of the pruned segment's entry hashes, and the approving retention-policy fingerprint plus the `AuditRetentionReport` integrity digest; no entry content), and restore transitions that open a restore epoch. `verify_continuity` replays it offline against the chain and returns a bounded, value-free `ContinuityVerificationReport` with stable reason codes (`sequence_gap`, `fork`, `unsigned_epoch_transition`, `anchor_mismatch`, `anchor_missing`, `tombstone_mismatch`, `unknown_signer_key`, `retired_signer_key`, `incomplete_transition`, `policy_mismatch`, and others). Externally retained head references detect truncated or rewritten manifests and let retired keys be dropped for the history they cover. `AuditContinuityStore` keeps the chain and manifest in step under a process lock plus an OS file lock, writing each document with an fsynced atomic rename. Rotation commits to the exact head even with concurrent appenders and is idempotent per key. Pruning is write-ahead and is completed deterministically after a crash. A restore re-applies recorded pruning, so pruned entries never come back.
+
+Supporting changes: `AuditChain` gains `prune_through` with a retained base (pruned chains serialize as chain version 2; unpruned chains keep the version 1 layout), stable `ChainVerificationResult.code` values, and fsynced writes. `AuditKeyRotationSigner.sign_digest` and `AuditKeyRotationVerifier.verify_digest` sign value-free digests with a per-purpose key derivation, so continuity signatures cannot be replayed as report signatures. Docs: new `docs/security/audit-continuity.md`, linked from the audit-chain and key-rotation pages.
+
+For the stacked backup/restore work (#5452): `record_restore_transition(...)` and `AuditContinuityRecoveryHook` (a duck-typed `open_recovery_epoch(context)` that reads `manifest_digest` and `recovery_point_id`) are the hook to call. That branch currently backs up only `audit/chain-NNNN.json` and records `CHAIN_VERSION` for every chain. It will need to include the `.continuity.json` sidecar and accept pruned version 2 chains.
+
+The issue's listed dependency on #3580 (TLS/mTLS reload) looks wrong. Audit signing keys are a separate key domain from listener TLS credentials, and nothing here depends on it. #3550 is not needed either: the chain and manifest hold only digests, offsets, labels, and key IDs.
+
+Not covered: the separate hash-chained log in `openmed/compliance/audit_chain.py` (GDPR and Part 11 workflows) is not under the continuity manifest. Merging the two chains is a separate contract item. Signatures stay HMAC-SHA256 from the existing key-rotation foundation, so there is no public verification material or non-repudiation; an asymmetric scheme would be a new manifest algorithm value. No CLI subcommand was added.
+
+Validation: `pytest tests/unit/core/test_audit_continuity.py tests/unit/core/test_audit_chain.py tests/unit/core/test_audit_key_rotation.py` (86 passed, 35 subtests, together with `tests/unit/cli/test_audit_risk_cli.py`), `pytest tests/unit -k "docs or publication or mkdocs"` (258 passed, 15 skipped), `ruff check .` and `ruff format --check .` (clean), `scripts/security/check_effect_paths.py --check` (effect_paths_verified), `mypy` (scoped config clean; the three touched audit modules are also mypy-clean), full suite `pytest tests/ -m "not slow and not fuzz" --ignore=tests/unit/training/synthetic/test_dicom_overlays.py` (27938 passed, 270 skipped, 11384 subtests passed; the ignored module fails to collect on master because `pydicom` is not installed in the shared venv). The strict MkDocs build was left to CI because `mkdocs` is not installed locally.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `f8969c5b0f1a`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

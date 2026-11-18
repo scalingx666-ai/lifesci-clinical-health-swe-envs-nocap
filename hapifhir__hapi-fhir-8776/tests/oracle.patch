@@ -1,0 +1,103 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8776-unique-index-retry-false-duplicate.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8776-unique-index-retry-false-duplicate.yaml
+new file mode 100644
+index 000000000000..fb2bf65c4add
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8776-unique-index-retry-false-duplicate.yaml
+@@ -0,0 +1,7 @@
++---
++type: fix
++issue: 8776
++jira: SMILE-13187
++title: "Previously, when a FHIR transaction containing a resource with a unique combo search parameter was retried
++  after a version conflict, each retry failed with HAPI-2883 and incorrectly reported a duplicate unique index
++  within the transaction. The unique indexes recorded by a failed attempt are now cleared before retrying."
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/index/UniqueIndexPreExistenceChecker.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/index/UniqueIndexPreExistenceChecker.java
+index 7567909b8f4f..4e6dfc238e05 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/index/UniqueIndexPreExistenceChecker.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/index/UniqueIndexPreExistenceChecker.java
+@@ -165,9 +165,19 @@ public RuntimeException onRollback(@Nonnull RuntimeException theCause) {
+ 				cause = validateNoExistingUniqueIndexesMatchAny(
+ 						myRequestDetails, myIndexesToRemove, myIndexesToAdd, cause);
+ 			}
++
++			clearIndexesFromRollbackAttempt();
+ 			return cause;
+ 		}
+ 
++		/**
++		 * A retry records its indexes again, and would report these as duplicates within the bundle.
++		 */
++		private void clearIndexesFromRollbackAttempt() {
++			myIndexesToRemove.clear();
++			myIndexesToAdd.clear();
++		}
++
+ 		/**
+ 		 * Given an exception thrown during processing in the JPA server, checks whether
+ 		 * the exception is caused by a unique constraint violation on the
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4ComboUniqueParamTest.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4ComboUniqueParamTest.java
+index 8928624b46cf..071f73654d3a 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4ComboUniqueParamTest.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4ComboUniqueParamTest.java
+@@ -6,7 +6,9 @@
+ import ca.uhn.fhir.context.ComboSearchParamType;
+ import ca.uhn.fhir.context.RuntimeSearchParam;
+ import ca.uhn.fhir.i18n.Msg;
++import ca.uhn.fhir.interceptor.api.Pointcut;
+ import ca.uhn.fhir.jpa.batch.models.Batch2JobStartResponse;
++import ca.uhn.fhir.jpa.interceptor.UserRequestRetryVersionConflictsInterceptor;
+ import ca.uhn.fhir.jpa.model.dao.JpaPid;
+ import ca.uhn.fhir.jpa.model.entity.EntityIndexStatusEnum;
+ import ca.uhn.fhir.jpa.model.entity.ResourceIndexedComboStringUnique;
+@@ -16,6 +18,7 @@
+ import ca.uhn.fhir.jpa.searchparam.SearchParameterMap;
+ import ca.uhn.fhir.jpa.searchparam.util.JpaParamUtil;
+ import ca.uhn.fhir.rest.api.server.IBundleProvider;
++import ca.uhn.fhir.rest.api.server.SystemRequestDetails;
+ import ca.uhn.fhir.rest.param.ReferenceParam;
+ import ca.uhn.fhir.rest.param.StringOrListParam;
+ import ca.uhn.fhir.rest.param.StringParam;
+@@ -58,6 +61,7 @@
+ import java.util.Comparator;
+ import java.util.List;
+ import java.util.UUID;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.stream.Collectors;
+ 
+ import static ca.uhn.fhir.batch2.jobs.reindex.ReindexUtils.JOB_REINDEX;
+@@ -1910,6 +1914,35 @@ void testTransaction_WithConflictWithinTransaction() {
+ 			.hasMessageContaining("Multiple resources of type Patient in the same FHIR transaction would create a duplicate unique index matching query: Patient?identifier=http%3A%2F%2Ffoo%7Cid1 (new unique index created by SearchParameter/patient-uniq-identifier)");
+ 	}
+ 
++	@Test
++	void testTransaction_withUniqueIndexRetriedAfterVersionConflict_succeeds() {
++		myComboSearchParameterTestHelper.createPatientIdentifierUnique();
++		registerInterceptor(new UserRequestRetryVersionConflictsInterceptor());
++		AtomicInteger attempts = new AtomicInteger();
++		myInterceptorRegistry.registerAnonymousInterceptor(Pointcut.STORAGE_PRECOMMIT_RESOURCE_CREATED, (thePointcut, theParams) -> {
++			if (attempts.incrementAndGet() <= 2) {
++				throw new ResourceVersionConflictException("Simulated collision with a concurrent transaction");
++			}
++		});
++
++		BundleBuilder bb = new BundleBuilder(myFhirContext);
++		bb.addTransactionCreateEntry(
++			buildPatient(
++				withIdentifier("http://foo", "id1")
++			));
++		SystemRequestDetails requestDetails = newSrd();
++		requestDetails.setRetry(true);
++		requestDetails.setMaxRetries(3);
++
++		Bundle response = mySystemDao.transaction(requestDetails, bb.getBundleTyped());
++
++		assertThat(attempts).hasValue(3);
++		assertThat(response.getEntry().get(0).getResponse().getStatus()).startsWith("201");
++		assertThat(myResourceIndexedComboStringUniqueDao.findAll()).hasSize(1);
++
++		assertThat(myTestDaoSearch.searchForIds("Patient?identifier=http://foo|id1")).hasSize(1);
++	}
++
+ 	@Test
+ 	void testTransaction_WithConflictAgainstPreExisting() {
+ 		myComboSearchParameterTestHelper.createPatientIdentifierUnique();

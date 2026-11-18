@@ -1,0 +1,374 @@
+diff --git a/backend/app/constants/health_scores.py b/backend/app/constants/health_scores.py
+index e9f2ef327f..89ee7428e3 100644
+--- a/backend/app/constants/health_scores.py
++++ b/backend/app/constants/health_scores.py
+@@ -15,6 +15,7 @@ class ScoreRange(NamedTuple):
+         ProviderName.GARMIN: ScoreRange(1, 100),
+         ProviderName.WHOOP: ScoreRange(0, 100),
+         ProviderName.POLAR: ScoreRange(1, 100),
++        ProviderName.SAMSUNG: ScoreRange(0, 100),
+     },
+     HealthScoreCategory.READINESS: {
+         ProviderName.OURA: ScoreRange(1, 100),
+diff --git a/backend/app/schemas/providers/mobile_sdk/sleep_state.py b/backend/app/schemas/providers/mobile_sdk/sleep_state.py
+index 905f21aa8b..dbb63ae14f 100644
+--- a/backend/app/schemas/providers/mobile_sdk/sleep_state.py
++++ b/backend/app/schemas/providers/mobile_sdk/sleep_state.py
+@@ -34,6 +34,9 @@ class SleepState(BaseModel):
+     deep_seconds: float = 0
+     rem_seconds: float = 0
+ 
++    # Provider-computed sleep score sent in the SDK sleep entry `values` (Samsung `sleepScore`)
++    sleep_score: float | None = None
++
+     stages: list[SleepStateStage] = Field(default_factory=list)
+ 
+ 
+diff --git a/backend/app/services/providers/samsung/coverage.py b/backend/app/services/providers/samsung/coverage.py
+index 8fe6b6bb08..cd85ef88c2 100644
+--- a/backend/app/services/providers/samsung/coverage.py
++++ b/backend/app/services/providers/samsung/coverage.py
+@@ -1,7 +1,7 @@
+ from app.constants.series_types.sdk.metric_types import SAMSUNG_METRIC_TYPE_TO_SERIES_TYPE
+ from app.constants.series_types.sdk.workout_statistics import SAMSUNG_WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE
+-from app.schemas.enums import SeriesType
+-from app.services.providers.apple.coverage import HEALTH_SCORES, SLEEP_FIELDS
++from app.schemas.enums import HealthScoreCategory, SeriesType
++from app.services.providers.apple.coverage import SLEEP_FIELDS
+ 
+ # Samsung Health Data SDK exposes a narrower set than Health Connect, so Samsung
+ # declares exactly what SamsungHealthManager emits instead of reusing Android/Apple.
+@@ -28,4 +28,7 @@
+     }
+ )
+ 
++# SamsungHealthManager forwards SleepType.SLEEP_SCORE as a `sleepScore` value on each sleep entry
++HEALTH_SCORES: frozenset[HealthScoreCategory] = frozenset({HealthScoreCategory.SLEEP})
++
+ __all__ = ["HEALTH_SCORES", "SLEEP_FIELDS", "TIMESERIES", "WORKOUT_FIELDS"]
+diff --git a/backend/app/services/sdk/sleep_service.py b/backend/app/services/sdk/sleep_service.py
+index 22985c0948..2aa21f07d6 100644
+--- a/backend/app/services/sdk/sleep_service.py
++++ b/backend/app/services/sdk/sleep_service.py
+@@ -3,6 +3,7 @@
+ from datetime import datetime, timedelta, timezone
+ from decimal import Decimal
+ from logging import getLogger
++from typing import Any
+ from uuid import UUID, uuid4
+ 
+ from app.config import settings
+@@ -13,9 +14,12 @@
+ from app.constants.sleep import SleepStageType
+ from app.database import DbSession
+ from app.integrations.redis_client import get_redis_client
++from app.models import EventRecord
++from app.schemas.enums import HealthScoreCategory, ProviderName
+ from app.schemas.model_crud.activities import (
+     EventRecordCreate,
+     EventRecordDetailCreate,
++    HealthScoreCreate,
+     SleepStage,
+ )
+ from app.schemas.providers.mobile_sdk import (
+@@ -27,6 +31,7 @@
+     SyncRequest as SDKSyncRequest,
+ )
+ from app.services.event_record_service import event_record_service
++from app.services.health_score_service import health_score_service
+ from app.services.sdk.device_resolution import extract_device_info
+ from app.utils.structured_logging import log_structured
+ 
+@@ -41,6 +46,18 @@
+ }
+ 
+ 
++SLEEP_SCORE_VALUE_TYPE = "sleepScore"
++
++
++def _extract_sleep_score(values: list[dict[str, Any]] | None) -> float | None:
++    """Return the provider sleep score carried in an SDK sleep entry's `values`, if any."""
++    for value in values or []:
++        if value.get("type") == SLEEP_SCORE_VALUE_TYPE and value.get("value") is not None:
++            with contextlib.suppress(TypeError, ValueError):
++                return float(value["value"])
++    return None
++
++
+ def key(user_id: str) -> str:
+     """Generate a key for the sleep state."""
+     return f"sleep:active:{user_id}"
+@@ -294,6 +311,11 @@ def handle_sleep_data(
+                 sjson.zoneOffset,
+             )
+ 
++            sleep_score = _extract_sleep_score(sjson.values)
++            # The state is per user, so it may belong to another provider's open session
++            if sleep_score is not None and current_state.provider == provider:
++                current_state.sleep_score = sleep_score
++
+         # Persist the accumulated state to Redis only once after processing the entire batch
+         if current_state:
+             save_sleep_state(user_id, current_state)
+@@ -525,6 +547,7 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
+         # Always use the returned record's ID (whether newly created or existing)
+         detail_for_record = detail.model_copy(update={"record_id": created_or_existing_record.id})
+         event_record_service.create_detail(db_session, detail_for_record, detail_type="sleep")
++        _save_provider_sleep_score(db_session, user_id, state, created_or_existing_record, start_time)
+         # Delete from Redis only after a successful DB write so a transient error
+         # keeps the session available for the next periodic finalization attempt.
+         delete_sleep_state(user_id)
+@@ -539,3 +562,37 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
+             event_record_id=sleep_record.id,
+             error=str(e),
+         )
++
++
++def _save_provider_sleep_score(
++    db_session: DbSession,
++    user_id: str,
++    state: SleepState,
++    record: EventRecord,
++    start_time: datetime,
++) -> None:
++    """Persist the provider-computed sleep score (e.g. Samsung SLEEP_SCORE) linked to the session."""
++    if state.sleep_score is None or state.provider is None:
++        return
++    try:
++        provider = ProviderName(state.provider)
++    except ValueError:
++        return
++
++    health_score_service.bulk_create(
++        db_session,
++        [
++            HealthScoreCreate(
++                id=uuid4(),
++                user_id=UUID(user_id),
++                data_source_id=record.data_source_id,
++                provider=provider,
++                category=HealthScoreCategory.SLEEP,
++                value=state.sleep_score,
++                recorded_at=start_time,
++                zone_offset=state.zone_offset,
++                event_record_id=record.id,
++            )
++        ],
++    )
++    db_session.commit()
+diff --git a/backend/tests/services/test_sleep_service.py b/backend/tests/services/test_sleep_service.py
+index 66eab00c3a..ce980a24e4 100644
+--- a/backend/tests/services/test_sleep_service.py
++++ b/backend/tests/services/test_sleep_service.py
+@@ -17,6 +17,8 @@
+ from sqlalchemy.orm import Session
+ 
+ from app.constants.sleep import SleepStageType
++from app.models import EventRecord, HealthScore
++from app.schemas.enums import HealthScoreCategory, ProviderName
+ from app.schemas.model_crud.activities import (
+     EventRecordCreate,
+     EventRecordDetailCreate,
+@@ -31,6 +33,7 @@
+     finish_sleep,
+     handle_sleep_data,
+ )
++from tests.factories import UserFactory
+ 
+ 
+ def _dt(iso: str) -> datetime:
+@@ -839,3 +842,181 @@ def test_second_payload_merges_with_adjacent_db_record(
+         assert SleepStageType.LIGHT in stage_types
+         assert SleepStageType.DEEP in stage_types
+         assert SleepStageType.REM in stage_types
++
++
++class TestProviderSleepScore:
++    """Samsung sends SleepType.SLEEP_SCORE as a `sleepScore` value on every sleep entry."""
++
++    # Shaped like SamsungHealthManager.convertSleep output (UnifiedSleep.toMap)
++    SAMSUNG_SOURCE = {
++        "appId": "com.sec.android.app.shealth",
++        "deviceId": "samsung-watch-1",
++        "deviceName": "Galaxy Watch7",
++        "deviceManufacturer": "Samsung",
++        "deviceModel": "SM-L315F",
++        "deviceType": "watch",
++        "recordingMethod": None,
++    }
++    SAMSUNG_PAYLOAD = {
++        "provider": "samsung",
++        "sdkVersion": "1.0.0",
++        "syncTimestamp": "2026-03-23T08:00:01Z",
++        "data": {
++            "records": [],
++            "workouts": [],
++            "sleep": [
++                {
++                    "id": "S1-s0-0",
++                    "parentId": "S1",
++                    "stage": "light",
++                    "startDate": "2026-03-22T23:00:00Z",
++                    "endDate": "2026-03-23T01:00:00Z",
++                    "zoneOffset": "+01:00",
++                    "source": SAMSUNG_SOURCE,
++                    "values": [{"type": "sleepScore", "value": 82, "unit": "score"}],
++                    "metadata": None,
++                },
++                {
++                    "id": "S1-s0-1",
++                    "parentId": "S1",
++                    "stage": "deep",
++                    "startDate": "2026-03-23T01:00:00Z",
++                    "endDate": "2026-03-23T06:00:00Z",
++                    "zoneOffset": "+01:00",
++                    "source": SAMSUNG_SOURCE,
++                    "values": [{"type": "sleepScore", "value": 82, "unit": "score"}],
++                    "metadata": None,
++                },
++            ],
++        },
++    }
++
++    @staticmethod
++    def _state(provider: str, sleep_score: float | None) -> SleepState:
++        return SleepState(
++            uuid=str(uuid4()),
++            source_name="Galaxy Watch",
++            provider=provider,
++            zone_offset="+01:00",
++            start_time=_dt("2026-03-22T23:00:00Z"),
++            end_time=_dt("2026-03-23T06:00:00Z"),
++            last_start_timestamp=_dt("2026-03-23T01:00:00Z"),
++            last_end_timestamp=_dt("2026-03-23T06:00:00Z"),
++            sleep_score=sleep_score,
++            stages=[
++                SleepStateStage(
++                    stage=SleepStageType.LIGHT,
++                    start_time=_dt("2026-03-22T23:00:00Z"),
++                    end_time=_dt("2026-03-23T06:00:00Z"),
++                ),
++            ],
++        )
++
++    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
++    @patch("app.services.sdk.sleep_service.event_record_service")
++    @patch("app.services.sdk.sleep_service.get_redis_client")
++    def test_sleep_score_value_is_kept_in_state(
++        self,
++        mock_redis_func: MagicMock,
++        mock_event_service: MagicMock,
++        mock_finalize: MagicMock,
++        db: Session,
++    ) -> None:
++        mock_redis = MagicMock()
++        mock_redis.get.return_value = None
++        mock_redis_func.return_value = mock_redis
++        mock_event_service.find_adjacent_sleep_record.return_value = None
++
++        with patch("app.services.sdk.sleep_service.finish_sleep") as mock_finish:
++            handle_sleep_data(db, SyncRequest.model_validate(self.SAMSUNG_PAYLOAD), user_id=str(uuid4()))
++
++        state = SleepState.model_validate_json(mock_redis.set.call_args_list[-1][0][1])
++        assert state.sleep_score == 82
++        finished_state: SleepState = mock_finish.call_args[0][2]
++        assert finished_state.sleep_score == 82
++
++    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
++    @patch("app.services.sdk.sleep_service.event_record_service")
++    @patch("app.services.sdk.sleep_service.get_redis_client")
++    def test_sleep_score_is_not_attached_to_other_provider_state(
++        self,
++        mock_redis_func: MagicMock,
++        mock_event_service: MagicMock,
++        mock_finalize: MagicMock,
++        db: Session,
++    ) -> None:
++        mock_redis = MagicMock()
++        mock_redis.get.return_value = self._state("apple", None).model_dump_json()
++        mock_redis_func.return_value = mock_redis
++        mock_event_service.find_adjacent_sleep_record.return_value = None
++
++        with patch("app.services.sdk.sleep_service.finish_sleep") as mock_finish:
++            handle_sleep_data(db, SyncRequest.model_validate(self.SAMSUNG_PAYLOAD), user_id=str(uuid4()))
++
++        finished_state: SleepState = mock_finish.call_args[0][2]
++        assert finished_state.provider == "apple"
++        assert finished_state.sleep_score is None
++
++    @patch("app.services.sdk.sleep_service.health_score_service")
++    @patch("app.services.sdk.sleep_service.event_record_service")
++    @patch("app.services.sdk.sleep_service.delete_sleep_state")
++    def test_finish_sleep_saves_provider_sleep_score(
++        self,
++        mock_delete_state: MagicMock,
++        mock_event_service: MagicMock,
++        mock_score_service: MagicMock,
++        db: Session,
++    ) -> None:
++        user_id = str(uuid4())
++        mock_record = MagicMock()
++        mock_record.id = uuid4()
++        mock_record.data_source_id = uuid4()
++        mock_event_service.create.return_value = mock_record
++        mock_event_service.find_adjacent_sleep_record.return_value = None
++
++        finish_sleep(db, user_id, self._state("samsung", 82))
++
++        mock_score_service.bulk_create.assert_called_once()
++        [score] = mock_score_service.bulk_create.call_args[0][1]
++        assert score.provider == ProviderName.SAMSUNG
++        assert score.category == HealthScoreCategory.SLEEP
++        assert score.value == 82
++        assert score.event_record_id == mock_record.id
++        assert score.data_source_id == mock_record.data_source_id
++        assert score.recorded_at == _dt("2026-03-22T23:00:00Z")
++        assert score.zone_offset == "+01:00"
++
++    @patch("app.services.sdk.sleep_service.health_score_service")
++    @patch("app.services.sdk.sleep_service.event_record_service")
++    @patch("app.services.sdk.sleep_service.delete_sleep_state")
++    def test_finish_sleep_without_score_saves_none(
++        self,
++        mock_delete_state: MagicMock,
++        mock_event_service: MagicMock,
++        mock_score_service: MagicMock,
++        db: Session,
++    ) -> None:
++        mock_event_service.create.return_value = MagicMock(id=uuid4())
++        mock_event_service.find_adjacent_sleep_record.return_value = None
++
++        finish_sleep(db, str(uuid4()), self._state("apple", None))
++
++        mock_score_service.bulk_create.assert_not_called()
++
++    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
++    def test_samsung_sleep_score_is_persisted(self, mock_finalize: MagicMock, db: Session) -> None:
++        """End to end against the DB: a historical Samsung night lands as a session with its sleep score."""
++        user = UserFactory()
++
++        handle_sleep_data(db, SyncRequest.model_validate(self.SAMSUNG_PAYLOAD), str(user.id))
++
++        scores = db.query(HealthScore).filter(HealthScore.user_id == user.id).all()
++        samsung_scores = [s for s in scores if s.provider == ProviderName.SAMSUNG]
++        assert len(samsung_scores) == 1
++        score = samsung_scores[0]
++        assert score.category == HealthScoreCategory.SLEEP
++        assert score.value == 82
++        assert score.zone_offset == "+01:00"
++        session = db.get(EventRecord, score.event_record_id)
++        assert session is not None
++        assert session.category == "sleep"
+diff --git a/docs/providers/coverage.mdx b/docs/providers/coverage.mdx
+index 1e0fe16abe..aa855d937d 100644
+--- a/docs/providers/coverage.mdx
++++ b/docs/providers/coverage.mdx
+@@ -280,7 +280,7 @@ This guide gives an overview of data type support across the integrated wearable
+ | `body_battery` | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `readiness` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ | `recovery` | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ |
+-| `sleep` | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
++| `sleep` | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
+ | `strain` | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+ | `stress` | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+ 

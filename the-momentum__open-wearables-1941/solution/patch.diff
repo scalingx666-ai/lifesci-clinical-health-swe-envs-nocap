@@ -1,0 +1,390 @@
+diff --git a/backend/app/constants/series_types/history_rules.py b/backend/app/constants/series_types/history_rules.py
+index 91786a53be..bfb7dfb327 100644
+--- a/backend/app/constants/series_types/history_rules.py
++++ b/backend/app/constants/series_types/history_rules.py
+@@ -2,8 +2,8 @@
+ 
+ Frozen history, on purpose not derived from the providers' current mappings: it describes rows already
+ written, so it must not move when a provider's mapping does. The aggregate backfill copies what these
+-rules match into series_aggregate and event_record_aggregate; the later cleanup deletes a copy only where it sits at
+-the very instant of its aggregate row, so the rest stay samples.
++rules match into series_aggregate and event_record_aggregate and moves those samples to series_sample_backup, so
++series_sample holds readings only.
+ """
+ 
+ from dataclasses import dataclass
+diff --git a/backend/app/models/__init__.py b/backend/app/models/__init__.py
+index 73fb8ad58e..e8b9fecf55 100644
+--- a/backend/app/models/__init__.py
++++ b/backend/app/models/__init__.py
+@@ -20,6 +20,7 @@
+ from .refresh_token import RefreshToken
+ from .series_aggregate import SeriesAggregate
+ from .series_sample import SeriesSample
++from .series_sample_backup import SeriesSampleBackup
+ from .series_type_definition import SeriesTypeDefinition
+ from .sleep_details import SleepDetails
+ from .sync_run import SyncRun
+@@ -62,6 +63,7 @@
+     "WorkoutDetails",
+     "PersonalRecord",
+     "SeriesSample",
++    "SeriesSampleBackup",
+     "DataTypeCoverage",
+     "SeriesAggregate",
+     "SeriesTypeDefinition",
+diff --git a/backend/app/models/series_sample_backup.py b/backend/app/models/series_sample_backup.py
+new file mode 100644
+index 0000000000..61df90caba
+--- /dev/null
++++ b/backend/app/models/series_sample_backup.py
+@@ -0,0 +1,35 @@
++from uuid import UUID
++from datetime import datetime
++
++from sqlalchemy import Index
++from sqlalchemy.orm import Mapped
++
++from app.database import BaseDbModel
++from app.mappings import (
++    FKDataSource,
++    FKSeriesTypeDefinition,
++    PrimaryKey,
++    numeric_unbounded,
++    str_10,
++    str_100,
++)
++
++
++class SeriesSampleBackup(BaseDbModel):
++    """Day and session values code before the aggregate tables stored as series_sample rows, moved here once the
++    aggregate backfill copied them into the aggregate tables. Kept to restore them; nothing reads them."""
++
++    __tablename__ = "series_sample_backup"
++    __table_args__ = (
++        Index("ix_series_sample_backup_source_type_time", "data_source_id", "series_type_definition_id", "recorded_at"),
++    )
++
++    id: Mapped[PrimaryKey[UUID]]
++    external_id: Mapped[str_100 | None]
++    data_source_id: Mapped[FKDataSource]
++    recorded_at: Mapped[datetime]
++    zone_offset: Mapped[str_10 | None]
++    window_seconds: Mapped[int | None]
++    value: Mapped[numeric_unbounded]
++    series_type_definition_id: Mapped[FKSeriesTypeDefinition]
++    is_daily_total: Mapped[bool | None]
+diff --git a/backend/app/repositories/aggregate_backfill_repository.py b/backend/app/repositories/aggregate_backfill_repository.py
+index 5a65f3d72f..c4cd02bd6c 100644
+--- a/backend/app/repositories/aggregate_backfill_repository.py
++++ b/backend/app/repositories/aggregate_backfill_repository.py
+@@ -191,8 +191,9 @@ def copy_history_values(
+         self, db_session: DbSession, source_id: UUID, provider: str, from_day: date, to_day: date
+     ) -> int:
+         """The source's day and session values of the days from ``from_day`` up to ``to_day``, stored as samples, as
+-        provider rows in the aggregate tables where the provider holds none yet. Returns the rows written."""
+-        written = 0
++        provider rows in the aggregate tables where the provider holds none yet; then those samples moved to
++        series_sample_backup. Returns the rows written."""
++        written, moves = 0, []
+         for rule, statement in _HISTORY:
+             if ProviderName(provider) not in rule.providers:
+                 continue
+@@ -209,6 +210,10 @@ def copy_history_values(
+                 **_stat_params(rule),
+             }
+             written += db_session.execute(statement, params).rowcount  # ty: ignore[unresolved-attribute]
++            moves.append((_MOVES[rule], params))
++        # After every copy: a sample two rules match is still there for the second.
++        for move, params in moves:
++            db_session.execute(move, params)
+         return written
+ 
+ 
+@@ -325,3 +330,34 @@ def _stat_params(rule: HistoryRule) -> dict[str, list[int]]:
+         column = stat or get_aggregation_method(series_type).value
+         params[f"{column}_types"].append(get_series_type_id(series_type))
+     return params
++
++
++_BACKUP_COLUMNS = (
++    "id, external_id, data_source_id, recorded_at, zone_offset, window_seconds, value, series_type_definition_id,"
++    " is_daily_total, created_at"
++)
++
++
++def _move_values(rule: HistoryRule) -> TextClause:
++    """The rule's samples moved to series_sample_backup: a day value of the window's days, a session value where its
++    session is found, as the copy found them."""
++    if rule.session is SessionMatch.WORKOUT_ENDING:
++        using, matched = "USING event_record er", f"{_WORKOUT_ENDING.format(e='er')} AND "
++    elif rule.session is not None:
++        using, matched = "", f"EXISTS ({_RECORDS[rule.session]}) AND "
++    else:
++        assert rule.day is not None
++        # Only the window's days: the reach past its edges belongs to the next window's copy.
++        using, matched = "", f"{_DAYS[rule.day]} >= :from_day AND {_DAYS[rule.day]} < :to_day AND "
++    return text(f"""
++        WITH moved AS (
++            DELETE FROM series_sample s {using}
++            WHERE {matched}{_RULE_SAMPLES.format(where=rule.where)}
++            RETURNING {", ".join(f"s.{column.strip()}" for column in _BACKUP_COLUMNS.split(","))}
++        )
++        INSERT INTO series_sample_backup ({_BACKUP_COLUMNS}) SELECT {_BACKUP_COLUMNS} FROM moved
++        ON CONFLICT DO NOTHING
++    """)
++
++
++_MOVES = {rule: _move_values(rule) for rule in HISTORY_RULES}
+diff --git a/backend/app/services/aggregate_backfill_service.py b/backend/app/services/aggregate_backfill_service.py
+index 526f2c9450..a532f34c9b 100644
+--- a/backend/app/services/aggregate_backfill_service.py
++++ b/backend/app/services/aggregate_backfill_service.py
+@@ -22,7 +22,7 @@
+ from app.utils.sentry_helpers import log_and_capture_error
+ from app.utils.structured_logging import log_structured
+ 
+-# Set once every step is done; retention and the later cleanup wait for it.
++# Set once every step is done; retention waits for it.
+ BACKFILL_MIGRATION = "aggregate_backfill"
+ 
+ # The span the backfill fills before the rest of the history.
+diff --git a/backend/migrations/versions/2026_10_28_1412-2785d37e79cc_series_sample_backup.py b/backend/migrations/versions/2026_10_28_1412-2785d37e79cc_series_sample_backup.py
+new file mode 100644
+index 0000000000..910d95af91
+--- /dev/null
++++ b/backend/migrations/versions/2026_10_28_1412-2785d37e79cc_series_sample_backup.py
+@@ -0,0 +1,56 @@
++"""series sample backup
++
++Revision ID: 2785d37e79cc
++Revises: 6c49f0f8fba2
++
++"""
++
++from typing import Sequence, Union
++
++import sqlalchemy as sa
++from alembic import op
++
++# revision identifiers, used by Alembic.
++revision: str = "2785d37e79cc"
++down_revision: Union[str, None] = "6c49f0f8fba2"
++branch_labels: Union[str, Sequence[str], None] = None
++depends_on: Union[str, Sequence[str], None] = None
++
++_COLUMNS = (
++    "id, external_id, data_source_id, recorded_at, zone_offset, window_seconds, value, series_type_definition_id,"
++    " is_daily_total, created_at"
++)
++
++
++def upgrade() -> None:
++    op.create_table(
++        "series_sample_backup",
++        sa.Column("id", sa.UUID(), nullable=False),
++        sa.Column("external_id", sa.String(length=100), nullable=True),
++        sa.Column("data_source_id", sa.UUID(), nullable=False),
++        sa.Column("recorded_at", sa.DateTime(timezone=True), nullable=False),
++        sa.Column("zone_offset", sa.String(length=10), nullable=True),
++        sa.Column("window_seconds", sa.Integer(), nullable=True),
++        sa.Column("value", sa.Numeric(), nullable=False),
++        sa.Column("series_type_definition_id", sa.Integer(), nullable=False),
++        sa.Column("is_daily_total", sa.Boolean(), nullable=True),
++        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
++        sa.ForeignKeyConstraint(["data_source_id"], ["data_source.id"], ondelete="CASCADE"),
++        sa.ForeignKeyConstraint(["series_type_definition_id"], ["series_type_definition.id"], ondelete="RESTRICT"),
++        sa.PrimaryKeyConstraint("id"),
++    )
++    op.create_index(
++        "ix_series_sample_backup_source_type_time",
++        "series_sample_backup",
++        ["data_source_id", "series_type_definition_id", "recorded_at"],
++        unique=False,
++    )
++
++
++def downgrade() -> None:
++    # The moved values go back to series_sample, where the code before this revision reads them.
++    op.execute(
++        f"INSERT INTO series_sample ({_COLUMNS}) SELECT {_COLUMNS} FROM series_sample_backup ON CONFLICT DO NOTHING"
++    )
++    op.drop_index("ix_series_sample_backup_source_type_time", table_name="series_sample_backup")
++    op.drop_table("series_sample_backup")
+diff --git a/backend/tests/api/v1/test_summaries.py b/backend/tests/api/v1/test_summaries.py
+index 423cce8cc7..7387caa8e7 100644
+--- a/backend/tests/api/v1/test_summaries.py
++++ b/backend/tests/api/v1/test_summaries.py
+@@ -862,11 +862,13 @@ def test_get_activity_summary_with_elevation(self, client: TestClient, db: Sessi
+ 
+         # Also add some step data for the same day
+         steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
++        # A reading with its own id: one without, at a workout's end, is the workout's statistic and no reading.
+         DataPointSeriesFactory(
+             mapping=mapping,
+             series_type=steps_type,
+             value=Decimal("12000"),
+             recorded_at=workout_end,
++            external_id="hk-steps",
+         )
+ 
+         api_key = ApiKeyFactory()
+diff --git a/backend/tests/services/test_aggregate_backfill.py b/backend/tests/services/test_aggregate_backfill.py
+index 5c1fc7ee9b..a209d207c4 100644
+--- a/backend/tests/services/test_aggregate_backfill.py
++++ b/backend/tests/services/test_aggregate_backfill.py
+@@ -19,6 +19,7 @@
+     EventRecordAggregate,
+     SeriesAggregate,
+     SeriesSample,
++    SeriesSampleBackup,
+     SeriesTypeDefinition,
+     WorkoutDetails,
+ )
+@@ -518,8 +519,8 @@ def test_sdk_workout_statistics_land_on_the_workout_they_closed(self, db: Sessio
+             )
+         }
+         assert rows[ComputedBy.PROVIDER].avg == Decimal("82")
+-        # Ours, rolled up from the workout's samples, sits beside it: 82 at the end and 90 inside.
+-        assert rows[ComputedBy.OPEN_WEARABLES].avg == Decimal("86")
++        # Ours sits beside it, rolled up again once the copy at the end was deleted: the 90 inside.
++        assert rows[ComputedBy.OPEN_WEARABLES].avg == Decimal("90")
+ 
+ 
+ @pytest.mark.usefixtures("roll_up_history")
+@@ -592,3 +593,135 @@ def test_a_source_left_halfway_goes_on_from_its_last_chunk(self, db: Session) ->
+         aggregate_backfill_service.run(db, budget_seconds=60)
+ 
+         assert self._ours(db) == [date(2025, 1, 10)]
++
++
++@pytest.mark.usefixtures("roll_up_history")
++class TestHistoryValuesMovedToTheBackup:
++    """The copied samples move to series_sample_backup; our rows count readings only, as on an instance that never
++    stored day values as samples."""
++
++    def _ours(self, db: Session, series_type: SeriesType) -> list[tuple[date, Decimal | None, Decimal | None]]:
++        rows = db.query(SeriesAggregate, LOCAL_DAY).filter(
++            SeriesAggregate.computed_by == ComputedBy.OPEN_WEARABLES,
++            SeriesAggregate.series_type_definition_id == get_series_type_id(series_type),
++        )
++        return sorted((day, row.sum, row.avg) for row, day in rows)
++
++    def _values(self, db: Session, model: type[SeriesSample] | type[SeriesSampleBackup]) -> list[Decimal]:
++        return sorted(row.value for row in db.query(model))
++
++    def test_the_copy_moves_what_it_matched_and_nothing_else(self, db: Session) -> None:
++        polar = DataSourceFactory(provider=ProviderName.POLAR)
++        hrv = SeriesType.heart_rate_variability_rmssd
++        _sample(db, polar, hrv, datetime(2025, 6, 2, tzinfo=timezone.utc), "61")
++        _sample(db, polar, hrv, datetime(2025, 6, 2, 12, tzinfo=timezone.utc), "70")
++        apple = DataSourceFactory(provider=ProviderName.APPLE)
++        workout = EventRecordFactory(data_source=apple, start_datetime=AT, duration_seconds=1800)
++        _sample(db, apple, SeriesType.steps, workout.end_datetime, "500")
++        _sample(db, apple, SeriesType.steps, AT + timedelta(minutes=10), "1000")
++        xml = DataSourceFactory(provider=ProviderName.APPLE, source="apple_health_xml")
++        xml_workout = EventRecordFactory(data_source=xml, start_datetime=AT, duration_seconds=1800)
++        _sample(db, xml, SeriesType.vo2_max, xml_workout.end_datetime, "41")
++
++        aggregate_backfill_service.run(db, budget_seconds=60)
++
++        assert self._values(db, SeriesSample) == [Decimal("41"), Decimal("70"), Decimal("1000")]
++        assert self._values(db, SeriesSampleBackup) == [Decimal("61"), Decimal("500")]
++
++    def test_a_moved_sample_keeps_its_row(self, db: Session) -> None:
++        source = DataSourceFactory(provider=ProviderName.POLAR)
++        at = datetime(2025, 6, 2, tzinfo=timezone.utc)
++        _sample(db, source, SeriesType.heart_rate_variability_rmssd, at, "61", external_id="night-1")
++        (sample,) = db.query(SeriesSample)
++        before = (sample.id, sample.external_id, sample.recorded_at, sample.zone_offset, sample.created_at)
++
++        aggregate_backfill_service.run(db, budget_seconds=60)
++
++        (moved,) = db.query(SeriesSampleBackup)
++        assert (moved.id, moved.external_id, moved.recorded_at, moved.zone_offset, moved.created_at) == before
++        assert (moved.data_source_id, moved.value) == (source.id, Decimal("61"))
++
++    def test_a_day_value_leaves_the_samples_and_our_day(self, db: Session) -> None:
++        source = DataSourceFactory(provider=ProviderName.POLAR)
++        _sample(db, source, SeriesType.heart_rate_variability_rmssd, datetime(2025, 6, 2, tzinfo=timezone.utc), "61")
++        _sample(
++            db, source, SeriesType.heart_rate_variability_rmssd, datetime(2025, 6, 2, 12, tzinfo=timezone.utc), "70"
++        )
++
++        aggregate_backfill_service.run(db, budget_seconds=60)
++
++        assert db.query(SeriesSample).count() == 1
++        assert self._ours(db, SeriesType.heart_rate_variability_rmssd) == [(date(2025, 6, 2), None, Decimal("70"))]
++
++    def test_a_day_value_past_the_windows_edge_is_left_for_the_next_window(self, db: Session) -> None:
++        """A window reads two days past its edges to find its days; it moves its own days only, or the next window
++        would find nothing to copy."""
++        source = DataSourceFactory(provider=ProviderName.POLAR)
++        _sample(db, source, SeriesType.heart_rate_variability_rmssd, datetime(2025, 6, 2, tzinfo=timezone.utc), "61")
++        repo = AggregateBackfillRepository()
++
++        repo.copy_history_values(db, source.id, ProviderName.POLAR, date(2025, 5, 1), date(2025, 6, 2))
++        kept = self._values(db, SeriesSample)
++        repo.copy_history_values(db, source.id, ProviderName.POLAR, date(2025, 6, 2), date(2025, 7, 1))
++
++        assert kept == [Decimal("61")]
++        assert self._values(db, SeriesSampleBackup) == [Decimal("61")]
++        assert _days(db) == [("heart_rate_variability_rmssd", date(2025, 6, 2), "+00:00", None, Decimal("61"))]
++
++    def test_a_window_copied_again_moves_nothing_twice(self, db: Session) -> None:
++        source = DataSourceFactory(provider=ProviderName.POLAR)
++        _sample(db, source, SeriesType.heart_rate_variability_rmssd, datetime(2025, 6, 2, tzinfo=timezone.utc), "61")
++        repo = AggregateBackfillRepository()
++
++        first = repo.copy_history_values(db, source.id, ProviderName.POLAR, date(2025, 6, 1), date(2025, 7, 1))
++        again = repo.copy_history_values(db, source.id, ProviderName.POLAR, date(2025, 6, 1), date(2025, 7, 1))
++
++        assert (first, again) == (1, 0)
++        assert (db.query(SeriesSample).count(), db.query(SeriesSampleBackup).count()) == (0, 1)
++
++    def test_a_deleted_data_source_takes_its_backup_with_it(self, db: Session) -> None:
++        source = DataSourceFactory(provider=ProviderName.POLAR)
++        _sample(db, source, SeriesType.heart_rate_variability_rmssd, datetime(2025, 6, 2, tzinfo=timezone.utc), "61")
++        aggregate_backfill_service.run(db, budget_seconds=60)
++
++        db.execute(text("DELETE FROM data_source WHERE id = :id"), {"id": source.id})
++
++        assert db.query(SeriesSampleBackup).count() == 0
++
++    def test_garmins_nightly_hrv_off_midnight_is_left_out_too(self, db: Session) -> None:
++        source = DataSourceFactory(provider=ProviderName.GARMIN)
++        bedtime = datetime(2025, 6, 1, 21, tzinfo=timezone.utc)
++        hrv = SeriesType.heart_rate_variability_rmssd
++        _sample(db, source, hrv, bedtime, "84", zone_offset="+02:00", external_id="hrv-1")
++        _sample(db, source, hrv, bedtime + timedelta(hours=3), "50", zone_offset="+02:00", external_id="hrv-1:300")
++
++        aggregate_backfill_service.run(db, budget_seconds=60)
++
++        assert self._ours(db, hrv) == [(date(2025, 6, 2), None, Decimal("50"))]
++
++    def test_a_workout_statistic_counts_in_neither_our_day_nor_our_session(self, db: Session) -> None:
++        source = DataSourceFactory(provider=ProviderName.APPLE)
++        workout = EventRecordFactory(data_source=source, start_datetime=AT, duration_seconds=1800)
++        _sample(db, source, SeriesType.steps, workout.end_datetime, "500")
++        _sample(db, source, SeriesType.physical_effort, workout.end_datetime, "7")
++        _sample(db, source, SeriesType.steps, AT + timedelta(minutes=10), "1000", external_id="hk-uuid")
++
++        aggregate_backfill_service.run(db, budget_seconds=60)
++
++        assert self._ours(db, SeriesType.steps) == [(AT.date(), Decimal("1000"), Decimal("1000"))]
++        assert self._ours(db, SeriesType.physical_effort) == []
++        (session,) = db.query(EventRecordAggregate).filter(
++            EventRecordAggregate.record_id == workout.id,
++            EventRecordAggregate.computed_by == ComputedBy.OPEN_WEARABLES,
++            EventRecordAggregate.series_type_definition_id == get_series_type_id(SeriesType.steps),
++        )
++        assert session.sum == Decimal("1000")
++
++    def test_a_session_value_without_its_session_stays_a_reading(self, db: Session) -> None:
++        """The history could not copy it onto a sleep, so it is left where it was."""
++        source = DataSourceFactory(provider=ProviderName.OURA)
++        _sample(db, source, SeriesType.respiratory_rate, datetime(2025, 6, 2, 3, tzinfo=timezone.utc), "14")
++
++        aggregate_backfill_service.run(db, budget_seconds=60)
++
++        assert self._ours(db, SeriesType.respiratory_rate) == [(date(2025, 6, 2), None, Decimal("14"))]

@@ -1,0 +1,242 @@
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 4427f99901..527927f690 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -60,7 +60,14 @@ async def _lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
+         await asyncio.to_thread(endpoint_usage.flush)
+ 
+ 
+-api = FastAPI(title=settings.api_name, version=version("open-wearables"), lifespan=_lifespan)
++# FastAPI >= 0.142 turns on its own OpenTelemetry by default (request traces, metrics,
++# exception logs, OTLP exporters from OTEL_* variables). Keep it off: our OTel setup is explicit.
++api = FastAPI(
++    title=settings.api_name,
++    version=version("open-wearables"),
++    lifespan=_lifespan,
++    telemetry={"auto_configure": False, "tracing": False, "metrics": False, "logs": False},
++)
+ celery_app = create_celery()
+ init_sentry()
+ raw_payload_storage.configure(
+diff --git a/backend/pyproject.toml b/backend/pyproject.toml
+index 302dd2f845..ec141b0533 100644
+--- a/backend/pyproject.toml
++++ b/backend/pyproject.toml
+@@ -9,7 +9,7 @@ dependencies = [
+     "email-validator>=2.2.0",
+     "psycopg>=3.3.6",
+     "sqlalchemy>=2.0.54",
+-    "fastapi>=0.139.2",
++    "fastapi>=0.142.2",
+     "fastapi-cli>=0.0.32",
+     "celery>=5.6.3",
+     "flower>=2.2.0",
+diff --git a/backend/tests/utils_tests/test_fastapi_telemetry.py b/backend/tests/utils_tests/test_fastapi_telemetry.py
+new file mode 100644
+index 0000000000..ec1bc8a6a9
+--- /dev/null
++++ b/backend/tests/utils_tests/test_fastapi_telemetry.py
+@@ -0,0 +1,135 @@
++"""FastAPI's built-in OpenTelemetry support stays off, whatever OTEL_* variables are set and
++whatever OpenTelemetry providers other code installs."""
++
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++BACKEND_DIR = Path(__file__).resolve().parents[2]
++
++# Runs in a fresh process: OpenTelemetry providers are process-global. With
++# INSTALL_PROVIDERS=1 it installs providers that record every use before the app is
++# imported, the way a log or tracing integration would, which makes FastAPI's per-request
++# telemetry check pass; only the `tracing`/`metrics`/`logs` flags then keep it silent.
++_PROBE = """
++import json
++import logging
++import os
++
++from opentelemetry import _logs, metrics, trace
++
++uses = []
++
++
++# Real provider classes, not NoOp ones: FastAPI treats NoOp providers as unconfigured.
++class Tracers(trace.TracerProvider):
++    def get_tracer(self, name, *args, **kwargs):
++        uses.append("tracer")
++        return trace.NoOpTracer()
++
++
++class Meters(metrics.MeterProvider):
++    def get_meter(self, name, *args, **kwargs):
++        uses.append("meter")
++        return metrics.NoOpMeter(name)
++
++
++class Loggers(_logs.LoggerProvider):
++    def get_logger(self, name, *args, **kwargs):
++        uses.append("logger")
++        return _logs.NoOpLogger(name)
++
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++control_uses = 0
++if os.environ.get("INSTALL_PROVIDERS") == "1":
++    trace.set_tracer_provider(Tracers())
++    metrics.set_meter_provider(Meters())
++    _logs.set_logger_provider(Loggers())
++
++    # Positive control: a FastAPI app with default telemetry must use these providers,
++    # otherwise an empty `uses` below would prove nothing.
++    control = FastAPI()
++
++    @control.get("/")
++    def control_root():
++        return {}
++
++    with TestClient(control) as control_client:
++        control_client.get("/")
++    control_uses = len(uses)
++    uses.clear()
++
++import app.main
++
++api = app.main.api
++
++
++@api.get("/_probe/error")
++def probe_error():
++    raise RuntimeError("probe")
++
++
++@api.get("/_probe/validate")
++def probe_validate(number: int):
++    return number
++
++
++fastapi_messages = []
++
++
++class Collect(logging.Handler):
++    def emit(self, record):
++        fastapi_messages.append(record.getMessage())
++
++
++logging.getLogger("fastapi").addHandler(Collect())
++with TestClient(api, raise_server_exceptions=False) as client:
++    statuses = [
++        client.get("/openapi.json").status_code,
++        client.get("/_probe/validate", params={"number": "x"}).status_code,
++        client.get("/_probe/error").status_code,
++    ]
++
++providers = [trace.get_tracer_provider(), metrics.get_meter_provider(), _logs.get_logger_provider()]
++print("PROBE_REPORT " + json.dumps({
++    "control_uses": control_uses,
++    "uses": uses,
++    "statuses": statuses,
++    "sdk_providers": [type(p).__module__ for p in providers if type(p).__module__.startswith("opentelemetry.sdk")],
++    "fastapi_messages": fastapi_messages,
++}))
++"""
++
++
++@pytest.mark.parametrize("install_providers", ["0", "1"])
++def test_fastapi_telemetry_stays_off(install_providers: str) -> None:
++    env = {key: value for key, value in os.environ.items() if not key.startswith("OTEL_")} | {
++        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
++        "INSTALL_PROVIDERS": install_providers,
++        # The child does not get conftest's mocks; keep it away from external services.
++        "OUTGOING_WEBHOOKS_ENABLED": "false",
++        "SENTRY_ENABLED": "false",
++        "TELEMETRY_ENABLED": "false",
++    }
++    result = subprocess.run(
++        [sys.executable, "-c", _PROBE], cwd=BACKEND_DIR, env=env, capture_output=True, text=True, timeout=120
++    )
++
++    assert result.returncode == 0, result.stderr
++    [report_line] = [line for line in result.stdout.splitlines() if line.startswith("PROBE_REPORT ")]
++    report = json.loads(report_line.removeprefix("PROBE_REPORT "))
++    if install_providers == "1":
++        assert report["control_uses"] > 0
++    assert report["statuses"] == [200, 400, 500]
++    assert report["uses"] == []
++    # The SDK is not a dependency here; this guards against one pulling it in and FastAPI
++    # configuring exporters on its own.
++    assert report["sdk_providers"] == []
++    assert report["fastapi_messages"] == []
+diff --git a/backend/uv.lock b/backend/uv.lock
+index fa4adfec25..57285c1e42 100644
+--- a/backend/uv.lock
++++ b/backend/uv.lock
+@@ -617,18 +617,19 @@ wheels = [
+ 
+ [[package]]
+ name = "fastapi"
+-version = "0.141.1"
++version = "0.142.2"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "annotated-doc" },
++    { name = "opentelemetry-api" },
+     { name = "pydantic" },
+     { name = "starlette" },
+     { name = "typing-extensions" },
+     { name = "typing-inspection" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/8a/02/91e3416a8fdd715abb903a952a6bec7cdd8d14eed55d415fc8595524c319/fastapi-0.141.1.tar.gz", hash = "sha256:e8822fc40db1e1858054d7a949a888695bc9bdce70139178e33bd2871a453ca1", size = 425799, upload-time = "2026-07-29T17:18:05.568Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/56/4f/f7c30a73127e0a8bbffe788369b8359e530b01ae06e2757936fa35bc5e6d/fastapi-0.142.2.tar.gz", hash = "sha256:06366626f2e70576367714d9ab2fe8472e6c8456dba69b399f9f797ab5e92570", size = 466721, upload-time = "2026-09-30T09:51:11.277Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/cb/03/10388a42375ee7e4ac9b94eb2c5c569c8b5795e377e701c9ac3ad63de890/fastapi-0.141.1-py3-none-any.whl", hash = "sha256:bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3", size = 131954, upload-time = "2026-07-29T17:18:04.364Z" },
++    { url = "https://files.pythonhosted.org/packages/a0/b6/78aaf9141fb46742928c113f3cf6ef2259d538cb02b604b7656c1dc9883c/fastapi-0.142.2-py3-none-any.whl", hash = "sha256:bd5f4d81f1e93a88bcd77caf4dfe3c2dbffc3805407a0007e9a114c18b3a670b", size = 144409, upload-time = "2026-09-30T09:51:09.8Z" },
+ ]
+ 
+ [[package]]
+@@ -1088,7 +1089,7 @@ requires-dist = [
+     { name = "cryptography", specifier = ">=50.0.1" },
+     { name = "email-validator", specifier = ">=2.2.0" },
+     { name = "faker", specifier = ">=40.39.0" },
+-    { name = "fastapi", specifier = ">=0.139.2" },
++    { name = "fastapi", specifier = ">=0.142.2" },
+     { name = "fastapi-cli", specifier = ">=0.0.32" },
+     { name = "fitdecode", specifier = ">=0.11.0" },
+     { name = "flower", specifier = ">=2.2.0" },
+@@ -1125,6 +1126,18 @@ dev = [
+     { name = "testcontainers", extras = ["postgres", "redis"], specifier = ">=4.14.2" },
+ ]
+ 
++[[package]]
++name = "opentelemetry-api"
++version = "1.45.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "typing-extensions" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/1f/dc/e12c1fe1ed8a7b7149777127b1a0e12ce5bd5a81d97408bedc2128c260f5/opentelemetry_api-1.45.0.tar.gz", hash = "sha256:711ede81773c8025c2c03dac0450bc89f3d30aea6eabcc815c570d4e35a963f7", size = 72115, upload-time = "2026-09-25T12:32:28.399Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/44/b9/040d1a1c7836922828e6480cd2366bb8fe0ebf75b413d2bb51a9b0e7f78f/opentelemetry_api-1.45.0-py3-none-any.whl", hash = "sha256:80e068aba7cd56c8b58512d6a36f8d25cb1dfaa0c0a4cc1c938ccf9f362d9cb3", size = 60020, upload-time = "2026-09-25T12:32:03.192Z" },
++]
++
+ [[package]]
+ name = "packaging"
+ version = "26.3"
+diff --git a/docs/deployment/docker.mdx b/docs/deployment/docker.mdx
+index 58d7edf5c0..90375e7baa 100644
+--- a/docs/deployment/docker.mdx
++++ b/docs/deployment/docker.mdx
+@@ -161,6 +161,8 @@ The defaults in `.env.example` are development values. Override at least these f
+ 
+ `VITE_API_URL` is a frontend variable and is not part of `.env.example`—add it to the same `.env`. For a local trial of this stack, set it to `http://localhost:8000`; in production it is typically the same value as `API_BASE_URL`.
+ 
++Open Wearables does not use `OTEL_PROPAGATORS`, but FastAPI loads the propagators it lists at startup. If your platform sets it to one that is not installed in the image, such as `b3`, every backend container fails with `ValueError: Propagator b3 not found`. Unset it for these containers.
++
+ ### Running it
+ 
+ <Steps>

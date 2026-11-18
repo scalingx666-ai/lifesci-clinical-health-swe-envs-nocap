@@ -1,0 +1,193 @@
+diff --git a/backend/app/repositories/event_record_repository.py b/backend/app/repositories/event_record_repository.py
+index 7da4a554a4..0171e1ee12 100644
+--- a/backend/app/repositories/event_record_repository.py
++++ b/backend/app/repositories/event_record_repository.py
+@@ -1020,7 +1020,7 @@ def get_daily_workout_aggregates(
+         Aggregates WorkoutDetails data by date for activity summaries.
+ 
+         Returns list of dicts with keys:
+-        - workout_date, source, device_model
++        - workout_date, provider, source, device_model, device_type
+         - elevation_meters, distance_meters, energy_burned_kcal
+         """
+         local_workout_date = cast(
+@@ -1031,8 +1031,10 @@ def get_daily_workout_aggregates(
+         results = (
+             db_session.query(
+                 local_workout_date.label("workout_date"),
++                DataSource.provider,
+                 DataSource.source,
+                 DataSource.device_model,
++                DataSource.device_type,
+                 # Sum elevation gain for all workouts on that day
+                 func.sum(WorkoutDetails.total_elevation_gain).label("elevation_sum"),
+                 # Sum distance for all workouts
+@@ -1052,8 +1054,10 @@ def get_daily_workout_aggregates(
+             )
+             .group_by(
+                 local_workout_date,
++                DataSource.provider,
+                 DataSource.source,
+                 DataSource.device_model,
++                DataSource.device_type,
+             )
+             .order_by(asc(local_workout_date))
+             .all()
+@@ -1064,8 +1068,10 @@ def get_daily_workout_aggregates(
+             aggregates.append(
+                 {
+                     "workout_date": row.workout_date,
++                    "provider": row.provider,
+                     "source": row.source,
+                     "device_model": row.device_model,
++                    "device_type": row.device_type,
+                     "elevation_meters": float(row.elevation_sum) if row.elevation_sum is not None else None,
+                     "distance_meters": float(row.distance_sum) if row.distance_sum is not None else None,
+                     "energy_burned_kcal": float(row.energy_sum) if row.energy_sum is not None else None,
+diff --git a/backend/app/services/summaries_service.py b/backend/app/services/summaries_service.py
+index 54cb7a9732..cc6ac3754e 100644
+--- a/backend/app/services/summaries_service.py
++++ b/backend/app/services/summaries_service.py
+@@ -523,10 +523,10 @@ def get_activity_summaries(
+             db_session, user_id, page_start, page_end
+         )
+ 
+-        # Build lookup dict for workout data by (date, provider, device)
++        # Build lookup dict for workout data by (date, provider, source, device)
+         workout_lookup: dict[tuple, dict] = {}
+         for wa in workout_aggregates:
+-            key = (wa["workout_date"], wa["source"], wa.get("device_model"))
++            key = (wa["workout_date"], wa["provider"], wa["source"], wa.get("device_model"))
+             workout_lookup[key] = wa
+ 
+         # Get active/sedentary minutes from step data
+@@ -566,7 +566,9 @@ def get_activity_summaries(
+         for result in results:
+             # Look up workout data for this day/provider/device
+             result_key = (result["activity_date"], result["source"], result.get("device_model"))
+-            workout_data = workout_lookup.get(result_key, {})
++            workout_data = workout_lookup.get(
++                (result["activity_date"], result.get("provider"), result["source"], result.get("device_model")), {}
++            )
+             activity_data = activity_lookup.get(result_key, {})
+             intensity_data = intensity_lookup.get(result_key, {})
+ 
+@@ -685,8 +687,38 @@ def _activity_days(self, db_session: DbSession, user_id: UUID, start: datetime,
+         """One row per day in [start, end): live and archived, best source per date."""
+         results = self.data_point_repo.get_daily_activity_aggregates(db_session, user_id, start, end)
+         results = self._merge_archive_activity(db_session, user_id, start, end, results)
++        results = self._add_workout_only_days(db_session, user_id, start, end, results)
+         return self._filter_by_priority(db_session, user_id, results, date_key="activity_date")
+ 
++    def _add_workout_only_days(
++        self, db_session: DbSession, user_id: UUID, start: datetime, end: datetime, results: list
++    ) -> list:
++        """Add an empty row per source for dates that have workouts but no time-series data."""
++        covered = {r["activity_date"] for r in results}
++        extra = [
++            {
++                "activity_date": wa["workout_date"],
++                "provider": wa["provider"],
++                "source": wa["source"],
++                "device_model": wa["device_model"],
++                "device_type": wa["device_type"],
++                "steps_sum": None,
++                "active_energy_sum": None,
++                "basal_energy_sum": None,
++                "hr_avg": None,
++                "hr_max": None,
++                "hr_min": None,
++                "distance_sum": None,
++                "flights_climbed_sum": None,
++                "active_time_minutes": None,
++            }
++            for wa in self.event_record_repo.get_daily_workout_aggregates(db_session, user_id, start, end)
++            if wa["workout_date"] not in covered
++        ]
++        if not extra:
++            return results
++        return sorted([*results, *extra], key=lambda r: r["activity_date"])
++
+     def _activity_page_days(
+         self,
+         db_session: DbSession,
+diff --git a/backend/tests/services/test_summaries_service.py b/backend/tests/services/test_summaries_service.py
+index 849b1a743b..8d6f0ad249 100644
+--- a/backend/tests/services/test_summaries_service.py
++++ b/backend/tests/services/test_summaries_service.py
+@@ -2,6 +2,7 @@
+ 
+ import math
+ from datetime import date, datetime, timedelta, timezone
++from decimal import Decimal
+ from logging import getLogger
+ from typing import Any
+ from uuid import UUID, uuid4
+@@ -22,6 +23,7 @@
+     SeriesTypeDefinitionFactory,
+     SleepDetailsFactory,
+     UserFactory,
++    WorkoutDetailsFactory,
+ )
+ 
+ 
+@@ -493,6 +495,59 @@ def test_aggregates_steps_for_user(self, db: Session, service: SummariesService)
+         assert len(result.data) == 1
+         assert result.data[0].steps == 3000
+ 
++    def test_includes_days_with_only_a_workout(self, db: Session, service: SummariesService) -> None:
++        user = UserFactory()
++        ds = DataSourceFactory(user=user, provider=ProviderName.STRAVA, source="strava")
++        EventRecordFactory(
++            data_source=ds,
++            category="workout",
++            type="running",
++            start_datetime=_dt("2026-01-01T10:00:00+00:00"),
++            end_datetime=_dt("2026-01-01T11:00:00+00:00"),
++            zone_offset="+00:00",
++        )
++
++        result = service.get_activity_summaries(
++            db,
++            user.id,
++            _dt("2026-01-01T00:00:00+00:00"),
++            _dt("2026-01-02T00:00:00+00:00"),
++            cursor=None,
++            limit=10,
++        )
++        assert [(d.date, d.source.provider, d.steps) for d in result.data] == [(date(2026, 1, 1), "strava", None)]
++
++    def test_takes_elevation_from_the_winning_provider_only(self, db: Session, service: SummariesService) -> None:
++        user = UserFactory()
++        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
++        elevations = {ProviderName.GARMIN: "100", ProviderName.STRAVA: "900"}
++        for provider, elevation in elevations.items():
++            ds = DataSourceFactory(user=user, provider=provider, source="watch", device_model="Forerunner 965")
++            WorkoutDetailsFactory(
++                event_record=EventRecordFactory(
++                    data_source=ds,
++                    category="workout",
++                    start_datetime=_dt("2026-01-01T10:00:00+00:00"),
++                    end_datetime=_dt("2026-01-01T11:00:00+00:00"),
++                    zone_offset="+00:00",
++                ),
++                total_elevation_gain=Decimal(elevation),
++            )
++            if provider == ProviderName.GARMIN:
++                DataPointSeriesFactory(
++                    data_source=ds, series_type=steps_type, value=1000, recorded_at=_dt("2026-01-01T10:00:00+00:00")
++                )
++
++        result = service.get_activity_summaries(
++            db,
++            user.id,
++            _dt("2026-01-01T00:00:00+00:00"),
++            _dt("2026-01-02T00:00:00+00:00"),
++            cursor=None,
++            limit=10,
++        )
++        assert [(d.source.provider, d.elevation_meters) for d in result.data] == [("garmin", 100.0)]
++
+     def test_does_not_return_other_users_data(self, db: Session, service: SummariesService) -> None:
+         user_a = UserFactory()
+         user_b = UserFactory()

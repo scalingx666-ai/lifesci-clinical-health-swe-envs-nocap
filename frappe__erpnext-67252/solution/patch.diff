@@ -1,0 +1,256 @@
+diff --git a/erpnext/accounts/doctype/purchase_invoice/purchase_invoice.py b/erpnext/accounts/doctype/purchase_invoice/purchase_invoice.py
+index db101eb3ed51..495d74734026 100644
+--- a/erpnext/accounts/doctype/purchase_invoice/purchase_invoice.py
++++ b/erpnext/accounts/doctype/purchase_invoice/purchase_invoice.py
+@@ -43,8 +43,8 @@
+ from erpnext.controllers.accounts_controller import merge_taxes, validate_account_head
+ from erpnext.controllers.buying_controller import (
+ 	BuyingController,
++	get_received_stock_qty_status_args,
+ 	get_stock_qty,
+-	get_stock_qty_status_args,
+ 	get_transit_amount,
+ )
+ from erpnext.controllers.mapper import get_qty_already_mapped
+@@ -875,9 +875,9 @@ def update_status_updater_args(self):
+ 					"target_parent_dt": "Material Request",
+ 					"target_parent_field": "per_received",
+ 					"target_ref_field": "stock_qty",
+-					**get_stock_qty_status_args(),
++					**get_received_stock_qty_status_args(),
+ 					"second_source_dt": "Purchase Receipt Item",
+-					"second_source_field": get_stock_qty_status_args()["source_field"],
++					"second_source_field": "qty * conversion_factor",
+ 					"second_join_field": "material_request_item",
+ 					"extra_cond": """ and exists(select name from `tabPurchase Invoice`
+ 					where name=`tabPurchase Invoice Item`.parent and update_stock = 1)""",
+diff --git a/erpnext/buying/doctype/purchase_order/test_purchase_order.py b/erpnext/buying/doctype/purchase_order/test_purchase_order.py
+index 77276574dc6b..326e16bebb38 100644
+--- a/erpnext/buying/doctype/purchase_order/test_purchase_order.py
++++ b/erpnext/buying/doctype/purchase_order/test_purchase_order.py
+@@ -160,21 +160,35 @@ def test_orders_for_parts_of_a_material_request_add_up_to_its_stock_qty(self):
+ 
+ 	@ERPNextTestSuite.change_settings("Stock Settings", {"allow_to_edit_stock_uom_qty_for_purchase": 1})
+ 	def test_receipts_for_parts_of_a_material_request_add_up_to_its_stock_qty(self):
+-		item = make_item_with_fractional_box()
+-		mr = make_material_request(item_code=item, qty=3, uom="Box", conversion_factor=0.666666667)
++		mr = receive_material_request_in_parts()
++		self.assertEqual(
++			mr.items[0].received_qty, flt(mr.items[0].stock_qty, mr.precision("stock_qty", "items"))
++		)
++		self.assertEqual(mr.per_received, 100)
++
++	@ERPNextTestSuite.change_settings("Stock Settings", {"allow_to_edit_stock_uom_qty_for_purchase": 0})
++	def test_receipts_for_parts_of_a_material_request_add_up_to_its_unrounded_stock_qty(self):
++		mr = receive_material_request_in_parts()
++		self.assertEqual(mr.items[0].received_qty, mr.items[0].stock_qty)
++		self.assertEqual(mr.per_received, 100)
++
++	@ERPNextTestSuite.change_settings("Stock Settings", {"allow_to_edit_stock_uom_qty_for_purchase": 0})
++	def test_receipt_of_a_material_request_in_a_whole_number_uom_completes_it(self):
++		item = make_item(
++			properties={
++				"is_stock_item": 1,
++				"stock_uom": "Nos",
++				"uoms": [{"uom": "Box", "conversion_factor": 0.3333}],
++			}
++		).name
++		mr = make_material_request(item_code=item, qty=3, uom="Box", conversion_factor=0.3333)
+ 		po = make_purchase_order(mr.name)
+ 		po.supplier = "_Test Supplier"
+ 		po.submit()
+-
+-		for _ in range(3):
+-			pr = make_purchase_receipt(po.name)
+-			pr.items[0].qty = pr.items[0].received_qty = 1
+-			pr.submit()
++		make_purchase_receipt(po.name).submit()
+ 
+ 		mr.reload()
+-		self.assertEqual(
+-			mr.items[0].received_qty, flt(mr.items[0].stock_qty, mr.precision("stock_qty", "items"))
+-		)
++		self.assertEqual(mr.items[0].received_qty, mr.items[0].stock_qty)
+ 		self.assertEqual(mr.per_received, 100)
+ 
+ 	@ERPNextTestSuite.change_settings("Stock Settings", {"allow_to_edit_stock_uom_qty_for_purchase": 1})
+@@ -2938,6 +2952,23 @@ def make_po_for_sales_order_row(sales_order_row):
+ 	return make_po_from_so(sales_order_row.parent, selected_items=selected_items)[0]
+ 
+ 
++def receive_material_request_in_parts():
++	"""Material Request for 3 fractional Boxes, ordered at once and received one Box at a time."""
++	item = make_item_with_fractional_box()
++	mr = make_material_request(item_code=item, qty=3, uom="Box", conversion_factor=0.666666667)
++	po = make_purchase_order(mr.name)
++	po.supplier = "_Test Supplier"
++	po.submit()
++
++	for _ in range(3):
++		pr = make_purchase_receipt(po.name)
++		pr.items[0].qty = pr.items[0].received_qty = 1
++		pr.submit()
++
++	mr.reload()
++	return mr
++
++
+ def make_item_with_fractional_box(uom="Box"):
+ 	"""Stock item in Kg whose ``uom`` is 2/3 Kg, so the stock qty of ordered ``uom`` is rounded."""
+ 	return make_item(
+diff --git a/erpnext/controllers/buying_controller.py b/erpnext/controllers/buying_controller.py
+index 24f2efa48064..5046b635c565 100644
+--- a/erpnext/controllers/buying_controller.py
++++ b/erpnext/controllers/buying_controller.py
+@@ -1997,3 +1997,17 @@ def get_stock_qty_status_args(round_total=True) -> dict:
+ 		return {"source_field": "stock_qty"}
+ 
+ 	return {"source_field": "qty * conversion_factor", "round_to_target_precision": round_total}
++
++
++def get_received_stock_qty_status_args() -> dict:
++	"""Status updater args that add up receipts' stock qty. A receipt rounds the stock qty of each row whatever the
++	setting, so add up qty * conversion factor, rounded once at the total where the target rounds its stock qty too."""
++	return {"source_field": "qty * conversion_factor", "round_to_target_precision": rounds_stock_qty}
++
++
++def rounds_stock_qty(row) -> bool:
++	"""Whether set_qty_as_per_stock_uom rounds the stock qty of a purchase row."""
++	return bool(
++		frappe.get_single_value("Stock Settings", "allow_to_edit_stock_uom_qty_for_purchase")
++		or frappe.get_cached_value("UOM", row.stock_uom, "must_be_whole_number")
++	)
+diff --git a/erpnext/controllers/status_updater.py b/erpnext/controllers/status_updater.py
+index a0a36cdfe7a6..e59a8154c5fb 100644
+--- a/erpnext/controllers/status_updater.py
++++ b/erpnext/controllers/status_updater.py
+@@ -661,7 +661,11 @@ def _update_children(self, args, update_modified):
+ 				if args["second_source_condition"]:
+ 					args["source_dt_value"] += flt(args["second_source_condition"])
+ 
+-				if args.get("round_to_target_precision"):
++				round_total = args.get("round_to_target_precision")
++				if callable(round_total):
++					round_total = round_total(d)
++
++				if round_total:
+ 					args["source_dt_value"] = flt(
+ 						args["source_dt_value"], frappe.get_precision(args["target_dt"], args["target_field"])
+ 					)
+diff --git a/erpnext/patches.txt b/erpnext/patches.txt
+index c9921303442f..ae38ed229aa3 100644
+--- a/erpnext/patches.txt
++++ b/erpnext/patches.txt
+@@ -562,3 +562,4 @@ erpnext.patches.v16_0.restrict_company_address_flag
+ erpnext.patches.v16_0.add_accounting_dimensions_to_request_for_quotation_item
+ erpnext.patches.v16_0.set_stock_uom_on_plan_rows_without_conversion
+ erpnext.patches.v16_0.recalculate_ordered_qty_of_material_requests_ordered_in_parts
++erpnext.patches.v16_0.recalculate_received_qty_of_material_requests_received_in_parts
+diff --git a/erpnext/patches/v16_0/recalculate_received_qty_of_material_requests_received_in_parts.py b/erpnext/patches/v16_0/recalculate_received_qty_of_material_requests_received_in_parts.py
+new file mode 100644
+index 000000000000..21b0fbd06638
+--- /dev/null
++++ b/erpnext/patches/v16_0/recalculate_received_qty_of_material_requests_received_in_parts.py
+@@ -0,0 +1,77 @@
++import frappe
++from frappe.query_builder.functions import Sum
++from frappe.utils import flt
++
++from erpnext.controllers.buying_controller import rounds_stock_qty
++
++
++def execute():
++	rows, received_qty = {}, {}
++	for row in get_received_rows("Purchase Receipt") + get_received_rows("Purchase Invoice"):
++		rows[row.name] = row
++		received_qty[row.name] = received_qty.get(row.name, 0) + row.qty
++
++	precision = frappe.get_precision("Material Request Item", "received_qty")
++	updates, requests = {}, set()
++	for name, row in rows.items():
++		qty = flt(received_qty[name])
++		if rounds_stock_qty(row):
++			qty = flt(qty, precision)
++
++		if qty != flt(row.received_qty):
++			updates[name] = {"received_qty": qty}
++			requests.add(row.parent)
++
++	frappe.db.bulk_update("Material Request Item", updates, update_modified=False)
++	for name in requests:
++		update_per_received(name)
++
++
++def get_received_rows(receipt_doctype):
++	"""Rows of partly received Material Requests not stopped, with the qty their submitted receipts add up to."""
++	request = frappe.qb.DocType("Material Request")
++	request_item = frappe.qb.DocType("Material Request Item")
++	receipt = frappe.qb.DocType(receipt_doctype)
++	receipt_item = frappe.qb.DocType(f"{receipt_doctype} Item")
++
++	query = (
++		frappe.qb.from_(request_item)
++		.join(request)
++		.on(request.name == request_item.parent)
++		.join(receipt_item)
++		.on(receipt_item.material_request_item == request_item.name)
++		.join(receipt)
++		.on(receipt.name == receipt_item.parent)
++		.select(
++			request_item.name,
++			request_item.parent,
++			request_item.stock_uom,
++			request_item.received_qty,
++			Sum(receipt_item.qty * receipt_item.conversion_factor).as_("qty"),
++		)
++		.where(
++			(request.docstatus == 1)
++			& (request.status != "Stopped")
++			& (request.per_received < 100)
++			& (receipt.docstatus == 1)
++		)
++		.groupby(request_item.name, request_item.parent, request_item.stock_uom, request_item.received_qty)
++	)
++	if receipt_doctype == "Purchase Invoice":
++		query = query.where(receipt.update_stock == 1)
++
++	return query.run(as_dict=True)
++
++
++def update_per_received(request):
++	frappe.get_doc("Material Request", request)._update_percent_field(
++		{
++			"target_dt": "Material Request Item",
++			"target_parent_dt": "Material Request",
++			"target_parent_field": "per_received",
++			"target_ref_field": "stock_qty",
++			"target_field": "received_qty",
++			"name": request,
++		},
++		update_modified=False,
++	)
+diff --git a/erpnext/stock/doctype/purchase_receipt/purchase_receipt.py b/erpnext/stock/doctype/purchase_receipt/purchase_receipt.py
+index 54d0c797d8f5..6e2cecb20b13 100644
+--- a/erpnext/stock/doctype/purchase_receipt/purchase_receipt.py
++++ b/erpnext/stock/doctype/purchase_receipt/purchase_receipt.py
+@@ -18,7 +18,7 @@
+ from erpnext.accounts.utils import get_account_currency
+ from erpnext.assets.doctype.asset.asset import get_asset_account, is_cwip_accounting_enabled
+ from erpnext.controllers.accounts_controller import merge_taxes
+-from erpnext.controllers.buying_controller import BuyingController, get_stock_qty_status_args
++from erpnext.controllers.buying_controller import BuyingController, get_received_stock_qty_status_args
+ from erpnext.controllers.mapper import get_qty_already_mapped
+ from erpnext.stock import get_warehouse_account
+ from erpnext.stock.doctype.delivery_note.delivery_note import make_inter_company_transaction
+@@ -192,9 +192,9 @@ def __init__(self, *args, **kwargs):
+ 				"target_parent_dt": "Material Request",
+ 				"target_parent_field": "per_received",
+ 				"target_ref_field": "stock_qty",
+-				**get_stock_qty_status_args(),
++				**get_received_stock_qty_status_args(),
+ 				"second_source_dt": "Purchase Invoice Item",
+-				"second_source_field": get_stock_qty_status_args()["source_field"],
++				"second_source_field": "qty * conversion_factor",
+ 				"second_join_field": "material_request_item",
+ 				"second_source_extra_cond": """ and exists(select name from `tabPurchase Invoice`
+ 				where name=`tabPurchase Invoice Item`.parent and update_stock = 1)""",

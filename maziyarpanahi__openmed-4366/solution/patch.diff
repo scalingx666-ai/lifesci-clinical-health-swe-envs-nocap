@@ -1,0 +1,2265 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 63a25660be..dae04a3294 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Add post-restore authorization reconciliation that opens a new recovery epoch, burns pre-restore approval nonces, rechecks recorded authority against current status, and holds or requires fresh review instead of reviving spent or revoked authority (#3707).
++
+ - Add deterministic edge-VLM execution memory plans with explicit device budgets, bounded preprocessing estimates and local-only abstention before allocation (#2792).
+ 
+ - Define an offline edge-VLM provider contract with bounded image/prompt inputs, source-linked evidence, model/preprocessing digests, shared abstentions, content-free reports and explicit human review for non-diagnostic drafts (#2791).
+diff --git a/docs/agent/index.md b/docs/agent/index.md
+index 287a31ad2b..f620647222 100644
+--- a/docs/agent/index.md
++++ b/docs/agent/index.md
+@@ -140,6 +140,7 @@ bindings. They neither establish semantic reversibility nor execute a rollback.
+ Compensating clinical writes remain proposals requiring separate review.
+ 
+ - [Durable workflow recovery](workflow-recovery.md): reconcile absent, committed and ambiguous effects without replaying bearer approval tokens.
++- [Restore authority reconciliation](restore-authority-reconciliation.md): bind a restored backup to a new recovery epoch so spent, revoked or expired authority cannot be revived.
+ - [OMOP rollback manifests](../interop/omop-rollback-manifests.md): bind operation-compatible rollback strategies to the exact batch and vocabulary snapshot.
+ - [OMOP rollback JSON Schema](../interop/omop-rollback-schema.md): validate the portable structural contract before semantic binding checks.
+ 
+diff --git a/docs/agent/restore-authority-reconciliation.md b/docs/agent/restore-authority-reconciliation.md
+new file mode 100644
+index 0000000000..9b21f6d92e
+--- /dev/null
++++ b/docs/agent/restore-authority-reconciliation.md
+@@ -0,0 +1,176 @@
++# Restore authority reconciliation
++
++A verified, schema-compatible backup proves that bytes were preserved. It does
++not prove that the authority recorded in those bytes is still usable. A backup
++taken before an approval token was spent still holds a nonce store with no claim
++for that token. A snapshot taken before a revocation still records the grant as
++active. `openmed.agent.approvals.restore_reconciliation` adds an explicit
++anti-replay boundary between restore and admission. It reconciles the restored
++generation against current, injected authority before any protected work
++resumes.
++
++This slice owns reconciliation only. Backup format, encryption, integrity
++checks and identity services stay with their own components. The module reuses
++the existing approval token, nonce store, runtime revocation and workflow
++recovery contracts. It performs no network access.
++
++## Inputs
++
++`RestoredSnapshot` is a content-free view of one restored generation:
++
++- `snapshot_digest`: opaque digest of the backup generation.
++- `recorded_epoch`: recovery epoch recorded in the backup.
++- `approvals`: `RestoredApproval` records for tokens outstanding at backup time.
++  `RestoredApproval.from_token(token, clock_skew_seconds=...)` keeps only the
++  token digest, nonce digest and verifier retention bound, never the bearer
++  token. Pass the live verifier's skew so the burn covers its full acceptance
++  window.
++- `workflows`: `RestoredWorkflow` entries holding a validated checkpoint
++  lineage, or a sealed `RetiredJournalRecord`, plus the `AuthorityBinding` the
++  run recorded at preview. Use `authority=None` only for runs that use no
++  runtime-revocable authority.
++
++Everything in the snapshot is historical evidence. Nothing in it establishes
++current authority.
++
++`RestoreReconciler` takes the authoritative current state as injected ports:
++
++| Port | Contract |
++| --- | --- |
++| `nonce_store` | The live `ApprovalNonceStore` shared with every verifier |
++| `epochs` | A `RecoveryEpochStore` with monotonic high water, never restored from the same backup |
++| `authority` | An `AuthorityRuntime` with the current status provider and independent generation store |
++| `clock` | Trusted integer Unix clock |
++| `observe` | Read-only effect status lookup by idempotency key for one restored tip |
++
++`InMemoryRecoveryEpochStore` serves single-process use and tests. Production
++restores need a durable epoch store kept outside every backup. A store restored
++with the run state could rewind epochs.
++
++## Reconciliation order
++
++`reconcile(snapshot, observe=...)` runs these steps in a fixed order:
++
++1. **Open a recovery epoch.** The new epoch is strictly above both the
++   recorded epoch and the retained high water. `RecoveryEpoch` binds the epoch,
++   its predecessor, the snapshot digest and the time into `epoch_digest`. If the
++   store fails or rewinds, the call fails with `recovery_epoch_unavailable` or
++   `epoch_not_monotonic`, and nothing is admitted.
++2. **Burn pre-restore approvals.** Each unexpired snapshot nonce is claimed in
++   the live nonce store, using the same digest and retention bound as
++   `ApprovalTokenVerifier`. After this step the token raises
++   `ApprovalReplayError`, even when the live store is the restored
++   pre-consumption copy. The outcome is `pre_restore_nonce_burned`, or
++   `pre_restore_nonce_already_claimed` when the authoritative store already
++   held the claim. Expired approvals are `approval_expired`. A store failure
++   holds the approval with `nonce_journal_unavailable`.
++3. **Check current authority.** A workflow that recorded a binding is checked
++   at the `resume` boundary with fresh status, before any sink read. Revoked,
++   expired, changed-generation, rolled-back and mismatched authority stay
++   unusable even when the snapshot recorded an earlier active state. The
++   outcome is `fresh_review_required`. An unavailable, stale or
++   store-unavailable status, or a missing runtime, keeps the workflow `held`.
++4. **Reconcile effects.** The existing `recover_workflow` planner compares the
++   restored lineage with live sink observations. Effects committed after the
++   backup are reported as committed and are never repeated. Ambiguous or
++   mismatched effects need `review_required`. A failed or malformed lookup
++   keeps the workflow `held`.
++5. **Invalidate pre-restore approval receipts.** A resumable plan whose
++   pending retries need approval becomes `fresh_review_required` with
++   `pre_restore_approval_invalidated`. The checkpoint receipt digest is kept as
++   `historical_approval_receipt_digest`. It never authorizes a retry. Only
++   plans without approval-gated retries return `resume` with idempotency keys.
++   A missing or expired recorded receipt also needs `fresh_review_required`.
++
++Completed, aborted and retired lineages skip authority and sink lookups,
++because they admit no further effect.
++
++## Epoch-bound approvals
++
++Burning covers tokens the snapshot recorded. A token issued after the backup is
++not in the snapshot. To cover it, issue and verify every approval against
++`epoch_action_digest(action_digest, epoch)`. A token signed for an earlier epoch
++then fails as an action mismatch and is consumed. Before admission, call
++`require_current_epoch(epoch, epochs)`. It fails with `stale_recovery_epoch`
++after a later restore.
++
++```python
++from openmed.agent.approvals import (
++    ApprovalReplayError,
++    ApprovalTokenSigner,
++    ApprovalTokenVerifier,
++    InMemoryApprovalNonceStore,
++)
++from openmed.agent.approvals.restore_reconciliation import (
++    InMemoryRecoveryEpochStore,
++    RestoredApproval,
++    RestoredSnapshot,
++    RestoreReconciler,
++    epoch_action_digest,
++    require_current_epoch,
++)
++
++key = b"synthetic-local-approval-key-32-bytes"
++action = "sha256:" + "a" * 64
++role = "role:org.example/clinical-reviewer@1.0.0"
++signer = ApprovalTokenSigner(key, clock=lambda: 10)
++token = signer.issue(action_digest=action, reviewer_role=role, expires_at=500)
++
++# The live store was replaced by a pre-consumption backup copy.
++restored_store = InMemoryApprovalNonceStore()
++epochs = InMemoryRecoveryEpochStore()
++snapshot = RestoredSnapshot(
++    snapshot_digest="sha256:" + "b" * 64,
++    recorded_epoch=0,
++    approvals=(RestoredApproval.from_token(token),),
++    workflows=(),
++)
++report = RestoreReconciler(restored_store, epochs, clock=lambda: 10).reconcile(
++    snapshot, observe=lambda checkpoint: ()
++)
++report.require_complete()
++assert report.approvals[0].reason.value == "pre_restore_nonce_burned"
++
++verifier = ApprovalTokenVerifier(key, restored_store, clock=lambda: 10)
++try:
++    verifier.consume(token, action_digest=action, reviewer_role=role)
++except ApprovalReplayError:
++    pass
++else:
++    raise AssertionError("restored token must stay spent")
++
++require_current_epoch(report.epoch, epochs)
++bound = epoch_action_digest(action, report.epoch)
++fresh = signer.issue(action_digest=bound, reviewer_role=role, expires_at=500)
++verifier.consume(fresh, action_digest=bound, reviewer_role=role)
++```
++
++## Admission and evidence
++
++`RestoreReconciliationReport.require_complete()` raises
++`restore_reconciliation_incomplete` while any approval or workflow is held.
++Hosts must not admit restored work until a later run completes. Reconciliation
++is idempotent: rerunning it opens a newer epoch and never revives a burned
++nonce.
++
++Restore never erases committed effects. Committed effects recorded in the
++snapshot stay in the outcome even when authority is denied or unavailable.
++Journals and sinks are only read. Restore also never claims that review was
++repeated. Its outcomes contain no approval-success code, and
++`fresh_review_required` means a new human review is still needed. A resumable
++plan still needs the normal read and dispatch checks at the next operation.
++
++`to_json()` emits only the schema version, epoch record, controlled reason
++codes, counts, opaque action identifiers, idempotency keys and digests. It never
++includes bearer tokens, nonces, provider or store exception text, paths or
++source payloads. Keep these linkable digests under audit-data access controls.
++
++This slice adds no autonomous clinical action, cloud fallback, identity service
++or backup format. It covers the Python contracts only; no matching Swift API is
++introduced.
++
++Focused offline validation:
++
++```text
++.venv/bin/python -m pytest tests/unit/agent/approvals/test_restore_reconciliation.py tests/integration/agent/test_restore_authority_reconciliation.py -q
++```
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index 5564f57d04..da368bec87 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -174,6 +174,7 @@ classification:
+     - interop/fhir-transaction-compensation.md
+     - interop/fhir-subscription-checkpoints.md
+     - agent/workflow-recovery.md
++    - agent/restore-authority-reconciliation.md
+     - interop/omop-rollback-manifests.md
+     - interop/omop-rollback-schema.md
+     - evaluation/governed-agent-fixtures.md
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 13b54bcc94..6072835dd2 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -100,6 +100,7 @@ nav:
+           - FHIR Transaction Compensation: interop/fhir-transaction-compensation.md
+           - FHIR Subscription Checkpoints: interop/fhir-subscription-checkpoints.md
+           - Durable Workflow Recovery: agent/workflow-recovery.md
++          - Restore Authority Reconciliation: agent/restore-authority-reconciliation.md
+           - OMOP Rollback Manifests: interop/omop-rollback-manifests.md
+           - OMOP Rollback Manifest Schema: interop/omop-rollback-schema.md
+       - Evaluation:
+diff --git a/openmed/agent/approvals/restore_reconciliation.py b/openmed/agent/approvals/restore_reconciliation.py
+new file mode 100644
+index 0000000000..65ebdb84da
+--- /dev/null
++++ b/openmed/agent/approvals/restore_reconciliation.py
+@@ -0,0 +1,940 @@
++"""Anti-replay authorization reconciliation for restored local service state.
++
++Backup integrity and schema compatibility do not establish that authority
++recorded in an older snapshot is still usable. This module binds a restored
++generation to a new recovery epoch, burns every pre-restore approval nonce in
++the live nonce store, rechecks recorded authority against injected current
++status, and reconciles resumable effects by idempotency key. It never deletes
++committed effects, rewrites checkpoints, contacts a network service, or claims
++that a human review was repeated. Reports carry only controlled codes, counts,
++opaque effect identifiers and digests.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import threading
++import time
++from collections.abc import Callable, Iterable, Mapping
++from dataclasses import dataclass
++from enum import Enum
++from typing import Any, Final, NoReturn, Protocol, cast
++
++from openmed.agent.permissions.revocation import (
++    AuthorityBinding,
++    AuthorityBoundary,
++    AuthorityDeniedError,
++    AuthorityReason,
++    AuthorityRuntime,
++)
++from openmed.agent.workflows.recovery import (
++    EffectObservation,
++    EffectState,
++    RecoveryCheckpoint,
++    RecoveryDecision,
++    RecoveryDisposition,
++    RecoveryError,
++    RecoveryPhase,
++    RecoveryReason,
++    RetiredJournalRecord,
++    recover_workflow,
++    validate_checkpoint_lineage,
++)
++
++from .tokens import (
++    MAX_APPROVAL_CLOCK_SKEW_SECONDS,
++    ApprovalNonceStore,
++    ApprovalToken,
++)
++
++RESTORE_RECONCILIATION_SCHEMA_VERSION: Final = "openmed.agent.restore_reconciliation.v1"
++RECOVERY_EPOCH_SCHEMA_VERSION: Final = "openmed.agent.recovery_epoch.v1"
++EPOCH_ACTION_SCHEMA_VERSION: Final = "openmed.agent.recovery_epoch_action.v1"
++
++_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
++_MAX_INT: Final = 2**63 - 1
++
++
++class RestoreReconciliationError(ValueError):
++    """Fail-closed restore reconciliation error with a fixed code.
++
++    Args:
++        code: Stable machine-readable failure code.
++        field_name: Optional fixed public field associated with the failure.
++    """
++
++    def __init__(self, code: str, field_name: str | None = None) -> None:
++        self.code = code
++        self.field_name = field_name
++        message = code if field_name is None else f"{field_name}: {code}"
++        super().__init__(message)
++
++
++class ApprovalRestoreDisposition(str, Enum):
++    """Post-restore state of one approval recorded in a snapshot."""
++
++    INVALIDATED = "invalidated"
++    HELD = "held"
++
++
++class WorkflowRestoreDisposition(str, Enum):
++    """Post-restore admission state of one restored workflow lineage."""
++
++    RESUME = "resume"
++    COMPLETE = "complete"
++    RETIRED = "retired"
++    FRESH_REVIEW_REQUIRED = "fresh_review_required"
++    REVIEW_REQUIRED = "review_required"
++    HELD = "held"
++
++
++class RestoreReason(str, Enum):
++    """Closed reason codes safe to retain in restore audit evidence."""
++
++    NONCE_BURNED = "pre_restore_nonce_burned"
++    NONCE_ALREADY_CLAIMED = "pre_restore_nonce_already_claimed"
++    APPROVAL_EXPIRED = "approval_expired"
++    NONCE_JOURNAL_UNAVAILABLE = "nonce_journal_unavailable"
++    RESUME_SAFE = "restore_resume_safe"
++    EFFECTS_COMPLETE = "restore_effects_complete"
++    JOURNAL_RETIRED = "restore_journal_retired"
++    APPROVAL_INVALIDATED = "pre_restore_approval_invalidated"
++    APPROVAL_MISSING = "approval_missing"
++    AUTHORITY_REVOKED = "authority_revoked"
++    AUTHORITY_EXPIRED = "authority_expired"
++    AUTHORITY_CHANGED = "authority_generation_changed"
++    AUTHORITY_ROLLBACK = "authority_status_rollback"
++    AUTHORITY_MISMATCH = "authority_contract_mismatch"
++    AUTHORITY_UNAVAILABLE = "authority_status_unavailable"
++    EFFECT_STATUS_UNAVAILABLE = "effect_status_unavailable"
++    EFFECTS_NEED_REVIEW = "restored_effects_need_review"
++
++
++_AUTHORITY_OUTCOMES: Final = {
++    AuthorityReason.REVOKED: RestoreReason.AUTHORITY_REVOKED,
++    AuthorityReason.EXPIRED: RestoreReason.AUTHORITY_EXPIRED,
++    AuthorityReason.GENERATION_CHANGED: RestoreReason.AUTHORITY_CHANGED,
++    AuthorityReason.ROLLBACK: RestoreReason.AUTHORITY_ROLLBACK,
++    AuthorityReason.CONTRACT_MISMATCH: RestoreReason.AUTHORITY_MISMATCH,
++    AuthorityReason.APPROVAL_MISMATCH: RestoreReason.AUTHORITY_MISMATCH,
++}
++
++
++class RecoveryEpochStore(Protocol):
++    """Monotonic recovery-epoch high water retained outside every backup."""
++
++    def current(self) -> int:
++        """Return the latest opened epoch, or zero before any restore."""
++
++    def advance(self, *, floor: int) -> int:
++        """Atomically open and retain an epoch above ``floor`` and high water."""
++
++
++class InMemoryRecoveryEpochStore:
++    """Thread-safe process-local epoch store for single-process use and tests.
++
++    Production restores need an injected durable store that is never restored
++    from the same backup as run state; otherwise epochs could be rewound.
++    """
++
++    def __init__(self) -> None:
++        self._current = 0
++        self._lock = threading.Lock()
++
++    def current(self) -> int:
++        """Return the latest opened epoch."""
++        with self._lock:
++            return self._current
++
++    def advance(self, *, floor: int) -> int:
++        """Open an epoch strictly above both ``floor`` and retained high water."""
++        _require_int(floor, "floor")
++        with self._lock:
++            self._current = max(self._current, floor) + 1
++            return self._current
++
++    def __repr__(self) -> str:
++        """Return a representation with the epoch number only."""
++        return f"InMemoryRecoveryEpochStore(current={self.current()})"
++
++
++@dataclass(frozen=True, slots=True, repr=False)
++class RecoveryEpoch:
++    """Digest-bound record of the epoch opened for one restored generation.
++
++    Args:
++        epoch: Newly opened epoch, strictly above ``previous_epoch``.
++        previous_epoch: Highest epoch known before this restore.
++        snapshot_digest: Opaque digest of the restored backup generation.
++        opened_at: Trusted integer Unix time of reconciliation.
++        epoch_digest: Commitment to every other field.
++        schema_version: Stable epoch schema version.
++    """
++
++    epoch: int
++    previous_epoch: int
++    snapshot_digest: str
++    opened_at: int
++    epoch_digest: str
++    schema_version: str = RECOVERY_EPOCH_SCHEMA_VERSION
++
++    def __post_init__(self) -> None:
++        if self.schema_version != RECOVERY_EPOCH_SCHEMA_VERSION:
++            raise RestoreReconciliationError(
++                "unsupported_schema_version", "schema_version"
++            )
++        _require_int(self.epoch, "epoch")
++        _require_int(self.previous_epoch, "previous_epoch")
++        if self.epoch <= self.previous_epoch:
++            raise RestoreReconciliationError("epoch_not_monotonic", "epoch")
++        _require_digest(self.snapshot_digest, "snapshot_digest")
++        _require_int(self.opened_at, "opened_at")
++        _require_digest(self.epoch_digest, "epoch_digest")
++        if self.epoch_digest != _digest(self._unsigned_dict()):
++            raise RestoreReconciliationError("epoch_digest_mismatch", "epoch_digest")
++
++    @classmethod
++    def create(
++        cls,
++        *,
++        epoch: int,
++        previous_epoch: int,
++        snapshot_digest: str,
++        opened_at: int,
++    ) -> RecoveryEpoch:
++        """Create an epoch record and bind every field into its digest."""
++        values = {
++            "schema_version": RECOVERY_EPOCH_SCHEMA_VERSION,
++            "epoch": epoch,
++            "previous_epoch": previous_epoch,
++            "snapshot_digest": snapshot_digest,
++            "opened_at": opened_at,
++        }
++        try:
++            digest = _digest(values)
++        except (TypeError, ValueError):
++            raise RestoreReconciliationError("invalid_epoch", "epoch") from None
++        return cls(epoch_digest=digest, **values)  # type: ignore[arg-type]
++
++    def _unsigned_dict(self) -> dict[str, Any]:
++        return {
++            "schema_version": self.schema_version,
++            "epoch": self.epoch,
++            "previous_epoch": self.previous_epoch,
++            "snapshot_digest": self.snapshot_digest,
++            "opened_at": self.opened_at,
++        }
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the epoch, its predecessor, timestamps and digests only."""
++        return {**self._unsigned_dict(), "epoch_digest": self.epoch_digest}
++
++    def __repr__(self) -> str:
++        """Return the epoch number without linkable digests."""
++        return f"RecoveryEpoch(epoch={self.epoch})"
++
++
++def epoch_action_digest(action_digest: str, epoch: RecoveryEpoch) -> str:
++    """Bind a reviewed action digest to one recovery epoch.
++
++    Issue and verify post-restore approval tokens against this digest, so a
++    token signed before the restore, including one absent from the snapshot,
++    fails as an action mismatch and is consumed rather than authorizing work.
++
++    Args:
++        action_digest: Canonical SHA-256 digest of the reviewed action.
++        epoch: Epoch returned by the restore reconciliation report.
++
++    Returns:
++        A SHA-256 digest committing to the action and the complete epoch.
++
++    Raises:
++        RestoreReconciliationError: An input is malformed.
++    """
++    _require_digest(action_digest, "action_digest")
++    if type(epoch) is not RecoveryEpoch:
++        raise RestoreReconciliationError("invalid_epoch", "epoch")
++    return _digest(
++        {
++            "schema_version": EPOCH_ACTION_SCHEMA_VERSION,
++            "action_digest": action_digest,
++            "epoch": epoch.epoch,
++            "epoch_digest": epoch.epoch_digest,
++        }
++    )
++
++
++def require_current_epoch(epoch: RecoveryEpoch, store: RecoveryEpochStore) -> None:
++    """Refuse admission under an epoch superseded by a later restore.
++
++    Args:
++        epoch: Epoch from the reconciliation report the caller is acting on.
++        store: The same independently retained epoch store.
++
++    Raises:
++        RestoreReconciliationError: The store is unavailable or the epoch is
++            no longer current.
++    """
++    if type(epoch) is not RecoveryEpoch:
++        raise RestoreReconciliationError("invalid_epoch", "epoch")
++    if epoch.epoch != _read_current(store):
++        raise RestoreReconciliationError("stale_recovery_epoch", "epoch")
++
++
++@dataclass(frozen=True, slots=True, repr=False)
++class RestoredApproval:
++    """Digest-only record of an approval outstanding in a restored snapshot.
++
++    Args:
++        token_digest: SHA-256 digest of the complete signed token JSON, as in
++            ``ApprovalReceipt.token_digest``.
++        nonce_digest: SHA-256 digest of the token nonce, as claimed by
++            ``ApprovalTokenVerifier``.
++        expires_at: Exclusive verifier retention bound, including skew.
++    """
++
++    token_digest: str
++    nonce_digest: str
++    expires_at: int
++
++    def __post_init__(self) -> None:
++        _require_digest(self.token_digest, "token_digest")
++        _require_digest(self.nonce_digest, "nonce_digest")
++        _require_int(self.expires_at, "expires_at")
++
++    @classmethod
++    def from_token(
++        cls, token: ApprovalToken, *, clock_skew_seconds: int = 0
++    ) -> RestoredApproval:
++        """Derive digests without retaining the bearer token.
++
++        Args:
++            token: Signed token recorded as outstanding in the snapshot.
++            clock_skew_seconds: Skew configured on the live verifier, so the
++                burn covers its full acceptance window.
++
++        Returns:
++            A digest-only restored approval record.
++
++        Raises:
++            RestoreReconciliationError: An input is malformed.
++        """
++        if type(token) is not ApprovalToken:
++            raise RestoreReconciliationError("invalid_token", "token")
++        if (
++            type(clock_skew_seconds) is not int
++            or not 0 <= clock_skew_seconds <= MAX_APPROVAL_CLOCK_SKEW_SECONDS
++        ):
++            raise RestoreReconciliationError("invalid_skew", "clock_skew_seconds")
++        return cls(
++            token_digest=_sha256(token.to_json().encode("utf-8")),
++            nonce_digest=_sha256(token.nonce.encode("ascii")),
++            expires_at=token.expires_at + clock_skew_seconds,
++        )
++
++    def __repr__(self) -> str:
++        """Hide linkable token and nonce digests."""
++        return "RestoredApproval(<digest-only>)"
++
++
++@dataclass(frozen=True, slots=True, repr=False)
++class RestoredWorkflow:
++    """One restored recovery lineage and the authority binding it recorded.
++
++    Args:
++        lineage: Restored checkpoint lineage, or a sealed retired record.
++        authority: Preview authority binding recorded with the run, or
++            ``None`` when the run uses no runtime-revocable authority.
++    """
++
++    lineage: tuple[RecoveryCheckpoint, ...] | RetiredJournalRecord
++    authority: AuthorityBinding | None = None
++
++    def __post_init__(self) -> None:
++        if type(self.lineage) is not RetiredJournalRecord:
++            if type(self.lineage) is not tuple:
++                raise RestoreReconciliationError("invalid_restored_lineage", "lineage")
++            try:
++                validate_checkpoint_lineage(self.lineage)
++            except RecoveryError:
++                raise RestoreReconciliationError(
++                    "invalid_restored_lineage", "lineage"
++                ) from None
++        if self.authority is not None and type(self.authority) is not AuthorityBinding:
++            raise RestoreReconciliationError("invalid_restored_authority", "authority")
++
++    @property
++    def source_digest(self) -> str:
++        """Return the digest of the restored tip checkpoint or retired record."""
++        if type(self.lineage) is RetiredJournalRecord:
++            return self.lineage.final_checkpoint_digest
++        return self.lineage[-1].checkpoint_digest
++
++    def __repr__(self) -> str:
++        """Return counts only."""
++        count = (
++            self.lineage.checkpoint_count
++            if type(self.lineage) is RetiredJournalRecord
++            else len(self.lineage)
++        )
++        return f"RestoredWorkflow(checkpoints={count})"
++
++
++@dataclass(frozen=True, slots=True, repr=False)
++class RestoredSnapshot:
++    """Content-free fixture view of one restored backup generation.
++
++    Backup format, decryption and integrity checks belong to the backup tool.
++    Everything here is treated as historical, never as current authority.
++
++    Args:
++        snapshot_digest: Opaque digest identifying the restored generation.
++        recorded_epoch: Recovery epoch recorded in the backup.
++        approvals: Approvals outstanding when the backup was taken.
++        workflows: Restored workflow lineages.
++    """
++
++    snapshot_digest: str
++    recorded_epoch: int
++    approvals: tuple[RestoredApproval, ...]
++    workflows: tuple[RestoredWorkflow, ...]
++
++    def __post_init__(self) -> None:
++        _require_digest(self.snapshot_digest, "snapshot_digest")
++        _require_int(self.recorded_epoch, "recorded_epoch")
++        if type(self.approvals) is not tuple or any(
++            type(item) is not RestoredApproval for item in self.approvals
++        ):
++            raise RestoreReconciliationError("invalid_restored_approvals", "approvals")
++        if type(self.workflows) is not tuple or any(
++            type(item) is not RestoredWorkflow for item in self.workflows
++        ):
++            raise RestoreReconciliationError("invalid_restored_workflows", "workflows")
++        token_digests = [item.token_digest for item in self.approvals]
++        nonce_digests = [item.nonce_digest for item in self.approvals]
++        if len(set(token_digests)) != len(token_digests) or len(
++            set(nonce_digests)
++        ) != len(nonce_digests):
++            raise RestoreReconciliationError("duplicate_restored_approval", "approvals")
++        sources = [item.source_digest for item in self.workflows]
++        if len(set(sources)) != len(sources):
++            raise RestoreReconciliationError("duplicate_restored_workflow", "workflows")
++
++    def __repr__(self) -> str:
++        """Return counts only."""
++        return (
++            f"RestoredSnapshot(approvals={len(self.approvals)}, "
++            f"workflows={len(self.workflows)})"
++        )
++
++
++@dataclass(frozen=True, slots=True)
++class ApprovalRestoreOutcome:
++    """Reconciled state of one pre-restore approval.
++
++    Args:
++        token_digest: Digest of the historical token, for audit linkage.
++        disposition: Whether the approval is now unspendable or held.
++        reason: Controlled reason code.
++    """
++
++    token_digest: str
++    disposition: ApprovalRestoreDisposition
++    reason: RestoreReason
++
++    def to_dict(self) -> dict[str, str]:
++        """Return the token digest and controlled codes only."""
++        return {
++            "token_digest": self.token_digest,
++            "disposition": self.disposition.value,
++            "reason_code": self.reason.value,
++        }
++
++
++@dataclass(frozen=True, slots=True)
++class WorkflowRestoreOutcome:
++    """Reconciled admission state of one restored workflow.
++
++    Args:
++        source_digest: Restored tip checkpoint or retired record digest.
++        disposition: Admission state under the new epoch.
++        reason: Controlled restore reason code.
++        recovery_reason: Underlying recovery planner reason code, if planned.
++        committed_effects: Opaque action identifiers and commit evidence
++            digests known from the snapshot or from live sink observations.
++        retry_idempotency_keys: Keys that may be re-dispatched; empty unless
++            the disposition is ``resume``.
++        recovery_evidence_digest: Digest of the underlying recovery decision.
++        historical_approval_receipt_digest: Pre-restore approval receipt kept
++            as historical evidence only; it never authorizes a retry.
++    """
++
++    source_digest: str
++    disposition: WorkflowRestoreDisposition
++    reason: RestoreReason
++    recovery_reason: str | None = None
++    committed_effects: tuple[tuple[str, str], ...] = ()
++    retry_idempotency_keys: tuple[str, ...] = ()
++    recovery_evidence_digest: str | None = None
++    historical_approval_receipt_digest: str | None = None
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return controlled codes, opaque identifiers and digests only."""
++        return {
++            "source_digest": self.source_digest,
++            "disposition": self.disposition.value,
++            "reason_code": self.reason.value,
++            "recovery_reason_code": self.recovery_reason,
++            "committed_effects": [
++                {"action_id": action_id, "commit_evidence_digest": evidence}
++                for action_id, evidence in self.committed_effects
++            ],
++            "retry_idempotency_keys": list(self.retry_idempotency_keys),
++            "recovery_evidence_digest": self.recovery_evidence_digest,
++            "historical_approval_receipt_digest": (
++                self.historical_approval_receipt_digest
++            ),
++        }
++
++
++@dataclass(frozen=True, slots=True, repr=False)
++class RestoreReconciliationReport:
++    """Deterministic, content-free evidence of one post-restore reconciliation.
++
++    Args:
++        epoch: Recovery epoch opened for the restored generation.
++        approvals: One outcome per snapshot approval, in snapshot order.
++        workflows: One outcome per restored workflow, in snapshot order.
++    """
++
++    epoch: RecoveryEpoch
++    approvals: tuple[ApprovalRestoreOutcome, ...]
++    workflows: tuple[WorkflowRestoreOutcome, ...]
++
++    @property
++    def held_count(self) -> int:
++        """Return how many approvals and workflows remain held."""
++        return sum(
++            item.disposition is ApprovalRestoreDisposition.HELD
++            for item in self.approvals
++        ) + sum(
++            item.disposition is WorkflowRestoreDisposition.HELD
++            for item in self.workflows
++        )
++
++    @property
++    def fresh_review_count(self) -> int:
++        """Return how many workflows need fresh authority or human review."""
++        return sum(
++            item.disposition is WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED
++            for item in self.workflows
++        )
++
++    @property
++    def complete(self) -> bool:
++        """Return whether every snapshot item was reconciled without a hold."""
++        return self.held_count == 0
++
++    @property
++    def report_digest(self) -> str:
++        """Return a commitment to the complete report body."""
++        return _digest(self._unsigned_dict())
++
++    def require_complete(self) -> None:
++        """Refuse restored admission while any approval or workflow is held.
++
++        Raises:
++            RestoreReconciliationError: Reconciliation must be rerun once the
++                unavailable nonce journal, authority or sink status returns.
++        """
++        if not self.complete:
++            raise RestoreReconciliationError(
++                "restore_reconciliation_incomplete", "report"
++            )
++
++    def _unsigned_dict(self) -> dict[str, Any]:
++        return {
++            "schema_version": RESTORE_RECONCILIATION_SCHEMA_VERSION,
++            "epoch": self.epoch.to_dict(),
++            "approvals": [item.to_dict() for item in self.approvals],
++            "workflows": [item.to_dict() for item in self.workflows],
++            "counts": {
++                "approvals": len(self.approvals),
++                "workflows": len(self.workflows),
++                "invalidated_approvals": sum(
++                    item.disposition is ApprovalRestoreDisposition.INVALIDATED
++                    for item in self.approvals
++                ),
++                "held": self.held_count,
++                "fresh_review_required": self.fresh_review_count,
++            },
++            "complete": self.complete,
++        }
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the report body and its digest for audit storage."""
++        values = self._unsigned_dict()
++        values["report_digest"] = _digest(values)
++        return values
++
++    def to_json(self) -> str:
++        """Serialize the report as compact canonical JSON."""
++        return _canonical_json(self.to_dict())
++
++    def __repr__(self) -> str:
++        """Return the epoch number and counts only."""
++        return (
++            f"RestoreReconciliationReport(epoch={self.epoch.epoch}, "
++            f"approvals={len(self.approvals)}, workflows={len(self.workflows)}, "
++            f"held={self.held_count})"
++        )
++
++
++EffectObserver = Callable[[RecoveryCheckpoint], Iterable[EffectObservation]]
++
++
++class RestoreReconciler:
++    """Reconcile a restored generation against authoritative current state.
++
++    Args:
++        nonce_store: Live approval nonce store shared with every verifier.
++            Pre-restore nonces are claimed here so they can never be spent.
++        epochs: Independently retained monotonic recovery-epoch store.
++        authority: Runtime with the current status provider and generation
++            high water; required for workflows that recorded a binding.
++        clock: Trusted integer Unix clock.
++    """
++
++    def __init__(
++        self,
++        nonce_store: ApprovalNonceStore,
++        epochs: RecoveryEpochStore,
++        *,
++        authority: AuthorityRuntime | None = None,
++        clock: Callable[[], int] = lambda: int(time.time()),
++    ) -> None:
++        if not callable(getattr(nonce_store, "claim", None)):
++            raise RestoreReconciliationError("invalid_nonce_store", "nonce_store")
++        if not callable(getattr(epochs, "advance", None)) or not callable(
++            getattr(epochs, "current", None)
++        ):
++            raise RestoreReconciliationError("invalid_epoch_store", "epochs")
++        if authority is not None and type(authority) is not AuthorityRuntime:
++            raise RestoreReconciliationError("invalid_authority_runtime", "authority")
++        if not callable(clock):
++            raise RestoreReconciliationError("invalid_clock", "clock")
++        self._nonce_store = nonce_store
++        self._epochs = epochs
++        self._authority = authority
++        self._clock = clock
++
++    def reconcile(
++        self, snapshot: RestoredSnapshot, *, observe: EffectObserver
++    ) -> RestoreReconciliationReport:
++        """Open a new epoch, burn restored approvals and plan restored work.
++
++        Steps run in a fixed order: open the epoch, burn every unexpired
++        snapshot nonce in the live store, then for each workflow check current
++        authority before reading effect status by idempotency key.
++
++        Args:
++            snapshot: Restored generation; its contents are historical only.
++            observe: Read-only effect status lookup for one restored tip.
++
++        Returns:
++            Content-free report; act only on ``resume`` retry keys, and only
++            after ``require_complete`` succeeds.
++
++        Raises:
++            RestoreReconciliationError: The snapshot, observer, clock or epoch
++                store is invalid or unavailable. Nothing is admitted.
++        """
++        if type(snapshot) is not RestoredSnapshot:
++            raise RestoreReconciliationError("invalid_snapshot", "snapshot")
++        if not callable(observe):
++            raise RestoreReconciliationError("invalid_effect_observer", "observe")
++        now = self._now()
++        epoch = self._open_epoch(snapshot, now)
++        approvals = tuple(self._burn(item, now) for item in snapshot.approvals)
++        workflows = tuple(
++            self._workflow(item, observe, now) for item in snapshot.workflows
++        )
++        return RestoreReconciliationReport(epoch, approvals, workflows)
++
++    def _now(self) -> int:
++        try:
++            value = self._clock()
++        except (KeyboardInterrupt, SystemExit):
++            raise
++        except BaseException:
++            raise RestoreReconciliationError("clock_unavailable", "clock") from None
++        if type(value) is not int or not 0 <= value <= _MAX_INT:
++            raise RestoreReconciliationError("clock_unavailable", "clock")
++        return value
++
++    def _open_epoch(self, snapshot: RestoredSnapshot, now: int) -> RecoveryEpoch:
++        previous = max(_read_current(self._epochs), snapshot.recorded_epoch)
++        try:
++            opened = self._epochs.advance(floor=previous)
++        except (KeyboardInterrupt, SystemExit):
++            raise
++        except BaseException:
++            raise RestoreReconciliationError(
++                "recovery_epoch_unavailable", "epochs"
++            ) from None
++        if type(opened) is not int or not previous < opened <= _MAX_INT:
++            raise RestoreReconciliationError("epoch_not_monotonic", "epochs")
++        return RecoveryEpoch.create(
++            epoch=opened,
++            previous_epoch=previous,
++            snapshot_digest=snapshot.snapshot_digest,
++            opened_at=now,
++        )
++
++    def _burn(self, approval: RestoredApproval, now: int) -> ApprovalRestoreOutcome:
++        def outcome(
++            disposition: ApprovalRestoreDisposition, reason: RestoreReason
++        ) -> ApprovalRestoreOutcome:
++            return ApprovalRestoreOutcome(approval.token_digest, disposition, reason)
++
++        if now >= approval.expires_at:
++            return outcome(
++                ApprovalRestoreDisposition.INVALIDATED, RestoreReason.APPROVAL_EXPIRED
++            )
++        try:
++            claimed = self._nonce_store.claim(
++                approval.nonce_digest, expires_at=approval.expires_at, now=now
++            )
++        except (KeyboardInterrupt, SystemExit):
++            raise
++        except BaseException:
++            claimed = None
++        if type(claimed) is not bool:
++            return outcome(
++                ApprovalRestoreDisposition.HELD,
++                RestoreReason.NONCE_JOURNAL_UNAVAILABLE,
++            )
++        return outcome(
++            ApprovalRestoreDisposition.INVALIDATED,
++            RestoreReason.NONCE_BURNED
++            if claimed
++            else RestoreReason.NONCE_ALREADY_CLAIMED,
++        )
++
++    def _workflow(
++        self, workflow: RestoredWorkflow, observe: EffectObserver, now: int
++    ) -> WorkflowRestoreOutcome:
++        source = workflow.source_digest
++        if type(workflow.lineage) is RetiredJournalRecord:
++            return WorkflowRestoreOutcome(
++                source,
++                WorkflowRestoreDisposition.RETIRED,
++                RestoreReason.JOURNAL_RETIRED,
++            )
++        lineage = cast(tuple[RecoveryCheckpoint, ...], workflow.lineage)
++        tip = lineage[-1]
++        recorded = tuple(
++            (effect.action_id.serialize(), str(effect.commit_evidence_digest))
++            for effect in tip.effects
++            if effect.state is EffectState.COMMITTED
++        )
++        history = tip.approval_receipt_digest
++
++        def held_or_review(
++            disposition: WorkflowRestoreDisposition, reason: RestoreReason
++        ) -> WorkflowRestoreOutcome:
++            return WorkflowRestoreOutcome(
++                source,
++                disposition,
++                reason,
++                committed_effects=recorded,
++                historical_approval_receipt_digest=history,
++            )
++
++        if tip.phase in {RecoveryPhase.COMPLETED, RecoveryPhase.ABORTED}:
++            return _plan(source, lineage, (), now, recorded)
++        if workflow.authority is not None:
++            if self._authority is None:
++                return held_or_review(
++                    WorkflowRestoreDisposition.HELD,
++                    RestoreReason.AUTHORITY_UNAVAILABLE,
++                )
++            try:
++                self._authority.check(workflow.authority, AuthorityBoundary.RESUME)
++            except AuthorityDeniedError as denied:
++                reason = _AUTHORITY_OUTCOMES.get(denied.receipt.reason)
++                if reason is None:
++                    return held_or_review(
++                        WorkflowRestoreDisposition.HELD,
++                        RestoreReason.AUTHORITY_UNAVAILABLE,
++                    )
++                return held_or_review(
++                    WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED, reason
++                )
++        try:
++            observations = tuple(observe(tip))
++        except (KeyboardInterrupt, SystemExit):
++            raise
++        except BaseException:
++            return held_or_review(
++                WorkflowRestoreDisposition.HELD,
++                RestoreReason.EFFECT_STATUS_UNAVAILABLE,
++            )
++        return _plan(source, lineage, observations, now, recorded)
++
++    def __repr__(self) -> str:
++        """Hide injected stores and providers."""
++        return "RestoreReconciler(<redacted>)"
++
++
++def _plan(
++    source: str,
++    lineage: tuple[RecoveryCheckpoint, ...],
++    observations: tuple[Any, ...],
++    now: int,
++    recorded: tuple[tuple[str, str], ...],
++) -> WorkflowRestoreOutcome:
++    tip = lineage[-1]
++    history = tip.approval_receipt_digest
++    try:
++        decision = recover_workflow(lineage, observations, now=now)
++    except RecoveryError:
++        return WorkflowRestoreOutcome(
++            source,
++            WorkflowRestoreDisposition.HELD,
++            RestoreReason.EFFECT_STATUS_UNAVAILABLE,
++            committed_effects=recorded,
++            historical_approval_receipt_digest=history,
++        )
++    disposition, reason = _map_decision(decision, tip)
++    resume = disposition is WorkflowRestoreDisposition.RESUME
++    return WorkflowRestoreOutcome(
++        source,
++        disposition,
++        reason,
++        recovery_reason=decision.reason.value,
++        committed_effects=_merge_committed(tip, recorded, decision),
++        retry_idempotency_keys=decision.retry_idempotency_keys if resume else (),
++        recovery_evidence_digest=decision.evidence_digest,
++        historical_approval_receipt_digest=history,
++    )
++
++
++def _map_decision(
++    decision: RecoveryDecision, tip: RecoveryCheckpoint
++) -> tuple[WorkflowRestoreDisposition, RestoreReason]:
++    if decision.disposition is RecoveryDisposition.COMPLETE:
++        return WorkflowRestoreDisposition.COMPLETE, RestoreReason.EFFECTS_COMPLETE
++    if decision.disposition is RecoveryDisposition.RESUME:
++        retry = set(decision.retry_effect_ids)
++        gated = any(
++            effect.approval_required
++            for effect in tip.effects
++            if effect.action_id.serialize() in retry
++        )
++        if gated:
++            # A pre-restore receipt cannot be verified against current state.
++            return (
++                WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED,
++                RestoreReason.APPROVAL_INVALIDATED,
++            )
++        return WorkflowRestoreDisposition.RESUME, RestoreReason.RESUME_SAFE
++    if decision.reason is RecoveryReason.APPROVAL_EXPIRED:
++        return (
++            WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED,
++            RestoreReason.APPROVAL_EXPIRED,
++        )
++    if decision.reason is RecoveryReason.APPROVAL_MISSING:
++        return (
++            WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED,
++            RestoreReason.APPROVAL_MISSING,
++        )
++    return WorkflowRestoreDisposition.REVIEW_REQUIRED, RestoreReason.EFFECTS_NEED_REVIEW
++
++
++def _merge_committed(
++    tip: RecoveryCheckpoint,
++    recorded: tuple[tuple[str, str], ...],
++    decision: RecoveryDecision,
++) -> tuple[tuple[str, str], ...]:
++    known = dict(recorded)
++    for action_id, evidence in decision.committed_effects:
++        known.setdefault(action_id, evidence)
++    order = [effect.action_id.serialize() for effect in tip.effects]
++    return tuple(
++        (action_id, known[action_id]) for action_id in order if action_id in known
++    )
++
++
++def _read_current(store: RecoveryEpochStore) -> int:
++    try:
++        value = store.current()
++    except (KeyboardInterrupt, SystemExit):
++        raise
++    except BaseException:
++        raise RestoreReconciliationError(
++            "recovery_epoch_unavailable", "epochs"
++        ) from None
++    if type(value) is not int or not 0 <= value <= _MAX_INT:
++        raise RestoreReconciliationError("recovery_epoch_unavailable", "epochs")
++    return value
++
++
++def _require_int(value: object, field_name: str) -> int:
++    if type(value) is not int or not 0 <= value <= _MAX_INT:
++        _fail("invalid_integer", field_name)
++    return value  # type: ignore[return-value]
++
++
++def _require_digest(value: object, field_name: str) -> str:
++    if type(value) is not str or _DIGEST_RE.fullmatch(value) is None:
++        _fail("invalid_digest", field_name)
++    return value  # type: ignore[return-value]
++
++
++def _fail(code: str, field_name: str) -> NoReturn:
++    raise RestoreReconciliationError(code, field_name)
++
++
++def _canonical_json(payload: Mapping[str, Any]) -> str:
++    return json.dumps(
++        payload,
++        sort_keys=True,
++        separators=(",", ":"),
++        ensure_ascii=True,
++        allow_nan=False,
++    )
++
++
++def _digest(payload: Mapping[str, Any]) -> str:
++    return _sha256(_canonical_json(payload).encode("ascii"))
++
++
++def _sha256(value: bytes) -> str:
++    return f"sha256:{hashlib.sha256(value).hexdigest()}"
++
++
++__all__ = [
++    "EPOCH_ACTION_SCHEMA_VERSION",
++    "RECOVERY_EPOCH_SCHEMA_VERSION",
++    "RESTORE_RECONCILIATION_SCHEMA_VERSION",
++    "ApprovalRestoreDisposition",
++    "ApprovalRestoreOutcome",
++    "EffectObserver",
++    "InMemoryRecoveryEpochStore",
++    "RecoveryEpoch",
++    "RecoveryEpochStore",
++    "RestoreReason",
++    "RestoreReconciler",
++    "RestoreReconciliationError",
++    "RestoreReconciliationReport",
++    "RestoredApproval",
++    "RestoredSnapshot",
++    "RestoredWorkflow",
++    "WorkflowRestoreDisposition",
++    "WorkflowRestoreOutcome",
++    "epoch_action_digest",
++    "require_current_epoch",
++]
+diff --git a/tests/integration/agent/test_restore_authority_reconciliation.py b/tests/integration/agent/test_restore_authority_reconciliation.py
+new file mode 100644
+index 0000000000..691a8d6add
+--- /dev/null
++++ b/tests/integration/agent/test_restore_authority_reconciliation.py
+@@ -0,0 +1,285 @@
++"""Offline backup/restore anti-replay tests with synthetic fixture snapshots."""
++
++from __future__ import annotations
++
++import shutil
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from openmed.agent.approvals import (
++    ApprovalActionMismatchError,
++    ApprovalReplayError,
++    ApprovalTokenSigner,
++    ApprovalTokenVerifier,
++    SQLiteApprovalNonceStore,
++)
++from openmed.agent.approvals.restore_reconciliation import (
++    ApprovalRestoreDisposition,
++    RestoredApproval,
++    RestoredSnapshot,
++    RestoredWorkflow,
++    RestoreReason,
++    RestoreReconciler,
++    WorkflowRestoreDisposition,
++    epoch_action_digest,
++    require_current_epoch,
++)
++from openmed.agent.correlation import ActionId
++from openmed.agent.identifiers import ToolId, WorkflowId
++from openmed.agent.workflows.recovery import (
++    CheckpointJournal,
++    CompensationLimit,
++    EffectKind,
++    EffectObservation,
++    EffectRecord,
++    ObservationState,
++    RecoveryCheckpoint,
++    RecoveryPhase,
++)
++from tests.fixtures.agent.authority_status import ACTION_DIGEST, SyntheticAuthority
++
++pytestmark = pytest.mark.integration
++
++KEY = b"synthetic-local-approval-key-32-bytes"
++ROLE = "role:org.example/clinical-reviewer@1.0.0"
++SNAPSHOT_DIGEST = "sha256:" + "b" * 64
++COMMIT_EVIDENCE = "sha256:" + "c" * 64
++
++
++class SyntheticDurableEpochs:
++    """Test-only durable epoch high water kept outside every backup."""
++
++    def __init__(self, path: Path) -> None:
++        self.path = path
++        with sqlite3.connect(path) as connection:
++            connection.execute(
++                "CREATE TABLE IF NOT EXISTS epoch "
++                "(id INTEGER PRIMARY KEY, value INTEGER)"
++            )
++            connection.execute("INSERT OR IGNORE INTO epoch VALUES (0, 0)")
++
++    def current(self) -> int:
++        with sqlite3.connect(self.path) as connection:
++            return connection.execute("SELECT value FROM epoch").fetchone()[0]
++
++    def advance(self, *, floor: int) -> int:
++        with sqlite3.connect(self.path) as connection:
++            connection.execute("BEGIN IMMEDIATE")
++            current = connection.execute("SELECT value FROM epoch").fetchone()[0]
++            value = max(current, floor) + 1
++            connection.execute("UPDATE epoch SET value = ?", (value,))
++            return value
++
++
++class SyntheticSink:
++    """Idempotent effect sink; restore may observe it but never delete from it."""
++
++    def __init__(self) -> None:
++        self.commits: dict[str, str] = {}
++        self.observed = 0
++
++    def apply(self, key: str) -> None:
++        self.commits.setdefault(key, COMMIT_EVIDENCE)
++
++    def observe(self, checkpoint: RecoveryCheckpoint):
++        self.observed += 1
++        return tuple(
++            EffectObservation(
++                action_id=effect.action_id,
++                operation_digest=effect.operation_digest,
++                idempotency_key=effect.idempotency_key,
++                state=(
++                    ObservationState.COMMITTED
++                    if effect.idempotency_key in self.commits
++                    else ObservationState.ABSENT
++                ),
++                commit_evidence_digest=self.commits.get(effect.idempotency_key),
++            )
++            for effect in checkpoint.effects
++        )
++
++
++def _checkpoint(fixture, *, approval_required: bool, receipt=None):
++    effects = tuple(
++        EffectRecord.create(
++            ordinal=index,
++            run_id=fixture.ticket.run_id,
++            action_id=ActionId(f"act_{index + 1:032x}"),
++            tool_id=ToolId(fixture.constraint.tool),
++            kind=kind,
++            operation_digest=f"sha256:{index + (20 if approval_required else 40):064x}",
++            approval_required=approval_required,
++            compensation_limit=CompensationLimit.PROPOSE_ONLY,
++        )
++        for index, kind in enumerate((EffectKind.FHIR_WRITE, EffectKind.OMOP_BATCH))
++    )
++    approval = (
++        {
++            "approval_action_digest": ACTION_DIGEST,
++            "approval_receipt_digest": receipt.token_digest,
++            "approval_expires_at": 90,
++        }
++        if receipt is not None
++        else {}
++    )
++    return RecoveryCheckpoint.create(
++        workflow_id=WorkflowId("workflow:org.example/restore@1.0.0"),
++        run_id=fixture.ticket.run_id,
++        sequence=0,
++        phase=(
++            RecoveryPhase.APPROVAL_RECORDED
++            if receipt is not None
++            else RecoveryPhase.PLANNED
++        ),
++        plan_digest=ACTION_DIGEST,
++        effects=effects,
++        **approval,
++    )
++
++
++def _restore_file(backup: Path, live: Path) -> None:
++    live.unlink()
++    shutil.copy2(backup, live)
++
++
++def test_backup_before_consumption_cannot_revive_spent_or_unlisted_tokens(
++    tmp_path,
++) -> None:
++    fixture = SyntheticAuthority()
++    nonce_path = tmp_path / "live" / "nonces.sqlite"
++    nonce_path.parent.mkdir()
++    backup_dir = tmp_path / "backup"
++    backup_dir.mkdir()
++    epochs = SyntheticDurableEpochs(tmp_path / "independent-epochs.sqlite")
++    signer = ApprovalTokenSigner(KEY, clock=fixture.clock)
++    verifier = ApprovalTokenVerifier(
++        KEY, SQLiteApprovalNonceStore(nonce_path), clock=fixture.clock
++    )
++
++    # Reviewed token recorded as outstanding in the backup.
++    spent = signer.issue(action_digest=ACTION_DIGEST, reviewer_role=ROLE, expires_at=90)
++    shutil.copy2(nonce_path, backup_dir / "nonces.sqlite")
++    snapshot = RestoredSnapshot(
++        snapshot_digest=SNAPSHOT_DIGEST,
++        recorded_epoch=0,
++        approvals=(RestoredApproval.from_token(spent),),
++        workflows=(),
++    )
++
++    # After the backup: consume the token, then issue one the backup never saw.
++    verifier.consume(spent, action_digest=ACTION_DIGEST, reviewer_role=ROLE)
++    unlisted = signer.issue(
++        action_digest=ACTION_DIGEST, reviewer_role=ROLE, expires_at=90
++    )
++
++    # Negative control: the restored nonce file alone would accept a replay.
++    control = tmp_path / "control.sqlite"
++    shutil.copy2(backup_dir / "nonces.sqlite", control)
++    ApprovalTokenVerifier(
++        KEY, SQLiteApprovalNonceStore(control), clock=fixture.clock
++    ).consume(spent, action_digest=ACTION_DIGEST, reviewer_role=ROLE)
++
++    _restore_file(backup_dir / "nonces.sqlite", nonce_path)
++    restored_store = SQLiteApprovalNonceStore(nonce_path)
++    report = RestoreReconciler(
++        restored_store, epochs, authority=fixture.runtime, clock=fixture.clock
++    ).reconcile(snapshot, observe=SyntheticSink().observe)
++    assert report.complete
++    assert report.approvals[0].disposition is ApprovalRestoreDisposition.INVALIDATED
++    assert report.approvals[0].reason is RestoreReason.NONCE_BURNED
++
++    # A separate process-like verifier over the durable store still refuses.
++    restarted = ApprovalTokenVerifier(
++        KEY, SQLiteApprovalNonceStore(nonce_path), clock=fixture.clock
++    )
++    with pytest.raises(ApprovalReplayError):
++        restarted.consume(spent, action_digest=ACTION_DIGEST, reviewer_role=ROLE)
++    bound = epoch_action_digest(ACTION_DIGEST, report.epoch)
++    require_current_epoch(report.epoch, epochs)
++    with pytest.raises(ApprovalActionMismatchError):
++        restarted.consume(unlisted, action_digest=bound, reviewer_role=ROLE)
++    fresh = signer.issue(action_digest=bound, reviewer_role=ROLE, expires_at=90)
++    restarted.consume(fresh, action_digest=bound, reviewer_role=ROLE)
++
++
++def test_restore_reconciles_effects_and_authority_against_current_status(
++    tmp_path,
++) -> None:
++    fixture = SyntheticAuthority()
++    epochs = SyntheticDurableEpochs(tmp_path / "independent-epochs.sqlite")
++    nonce_store = SQLiteApprovalNonceStore(tmp_path / "nonces.sqlite")
++    sink = SyntheticSink()
++    binding = fixture.runtime.bind(fixture.contracts)
++    signer = ApprovalTokenSigner(KEY, clock=fixture.clock)
++    token = signer.issue(action_digest=ACTION_DIGEST, reviewer_role=ROLE, expires_at=90)
++    receipt = ApprovalTokenVerifier(KEY, nonce_store, clock=fixture.clock).consume(
++        token, action_digest=ACTION_DIGEST, reviewer_role=ROLE
++    )
++    gated = _checkpoint(fixture, approval_required=True, receipt=receipt)
++    open_run = _checkpoint(fixture, approval_required=False)
++    journals = {}
++    for name, checkpoint in (("gated", gated), ("open", open_run)):
++        journal = CheckpointJournal(tmp_path / "journals" / name)
++        journal.append(checkpoint)
++        journals[name] = journal
++
++    # One gated effect commits after the backup; it must not be repeated.
++    sink.apply(gated.effects[0].idempotency_key)
++    lineage = {name: journal.load() for name, journal in journals.items()}
++    snapshot = RestoredSnapshot(
++        snapshot_digest=SNAPSHOT_DIGEST,
++        recorded_epoch=epochs.current(),
++        approvals=(),
++        workflows=(
++            RestoredWorkflow(lineage=lineage["gated"], authority=binding),
++            RestoredWorkflow(lineage=lineage["open"], authority=binding),
++        ),
++    )
++
++    # Current authority status is unavailable: everything protected stays held.
++    fixture.provider.unavailable = True
++    held = RestoreReconciler(
++        nonce_store, epochs, authority=fixture.runtime, clock=fixture.clock
++    ).reconcile(snapshot, observe=sink.observe)
++    assert [w.disposition for w in held.workflows] == [
++        WorkflowRestoreDisposition.HELD,
++        WorkflowRestoreDisposition.HELD,
++    ]
++    assert sink.observed == 0
++    assert not held.complete
++
++    fixture.provider.unavailable = False
++    restored = RestoreReconciler(
++        nonce_store, epochs, authority=fixture.runtime, clock=fixture.clock
++    ).reconcile(snapshot, observe=sink.observe)
++    assert restored.epoch.epoch > held.epoch.epoch
++    gated_outcome, open_outcome = restored.workflows
++    assert gated_outcome.disposition is WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED
++    assert gated_outcome.reason is RestoreReason.APPROVAL_INVALIDATED
++    assert gated_outcome.retry_idempotency_keys == ()
++    assert gated_outcome.historical_approval_receipt_digest == receipt.token_digest
++    assert gated_outcome.committed_effects == (
++        (gated.effects[0].action_id.serialize(), COMMIT_EVIDENCE),
++    )
++    assert open_outcome.disposition is WorkflowRestoreDisposition.RESUME
++    assert open_outcome.retry_idempotency_keys == tuple(
++        effect.idempotency_key for effect in open_run.effects
++    )
++
++    # Revocation after the backup: the snapshot binding still records it active.
++    fixture.provider.revoke(fixture.contracts[0])
++    revoked = RestoreReconciler(
++        nonce_store, epochs, authority=fixture.runtime, clock=fixture.clock
++    ).reconcile(snapshot, observe=sink.observe)
++    for outcome in revoked.workflows:
++        assert outcome.disposition is WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED
++        assert outcome.reason is RestoreReason.AUTHORITY_REVOKED
++        assert outcome.retry_idempotency_keys == ()
++    assert revoked.workflows[0].committed_effects == ()  # recorded tip had none
++    # Committed effects remain in the sink; restore never deletes them.
++    assert sink.commits == {gated.effects[0].idempotency_key: COMMIT_EVIDENCE}
++    # Journals are retained unchanged as historical audit evidence.
++    for name, journal in journals.items():
++        assert journal.load() == lineage[name]
+diff --git a/tests/unit/agent/approvals/test_restore_reconciliation.py b/tests/unit/agent/approvals/test_restore_reconciliation.py
+new file mode 100644
+index 0000000000..1bb91ca498
+--- /dev/null
++++ b/tests/unit/agent/approvals/test_restore_reconciliation.py
+@@ -0,0 +1,791 @@
++"""Offline tests for post-restore approval and authority reconciliation."""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from openmed.agent.approvals.restore_reconciliation import (
++    RESTORE_RECONCILIATION_SCHEMA_VERSION,
++    ApprovalRestoreDisposition,
++    InMemoryRecoveryEpochStore,
++    RecoveryEpoch,
++    RestoredApproval,
++    RestoredSnapshot,
++    RestoredWorkflow,
++    RestoreReason,
++    RestoreReconciler,
++    RestoreReconciliationError,
++    WorkflowRestoreDisposition,
++    epoch_action_digest,
++    require_current_epoch,
++)
++from openmed.agent.approvals.tokens import (
++    ApprovalActionMismatchError,
++    ApprovalReplayError,
++    ApprovalTokenSigner,
++    ApprovalTokenVerifier,
++    InMemoryApprovalNonceStore,
++)
++from openmed.agent.correlation import ActionId, RunId
++from openmed.agent.identifiers import ToolId, WorkflowId
++from openmed.agent.workflows.recovery import (
++    CompensationLimit,
++    EffectKind,
++    EffectObservation,
++    EffectRecord,
++    ObservationState,
++    RecoveryCheckpoint,
++    RecoveryDisposition,
++    RecoveryPhase,
++    RetiredJournalRecord,
++    advance_checkpoint,
++    recover_workflow,
++)
++from tests.fixtures.agent.authority_status import SyntheticAuthority
++
++KEY = b"synthetic-local-approval-key-32-bytes"
++ROLE = "role:org.example/clinical-reviewer@1.0.0"
++ACTION = "sha256:" + "a" * 64
++SNAPSHOT = "sha256:" + "5" * 64
++RECEIPT = "sha256:" + "6" * 64
++COMMIT_EVIDENCE = "sha256:" + "7" * 64
++RUN_ID = RunId("run_" + "1" * 32)
++WORKFLOW_ID = WorkflowId("workflow:org.example/restore@1.0.0")
++SENTINEL = "SENTINEL-PRIVATE-NOTE-0001"
++NOW = 10
++
++
++class Clock:
++    def __init__(self, now: int = NOW) -> None:
++        self.now = now
++
++    def __call__(self) -> int:
++        return self.now
++
++
++class RecordingNonceStore(InMemoryApprovalNonceStore):
++    def __init__(self) -> None:
++        super().__init__()
++        self.calls = 0
++
++    def claim(self, nonce_digest: str, *, expires_at: int, now: int) -> bool:
++        self.calls += 1
++        return super().claim(nonce_digest, expires_at=expires_at, now=now)
++
++
++class FailingNonceStore:
++    def claim(self, nonce_digest: str, *, expires_at: int, now: int) -> bool:
++        raise RuntimeError(SENTINEL)
++
++
++class NonBoolNonceStore:
++    def claim(self, nonce_digest: str, *, expires_at: int, now: int) -> object:
++        return 1
++
++
++class Sink:
++    """Observation-only effect status source; it exposes no delete operation."""
++
++    def __init__(self) -> None:
++        self.commits: dict[str, str] = {}
++        self.calls = 0
++        self.fail = False
++        self.ambiguous = False
++
++    def __call__(self, checkpoint: RecoveryCheckpoint):
++        self.calls += 1
++        if self.fail:
++            raise RuntimeError(SENTINEL)
++        return tuple(
++            EffectObservation(
++                action_id=effect.action_id,
++                operation_digest=effect.operation_digest,
++                idempotency_key=effect.idempotency_key,
++                state=(
++                    ObservationState.AMBIGUOUS
++                    if self.ambiguous
++                    else ObservationState.COMMITTED
++                    if effect.idempotency_key in self.commits
++                    else ObservationState.ABSENT
++                ),
++                commit_evidence_digest=(
++                    None if self.ambiguous else self.commits.get(effect.idempotency_key)
++                ),
++            )
++            for effect in checkpoint.effects
++        )
++
++
++def _token(*, action: str = ACTION, nonce_byte: int = 1, expires_at: int = 500):
++    signer = ApprovalTokenSigner(KEY, clock=lambda: NOW)
++    return signer.issue(
++        action_digest=action,
++        reviewer_role=ROLE,
++        expires_at=expires_at,
++        nonce_source=lambda size: bytes([nonce_byte]) * size,
++    )
++
++
++def _effects(*, approval_required: bool, count: int = 2):
++    return tuple(
++        EffectRecord.create(
++            ordinal=index,
++            run_id=RUN_ID,
++            action_id=ActionId(f"act_{index + 1:032x}"),
++            tool_id=ToolId(f"tool:org.example/restore-{index + 1}@1.0.0"),
++            kind=EffectKind.LOCAL_TOOL,
++            operation_digest=f"sha256:{index + 10:064x}",
++            approval_required=approval_required,
++            compensation_limit=CompensationLimit.NONE,
++        )
++        for index in range(count)
++    )
++
++
++def _lineage(*, approval_required: bool, commit_first: bool = False):
++    approval = (
++        {
++            "approval_action_digest": ACTION,
++            "approval_receipt_digest": RECEIPT,
++            "approval_expires_at": 500,
++        }
++        if approval_required
++        else {}
++    )
++    initial = RecoveryCheckpoint.create(
++        workflow_id=WORKFLOW_ID,
++        run_id=RUN_ID,
++        sequence=0,
++        phase=(
++            RecoveryPhase.APPROVAL_RECORDED
++            if approval_required
++            else RecoveryPhase.PLANNED
++        ),
++        plan_digest=ACTION,
++        effects=_effects(approval_required=approval_required),
++        **approval,
++    )
++    if not commit_first:
++        return (initial,)
++    sink = Sink()
++    sink.commits[initial.effects[0].idempotency_key] = COMMIT_EVIDENCE
++    decision = recover_workflow((initial,), sink(initial), now=NOW)
++    assert decision.disposition is RecoveryDisposition.RESUME
++    return (initial, advance_checkpoint(initial, decision))
++
++
++def _reconciler(nonce_store=None, *, authority=None, clock=None, epochs=None):
++    return RestoreReconciler(
++        InMemoryApprovalNonceStore() if nonce_store is None else nonce_store,
++        InMemoryRecoveryEpochStore() if epochs is None else epochs,
++        authority=authority,
++        clock=Clock() if clock is None else clock,
++    )
++
++
++def _snapshot(*, approvals=(), workflows=(), recorded_epoch: int = 0):
++    return RestoredSnapshot(
++        snapshot_digest=SNAPSHOT,
++        recorded_epoch=recorded_epoch,
++        approvals=tuple(approvals),
++        workflows=tuple(workflows),
++    )
++
++
++# Approvals and nonces -------------------------------------------------------
++
++
++def test_backup_taken_before_consumption_cannot_make_token_spendable() -> None:
++    token = _token()
++    # The live store was consumed after the backup; restore replaced it with
++    # the pre-consumption copy, so it holds no claim for this nonce.
++    restored_store = InMemoryApprovalNonceStore()
++    snapshot = _snapshot(approvals=(RestoredApproval.from_token(token),))
++
++    report = _reconciler(restored_store).reconcile(snapshot, observe=Sink())
++
++    (outcome,) = report.approvals
++    assert outcome.disposition is ApprovalRestoreDisposition.INVALIDATED
++    assert outcome.reason is RestoreReason.NONCE_BURNED
++    verifier = ApprovalTokenVerifier(KEY, restored_store, clock=lambda: NOW)
++    with pytest.raises(ApprovalReplayError):
++        verifier.consume(token, action_digest=ACTION, reviewer_role=ROLE)
++
++
++def test_negative_control_restored_store_alone_would_replay() -> None:
++    token = _token()
++    live = InMemoryApprovalNonceStore()
++    ApprovalTokenVerifier(KEY, live, clock=lambda: NOW).consume(
++        token, action_digest=ACTION, reviewer_role=ROLE
++    )
++    restored_store = InMemoryApprovalNonceStore()
++    receipt = ApprovalTokenVerifier(KEY, restored_store, clock=lambda: NOW).consume(
++        token, action_digest=ACTION, reviewer_role=ROLE
++    )
++    assert receipt.code == "approved"
++
++
++def test_authoritative_journal_claim_is_reported_without_new_claim() -> None:
++    token = _token()
++    live = InMemoryApprovalNonceStore()
++    ApprovalTokenVerifier(KEY, live, clock=lambda: NOW).consume(
++        token, action_digest=ACTION, reviewer_role=ROLE
++    )
++    report = _reconciler(live).reconcile(
++        _snapshot(approvals=(RestoredApproval.from_token(token),)), observe=Sink()
++    )
++    (outcome,) = report.approvals
++    assert outcome.disposition is ApprovalRestoreDisposition.INVALIDATED
++    assert outcome.reason is RestoreReason.NONCE_ALREADY_CLAIMED
++    assert report.complete
++
++
++def test_reconciliation_is_idempotent_and_never_revives_a_burned_nonce() -> None:
++    token = _token()
++    store = InMemoryApprovalNonceStore()
++    epochs = InMemoryRecoveryEpochStore()
++    snapshot = _snapshot(approvals=(RestoredApproval.from_token(token),))
++    first = _reconciler(store, epochs=epochs).reconcile(snapshot, observe=Sink())
++    second = _reconciler(store, epochs=epochs).reconcile(snapshot, observe=Sink())
++    assert first.approvals[0].reason is RestoreReason.NONCE_BURNED
++    assert second.approvals[0].reason is RestoreReason.NONCE_ALREADY_CLAIMED
++    assert second.epoch.epoch > first.epoch.epoch
++
++
++def test_expired_approval_is_invalidated_without_a_claim() -> None:
++    store = RecordingNonceStore()
++    approval = RestoredApproval.from_token(_token(expires_at=50))
++    report = _reconciler(store, clock=Clock(60)).reconcile(
++        _snapshot(approvals=(approval,)), observe=Sink()
++    )
++    assert report.approvals[0].reason is RestoreReason.APPROVAL_EXPIRED
++    assert report.approvals[0].disposition is ApprovalRestoreDisposition.INVALIDATED
++    assert store.calls == 0
++
++
++def test_skew_extends_retention_to_the_verifier_window() -> None:
++    token = _token(expires_at=50)
++    approval = RestoredApproval.from_token(token, clock_skew_seconds=30)
++    assert approval.expires_at == 80
++    store = InMemoryApprovalNonceStore()
++    report = _reconciler(store, clock=Clock(60)).reconcile(
++        _snapshot(approvals=(approval,)), observe=Sink()
++    )
++    assert report.approvals[0].reason is RestoreReason.NONCE_BURNED
++    verifier = ApprovalTokenVerifier(
++        KEY, store, clock=lambda: 60, clock_skew_seconds=30
++    )
++    with pytest.raises(ApprovalReplayError):
++        verifier.consume(token, action_digest=ACTION, reviewer_role=ROLE)
++
++
++@pytest.mark.parametrize("store", [FailingNonceStore(), NonBoolNonceStore()])
++def test_unavailable_nonce_journal_holds_restore(store) -> None:
++    report = _reconciler(store).reconcile(
++        _snapshot(approvals=(RestoredApproval.from_token(_token()),)), observe=Sink()
++    )
++    (outcome,) = report.approvals
++    assert outcome.disposition is ApprovalRestoreDisposition.HELD
++    assert outcome.reason is RestoreReason.NONCE_JOURNAL_UNAVAILABLE
++    assert not report.complete
++    assert report.held_count == 1
++    with pytest.raises(RestoreReconciliationError) as raised:
++        report.require_complete()
++    assert raised.value.code == "restore_reconciliation_incomplete"
++    assert SENTINEL not in str(raised.value)
++    assert SENTINEL not in report.to_json()
++
++
++# Recovery epochs ------------------------------------------------------------
++
++
++def test_restore_opens_a_new_epoch_above_recorded_and_retained_high_water() -> None:
++    epochs = InMemoryRecoveryEpochStore()
++    first = _reconciler(epochs=epochs).reconcile(
++        _snapshot(recorded_epoch=7), observe=Sink()
++    )
++    assert first.epoch.epoch == 8
++    assert first.epoch.previous_epoch == 7
++    assert first.epoch.snapshot_digest == SNAPSHOT
++    # An older snapshot cannot rewind the independently retained epoch.
++    second = _reconciler(epochs=epochs).reconcile(
++        _snapshot(recorded_epoch=2), observe=Sink()
++    )
++    assert second.epoch.epoch == 9
++    assert epochs.current() == 9
++    require_current_epoch(second.epoch, epochs)
++    with pytest.raises(RestoreReconciliationError) as raised:
++        require_current_epoch(first.epoch, epochs)
++    assert raised.value.code == "stale_recovery_epoch"
++
++
++def test_epoch_bound_action_digest_rejects_pre_restore_tokens() -> None:
++    epochs = InMemoryRecoveryEpochStore()
++    report = _reconciler(epochs=epochs).reconcile(_snapshot(), observe=Sink())
++    bound = epoch_action_digest(ACTION, report.epoch)
++    assert bound != ACTION
++    # A token issued before restore and absent from the snapshot.
++    unlisted = _token(nonce_byte=9)
++    store = InMemoryApprovalNonceStore()
++    verifier = ApprovalTokenVerifier(KEY, store, clock=lambda: NOW)
++    with pytest.raises(ApprovalActionMismatchError):
++        verifier.consume(unlisted, action_digest=bound, reviewer_role=ROLE)
++    with pytest.raises(ApprovalReplayError):
++        verifier.consume(unlisted, action_digest=bound, reviewer_role=ROLE)
++    later = _reconciler(epochs=epochs).reconcile(_snapshot(), observe=Sink())
++    assert epoch_action_digest(ACTION, later.epoch) != bound
++    fresh = _token(action=epoch_action_digest(ACTION, later.epoch), nonce_byte=3)
++    verifier.consume(
++        fresh,
++        action_digest=epoch_action_digest(ACTION, later.epoch),
++        reviewer_role=ROLE,
++    )
++
++
++class RewindingEpochStore(InMemoryRecoveryEpochStore):
++    def advance(self, *, floor: int) -> int:
++        return floor
++
++
++class FailingEpochStore:
++    def current(self) -> int:
++        raise RuntimeError(SENTINEL)
++
++    def advance(self, *, floor: int) -> int:
++        raise RuntimeError(SENTINEL)
++
++
++@pytest.mark.parametrize(
++    ("epochs", "code"),
++    [
++        (RewindingEpochStore(), "epoch_not_monotonic"),
++        (FailingEpochStore(), "recovery_epoch_unavailable"),
++    ],
++)
++def test_untrustworthy_epoch_store_fails_closed(epochs, code) -> None:
++    store = RecordingNonceStore()
++    with pytest.raises(RestoreReconciliationError) as raised:
++        _reconciler(store, epochs=epochs).reconcile(
++            _snapshot(approvals=(RestoredApproval.from_token(_token()),)),
++            observe=Sink(),
++        )
++    assert raised.value.code == code
++    assert SENTINEL not in str(raised.value)
++    assert store.calls == 0
++
++
++def test_unavailable_clock_fails_closed() -> None:
++    def clock() -> int:
++        raise RuntimeError(SENTINEL)
++
++    with pytest.raises(RestoreReconciliationError) as raised:
++        _reconciler(clock=clock).reconcile(_snapshot(), observe=Sink())
++    assert raised.value.code == "clock_unavailable"
++    assert SENTINEL not in str(raised.value)
++
++
++def test_recovery_epoch_detects_tampering() -> None:
++    epoch = RecoveryEpoch.create(
++        epoch=2, previous_epoch=1, snapshot_digest=SNAPSHOT, opened_at=NOW
++    )
++    with pytest.raises(RestoreReconciliationError) as raised:
++        RecoveryEpoch(
++            epoch=3,
++            previous_epoch=1,
++            snapshot_digest=SNAPSHOT,
++            opened_at=NOW,
++            epoch_digest=epoch.epoch_digest,
++        )
++    assert raised.value.code == "epoch_digest_mismatch"
++    with pytest.raises(RestoreReconciliationError):
++        RecoveryEpoch.create(
++            epoch=1, previous_epoch=1, snapshot_digest=SNAPSHOT, opened_at=NOW
++        )
++
++
++# Workflows, authority and effects -------------------------------------------
++
++
++def _authority_workflow(fixture, *, approval_required=False, commit_first=False):
++    binding = fixture.runtime.bind(fixture.contracts)
++    return RestoredWorkflow(
++        lineage=_lineage(
++            approval_required=approval_required, commit_first=commit_first
++        ),
++        authority=binding,
++    )
++
++
++@pytest.mark.parametrize("revoked_index", [0, 1, 2])
++def test_revoked_authority_stays_unusable_when_snapshot_records_it_active(
++    revoked_index,
++) -> None:
++    fixture = SyntheticAuthority()
++    workflow = _authority_workflow(fixture, commit_first=True)
++    fixture.provider.revoke(fixture.contracts[revoked_index])
++    sink = Sink()
++    report = _reconciler(authority=fixture.runtime, clock=fixture.clock).reconcile(
++        _snapshot(workflows=(workflow,)), observe=sink
++    )
++    (outcome,) = report.workflows
++    assert outcome.disposition is WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED
++    assert outcome.reason is RestoreReason.AUTHORITY_REVOKED
++    assert outcome.retry_idempotency_keys == ()
++    assert sink.calls == 0
++    # Committed effects recorded before the backup are retained as evidence.
++    assert outcome.committed_effects == (
++        (workflow.lineage[-1].effects[0].action_id.serialize(), COMMIT_EVIDENCE),
++    )
++
++
++def test_expired_authority_stays_unusable() -> None:
++    fixture = SyntheticAuthority()
++    workflow = _authority_workflow(fixture)
++    fixture.clock.now = 150
++    sink = Sink()
++    report = _reconciler(authority=fixture.runtime, clock=fixture.clock).reconcile(
++        _snapshot(workflows=(workflow,)), observe=sink
++    )
++    (outcome,) = report.workflows
++    assert outcome.disposition is WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED
++    assert outcome.reason is RestoreReason.AUTHORITY_EXPIRED
++    assert sink.calls == 0
++
++
++def test_generation_change_requires_fresh_review() -> None:
++    fixture = SyntheticAuthority()
++    workflow = _authority_workflow(fixture)
++    key = (fixture.contracts[0].kind, fixture.contracts[0].digest)
++    fixture.provider.records[key] = (1, False)
++    report = _reconciler(authority=fixture.runtime, clock=fixture.clock).reconcile(
++        _snapshot(workflows=(workflow,)), observe=Sink()
++    )
++    assert report.workflows[0].reason is RestoreReason.AUTHORITY_CHANGED
++    assert (
++        report.workflows[0].disposition
++        is WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED
++    )
++
++
++def test_unavailable_current_authority_keeps_work_held() -> None:
++    fixture = SyntheticAuthority()
++    workflow = _authority_workflow(fixture, commit_first=True)
++    fixture.provider.unavailable = True
++    sink = Sink()
++    report = _reconciler(authority=fixture.runtime, clock=fixture.clock).reconcile(
++        _snapshot(workflows=(workflow,)), observe=sink
++    )
++    (outcome,) = report.workflows
++    assert outcome.disposition is WorkflowRestoreDisposition.HELD
++    assert outcome.reason is RestoreReason.AUTHORITY_UNAVAILABLE
++    assert outcome.retry_idempotency_keys == ()
++    assert len(outcome.committed_effects) == 1
++    assert sink.calls == 0
++    assert not report.complete
++    assert "synthetic-private-provider-payload" not in report.to_json()
++
++
++def test_bound_workflow_without_runtime_is_held() -> None:
++    fixture = SyntheticAuthority()
++    workflow = _authority_workflow(fixture)
++    report = _reconciler().reconcile(_snapshot(workflows=(workflow,)), observe=Sink())
++    assert report.workflows[0].disposition is WorkflowRestoreDisposition.HELD
++    assert report.workflows[0].reason is RestoreReason.AUTHORITY_UNAVAILABLE
++
++
++def test_active_authority_without_approval_resumes_idempotently() -> None:
++    fixture = SyntheticAuthority()
++    workflow = _authority_workflow(fixture)
++    report = _reconciler(authority=fixture.runtime, clock=fixture.clock).reconcile(
++        _snapshot(workflows=(workflow,)), observe=Sink()
++    )
++    (outcome,) = report.workflows
++    assert outcome.disposition is WorkflowRestoreDisposition.RESUME
++    assert outcome.reason is RestoreReason.RESUME_SAFE
++    assert outcome.retry_idempotency_keys == tuple(
++        effect.idempotency_key for effect in workflow.lineage[-1].effects
++    )
++    assert outcome.recovery_evidence_digest is not None
++    assert report.complete
++
++
++def test_pre_restore_approval_receipt_cannot_authorize_resume() -> None:
++    workflow = RestoredWorkflow(lineage=_lineage(approval_required=True))
++    report = _reconciler().reconcile(_snapshot(workflows=(workflow,)), observe=Sink())
++    (outcome,) = report.workflows
++    assert outcome.disposition is WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED
++    assert outcome.reason is RestoreReason.APPROVAL_INVALIDATED
++    assert outcome.retry_idempotency_keys == ()
++    assert outcome.historical_approval_receipt_digest == RECEIPT
++
++
++def test_expired_recorded_approval_requires_fresh_review() -> None:
++    workflow = RestoredWorkflow(lineage=_lineage(approval_required=True))
++    report = _reconciler(clock=Clock(600)).reconcile(
++        _snapshot(workflows=(workflow,)), observe=Sink()
++    )
++    assert report.workflows[0].reason is RestoreReason.APPROVAL_EXPIRED
++    assert (
++        report.workflows[0].disposition
++        is WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED
++    )
++
++
++def test_effect_committed_after_backup_is_reconciled_not_repeated() -> None:
++    lineage = _lineage(approval_required=False)
++    sink = Sink()
++    sink.commits[lineage[-1].effects[1].idempotency_key] = COMMIT_EVIDENCE
++    report = _reconciler().reconcile(
++        _snapshot(workflows=(RestoredWorkflow(lineage=lineage),)), observe=sink
++    )
++    (outcome,) = report.workflows
++    assert outcome.disposition is WorkflowRestoreDisposition.RESUME
++    assert outcome.retry_idempotency_keys == (lineage[-1].effects[0].idempotency_key,)
++    assert outcome.committed_effects == (
++        (lineage[-1].effects[1].action_id.serialize(), COMMIT_EVIDENCE),
++    )
++
++
++def test_all_effects_committed_live_completes_with_approval_history() -> None:
++    lineage = _lineage(approval_required=True)
++    sink = Sink()
++    for effect in lineage[-1].effects:
++        sink.commits[effect.idempotency_key] = COMMIT_EVIDENCE
++    report = _reconciler().reconcile(
++        _snapshot(workflows=(RestoredWorkflow(lineage=lineage),)), observe=sink
++    )
++    (outcome,) = report.workflows
++    assert outcome.disposition is WorkflowRestoreDisposition.COMPLETE
++    assert outcome.reason is RestoreReason.EFFECTS_COMPLETE
++    assert len(outcome.committed_effects) == 2
++    assert outcome.historical_approval_receipt_digest == RECEIPT
++
++
++def test_unavailable_effect_status_is_held() -> None:
++    sink = Sink()
++    sink.fail = True
++    workflow = RestoredWorkflow(lineage=_lineage(approval_required=False))
++    report = _reconciler().reconcile(_snapshot(workflows=(workflow,)), observe=sink)
++    assert report.workflows[0].disposition is WorkflowRestoreDisposition.HELD
++    assert report.workflows[0].reason is RestoreReason.EFFECT_STATUS_UNAVAILABLE
++    assert SENTINEL not in report.to_json()
++
++
++def test_malformed_effect_status_is_held() -> None:
++    workflow = RestoredWorkflow(lineage=_lineage(approval_required=False))
++    report = _reconciler().reconcile(
++        _snapshot(workflows=(workflow,)), observe=lambda checkpoint: ()
++    )
++    assert report.workflows[0].disposition is WorkflowRestoreDisposition.HELD
++    assert report.workflows[0].reason is RestoreReason.EFFECT_STATUS_UNAVAILABLE
++
++
++def test_ambiguous_effect_requires_effect_review() -> None:
++    sink = Sink()
++    sink.ambiguous = True
++    workflow = RestoredWorkflow(lineage=_lineage(approval_required=False))
++    report = _reconciler().reconcile(_snapshot(workflows=(workflow,)), observe=sink)
++    assert report.workflows[0].disposition is WorkflowRestoreDisposition.REVIEW_REQUIRED
++    assert report.workflows[0].reason is RestoreReason.EFFECTS_NEED_REVIEW
++    assert report.workflows[0].recovery_reason == "ambiguous_effect"
++
++
++def test_terminal_and_retired_lineages_skip_authority_and_sinks() -> None:
++    lineage = _lineage(approval_required=False, commit_first=True)
++    sink = Sink()
++    for effect in lineage[-1].effects:
++        sink.commits[effect.idempotency_key] = COMMIT_EVIDENCE
++    decision = recover_workflow(lineage, sink(lineage[-1]), now=NOW)
++    completed = (*lineage, advance_checkpoint(lineage[-1], decision))
++    retired = RetiredJournalRecord(
++        final_checkpoint_digest=completed[-1].checkpoint_digest,
++        recovery_evidence_digest=decision.evidence_digest,
++        checkpoint_recovery_evidence_digest=decision.evidence_digest,
++        phase=RecoveryPhase.COMPLETED,
++        checkpoint_count=3,
++        effect_count=2,
++        committed_effect_count=2,
++        record_digest=_retired_digest(completed, decision),
++    )
++    fixture = SyntheticAuthority()
++    binding = fixture.runtime.bind(fixture.contracts)
++    fixture.provider.unavailable = True
++    probe = Sink()
++    reconciler = _reconciler(authority=fixture.runtime, clock=fixture.clock)
++    outcomes = [
++        reconciler.reconcile(
++            _snapshot(workflows=(RestoredWorkflow(lineage=item, authority=binding),)),
++            observe=probe,
++        ).workflows[0]
++        for item in (completed, retired)
++    ]
++    assert [outcome.disposition for outcome in outcomes] == [
++        WorkflowRestoreDisposition.COMPLETE,
++        WorkflowRestoreDisposition.RETIRED,
++    ]
++    assert outcomes[0].committed_effects
++    assert outcomes[1].source_digest == completed[-1].checkpoint_digest
++    assert probe.calls == 0
++    # The same restored lineage cannot appear twice in one snapshot.
++    with pytest.raises(RestoreReconciliationError) as raised:
++        _snapshot(
++            workflows=(
++                RestoredWorkflow(lineage=completed),
++                RestoredWorkflow(lineage=retired),
++            )
++        )
++    assert raised.value.code == "duplicate_restored_workflow"
++
++
++def _retired_digest(completed, decision) -> str:
++    import hashlib
++
++    values = {
++        "final_checkpoint_digest": completed[-1].checkpoint_digest,
++        "recovery_evidence_digest": decision.evidence_digest,
++        "checkpoint_recovery_evidence_digest": decision.evidence_digest,
++        "phase": "completed",
++        "checkpoint_count": 3,
++        "effect_count": 2,
++        "committed_effect_count": 2,
++        "schema_version": "openmed.agent.retired_journal.v1",
++    }
++    encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
++    return "sha256:" + hashlib.sha256(encoded).hexdigest()
++
++
++# Snapshot validation and report privacy -------------------------------------
++
++
++def test_snapshot_rejects_duplicates_and_malformed_state() -> None:
++    approval = RestoredApproval.from_token(_token())
++    with pytest.raises(RestoreReconciliationError) as raised:
++        _snapshot(approvals=(approval, approval))
++    assert raised.value.code == "duplicate_restored_approval"
++    workflow = RestoredWorkflow(lineage=_lineage(approval_required=False))
++    with pytest.raises(RestoreReconciliationError) as raised:
++        _snapshot(workflows=(workflow, workflow))
++    assert raised.value.code == "duplicate_restored_workflow"
++    with pytest.raises(RestoreReconciliationError) as raised:
++        RestoredSnapshot(
++            snapshot_digest=SENTINEL, recorded_epoch=0, approvals=(), workflows=()
++        )
++    assert raised.value.code == "invalid_digest"
++    assert SENTINEL not in str(raised.value)
++    with pytest.raises(RestoreReconciliationError) as raised:
++        RestoredWorkflow(lineage=(_lineage(approval_required=False)[0], SENTINEL))
++    assert raised.value.code == "invalid_restored_lineage"
++    with pytest.raises(RestoreReconciliationError) as raised:
++        RestoredWorkflow(lineage=_lineage(approval_required=False), authority=SENTINEL)
++    assert raised.value.code == "invalid_restored_authority"
++    with pytest.raises(RestoreReconciliationError):
++        RestoredApproval(token_digest=SENTINEL, nonce_digest=SENTINEL, expires_at=1)
++    with pytest.raises(RestoreReconciliationError):
++        RestoredApproval.from_token(SENTINEL)
++
++
++def test_report_is_deterministic_content_free_and_never_claims_review() -> None:
++    token = _token()
++    lineage = _lineage(approval_required=True)
++
++    def run():
++        return _reconciler().reconcile(
++            _snapshot(
++                approvals=(RestoredApproval.from_token(token),),
++                workflows=(RestoredWorkflow(lineage=lineage),),
++            ),
++            observe=Sink(),
++        )
++
++    first, second = run(), run()
++    assert first.to_json() == second.to_json()
++    payload = json.loads(first.to_json())
++    assert payload["schema_version"] == RESTORE_RECONCILIATION_SCHEMA_VERSION
++    assert payload["report_digest"] == first.report_digest
++    assert payload["counts"] == {
++        "approvals": 1,
++        "workflows": 1,
++        "invalidated_approvals": 1,
++        "held": 0,
++        "fresh_review_required": 1,
++    }
++    serialized = first.to_json()
++    assert token.nonce not in serialized
++    assert token.signature not in serialized
++    assert '"approved"' not in serialized
++    assert "review_repeated" not in serialized
++    assert first.workflows[0].historical_approval_receipt_digest == RECEIPT
++    for text in (
++        repr(first),
++        repr(first.epoch),
++        repr(RestoredApproval.from_token(token)),
++    ):
++        assert token.nonce not in text
++        assert SNAPSHOT not in text
++
++
++def test_reconciler_rejects_invalid_ports() -> None:
++    with pytest.raises(RestoreReconciliationError) as raised:
++        RestoreReconciler(object(), InMemoryRecoveryEpochStore())
++    assert raised.value.code == "invalid_nonce_store"
++    with pytest.raises(RestoreReconciliationError) as raised:
++        RestoreReconciler(InMemoryApprovalNonceStore(), object())
++    assert raised.value.code == "invalid_epoch_store"
++    with pytest.raises(RestoreReconciliationError) as raised:
++        RestoreReconciler(
++            InMemoryApprovalNonceStore(), InMemoryRecoveryEpochStore(), authority=1
++        )
++    assert raised.value.code == "invalid_authority_runtime"
++    with pytest.raises(RestoreReconciliationError) as raised:
++        _reconciler().reconcile(SENTINEL, observe=Sink())
++    assert raised.value.code == "invalid_snapshot"
++    with pytest.raises(RestoreReconciliationError) as raised:
++        _reconciler().reconcile(_snapshot(), observe=SENTINEL)
++    assert raised.value.code == "invalid_effect_observer"
++
++
++def test_authority_rollback_requires_fresh_review() -> None:
++    from openmed.agent.permissions.revocation import AuthorityStatus
++
++    fixture = SyntheticAuthority()
++    workflow = _authority_workflow(fixture)
++    contract = fixture.contracts[0]
++    fixture.store.observe(AuthorityStatus(contract.kind, contract.digest, 2, False, 10))
++    report = _reconciler(authority=fixture.runtime, clock=fixture.clock).reconcile(
++        _snapshot(workflows=(workflow,)), observe=Sink()
++    )
++    assert report.workflows[0].reason is RestoreReason.AUTHORITY_ROLLBACK
++    assert (
++        report.workflows[0].disposition
++        is WorkflowRestoreDisposition.FRESH_REVIEW_REQUIRED
++    )
++
++
++def test_aborted_lineage_requires_effect_review_without_sink_reads() -> None:
++    (initial,) = _lineage(approval_required=False)
++    aborted = RecoveryCheckpoint.create(
++        workflow_id=WORKFLOW_ID,
++        run_id=RUN_ID,
++        sequence=1,
++        phase=RecoveryPhase.ABORTED,
++        plan_digest=ACTION,
++        effects=initial.effects,
++        previous_checkpoint_digest=initial.checkpoint_digest,
++    )
++    sink = Sink()
++    report = _reconciler().reconcile(
++        _snapshot(workflows=(RestoredWorkflow(lineage=(initial, aborted)),)),
++        observe=sink,
++    )
++    assert report.workflows[0].disposition is WorkflowRestoreDisposition.REVIEW_REQUIRED
++    assert report.workflows[0].recovery_reason == "workflow_aborted"
++    assert sink.calls == 0
++
++
++@pytest.mark.parametrize("value", [-1, "10", True, None])
++def test_malformed_clock_value_fails_closed(value) -> None:
++    with pytest.raises(RestoreReconciliationError) as raised:
++        _reconciler(clock=lambda: value).reconcile(_snapshot(), observe=Sink())
++    assert raised.value.code == "clock_unavailable"

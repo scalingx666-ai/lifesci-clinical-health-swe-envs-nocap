@@ -1,0 +1,140 @@
+diff --git a/grails-app/domain/org/pih/warehouse/requisition/Requisition.groovy b/grails-app/domain/org/pih/warehouse/requisition/Requisition.groovy
+index 585166a160f..6bed471e23f 100644
+--- a/grails-app/domain/org/pih/warehouse/requisition/Requisition.groovy
++++ b/grails-app/domain/org/pih/warehouse/requisition/Requisition.groovy
+@@ -492,6 +492,10 @@ class Requisition implements Comparable<Requisition>, Serializable {
+         return true
+     }
+ 
++    boolean isEligibleForCancellation() {
++        return status < RequisitionStatus.PICKING
++    }
++
+     /**
+      * Message based count of ERROR_OCCURRED event logs, used as the allocation-attempt count for the retry cap.
+      * FIXME: stand-in for a proper classification subtype on EventLog (see EventLogCode#ERROR_OCCURRED).
+diff --git a/grails-app/domain/org/pih/warehouse/requisition/RequisitionItem.groovy b/grails-app/domain/org/pih/warehouse/requisition/RequisitionItem.groovy
+index fe87d9747b9..af726f773ad 100644
+--- a/grails-app/domain/org/pih/warehouse/requisition/RequisitionItem.groovy
++++ b/grails-app/domain/org/pih/warehouse/requisition/RequisitionItem.groovy
+@@ -432,10 +432,21 @@ class RequisitionItem implements Comparable<RequisitionItem>, Serializable {
+         if (!reasonCode) {
+             errors.rejectValue("cancelReasonCode", "requisitionItem.reasonCode.invalid")
+         }
++        if (!requisition.isEligibleForCancellation()) {
++            // Order has progressed past Allocated (picking already started) - cancelling would
++            // require rolling back picklist/shipment items that may already be picked or staged.
++            // Refuse outright rather than cancelling the quantity while leaving the allocation in
++            // place; the picked items must be manually rolled back before this item can be cancelled.
++            errors.reject("requisitionItem.notEligibleForCancellation.message")
++        }
+         if (hasErrors() || !validate()) {
+             throw new ValidationException("Validation errors on requisition item", errors)
+         }
+ 
++        quantityCanceled = quantity
++        cancelReasonCode = reasonCode
++        cancelComments = comments
++
+         // Remove all picklist items
+         def picklistItems = getPicklistItems()
+         picklistItems?.toArray()?.each {
+@@ -443,10 +454,6 @@ class RequisitionItem implements Comparable<RequisitionItem>, Serializable {
+             it.picklist.removeFromPicklistItems(it)
+             it.delete()
+         }
+-
+-        quantityCanceled = quantity
+-        cancelReasonCode = reasonCode
+-        cancelComments = comments
+     }
+ 
+ 
+@@ -628,7 +635,7 @@ class RequisitionItem implements Comparable<RequisitionItem>, Serializable {
+ 
+     def canCancelQuantity() {
+         def startTime = System.currentTimeMillis()
+-        def canCancelQuantity = !isChanged() && !isApproved() && !isCanceled()
++        def canCancelQuantity = !isChanged() && !isApproved() && !isCanceled() && requisition.isEligibleForCancellation()
+ 
+         //println "canCancelQuantity: " + (System.currentTimeMillis() - startTime) + " ms"
+         return canCancelQuantity
+diff --git a/grails-app/i18n/messages.properties b/grails-app/i18n/messages.properties
+index cf211340d8a..8ceb50cb886 100644
+--- a/grails-app/i18n/messages.properties
++++ b/grails-app/i18n/messages.properties
+@@ -2913,6 +2913,7 @@ requisitionItem.quantity.invalid=Must specify a valid quantity
+ requisitionItem.quantity.overpick=The quantity you have picked ({0}) for product ({1}) is not available in stock
+ requisitionItem.mustChangeQuantityOrPackage.message=Must change quantity or package size
+ requisitionItem.invalidReasonCode.message=Must specify a reason code
++requisitionItem.notEligibleForCancellation.message=Cannot cancel this item automatically because the order has already progressed past Allocated. The picked/staged items must be manually rolled back before it can be cancelled.
+ requisitionItem.quantityMustBeGreaterThanZero.message=Quantity be greater than 0
+ requisitionItem.canceled.label=Canceled due to
+ requisitionItem.modified.label=Modified due to
+diff --git a/grails-app/services/org/pih/warehouse/inventory/StockMovementService.groovy b/grails-app/services/org/pih/warehouse/inventory/StockMovementService.groovy
+index c467de2cb72..4af382cf6d7 100644
+--- a/grails-app/services/org/pih/warehouse/inventory/StockMovementService.groovy
++++ b/grails-app/services/org/pih/warehouse/inventory/StockMovementService.groovy
+@@ -43,6 +43,7 @@ import org.pih.warehouse.core.Location
+ import org.pih.warehouse.core.LocationService
+ import org.pih.warehouse.core.Person
+ import org.pih.warehouse.core.LocationTypeCode
++import org.pih.warehouse.core.ReasonCode
+ import org.pih.warehouse.core.RoleType
+ import org.pih.warehouse.core.StockMovementItemParamsCommand
+ import org.pih.warehouse.core.StockMovementItemsParamsCommand
+@@ -2862,6 +2863,17 @@ class StockMovementService {
+                     throw new IllegalArgumentException("Could not find stock movement item with ID ${stockMovementItem.id}")
+                 }
+ 
++                boolean isCancellation = stockMovementItem.quantityRevised?.intValueExact() == 0 &&
++                        stockMovementItem.reasonCode != ReasonCode.BACKORDER.toString()
++
++                if (isCancellation && !requisition.isEligibleForCancellation()) {
++                    // Order has progressed past Allocated (picking already started) - leave this
++                    // item entirely untouched. The picked/staged items must be manually rolled back
++                    // before it can be cancelled; flag it for review instead of attempting the change.
++                    logManualCancellationReviewNeeded(requisitionItem, stockMovementItem.reasonCode)
++                    return
++                }
++
+                 log.info 'Removing previous changes, picklists and shipments, if present'
+                 removeShipmentAndPicklistItemsForModifiedRequisitionItem(requisitionItem)
+                 if (requisitionItem.isChanged() || requisitionItem.isCanceled() || requisitionItem.isBackordered()) {
+@@ -2933,9 +2945,18 @@ class StockMovementService {
+     }
+ 
+     def cancelItem(StockMovementItem stockMovementItem) {
+-        removeShipmentItemsForModifiedRequisitionItem(stockMovementItem)
+-
+         RequisitionItem requisitionItem = stockMovementItem.requisitionItem
++        Requisition requisition = requisitionItem.requisition
++
++        if (!requisition.isEligibleForCancellation()) {
++            // Order has progressed past Allocated (picking already started) - leave this item
++            // entirely untouched. The picked/staged items must be manually rolled back before it
++            // can be cancelled; flag it for review instead of attempting the cancellation.
++            logManualCancellationReviewNeeded(requisitionItem, stockMovementItem.reasonCode)
++            return StockMovementItem.createFromRequisitionItem(requisitionItem)
++        }
++
++        removeShipmentItemsForModifiedRequisitionItem(stockMovementItem)
+ 
+         log.debug "Item canceled " + requisitionItem.id
+         requisitionItem.cancelQuantity(stockMovementItem.reasonCode, stockMovementItem.comments)
+@@ -2946,6 +2967,15 @@ class StockMovementService {
+         return StockMovementItem.createFromRequisitionItem(requisitionItem)
+     }
+ 
++    private void logManualCancellationReviewNeeded(RequisitionItem requisitionItem, String reasonCode) {
++        String message = "Cancellation requested for item ${requisitionItem.id} " +
++                "(product: ${requisitionItem.product?.productCode}, qty: ${requisitionItem.quantity}, " +
++                "reason: ${reasonCode}) while order status is ${requisitionItem.requisition.status} - " +
++                "allocation was not automatically rolled back and requires manual review."
++        requisitionService.logRequisitionComment(requisitionItem.requisition.id, message)
++        requisitionService.logRequisitionEvent(requisitionItem.requisition.id, message)
++    }
++
+     /**
+      * Remove all requisition items for a requisition, modification and substitution items first.
+      *

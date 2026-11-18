@@ -1,0 +1,653 @@
+diff --git a/clinica/converters/_utils.py b/clinica/converters/_utils.py
+index 66d41961a..6c8dbaf5b 100644
+--- a/clinica/converters/_utils.py
++++ b/clinica/converters/_utils.py
+@@ -14,7 +14,6 @@
+ 
+ __all__ = [
+     "create_participants_df",
+-    "json_from_dcm",
+     "run_dcm2niix",
+     "write_to_tsv",
+     "identify_modality",
+@@ -292,54 +291,6 @@ def write_modality_agnostic_files(
+     _write_bidsignore(bids_dir)
+ 
+ 
+-def json_from_dcm(dcm_dir: Path, json_path: Path) -> None:
+-    """Writes descriptive JSON file from DICOM header.
+-
+-    Parameters
+-    ----------
+-    dcm_dir : Path
+-        The path to the DICOM directory.
+-
+-    json_path : Path
+-        The path to the output JSON file.
+-    """
+-    from pydicom import dcmread
+-    from pydicom.tag import Tag
+-
+-    from clinica.utils.stream import cprint
+-
+-    fields_dict = {
+-        "DeviceSerialNumber": Tag(("0018", "1000")),
+-        "Manufacturer": Tag(("0008", "0070")),
+-        "ManufacturersModelName": Tag(("0008", "1090")),
+-        "SoftwareVersions": Tag(("0018", "1020")),
+-        "BodyPart": Tag(("0018", "0015")),
+-        "Units": Tag(("0054", "1001")),
+-        # Institution
+-        "InstitutionName": Tag(("0008", "0080")),
+-        "InstitutionAddress": Tag(("0008", "0081")),
+-        "InstitutionalDepartmentName": Tag(("0008", "1040")),
+-        # MRI
+-        "MagneticFieldStrength": Tag(("0018", "0087")),
+-        # PET
+-        "InjectedRadioactivity": Tag(("0018", "1074")),
+-        "MolarActivity": Tag(("0018", "1077")),
+-        "InjectionStart": Tag(("0018", "1042")),
+-        "FrameDuration": Tag(("0018", "1242")),
+-    }
+-
+-    try:
+-        dcm_path = [f for f in dcm_dir.glob("*.dcm")][0]
+-        ds = dcmread(dcm_path)
+-        json_dict = {
+-            key: ds.get(tag).value for key, tag in fields_dict.items() if tag in ds
+-        }
+-        with open(json_path, "w") as f:
+-            f.write(json.dumps(json_dict, skipkeys=True, indent=4))
+-    except IndexError:
+-        cprint(msg=f"No DICOM found at {dcm_dir}", lvl="warning")
+-
+-
+ def _build_dcm2niix_command(
+     input_dir: Path,
+     output_dir: Path,
+diff --git a/clinica/converters/aibl_to_bids/utils/bids.py b/clinica/converters/aibl_to_bids/utils/bids.py
+index 0bf525638..577df4126 100644
+--- a/clinica/converters/aibl_to_bids/utils/bids.py
++++ b/clinica/converters/aibl_to_bids/utils/bids.py
+@@ -635,7 +635,8 @@ def _create_file(
+     from clinica.iotools.data_handling import center_nifti_origin
+     from clinica.utils.stream import cprint
+ 
+-    from ..._utils import json_from_dcm, viscode_to_session
++    from ..._utils import viscode_to_session
++    from .json import get_json_data, write_json
+ 
+     # This function is executed in a multiprocessing context
+     # such that we need to re-configure the clinica logger in the child processes.
+@@ -684,7 +685,9 @@ def _create_file(
+         if output_path.with_suffix(".nii.gz").exists():
+             output_path.with_suffix(".nii.gz").unlink()
+         output_image = _dicom_to_nii(output_path, image_path)
+-        json_from_dcm(image_path, output_path.with_suffix(".json"))
++        write_json(
++            output_path.with_suffix(".json"), get_json_data(image_path, modality)
++        )
+ 
+     center_nifti_origin(output_image, output_image)
+ 
+diff --git a/clinica/converters/aibl_to_bids/utils/json.py b/clinica/converters/aibl_to_bids/utils/json.py
+new file mode 100644
+index 000000000..9c4847b30
+--- /dev/null
++++ b/clinica/converters/aibl_to_bids/utils/json.py
+@@ -0,0 +1,323 @@
++"""
++This module handles json writing from DICOM for PET modality in AIBL for BIDS 1.10 compliance
++"""
++
++import json
++from pathlib import Path
++from typing import Any, Optional, Union
++
++import numpy as np
++import pandas as pd
++from pydicom import dcmread
++from pydicom.dataset import DataElement, FileDataset
++from pydicom.multival import MultiValue
++
++from clinica.utils.stream import cprint
++
++from .bids import Modality
++
++__all__ = ["write_json", "get_json_data"]
++
++
++def write_json(json_path: Path, json_data: pd.DataFrame):
++    with open(json_path, "w") as f:
++        f.write(
++            json.dumps(
++                {row["BIDSname"]: row["Value"] for _, row in json_data.iterrows()},
++                indent=4,
++            )
++        )
++
++
++def _format_time(timestamp: str) -> str:
++    """Format the timestamps that comes under the format HHMMSS or HHMMSS.0000 to HH:MM:SS."""
++    from time import strftime, strptime
++
++    return strftime("%H:%M:%S", strptime(timestamp.split(".")[0], "%H%M%S"))
++
++
++def _substract_formatted_times(reference_time: str, event_time: str) -> float:
++    from datetime import datetime
++
++    return (
++        datetime.strptime(event_time, "%H:%M:%S")
++        - datetime.strptime(reference_time, "%H:%M:%S")
++    ).total_seconds()
++
++
++def _get_dicom_tags_and_defaults_pet() -> pd.DataFrame:
++    return pd.DataFrame(
++        columns=["BIDSname", "DCMtag", "Value"],
++        data=[
++            # Hardware
++            ["DeviceSerialNumber", ("DeviceSerialNumber",), "n/a"],
++            ["ManufacturersModelName", ("ManufacturerModelName",), "n/a"],
++            ["SoftwareVersions", ("SoftwareVersions",), "n/a"],
++            ["BodyPart", ("BodyPartExamined",), "n/a"],
++            ["MagneticFieldStrength", ("MagneticFieldStrength",), "n/a"],
++            ["Units", ("Units",), "n/a"],
++            # Institution
++            ["InstitutionName", ("InstitutionName",), "n/a"],
++            ["InstitutionAddress", ("InstitutionAddress",), "n/a"],
++            [
++                "InstitutionalDepartmentName",
++                ("InstitutionalDepartmentName",),
++                "n/a",
++            ],
++            # Time
++            ["TimeZero", ("SeriesTime",), "n/a"],
++            ["ScanStart", ("AcquisitionTime",), np.nan],
++            [
++                "InjectionStart",
++                (
++                    "RadiopharmaceuticalInformationSequence",
++                    "RadiopharmaceuticalStartTime",
++                ),
++                np.nan,
++            ],
++            ["FrameTimesStart", ("FrameReferenceTime",), []],
++            ["FrameDuration", ("ActualFrameDuration",), []],
++            # Radiochemistry
++            [
++                "TracerName",
++                (
++                    "RadiopharmaceuticalInformationSequence",
++                    "RadionuclideCodeSequence",
++                    "MappingResourceName",
++                ),
++                "n/a",
++            ],
++            [
++                "TracerRadionuclide",
++                (
++                    "RadiopharmaceuticalInformationSequence",
++                    "RadionuclideCodeSequence",
++                    "CodeMeaning",
++                ),
++                "n/a",
++            ],
++            [
++                "InjectedRadioactivity",
++                (
++                    "RadiopharmaceuticalInformationSequence",
++                    "RadionuclideTotalDose",
++                ),
++                np.nan,
++            ],
++            ["InjectedRadioactivityUnits", (), "MBq"],
++            ["InjectedMass", (), "n/a"],
++            ["InjectedMassUnits", (), "n/a"],
++            [
++                "SpecificRadioactivity",
++                (
++                    "RadiopharmaceuticalInformationSequence",
++                    "RadiopharmaceuticalSpecificActivity",
++                ),
++                "n/a",
++            ],
++            ["SpecificRadioactivityUnits", (), "Bq/micromole"],
++            [
++                "ModeOfAdministration",
++                (),
++                "n/a",
++            ],  # todo : could not find
++            # Reconstruction
++            [
++                "AcquisitionMode",
++                (),
++                "n/a",
++            ],  # todo : could not find / (0054, 1000) Series Type ?
++            ["ImageDecayCorrected", ("DecayCorrection",), "n/a"],
++            ["ImageDecayCorrectionTime", ("DecayCorrection",), np.nan],
++            ["ReconMethodName", ("ReconstructionMethod",), "n/a"],
++            [
++                "ReconMethodParameterLabels",
++                ("ReconstructionMethod",),
++                [""],
++            ],  # todo : could not find
++            ["ReconMethodParameterUnits", ("ReconstructionMethod",), [""]],
++            ["ReconMethodParameterValues", ("ReconstructionMethod",), [""]],
++            ["ReconFilterType", ("ConvolutionKernel",), "n/a"],
++            [
++                "ReconFilterSize",
++                ("ConvolutionKernel",),
++                np.nan,
++            ],  # todo : could not find
++            ["AttenuationCorrection", ("AttenuationCorrectionMethod",), "n/a"],
++        ],
++    ).set_index(keys="BIDSname", drop=False)
++
++
++def _get_dicom_tags_and_defaults_base() -> pd.DataFrame:
++    return pd.DataFrame(
++        columns=["BIDSname", "DCMtag", "Value"],
++        data=[
++            # Hardware
++            ["DeviceSerialNumber", ("DeviceSerialNumber",), "n/a"],
++            ["ManufacturersModelName", ("ManufacturerModelName",), "n/a"],
++            ["SoftwareVersions", ("SoftwareVersions",), "n/a"],
++            ["BodyPart", ("BodyPartExamined",), "n/a"],
++            ["MagneticFieldStrength", ("MagneticFieldStrength",), "n/a"],
++            # Institution
++            ["InstitutionName", ("InstitutionName",), "n/a"],
++            ["InstitutionAddress", ("InstitutionAddress",), "n/a"],
++            [
++                "InstitutionalDepartmentName",
++                ("InstitutionalDepartmentName",),
++                "n/a",
++            ],
++        ],
++    ).set_index(keys="BIDSname", drop=False)
++
++
++def _check_dcm_value(
++    dicom_data: Optional[Any],
++) -> Union[None, str, list, float]:
++    """Handles case where result is MultiValue, which is not JSON serializable and would be replaced by a blank space"""
++    if dicom_data:
++        if type(dicom_data) == MultiValue:
++            return list(dicom_data)
++        return dicom_data
++    return None
++
++
++def _fetch_dcm_data_from_header(
++    dicom_header: Union[FileDataset, DataElement], dicom_tags: Optional[tuple[str, ...]]
++) -> Optional[Any]:
++    """
++    Gets the value from the dicom header corresponding to a dicom Tag/key list
++
++    Parameters
++    ----------
++    dicom_tags :
++        Tuple representing where to get the expected information in the dicom header
++
++    dicom_header :
++        Dicom header to parse
++
++    Returns
++    -------
++        The value of the tag obtained from the header
++
++    """
++    if not dicom_tags:
++        return None
++    header = dicom_header.get(dicom_tags[0])
++    if len(dicom_tags) == 1:
++        return header
++    if header:
++        return _fetch_dcm_data_from_header(header[0], dicom_tags[1:])
++    return None
++
++
++def _get_dcm_value_from_header(
++    dicom_tags: tuple[str, ...], dicom_header: Union[FileDataset, DataElement]
++) -> Union[None, str, list, float]:
++    return _check_dcm_value(_fetch_dcm_data_from_header(dicom_header, dicom_tags))
++
++
++def _update_metadata_from_image_dicoms(metadata: pd.DataFrame, dcm_dir: Path) -> None:
++    try:
++        dicom_header = dcmread(next(dcm_dir.rglob("*.dcm")))
++    except StopIteration:
++        cprint(
++            msg=f"No DICOM found at {dcm_dir}, the image json will be filled with default values",
++            lvl="warning",
++        )
++    else:
++        for index, data in metadata.iterrows():
++            if dcm_value := _get_dcm_value_from_header(data.DCMtag, dicom_header):
++                cprint(msg=f"Value for {data.DCMtag} is : {dcm_value}", lvl="debug")
++                metadata.loc[index, "Value"] = dcm_value
++            else:
++                cprint(
++                    msg=f"Value for {data.DCMtag} could not be retrieved.", lvl="debug"
++                )
++
++
++def _format_timezero(dcm_result: pd.DataFrame) -> None:
++    """Formats TimeZero if possible, else uses the default value."""
++    try:
++        dcm_result.loc["TimeZero", "Value"] = _format_time(
++            dcm_result.loc["TimeZero", "Value"]
++        )
++    except (ValueError, AttributeError) as e:
++        dcm_result.loc["TimeZero", "Value"] = "n/a"
++
++
++def _set_time_relative_to_zero(dcm_result: pd.DataFrame, field: str) -> None:
++    """Computes the difference from the time inside the field compared to TimeZero which should be formatted."""
++    if (zero := dcm_result.loc["TimeZero", "Value"]) != "n/a":
++        try:
++            dcm_result.loc[field, "Value"] = _format_time(
++                dcm_result.loc[field, "Value"]
++            )
++        except (ValueError, AttributeError) as e:
++            dcm_result.loc[field, "Value"] = np.nan
++        else:
++            dcm_result.loc[field, "Value"] = _substract_formatted_times(
++                reference_time=zero, event_time=dcm_result.loc[field, "Value"]
++            )
++
++
++def _set_time_from_ms_to_seconds(dcm_result: pd.DataFrame, field: str) -> None:
++    """Set time to seconds for FrameTimeStart and FrameDuration which are encoded as list(float), given in ms."""
++    if start := dcm_result.loc[field, "Value"]:
++        dcm_result.loc[field, "Value"] = start / 1000
++
++
++def _check_decay_correction(dcm_result: pd.DataFrame) -> None:
++    dcm_result.loc["ImageDecayCorrected", "Value"] = dcm_result.loc[
++        "ImageDecayCorrected", "Value"
++    ] in ("START", "ADMIN")
++
++
++def _set_decay_time(dcm_result: pd.DataFrame) -> None:
++    correction = dcm_result.loc["ImageDecayCorrectionTime", "Value"]
++
++    decay_time = None
++
++    if correction == "START":
++        decay_time = dcm_result.loc["ScanStart", "Value"]
++    elif correction == "ADMIN":
++        decay_time = dcm_result.loc["InjectionStart", "Value"]
++
++    dcm_result.loc["ImageDecayCorrectionTime", "Value"] = decay_time
++
++
++def _update_injected_mass(dcm_result: pd.DataFrame) -> None:
++    injected = dcm_result.loc["InjectedRadioactivity", "Value"]
++    specific = dcm_result.loc["SpecificRadioactivity", "Value"]
++    if injected and specific != "n/a":
++        dcm_result.loc["InjectedMass", "Value"] = injected / float(specific)
++        dcm_result.loc["InjectedMassUnits", "Value"] = "mole"
++
++
++def _get_dicom_tags_and_defaults(modality: Modality) -> pd.DataFrame:
++    if modality in (Modality.AV45, Modality.FLUTE, Modality.PIB):
++        return _get_dicom_tags_and_defaults_pet()
++    return _get_dicom_tags_and_defaults_base()
++
++
++def _postprocess_for_pet(metadata: pd.DataFrame):
++    _format_timezero(metadata)
++    # Scan Start in BIDS is the difference between Time Zero and the beginning of image acquisition
++    _set_time_relative_to_zero(metadata, field="ScanStart")
++    # Injection Start in BIDS is the difference between Time Zero and the beginning of injection
++    # RQ : can be negative
++    _set_time_relative_to_zero(metadata, field="InjectionStart")
++    _set_time_from_ms_to_seconds(metadata, "FrameTimesStart")
++    _set_time_from_ms_to_seconds(metadata, "FrameDuration")
++
++    _set_decay_time(metadata)
++    _check_decay_correction(metadata)
++
++    _update_injected_mass(metadata)
++
++
++def get_json_data(dcm_dir: Path, modality: Modality) -> pd.DataFrame:
++    metadata = _get_dicom_tags_and_defaults(modality)
++    _update_metadata_from_image_dicoms(metadata, dcm_dir)
++    if modality in (Modality.AV45, Modality.FLUTE, Modality.PIB):
++        _postprocess_for_pet(metadata)
++    return metadata
+diff --git a/test/unittests/converters/aibl_to_bids/test_aibl_json.py b/test/unittests/converters/aibl_to_bids/test_aibl_json.py
+new file mode 100644
+index 000000000..0e4b9df1d
+--- /dev/null
++++ b/test/unittests/converters/aibl_to_bids/test_aibl_json.py
+@@ -0,0 +1,222 @@
++from unittest.mock import patch
++
++import numpy as np
++import pandas as pd
++import pytest
++from pydicom.dataset import Dataset
++from pydicom.multival import MultiValue
++
++from clinica.converters.aibl_to_bids.utils.bids import Modality
++from clinica.converters.aibl_to_bids.utils.json import (
++    _format_time,
++    _get_dicom_tags_and_defaults_base,
++    _get_dicom_tags_and_defaults_pet,
++    _update_metadata_from_image_dicoms,
++)
++
++
++@pytest.mark.parametrize(
++    "input, expected", [("112233", "11:22:33"), ("112233.00", "11:22:33")]
++)
++def test_format_time_success(input, expected):
++    assert _format_time(input) == expected
++
++
++@pytest.mark.parametrize("input", ["foo", "112233,0000", "12", 112233])
++def test_format_time_error(input):
++    with pytest.raises((ValueError, AttributeError)):
++        _format_time(input)
++
++
++@pytest.mark.parametrize(
++    "reference, event, expected",
++    [("01:00:00", "01:00:01", 1), ("01:00:01", "01:00:00", -1)],
++)
++def test_substract_formatted_times(reference, event, expected):
++    from clinica.converters.aibl_to_bids.utils.json import _substract_formatted_times
++
++    assert expected == _substract_formatted_times(reference, event)
++
++
++@pytest.mark.parametrize(
++    "input, expected", [("112233", "11:22:33"), (112233, "n/a"), ("112233,00", "n/a")]
++)
++def test_format_timezero(input, expected):
++    from clinica.converters.aibl_to_bids.utils.json import _format_timezero
++
++    metadata = pd.DataFrame({"BIDSname": ["TimeZero"], "Value": [input]}).set_index(
++        "BIDSname", drop=False
++    )
++    _format_timezero(metadata)
++    assert expected == metadata.loc["TimeZero", "Value"]
++
++
++@pytest.mark.parametrize(
++    "input, expected", [("010001", 1), (112233, np.nan), ("112233,00", np.nan)]
++)
++def test_set_time_relative_to_zero(input, expected):
++    from clinica.converters.aibl_to_bids.utils.json import _set_time_relative_to_zero
++
++    metadata = pd.DataFrame(
++        {"BIDSname": ["TimeZero", "Test"], "Value": ["01:00:00", input]}
++    ).set_index("BIDSname", drop=False)
++    _set_time_relative_to_zero(metadata, "Test")
++    if not np.isnan(expected):
++        assert expected == metadata.loc["Test", "Value"]
++    else:
++        assert np.isnan(metadata.loc["Test", "Value"])
++
++
++@pytest.mark.parametrize(
++    "input, expected",
++    [("START", True), ("ADMIN", True), ("foo", False), ("NONE", False)],
++)
++def test_check_decay_correction(input, expected):
++    from clinica.converters.aibl_to_bids.utils.json import _check_decay_correction
++
++    metadata = pd.DataFrame(
++        {"BIDSname": ["ImageDecayCorrected"], "Value": [input]}
++    ).set_index("BIDSname", drop=False)
++    _check_decay_correction(metadata)
++    assert metadata.loc["ImageDecayCorrected", "Value"] == expected
++
++
++@pytest.mark.parametrize(
++    "input, expected",
++    [("START", "scan"), ("ADMIN", "injection"), ("foo", None), ("NONE", None)],
++)
++def test_set_decay_time(input, expected):
++    from clinica.converters.aibl_to_bids.utils.json import _set_decay_time
++
++    metadata = pd.DataFrame(
++        {
++            "BIDSname": ["ImageDecayCorrectionTime", "ScanStart", "InjectionStart"],
++            "Value": [input, "scan", "injection"],
++        }
++    ).set_index("BIDSname", drop=False)
++    _set_decay_time(metadata)
++    assert metadata.loc["ImageDecayCorrectionTime", "Value"] == expected
++
++
++@pytest.mark.parametrize(
++    "injected, specific, expected",
++    [(5, "2", 2.5), (None, "2", "n/a"), (12, "n/a", "n/a")],
++)
++def test_update_injected_mass(injected, specific, expected):
++    from clinica.converters.aibl_to_bids.utils.json import _update_injected_mass
++
++    metadata = pd.DataFrame(
++        {
++            "BIDSname": [
++                "InjectedRadioactivity",
++                "SpecificRadioactivity",
++                "InjectedMass",
++            ],
++            "Value": [injected, specific, "n/a"],
++        }
++    ).set_index("BIDSname", drop=False)
++    _update_injected_mass(metadata)
++
++    assert metadata.loc["InjectedMass", "Value"] == expected
++
++
++def build_dicom_header():
++    header = Dataset()
++    header.add_new("Time", "TM", "093015")
++    header.add_new("SoftwareVersions", "LO", ["clinica", "0.9.4"])
++    header.BeamSequence = [Dataset()]
++    header.BeamSequence[0].Manufacturer = "foo"
++    return header
++
++
++@pytest.mark.parametrize(
++    "keys, expected",
++    [
++        ((), None),
++        (("Time",), "093015"),
++        (("BeamSequence", "Manufacturer"), "foo"),
++    ],
++)
++def test_fetch_dcm_data_from_header(keys, expected):
++    from clinica.converters.aibl_to_bids.utils.json import _fetch_dcm_data_from_header
++
++    assert expected == _fetch_dcm_data_from_header(build_dicom_header(), keys)
++
++
++def test_get_dcm_value_from_header_multivalue():
++    from clinica.converters.aibl_to_bids.utils.json import _get_dcm_value_from_header
++
++    assert ["clinica", "0.9.4"] == _get_dcm_value_from_header(
++        ("SoftwareVersions",), build_dicom_header()
++    )
++
++
++@pytest.mark.parametrize(
++    "element, expected",
++    [
++        (None, None),
++        ("093015", "093015"),
++        (2, 2),
++        (MultiValue(int, [1, 2]), [1, 2]),
++    ],
++)
++def test_check_dcm_value(element, expected):
++    from clinica.converters.aibl_to_bids.utils.json import _check_dcm_value
++
++    assert expected == _check_dcm_value(element)
++
++
++@pytest.mark.parametrize(
++    "get_default, length, tag",
++    [
++        (_get_dicom_tags_and_defaults_pet, 33, "AttenuationCorrection"),
++        (_get_dicom_tags_and_defaults_base, 8, "BodyPart"),
++    ],
++)
++def test_get_dicom_tags_and_defaults_pet(get_default, length, tag):
++    defaults = get_default()
++    assert len(defaults) == length
++    assert set(defaults.columns) == {"BIDSname", "DCMtag", "Value"}
++    assert tag in defaults["BIDSname"]
++
++
++@pytest.mark.parametrize(
++    "modality, length",
++    [
++        (Modality.AV45, 33),
++        (Modality.FLUTE, 33),
++        (Modality.PIB, 33),
++        ("foo", 8),
++    ],
++)
++def test_get_default_for_modality(modality, length):
++    from clinica.converters.aibl_to_bids.utils.json import _get_dicom_tags_and_defaults
++
++    assert len(_get_dicom_tags_and_defaults(modality)) == length
++
++
++@patch("clinica.converters.aibl_to_bids.utils.json.cprint")
++def test_update_metadata_from_image_dicoms_error(mock_cprint, tmp_path):
++    _update_metadata_from_image_dicoms(pd.DataFrame(), tmp_path)
++    mock_cprint.assert_called_once_with(
++        msg=f"No DICOM found at {tmp_path}, the image json will be filled with default values",
++        lvl="warning",
++    )
++
++
++def test_update_metadata_from_image_dicoms_success(tmp_path, mocker):
++    metadata = pd.DataFrame(
++        {"BIDSname": ["BodyPart"], "DCMtag": ["Body"], "Value": ["n/a"]}
++    ).set_index("BIDSname", drop=False)
++
++    mocker.patch("clinica.converters.aibl_to_bids.utils.json.next", return_value=[])
++    mocker.patch(
++        "clinica.converters.aibl_to_bids.utils.json.dcmread",
++        return_value=build_dicom_header(),
++    )
++    mocker.patch(
++        "clinica.converters.aibl_to_bids.utils.json._get_dcm_value_from_header",
++        return_value=1,
++    )
++    _update_metadata_from_image_dicoms(metadata, tmp_path)
++    assert metadata.loc["BodyPart", "Value"] == 1
+diff --git a/test/unittests/converters/test_aibl_utils.py b/test/unittests/converters/aibl_to_bids/test_aibl_utils.py
+similarity index 100%
+rename from test/unittests/converters/test_aibl_utils.py
+rename to test/unittests/converters/aibl_to_bids/test_aibl_utils.py

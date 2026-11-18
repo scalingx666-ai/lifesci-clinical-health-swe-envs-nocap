@@ -1,0 +1,3007 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 63a25660be..b725778b85 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Recheck authorization for queued service work and long-lived streams: bind work to an authorization epoch, revalidate before protected output, resume, effects and declared checkpoints, and stop or quarantine with honest effect reconciliation (#3700).
++
+ - Add deterministic edge-VLM execution memory plans with explicit device budgets, bounded preprocessing estimates and local-only abstention before allocation (#2792).
+ 
+ - Define an offline edge-VLM provider contract with bounded image/prompt inputs, source-linked evidence, model/preprocessing digests, shared abstentions, content-free reports and explicit human review for non-diagnostic drafts (#2791).
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index 5564f57d04..38fe976433 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -216,6 +216,7 @@ classification:
+     - install/standalone.md
+     - install/smoke-check.md
+     - serving/async-jobs.md
++    - serving/continuation-authorization.md
+     - serving/request-signing.md
+     - serving/grpc.md
+     - serving/graphql.md
+diff --git a/docs/serving/continuation-authorization.md b/docs/serving/continuation-authorization.md
+new file mode 100644
+index 0000000000..5d80684bd0
+--- /dev/null
++++ b/docs/serving/continuation-authorization.md
+@@ -0,0 +1,206 @@
++# Continuation Authorization
++
++Service authentication decides whether a request may be admitted. A queued
++de-identification job or a long-lived NDJSON stream can keep running after the
++consent, scope or policy revision it was admitted under has been revoked or has
++expired. `openmed.service.continuation_auth` binds admitted work to an
++authorization epoch and revalidates that epoch every time the work is about to
++do something protected.
++
++The module owns continuation authorization only. It does not authenticate
++callers, define identity or consent policy, or persist the job queue. It is an
++injectable component: the application supplies the authority provider, the
++workers and the stream sources. It makes no network calls.
++
++## Building blocks it reuses
++
++- `AuthorityRuntime` from `openmed.agent.permissions.revocation` performs every
++  status lookup. It combines the application's `AuthorityStatusProvider`, a
++  monotonic `AuthorityGenerationStore` and a trusted clock. See
++  [Runtime Authority Revocation](../agent/runtime-revocation.md) for the
++  provider and generation-store contracts.
++- `EffectRecord` from `openmed.agent.workflows.recovery` records external
++  effects, the same record type the governed workflow service uses.
++- `CancellationSignal` from `openmed.agent.workflows.scheduler` is the
++  cooperative stop signal. Cancelling never undoes a committed effect.
++
++## Admission pins an epoch
++
++After the existing admission checks pass (authentication, route scopes and
++request limits), derive the authority the work depends on and admit it:
++
++```python
++from openmed.service.continuation_auth import (
++    ContinuationGuard,
++    consent_authority,
++    principal_authority,
++)
++
++guard = ContinuationGuard(runtime, ledger=durable_ledger)
++contracts = (
++    principal_authority(principal, policy_revision="policy:local@3", expires_at=exp),
++    consent_authority(consent_digest, expires_at=consent_exp),
++)
++record = guard.admit(job_id, contracts, checkpoints=("document",))
++job_store.save(job_id, {"continuation": record.to_dict()})
++```
++
++`principal_authority` commits to the authenticated subject, credential type,
++key id, sorted scopes and policy revision. Narrowing scopes or moving to a new
++policy revision gives a different contract, so the provider decides each one
++explicitly. `consent_authority` references a consent or purpose decision by its
++digest; the consent itself stays with its owner. Both return the existing
++`AuthorityContract` type. Register them with your provider at admission.
++
++`admit` calls `AuthorityRuntime.bind`, which pins the current generation of
++every contract. If any contract is unknown, revoked or expired, admission
++raises `ContinuationInterrupted` with an `admission` outcome.
++
++The returned `ContinuationRecord` is the persisted epoch. Its fields are fixed:
++a random admission id, the digest of the work id, the declared checkpoint names
++and the pinned authority binding. The `epoch_digest` property is a content-free
++commitment to all of them. A record never stores a verdict such as
++"authorized". `ContinuationRecord.from_dict` rejects missing or extra fields, so
++cached status or consent flags cannot be smuggled back in.
++
++## Boundaries that recheck authority
++
++Every boundary performs fresh provider lookups through the runtime. The
++default status age the runtime accepts is zero seconds.
++
++| Boundary | When it runs |
++| --- | --- |
++| `execution_start` | A queued item is picked up, or a stream starts, before the source is read |
++| `resume` | A restarted or paused worker resumes persisted work |
++| `checkpoint` | Each declared long-lived checkpoint; undeclared names are quarantined |
++| `effect_dispatch` | Immediately before each external effect |
++| `protected_output` | Immediately before each stream chunk or job result is released |
++
++Each decision is a `ContinuationOutcome` with one of four dispositions:
++
++- `continue`: authority is current and the work may cross the boundary.
++- `completed`: the work finished and its outputs were released.
++- `stopped`: authority was revoked or expired, or the work was cancelled.
++- `quarantined`: an integrity or availability failure, such as a stale or
++  unavailable status, a generation rollback, a record presented for a
++  different work id, an undeclared checkpoint, a worker or source failure, or a
++  ledger that cannot record the decision.
++
++Any disposition other than `continue` closes the epoch in the injected
++`ContinuationLedger`. A closed epoch reports `continuation_terminal` from then
++on, even if the authority is later valid again. Running the work again requires
++a new admission, which creates a new epoch.
++
++## Queued jobs
++
++`run_continuation` runs one unit of queued work under the guard:
++
++```python
++from openmed.service.continuation_auth import run_continuation
++
++def worker(ctx):
++    for ordinal, document in enumerate(documents):
++        ctx.checkpoint("document")
++        effect = plan_effect(ordinal, document)
++        ctx.commit_effect(effect, lambda: sink.commit(effect.idempotency_key))
++        ctx.emit(redact(document))
++
++result = run_continuation(guard, record, job_id, worker, resumed=False)
++job_store.save(job_id, {"continuation": record.to_dict(), "result": result.to_dict()})
++```
++
++- The start or resume boundary is checked before the worker is called, so
++  revoking authority while a job is queued means it never runs.
++- `ctx.checkpoint(name)` checks a declared checkpoint.
++- `ctx.commit_effect` checks `effect_dispatch`, records the effect as pending
++  and marks it committed only when the dispatch callback returns a `sha256:`
++  commit evidence digest.
++- `ctx.emit` buffers protected output. Buffered output is released only after
++  a final `protected_output` check once the worker returns. If the work stops,
++  the buffer is discarded and reported only as `withheld_output_count`.
++- A worker exception becomes a `continuation_worker_failed` quarantine. The
++  exception message and traceback are not kept.
++
++## Committed effects are reported honestly
++
++Stopping work never claims to undo what already happened. Every outcome
++reports `committed_effect_count`, `pending_effect_count`, a digest over the
++committed idempotency keys and evidence, a fixed `"compensation":
++"not_attempted"` field, and a `reconciliation` state:
++
++| Reconciliation | Meaning |
++| --- | --- |
++| `no_effects` | No effect was dispatched under this epoch |
++| `committed_effects_retained` | Dispatched effects are committed and remain in effect |
++| `pending_effects_unconfirmed` | At least one dispatch did not return commit evidence; reconcile it against the sink by idempotency key |
++
++`ContinuationResult.effects` keeps the `EffectRecord` list. These are the same
++records `openmed.agent.workflows.recovery` uses, so pending effects can be
++reconciled against their sink by idempotency key with `EffectObservation`.
++
++## Long-lived streams
++
++`GuardedStream` wraps a synchronous or asynchronous source:
++
++```python
++from openmed.service.continuation_auth import GuardedStream, continuation_error_event
++
++stream = GuardedStream(
++    guard,
++    record,
++    stream_id,
++    source,
++    terminal=continuation_error_event,
++)
++
++
++async def body():
++    async for item in stream:
++        yield item
++```
++
++The stream checks `execution_start` before reading the source. It then pulls
++each chunk and releases it only after a fresh `protected_output` check. A
++denied chunk is discarded and counted as withheld; no later chunk is read. The
++source is always closed. With `terminal=continuation_error_event` the stream
++ends with an error event in the same shape as the streaming endpoint's error
++envelope, carrying only the reason code, boundary, counts and epoch digest.
++Without `terminal`, the stream raises `ContinuationInterrupted`. Consumer
++disconnects, `asyncio` task cancellation and a set `CancellationSignal` are all
++recorded as `continuation_cancelled`. The `outcome` attribute holds the
++terminal decision.
++
++## Restarts cannot revive stale consent
++
++A restarted worker has only persisted metadata. That is never enough to
++continue:
++
++- The record holds pinned generations, not a status. Resuming always performs
++  new provider lookups, so a revoked or expired consent stays revoked or
++  expired.
++- Editing the restored generations does not help. The runtime compares them
++  exactly with current status, and the generation store rejects rollback and
++  any revival of a revoked digest.
++- The closed-epoch ledger is kept separate from job metadata. Resetting a job
++  row to `queued` cannot reopen a stopped or quarantined epoch.
++
++`InMemoryContinuationLedger` and `InMemoryAuthorityGenerationStore` only cover
++a single process. For restart safety in production, inject a durable, atomic
++ledger and generation store that are shared by every worker and stored
++separately from the job queue. If both are restored to an older copy, local
++rollback detection no longer works.
++
++## Privacy
++
++Outcomes, records, errors and stream error events contain only controlled
++reason codes, counts, declared checkpoint names, `sha256:` digests and pinned
++generations. Work ids, subjects, credentials, outputs and provider exception
++text are never stored or echoed. Invalid arguments raise `ContinuationError`
++with a fixed `invalid_continuation_*` code.
++
++## Integration status
++
++This module is not yet wired into `openmed/service/jobs.py` or the
++`/pii/deidentify/stream` endpoint. Applications that enforce continuation
++authorization must route queued execution through `run_continuation` and
++protected streams through `GuardedStream`.
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 13b54bcc94..e91c55d5a6 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -145,6 +145,7 @@ nav:
+       - Standalone Local Redactor Manifest: install/standalone.md
+       - Offline Install Smoke Check: install/smoke-check.md
+       - Async REST Jobs & Webhooks: serving/async-jobs.md
++      - Continuation Authorization: serving/continuation-authorization.md
+       - HMAC Request Signing: serving/request-signing.md
+       - gRPC Service: serving/grpc.md
+       - GraphQL Service: serving/graphql.md
+diff --git a/openmed/service/continuation_auth.py b/openmed/service/continuation_auth.py
+new file mode 100644
+index 0000000000..f1a1a3f3af
+--- /dev/null
++++ b/openmed/service/continuation_auth.py
+@@ -0,0 +1,1512 @@
++"""Continuation authorization for queued service work and long-lived streams.
++
++Admission proves only that a caller was authorized when work was accepted. A
++queued job or a long-lived stream can outlive the consent, scope or policy
++revision it was admitted under. This module binds admitted work to an
++authorization epoch and revalidates that epoch before each protected output,
++resumed execution, effect dispatch and declared checkpoint.
++
++The guard owns continuation authorization only. Identity policy, credential
++verification and durable queueing stay with their existing owners. Status
++lookups reuse the injected :class:`~openmed.agent.permissions.revocation.
++AuthorityRuntime` (provider, monotonic generation store and trusted clock),
++effects reuse :class:`~openmed.agent.workflows.recovery.EffectRecord`, and
++cooperative stops reuse :class:`~openmed.agent.workflows.scheduler.
++CancellationSignal`. Persisted continuation metadata never carries a cached
++authorization verdict, so a restarted worker always re-asks the provider.
++
++Outcomes, records and errors contain only controlled codes, counts, declared
++checkpoint names, opaque digests and pinned generations; never source text,
++outputs, credentials, subjects or provider exception text.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import hmac
++import json
++import re
++import secrets
++import threading
++from collections.abc import AsyncIterator, Callable, Iterator, Mapping
++from dataclasses import dataclass, replace
++from enum import Enum
++from typing import TYPE_CHECKING, Any, Final, Protocol
++
++from openmed.agent.permissions.revocation import (
++    AuthorityBinding,
++    AuthorityBoundary,
++    AuthorityContract,
++    AuthorityDeniedError,
++    AuthorityKind,
++    AuthorityRuntime,
++)
++from openmed.agent.workflows.recovery import EffectRecord, EffectState
++from openmed.agent.workflows.scheduler import CancellationSignal
++
++if TYPE_CHECKING:
++    from .auth import AuthPrincipal
++
++CONTINUATION_RECORD_VERSION: Final[str] = "openmed.service.continuation_record.v1"
++CONTINUATION_OUTCOME_VERSION: Final[str] = "openmed.service.continuation_outcome.v1"
++MAX_DECLARED_CHECKPOINTS: Final[int] = 64
++MAX_CONTINUATION_EFFECTS: Final[int] = 128
++
++_EPOCH_VERSION = "openmed.service.continuation_epoch.v1"
++_WORK_VERSION = "openmed.service.continuation_work.v1"
++_EFFECTS_VERSION = "openmed.service.continuation_effects.v1"
++_PRINCIPAL_VERSION = "openmed.service.principal_authority.v1"
++_CONSENT_VERSION = "openmed.service.consent_authority.v1"
++_MAX_WORK_ID_LENGTH = 256
++_MAX_COUNT = 2**63 - 1
++_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
++_ADMISSION_RE = re.compile(r"adm_[0-9a-f]{32}\Z")
++_CHECKPOINT_RE = re.compile(r"[a-z][a-z0-9_]{0,62}\Z")
++_POLICY_REVISION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,127}\Z")
++_END_OF_SOURCE = object()
++_RECORD_FIELDS = frozenset(
++    {"schema_version", "admission_id", "work_digest", "checkpoints", "authority"}
++)
++_ERROR_CODES: Final[frozenset[str]] = frozenset(
++    {
++        "invalid_continuation_authority",
++        "invalid_continuation_boundary",
++        "invalid_continuation_cancellation",
++        "invalid_continuation_checkpoint",
++        "invalid_continuation_commit_evidence",
++        "invalid_continuation_count",
++        "invalid_continuation_effect",
++        "invalid_continuation_guard",
++        "invalid_continuation_outcome",
++        "invalid_continuation_record",
++        "invalid_continuation_stream",
++        "invalid_continuation_work",
++        "invalid_continuation_worker",
++    }
++)
++
++
++class ContinuationError(ValueError):
++    """Fixed-code validation error that never echoes a rejected value.
++
++    Args:
++        code: One of the module's closed ``invalid_continuation_*`` codes.
++    """
++
++    def __init__(self, code: str) -> None:
++        self.code = code if code in _ERROR_CODES else "invalid_continuation_outcome"
++        super().__init__(self.code)
++
++
++class ContinuationBoundary(str, Enum):
++    """Points where continued work must hold current authority.
++
++    Values:
++        ADMISSION: Work is accepted and its authorization epoch is pinned.
++        EXECUTION_START: A queued item is picked up or a stream starts.
++        RESUME: A restarted or paused worker resumes persisted work.
++        CHECKPOINT: A declared long-lived checkpoint inside the worker.
++        EFFECT_DISPATCH: Immediately before one external effect.
++        PROTECTED_OUTPUT: Immediately before protected output is released.
++    """
++
++    ADMISSION = "admission"
++    EXECUTION_START = "execution_start"
++    RESUME = "resume"
++    CHECKPOINT = "checkpoint"
++    EFFECT_DISPATCH = "effect_dispatch"
++    PROTECTED_OUTPUT = "protected_output"
++
++
++_AUTHORITY_BOUNDARIES: Final[dict[ContinuationBoundary, AuthorityBoundary]] = {
++    ContinuationBoundary.ADMISSION: AuthorityBoundary.PREVIEW,
++    ContinuationBoundary.EXECUTION_START: AuthorityBoundary.RESUME,
++    ContinuationBoundary.RESUME: AuthorityBoundary.RESUME,
++    ContinuationBoundary.CHECKPOINT: AuthorityBoundary.RESUME,
++    ContinuationBoundary.EFFECT_DISPATCH: AuthorityBoundary.EFFECT_DISPATCH,
++    ContinuationBoundary.PROTECTED_OUTPUT: AuthorityBoundary.SENSITIVE_READ,
++}
++
++
++class ContinuationDisposition(str, Enum):
++    """What happens to the work after one boundary decision.
++
++    Values:
++        CONTINUE: Authority is current; the work may cross this boundary.
++        COMPLETED: The work finished and its outputs were released.
++        STOPPED: Authority ended or the work was cancelled; it never resumes
++            under this epoch and needs a fresh admission to run again.
++        QUARANTINED: Integrity or availability failure; the epoch is closed
++            and retained for operator reconciliation.
++    """
++
++    CONTINUE = "continue"
++    COMPLETED = "completed"
++    STOPPED = "stopped"
++    QUARANTINED = "quarantined"
++
++
++class ContinuationReason(str, Enum):
++    """Closed reason codes for continuation decisions.
++
++    ``authority_*`` values mirror
++    :class:`~openmed.agent.permissions.revocation.AuthorityReason` denials.
++    """
++
++    ACTIVE = "continuation_active"
++    COMPLETED = "continuation_completed"
++    CANCELLED = "continuation_cancelled"
++    TERMINAL = "continuation_terminal"
++    WORK_MISMATCH = "continuation_work_mismatch"
++    UNDECLARED_CHECKPOINT = "continuation_checkpoint_undeclared"
++    WORKER_FAILED = "continuation_worker_failed"
++    SOURCE_FAILED = "continuation_source_failed"
++    LEDGER_UNAVAILABLE = "continuation_ledger_unavailable"
++    AUTHORITY_REVOKED = "authority_revoked"
++    AUTHORITY_EXPIRED = "authority_expired"
++    AUTHORITY_GENERATION_CHANGED = "authority_generation_changed"
++    AUTHORITY_UNAVAILABLE = "authority_status_unavailable"
++    AUTHORITY_STALE = "authority_status_stale"
++    AUTHORITY_ROLLBACK = "authority_status_rollback"
++    AUTHORITY_STORE_UNAVAILABLE = "authority_generation_store_unavailable"
++    AUTHORITY_CONTRACT_MISMATCH = "authority_contract_mismatch"
++    AUTHORITY_APPROVAL_MISMATCH = "authority_approval_mismatch"
++
++
++_STOPPED_REASONS: Final[frozenset[ContinuationReason]] = frozenset(
++    {
++        ContinuationReason.CANCELLED,
++        ContinuationReason.TERMINAL,
++        ContinuationReason.AUTHORITY_REVOKED,
++        ContinuationReason.AUTHORITY_EXPIRED,
++    }
++)
++
++
++def _disposition_for(reason: ContinuationReason) -> ContinuationDisposition:
++    if reason is ContinuationReason.ACTIVE:
++        return ContinuationDisposition.CONTINUE
++    if reason is ContinuationReason.COMPLETED:
++        return ContinuationDisposition.COMPLETED
++    if reason in _STOPPED_REASONS:
++        return ContinuationDisposition.STOPPED
++    return ContinuationDisposition.QUARANTINED
++
++
++class ReconciliationState(str, Enum):
++    """Honest effect knowledge attached to every outcome.
++
++    Cancellation and revocation never compensate effects. Committed effects
++    stay committed and recorded; pending effects whose dispatch did not return
++    commit evidence must be reconciled against their sink by idempotency key.
++
++    Values:
++        NO_EFFECTS: No effect was dispatched under this epoch.
++        COMMITTED_EFFECTS_RETAINED: Every dispatched effect is committed and
++            remains in effect; nothing was undone.
++        PENDING_EFFECTS_UNCONFIRMED: At least one dispatched effect has no
++            commit evidence and may or may not have taken place.
++    """
++
++    NO_EFFECTS = "no_effects"
++    COMMITTED_EFFECTS_RETAINED = "committed_effects_retained"
++    PENDING_EFFECTS_UNCONFIRMED = "pending_effects_unconfirmed"
++
++
++def _hash(payload: Any) -> str:
++    encoded = json.dumps(
++        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
++    ).encode("ascii")
++    return "sha256:" + hashlib.sha256(encoded).hexdigest()
++
++
++def _is_digest(value: Any) -> bool:
++    return type(value) is str and _DIGEST_RE.fullmatch(value) is not None
++
++
++def _require_count(value: Any) -> int:
++    if type(value) is not int or not 0 <= value <= _MAX_COUNT:
++        raise ContinuationError("invalid_continuation_count")
++    return value
++
++
++def work_digest(work_id: str) -> str:
++    """Return the opaque, domain-separated digest of one work identifier.
++
++    Args:
++        work_id: Caller-owned job or stream identifier. It is hashed and never
++            retained.
++
++    Returns:
++        A ``sha256:`` digest used to bind continuation metadata to that work.
++
++    Raises:
++        ContinuationError: If ``work_id`` is not a non-empty bounded string.
++    """
++
++    if (
++        type(work_id) is not str
++        or not work_id
++        or len(work_id) > _MAX_WORK_ID_LENGTH
++        or not work_id.isprintable()
++    ):
++        raise ContinuationError("invalid_continuation_work")
++    encoded = (_WORK_VERSION + "\0" + work_id).encode("utf-8")
++    return "sha256:" + hashlib.sha256(encoded).hexdigest()
++
++
++def principal_authority(
++    principal: "AuthPrincipal", *, policy_revision: str, expires_at: int
++) -> AuthorityContract:
++    """Commit an admitted principal's scope and policy revision to a contract.
++
++    The digest covers the subject, credential type, key id, the sorted granted
++    scopes and the policy revision in force at admission. Narrowing scopes or
++    changing the revision yields a different contract, so the authority
++    provider must register (and later revoke) each one explicitly. Hashing a
++    principal does not authenticate it.
++
++    Args:
++        principal: Authenticated :class:`~openmed.service.auth.AuthPrincipal`.
++        policy_revision: Opaque policy revision label active at admission.
++        expires_at: Exclusive Unix expiry, normally the credential expiry.
++
++    Returns:
++        A ``grant`` :class:`AuthorityContract` for the continuation guard.
++
++    Raises:
++        ContinuationError: If any field is malformed.
++    """
++
++    try:
++        subject = principal.subject
++        credential_type = principal.credential_type
++        scopes = principal.scopes
++        key_id = principal.key_id
++    except AttributeError:
++        raise ContinuationError("invalid_continuation_authority") from None
++    if (
++        type(subject) is not str
++        or not subject
++        or type(credential_type) is not str
++        or not credential_type
++        or not isinstance(scopes, (tuple, list))
++        or any(type(scope) is not str or not scope for scope in scopes)
++        or (key_id is not None and type(key_id) is not str)
++        or type(policy_revision) is not str
++        or _POLICY_REVISION_RE.fullmatch(policy_revision) is None
++    ):
++        raise ContinuationError("invalid_continuation_authority")
++    digest = _hash(
++        {
++            "schema_version": _PRINCIPAL_VERSION,
++            "subject": subject,
++            "credential_type": credential_type,
++            "key_id": key_id,
++            "scopes": sorted(set(scopes)),
++            "policy_revision": policy_revision,
++        }
++    )
++    return _contract(AuthorityKind.GRANT, digest, expires_at)
++
++
++def consent_authority(consent_digest: str, *, expires_at: int) -> AuthorityContract:
++    """Reference one consent or purpose decision held by the application.
++
++    Args:
++        consent_digest: ``sha256:`` digest of the consent artifact. The artifact
++            itself stays with its owner.
++        expires_at: Exclusive Unix expiry of the consent.
++
++    Returns:
++        A ``purpose_ticket`` :class:`AuthorityContract` for the guard.
++
++    Raises:
++        ContinuationError: If the digest or expiry is malformed.
++    """
++
++    if not _is_digest(consent_digest):
++        raise ContinuationError("invalid_continuation_authority")
++    digest = _hash({"schema_version": _CONSENT_VERSION, "consent": consent_digest})
++    return _contract(AuthorityKind.PURPOSE_TICKET, digest, expires_at)
++
++
++def _contract(kind: AuthorityKind, digest: str, expires_at: int) -> AuthorityContract:
++    try:
++        return AuthorityContract(kind, digest, expires_at)
++    except ValueError:
++        raise ContinuationError("invalid_continuation_authority") from None
++
++
++def _validate_checkpoints(checkpoints: Any) -> tuple[str, ...]:
++    if not isinstance(checkpoints, (tuple, list)):
++        raise ContinuationError("invalid_continuation_checkpoint")
++    names = tuple(checkpoints)
++    if (
++        len(names) > MAX_DECLARED_CHECKPOINTS
++        or any(
++            type(name) is not str or _CHECKPOINT_RE.fullmatch(name) is None
++            for name in names
++        )
++        or len(set(names)) != len(names)
++    ):
++        raise ContinuationError("invalid_continuation_checkpoint")
++    return names
++
++
++@dataclass(frozen=True, slots=True, repr=False)
++class ContinuationRecord:
++    """Persistable authorization epoch for one admitted unit of work.
++
++    The record holds the pinned authority generations captured at admission,
++    never a verdict. Restoring it grants nothing: every boundary performs fresh
++    provider lookups, and a restored binding cannot be re-pinned to a newer
++    generation. Store it beside the job; store the ledger and generation high
++    water independently of it.
++
++    Attributes:
++        admission_id: Random ``adm_`` nonce distinguishing re-admissions.
++        work_digest: :func:`work_digest` of the admitted work identifier.
++        checkpoints: Declared long-lived checkpoint names, in order.
++        binding: Pinned authority generations from the injected runtime.
++    """
++
++    admission_id: str
++    work_digest: str
++    checkpoints: tuple[str, ...]
++    binding: AuthorityBinding
++
++    def __post_init__(self) -> None:
++        if (
++            type(self.admission_id) is not str
++            or _ADMISSION_RE.fullmatch(self.admission_id) is None
++            or not _is_digest(self.work_digest)
++            or type(self.binding) is not AuthorityBinding
++            or type(self.checkpoints) is not tuple
++        ):
++            raise ContinuationError("invalid_continuation_record")
++        try:
++            _validate_checkpoints(self.checkpoints)
++        except ContinuationError:
++            raise ContinuationError("invalid_continuation_record") from None
++
++    @property
++    def epoch_digest(self) -> str:
++        """Return the content-free commitment identifying this epoch."""
++
++        return _hash({"schema_version": _EPOCH_VERSION, "record": self.to_dict()})
++
++    @property
++    def authority_count(self) -> int:
++        """Return the number of authority contracts pinned by this epoch."""
++
++        return len(self.binding.versions)
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return exact persistable metadata without any authorization verdict."""
++
++        return {
++            "schema_version": CONTINUATION_RECORD_VERSION,
++            "admission_id": self.admission_id,
++            "work_digest": self.work_digest,
++            "checkpoints": list(self.checkpoints),
++            "authority": self.binding.to_dict(),
++        }
++
++    @classmethod
++    def from_dict(cls, payload: Mapping[str, Any]) -> "ContinuationRecord":
++        """Restore a record, rejecting missing, extra or cached-status fields.
++
++        Args:
++            payload: Mapping previously produced by :meth:`to_dict`.
++
++        Returns:
++            The restored record. It still requires a fresh boundary check.
++
++        Raises:
++            ContinuationError: If the mapping is not an exact record.
++        """
++
++        if (
++            not isinstance(payload, Mapping)
++            or set(payload) != _RECORD_FIELDS
++            or payload["schema_version"] != CONTINUATION_RECORD_VERSION
++            or type(payload["checkpoints"]) is not list
++            or not isinstance(payload["authority"], Mapping)
++        ):
++            raise ContinuationError("invalid_continuation_record")
++        try:
++            binding = AuthorityBinding.from_dict(dict(payload["authority"]))
++        except ValueError:
++            raise ContinuationError("invalid_continuation_record") from None
++        return cls(
++            admission_id=payload["admission_id"],
++            work_digest=payload["work_digest"],
++            checkpoints=tuple(payload["checkpoints"]),
++            binding=binding,
++        )
++
++    def __repr__(self) -> str:
++        return f"ContinuationRecord(epoch_digest={self.epoch_digest!r})"
++
++
++@dataclass(frozen=True, slots=True)
++class ContinuationOutcome:
++    """Content-free decision for one boundary, suitable for audit storage.
++
++    Attributes:
++        boundary: Boundary where the decision was made.
++        disposition: Whether the work continues, completed, stopped or is
++            quarantined.
++        reason: Closed reason code.
++        work_digest: Opaque digest of the work identifier.
++        epoch_digest: Epoch commitment; ``None`` only for a denied admission.
++        authority_count: Number of authority contracts consulted.
++        checkpoint: Declared checkpoint name, when the boundary was one.
++        delivered_output_count: Protected outputs already released.
++        withheld_output_count: Buffered outputs discarded unreleased.
++        committed_effect_count: Effects with commit evidence; never undone.
++        pending_effect_count: Dispatched effects without commit evidence.
++        committed_effect_digest: Commitment to committed effect keys and
++            evidence, or ``None`` when nothing was committed.
++    """
++
++    boundary: ContinuationBoundary
++    disposition: ContinuationDisposition
++    reason: ContinuationReason
++    work_digest: str
++    epoch_digest: str | None
++    authority_count: int
++    checkpoint: str | None = None
++    delivered_output_count: int = 0
++    withheld_output_count: int = 0
++    committed_effect_count: int = 0
++    pending_effect_count: int = 0
++    committed_effect_digest: str | None = None
++
++    def __post_init__(self) -> None:
++        try:
++            if (
++                type(self.boundary) is not ContinuationBoundary
++                or type(self.disposition) is not ContinuationDisposition
++                or type(self.reason) is not ContinuationReason
++                or self.disposition is not _disposition_for(self.reason)
++                or not _is_digest(self.work_digest)
++            ):
++                raise ContinuationError("invalid_continuation_outcome")
++            if self.epoch_digest is None:
++                if self.boundary is not ContinuationBoundary.ADMISSION:
++                    raise ContinuationError("invalid_continuation_outcome")
++            elif not _is_digest(self.epoch_digest):
++                raise ContinuationError("invalid_continuation_outcome")
++            if self.checkpoint is not None and (
++                type(self.checkpoint) is not str
++                or _CHECKPOINT_RE.fullmatch(self.checkpoint) is None
++            ):
++                raise ContinuationError("invalid_continuation_outcome")
++            for value in (
++                self.authority_count,
++                self.delivered_output_count,
++                self.withheld_output_count,
++                self.committed_effect_count,
++                self.pending_effect_count,
++            ):
++                _require_count(value)
++            if (self.committed_effect_count == 0) != (
++                self.committed_effect_digest is None
++            ):
++                raise ContinuationError("invalid_continuation_outcome")
++            if self.committed_effect_digest is not None and not _is_digest(
++                self.committed_effect_digest
++            ):
++                raise ContinuationError("invalid_continuation_outcome")
++        except ContinuationError:
++            raise ContinuationError("invalid_continuation_outcome") from None
++
++    @property
++    def reconciliation(self) -> ReconciliationState:
++        """Return what is honestly known about effects under this epoch."""
++
++        if self.pending_effect_count:
++            return ReconciliationState.PENDING_EFFECTS_UNCONFIRMED
++        if self.committed_effect_count:
++            return ReconciliationState.COMMITTED_EFFECTS_RETAINED
++        return ReconciliationState.NO_EFFECTS
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return controlled metadata; compensation is never attempted."""
++
++        return {
++            "schema_version": CONTINUATION_OUTCOME_VERSION,
++            "boundary": self.boundary.value,
++            "disposition": self.disposition.value,
++            "reason_code": self.reason.value,
++            "reconciliation": self.reconciliation.value,
++            "compensation": "not_attempted",
++            "work_digest": self.work_digest,
++            "epoch_digest": self.epoch_digest,
++            "authority_count": self.authority_count,
++            "checkpoint": self.checkpoint,
++            "delivered_output_count": self.delivered_output_count,
++            "withheld_output_count": self.withheld_output_count,
++            "committed_effect_count": self.committed_effect_count,
++            "pending_effect_count": self.pending_effect_count,
++            "committed_effect_digest": self.committed_effect_digest,
++        }
++
++
++class ContinuationInterrupted(RuntimeError):
++    """Raised when continued work must stop; carries only its outcome.
++
++    Args:
++        outcome: The terminal, content-free decision.
++    """
++
++    def __init__(self, outcome: ContinuationOutcome) -> None:
++        if type(outcome) is not ContinuationOutcome:
++            raise ContinuationError("invalid_continuation_outcome")
++        self.outcome = outcome
++        self.code = outcome.reason.value
++        super().__init__(self.code)
++
++
++class ContinuationLedger(Protocol):
++    """Closed-epoch tombstones retained independently of job metadata.
++
++    Production restart safety needs a durable, atomic implementation shared by
++    every worker. A closed epoch can never be reopened.
++    """
++
++    def is_closed(self, epoch_digest: str) -> bool:
++        """Return exactly ``True`` when the epoch was stopped or completed."""
++        ...
++
++    def close(self, epoch_digest: str) -> bool:
++        """Durably and idempotently close an epoch; return ``True`` on success."""
++        ...
++
++
++class InMemoryContinuationLedger:
++    """Thread-safe process-local ledger; restarts need a durable equivalent."""
++
++    def __init__(self) -> None:
++        self._closed: set[str] = set()
++        self._lock = threading.Lock()
++
++    def is_closed(self, epoch_digest: str) -> bool:
++        """Return whether ``epoch_digest`` was closed in this process.
++
++        Args:
++            epoch_digest: :attr:`ContinuationRecord.epoch_digest`.
++
++        Returns:
++            ``True`` when the epoch is closed.
++        """
++
++        if not _is_digest(epoch_digest):
++            raise ContinuationError("invalid_continuation_record")
++        with self._lock:
++            return epoch_digest in self._closed
++
++    def close(self, epoch_digest: str) -> bool:
++        """Close ``epoch_digest``; closing twice is a successful no-op.
++
++        Args:
++            epoch_digest: :attr:`ContinuationRecord.epoch_digest`.
++
++        Returns:
++            ``True`` once the tombstone is recorded.
++        """
++
++        if not _is_digest(epoch_digest):
++            raise ContinuationError("invalid_continuation_record")
++        with self._lock:
++            self._closed.add(epoch_digest)
++            return True
++
++
++def _effect_summary(effects: Any) -> tuple[int, int, str | None]:
++    if type(effects) is not tuple or len(effects) > MAX_CONTINUATION_EFFECTS:
++        raise ContinuationError("invalid_continuation_effect")
++    if any(type(effect) is not EffectRecord for effect in effects):
++        raise ContinuationError("invalid_continuation_effect")
++    committed = [e for e in effects if e.state is EffectState.COMMITTED]
++    pending = len(effects) - len(committed)
++    if not committed:
++        return 0, pending, None
++    digest = _hash(
++        {
++            "schema_version": _EFFECTS_VERSION,
++            "effects": [
++                {
++                    "idempotency_key": e.idempotency_key,
++                    "commit_evidence_digest": e.commit_evidence_digest,
++                }
++                for e in sorted(committed, key=lambda e: e.ordinal)
++            ],
++        }
++    )
++    return len(committed), pending, digest
++
++
++class ContinuationGuard:
++    """Revalidate admitted work against current authority at every boundary.
++
++    Args:
++        runtime: Injected :class:`AuthorityRuntime` with the application's
++            status provider, generation store and trusted clock.
++        ledger: Closed-epoch store; defaults to a process-local ledger.
++
++    Raises:
++        ContinuationError: If the runtime or ledger is not usable.
++    """
++
++    def __init__(
++        self,
++        runtime: AuthorityRuntime,
++        *,
++        ledger: ContinuationLedger | None = None,
++    ) -> None:
++        if not isinstance(runtime, AuthorityRuntime):
++            raise ContinuationError("invalid_continuation_guard")
++        ledger = ledger if ledger is not None else InMemoryContinuationLedger()
++        if not callable(getattr(ledger, "is_closed", None)) or not callable(
++            getattr(ledger, "close", None)
++        ):
++            raise ContinuationError("invalid_continuation_guard")
++        self._runtime = runtime
++        self._ledger = ledger
++
++    def admit(
++        self,
++        work_id: str,
++        contracts: tuple[AuthorityContract, ...],
++        *,
++        checkpoints: tuple[str, ...] = (),
++    ) -> ContinuationRecord:
++        """Pin current authority generations to newly admitted work.
++
++        Call after the existing admission checks (authentication, route scopes
++        and request limits) have passed.
++
++        Args:
++            work_id: Caller-owned job or stream identifier; only its digest is
++                kept.
++            contracts: Every authority the work relies on, for example from
++                :func:`principal_authority` and :func:`consent_authority`.
++            checkpoints: Long-lived checkpoint names the worker will declare.
++
++        Returns:
++            The persistable :class:`ContinuationRecord`.
++
++        Raises:
++            ContinuationError: If an argument is malformed.
++            ContinuationInterrupted: If any authority is not currently active.
++        """
++
++        digest = work_digest(work_id)
++        names = _validate_checkpoints(checkpoints)
++        if (
++            not isinstance(contracts, tuple)
++            or not contracts
++            or any(type(c) is not AuthorityContract for c in contracts)
++        ):
++            raise ContinuationError("invalid_continuation_authority")
++        try:
++            binding = self._runtime.bind(contracts)
++        except AuthorityDeniedError as denied:
++            reason = ContinuationReason(denied.receipt.reason.value)
++            raise ContinuationInterrupted(
++                ContinuationOutcome(
++                    boundary=ContinuationBoundary.ADMISSION,
++                    disposition=_disposition_for(reason),
++                    reason=reason,
++                    work_digest=digest,
++                    epoch_digest=None,
++                    authority_count=len(contracts),
++                )
++            ) from None
++        except ValueError:
++            raise ContinuationError("invalid_continuation_authority") from None
++        return ContinuationRecord(
++            admission_id="adm_" + secrets.token_hex(16),
++            work_digest=digest,
++            checkpoints=names,
++            binding=binding,
++        )
++
++    def check(
++        self,
++        record: ContinuationRecord,
++        work_id: str,
++        boundary: ContinuationBoundary,
++        *,
++        checkpoint: str | None = None,
++        delivered_outputs: int = 0,
++        buffered_outputs: int = 0,
++        effects: tuple[EffectRecord, ...] = (),
++    ) -> ContinuationOutcome:
++        """Decide whether work may cross ``boundary`` right now.
++
++        Every call performs fresh provider lookups through the runtime. Any
++        decision other than ``continue`` closes the epoch in the ledger, so the
++        same record can never continue later, even after a restart.
++
++        Args:
++            record: Restored or in-memory continuation record.
++            work_id: Identifier of the work presenting the record.
++            boundary: Boundary being crossed; not ``admission``.
++            checkpoint: Declared checkpoint name; required for ``checkpoint``.
++            delivered_outputs: Protected outputs already released.
++            buffered_outputs: Outputs held but not released; they are counted
++                as withheld when the work stops.
++            effects: Effects dispatched so far under this epoch.
++
++        Returns:
++            The boundary outcome. Denials are returned, not raised.
++
++        Raises:
++            ContinuationError: If an argument is malformed.
++        """
++
++        self._validate_call(record, boundary, checkpoint)
++        _require_count(delivered_outputs)
++        _require_count(buffered_outputs)
++        summary = _effect_summary(effects)
++        reason, declared = self._evaluate(record, work_id, boundary, checkpoint)
++        return self._decide(
++            record,
++            boundary,
++            reason,
++            checkpoint=declared,
++            delivered=delivered_outputs,
++            buffered=buffered_outputs,
++            summary=summary,
++        )
++
++    def require(
++        self,
++        record: ContinuationRecord,
++        work_id: str,
++        boundary: ContinuationBoundary,
++        **progress: Any,
++    ) -> ContinuationOutcome:
++        """Like :meth:`check`, but raise when the work may not continue.
++
++        Args:
++            record: Continuation record.
++            work_id: Identifier of the work presenting the record.
++            boundary: Boundary being crossed.
++            **progress: Keyword arguments accepted by :meth:`check`.
++
++        Returns:
++            The ``continue`` outcome.
++
++        Raises:
++            ContinuationInterrupted: If the decision is not ``continue``.
++        """
++
++        outcome = self.check(record, work_id, boundary, **progress)
++        if outcome.disposition is not ContinuationDisposition.CONTINUE:
++            raise ContinuationInterrupted(outcome)
++        return outcome
++
++    def cancel(
++        self,
++        record: ContinuationRecord,
++        work_id: str,
++        *,
++        boundary: ContinuationBoundary = ContinuationBoundary.EXECUTION_START,
++        delivered_outputs: int = 0,
++        buffered_outputs: int = 0,
++        effects: tuple[EffectRecord, ...] = (),
++    ) -> ContinuationOutcome:
++        """Record cancellation and close the epoch without undoing anything.
++
++        Args:
++            record: Continuation record of the cancelled work.
++            work_id: Identifier of the work presenting the record.
++            boundary: Boundary where cancellation was observed.
++            delivered_outputs: Protected outputs already released.
++            buffered_outputs: Outputs discarded unreleased.
++            effects: Effects dispatched so far; they stay recorded as is.
++
++        Returns:
++            A ``stopped`` outcome, or ``quarantined`` when the record does not
++            belong to ``work_id`` or the ledger cannot close the epoch.
++        """
++
++        self._validate_call(record, boundary, None)
++        _require_count(delivered_outputs)
++        _require_count(buffered_outputs)
++        summary = _effect_summary(effects)
++        reason = ContinuationReason.CANCELLED
++        if not self._work_matches(record, work_id):
++            reason = ContinuationReason.WORK_MISMATCH
++        return self._decide(
++            record,
++            boundary,
++            reason,
++            checkpoint=None,
++            delivered=delivered_outputs,
++            buffered=buffered_outputs,
++            summary=summary,
++        )
++
++    def _validate_call(
++        self,
++        record: Any,
++        boundary: Any,
++        checkpoint: Any,
++    ) -> None:
++        if type(record) is not ContinuationRecord:
++            raise ContinuationError("invalid_continuation_record")
++        if (
++            type(boundary) is not ContinuationBoundary
++            or boundary is ContinuationBoundary.ADMISSION
++        ):
++            raise ContinuationError("invalid_continuation_boundary")
++        if checkpoint is not None and boundary is not ContinuationBoundary.CHECKPOINT:
++            raise ContinuationError("invalid_continuation_checkpoint")
++
++    @staticmethod
++    def _work_matches(record: ContinuationRecord, work_id: str) -> bool:
++        return hmac.compare_digest(work_digest(work_id), record.work_digest)
++
++    def _evaluate(
++        self,
++        record: ContinuationRecord,
++        work_id: str,
++        boundary: ContinuationBoundary,
++        checkpoint: str | None,
++    ) -> tuple[ContinuationReason, str | None]:
++        if not self._work_matches(record, work_id):
++            return ContinuationReason.WORK_MISMATCH, None
++        declared = None
++        if boundary is ContinuationBoundary.CHECKPOINT:
++            if checkpoint not in record.checkpoints:
++                return ContinuationReason.UNDECLARED_CHECKPOINT, None
++            declared = checkpoint
++        try:
++            closed = self._ledger.is_closed(record.epoch_digest)
++        except (KeyboardInterrupt, SystemExit):
++            raise
++        except BaseException:
++            return ContinuationReason.LEDGER_UNAVAILABLE, declared
++        if type(closed) is not bool:
++            return ContinuationReason.LEDGER_UNAVAILABLE, declared
++        if closed:
++            return ContinuationReason.TERMINAL, declared
++        try:
++            self._runtime.check(record.binding, _AUTHORITY_BOUNDARIES[boundary])
++        except AuthorityDeniedError as denied:
++            return ContinuationReason(denied.receipt.reason.value), declared
++        except (KeyboardInterrupt, SystemExit):
++            raise
++        except BaseException:
++            return ContinuationReason.AUTHORITY_UNAVAILABLE, declared
++        return ContinuationReason.ACTIVE, declared
++
++    def _decide(
++        self,
++        record: ContinuationRecord,
++        boundary: ContinuationBoundary,
++        reason: ContinuationReason,
++        *,
++        checkpoint: str | None,
++        delivered: int,
++        buffered: int,
++        summary: tuple[int, int, str | None],
++    ) -> ContinuationOutcome:
++        if reason is not ContinuationReason.ACTIVE and reason is not (
++            ContinuationReason.TERMINAL
++        ):
++            if not self._close(record):
++                reason = ContinuationReason.LEDGER_UNAVAILABLE
++        disposition = _disposition_for(reason)
++        released = disposition in (
++            ContinuationDisposition.CONTINUE,
++            ContinuationDisposition.COMPLETED,
++        )
++        committed, pending, digest = summary
++        return ContinuationOutcome(
++            boundary=boundary,
++            disposition=disposition,
++            reason=reason,
++            work_digest=record.work_digest,
++            epoch_digest=record.epoch_digest,
++            authority_count=record.authority_count,
++            checkpoint=checkpoint,
++            delivered_output_count=delivered,
++            withheld_output_count=0 if released else buffered,
++            committed_effect_count=committed,
++            pending_effect_count=pending,
++            committed_effect_digest=digest,
++        )
++
++    def _close(self, record: ContinuationRecord) -> bool:
++        try:
++            return self._ledger.close(record.epoch_digest) is True
++        except (KeyboardInterrupt, SystemExit):
++            raise
++        except BaseException:
++            return False
++
++    def _terminate(
++        self,
++        record: ContinuationRecord,
++        boundary: ContinuationBoundary,
++        reason: ContinuationReason,
++        *,
++        delivered: int,
++        buffered: int,
++        effects: tuple[EffectRecord, ...],
++    ) -> ContinuationOutcome:
++        return self._decide(
++            record,
++            boundary,
++            reason,
++            checkpoint=None,
++            delivered=delivered,
++            buffered=buffered,
++            summary=_effect_summary(effects),
++        )
++
++
++class ContinuationContext:
++    """Worker-facing handle that guards checkpoints, effects and outputs.
++
++    Workers receive one context from :func:`run_continuation`. Outputs passed
++    to :meth:`emit` are buffered and released only after the final protected
++    output check; an interruption discards them.
++    """
++
++    def __init__(
++        self,
++        guard: ContinuationGuard,
++        record: ContinuationRecord,
++        work_id: str,
++        cancellation: CancellationSignal | None,
++    ) -> None:
++        self._guard = guard
++        self._record = record
++        self._work_id = work_id
++        self._cancellation = cancellation
++        self._outputs: list[Any] = []
++        self._effects: list[EffectRecord] = []
++        self._boundary = ContinuationBoundary.EXECUTION_START
++        self._interruption: ContinuationOutcome | None = None
++        self._issued: list[ContinuationOutcome] = []
++
++    @property
++    def effects(self) -> tuple[EffectRecord, ...]:
++        """Return effects dispatched so far, in dispatch order."""
++
++        return tuple(self._effects)
++
++    def checkpoint(self, name: str) -> None:
++        """Revalidate authority at a declared long-lived checkpoint.
++
++        Args:
++            name: Checkpoint name declared at admission.
++
++        Raises:
++            ContinuationInterrupted: If the work may not continue.
++        """
++
++        self._require(ContinuationBoundary.CHECKPOINT, checkpoint=name)
++
++    def commit_effect(
++        self, effect: EffectRecord, dispatch: Callable[[], str]
++    ) -> EffectRecord:
++        """Revalidate, dispatch one effect and record it honestly.
++
++        The effect is recorded as pending before ``dispatch`` runs and becomes
++        committed only when ``dispatch`` returns a ``sha256:`` commit evidence
++        digest. A failed or malformed dispatch leaves it pending, which the
++        outcome reports as unconfirmed rather than undone.
++
++        Args:
++            effect: Pending effect with a deterministic idempotency key.
++            dispatch: Callable performing the effect and returning evidence.
++
++        Returns:
++            The committed effect record.
++
++        Raises:
++            ContinuationInterrupted: If authority is not current.
++            ContinuationError: If the effect or evidence is malformed.
++        """
++
++        if (
++            type(effect) is not EffectRecord
++            or effect.state is not EffectState.PENDING
++            or not callable(dispatch)
++            or len(self._effects) >= MAX_CONTINUATION_EFFECTS
++            or any(e.idempotency_key == effect.idempotency_key for e in self._effects)
++        ):
++            raise ContinuationError("invalid_continuation_effect")
++        self._require(ContinuationBoundary.EFFECT_DISPATCH)
++        index = len(self._effects)
++        self._effects.append(effect)
++        evidence = dispatch()
++        if not _is_digest(evidence):
++            raise ContinuationError("invalid_continuation_commit_evidence")
++        committed = replace(
++            effect, state=EffectState.COMMITTED, commit_evidence_digest=evidence
++        )
++        self._effects[index] = committed
++        return committed
++
++    def emit(self, output: Any) -> None:
++        """Buffer one protected output until the final release check.
++
++        Args:
++            output: Worker result; never inspected, logged or persisted here.
++        """
++
++        self._outputs.append(output)
++
++    def _require(
++        self,
++        boundary: ContinuationBoundary,
++        *,
++        checkpoint: str | None = None,
++    ) -> ContinuationOutcome:
++        self._boundary = boundary
++        if self._cancellation is not None and self._cancellation.cancelled:
++            outcome = self._guard.cancel(
++                self._record,
++                self._work_id,
++                boundary=boundary,
++                buffered_outputs=len(self._outputs),
++                effects=self.effects,
++            )
++        else:
++            outcome = self._guard.check(
++                self._record,
++                self._work_id,
++                boundary,
++                checkpoint=checkpoint,
++                buffered_outputs=len(self._outputs),
++                effects=self.effects,
++            )
++        if outcome.disposition is not ContinuationDisposition.CONTINUE:
++            self._issued.append(outcome)
++            if self._interruption is None:
++                self._interruption = outcome
++            raise ContinuationInterrupted(outcome)
++        return outcome
++
++
++@dataclass(frozen=True, slots=True, repr=False)
++class ContinuationResult:
++    """Final outcome of one guarded run, its released outputs and effects.
++
++    Attributes:
++        outcome: Terminal :class:`ContinuationOutcome`.
++        outputs: Released outputs; empty unless the run completed.
++        effects: Every effect dispatched under the epoch, as recorded.
++    """
++
++    outcome: ContinuationOutcome
++    outputs: tuple[Any, ...]
++    effects: tuple[EffectRecord, ...]
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the outcome and content-free effect records; never outputs."""
++
++        return {
++            "outcome": self.outcome.to_dict(),
++            "effects": [effect.to_dict() for effect in self.effects],
++        }
++
++    def __repr__(self) -> str:
++        return (
++            "ContinuationResult("
++            f"disposition={self.outcome.disposition.value!r}, "
++            f"reason={self.outcome.reason.value!r}, "
++            f"outputs={len(self.outputs)}, effects={len(self.effects)})"
++        )
++
++
++def _validate_runner(guard: Any, record: Any, cancellation: Any) -> None:
++    if type(guard) is not ContinuationGuard:
++        raise ContinuationError("invalid_continuation_guard")
++    if type(record) is not ContinuationRecord:
++        raise ContinuationError("invalid_continuation_record")
++    if cancellation is not None and type(cancellation) is not CancellationSignal:
++        raise ContinuationError("invalid_continuation_cancellation")
++
++
++def run_continuation(
++    guard: ContinuationGuard,
++    record: ContinuationRecord,
++    work_id: str,
++    worker: Callable[[ContinuationContext], None],
++    *,
++    resumed: bool = False,
++    cancellation: CancellationSignal | None = None,
++) -> ContinuationResult:
++    """Run one queued unit of work under continuous authorization.
++
++    The start (or resume) boundary is checked before ``worker`` is called, each
++    checkpoint and effect is checked by the context, and buffered outputs are
++    released only after a final protected output check. A worker exception is
++    contained as a ``continuation_worker_failed`` quarantine without keeping its
++    message or traceback.
++
++    Args:
++        guard: Continuation guard built on the injected authority runtime.
++        record: Admitted or restored continuation record.
++        work_id: Identifier of the work being executed.
++        worker: Callable receiving a :class:`ContinuationContext`.
++        resumed: ``True`` when a restarted worker resumes persisted work.
++        cancellation: Optional existing cooperative cancellation signal.
++
++    Returns:
++        The :class:`ContinuationResult`.
++
++    Raises:
++        ContinuationError: If an argument is malformed.
++    """
++
++    _validate_runner(guard, record, cancellation)
++    if not callable(worker) or type(resumed) is not bool:
++        raise ContinuationError("invalid_continuation_worker")
++    work_digest(work_id)
++    context = ContinuationContext(guard, record, work_id, cancellation)
++    start = (
++        ContinuationBoundary.RESUME if resumed else ContinuationBoundary.EXECUTION_START
++    )
++    outcome: ContinuationOutcome | None = None
++    failed = False
++    try:
++        context._require(start)
++        worker(context)
++        context._require(ContinuationBoundary.PROTECTED_OUTPUT)
++    except ContinuationInterrupted as interrupted:
++        if not any(interrupted.outcome is issued for issued in context._issued):
++            failed = True
++    except (KeyboardInterrupt, SystemExit):
++        context._outputs.clear()
++        raise
++    except Exception:
++        failed = True
++    effects = context.effects
++    if context._interruption is not None:
++        # The first stop is authoritative even if the worker swallowed it and
++        # kept going; later boundaries could only report the closed epoch.
++        outcome = replace(
++            context._interruption, withheld_output_count=len(context._outputs)
++        )
++    elif failed:
++        outcome = guard._terminate(
++            record,
++            context._boundary,
++            ContinuationReason.WORKER_FAILED,
++            delivered=0,
++            buffered=len(context._outputs),
++            effects=effects,
++        )
++    if outcome is None:
++        # Completion closes the epoch; if the ledger cannot record that, the
++        # buffered outputs stay withheld rather than being released unrecorded.
++        outputs = tuple(context._outputs)
++        outcome = guard._decide(
++            record,
++            ContinuationBoundary.PROTECTED_OUTPUT,
++            ContinuationReason.COMPLETED,
++            checkpoint=None,
++            delivered=len(outputs),
++            buffered=len(outputs),
++            summary=_effect_summary(effects),
++        )
++        if outcome.disposition is ContinuationDisposition.COMPLETED:
++            return ContinuationResult(outcome, outputs, effects)
++        outcome = replace(outcome, delivered_output_count=0)
++    context._outputs.clear()
++    return ContinuationResult(outcome, (), effects)
++
++
++def continuation_error_event(outcome: ContinuationOutcome) -> dict[str, Any]:
++    """Return an NDJSON-style terminal error event for a stopped stream.
++
++    The shape matches the service streaming error envelope and carries only
++    controlled codes, counts and the epoch digest.
++
++    Args:
++        outcome: Terminal outcome reported by :class:`GuardedStream`.
++
++    Returns:
++        A ``{"type": "error", "error": {...}}`` mapping.
++    """
++
++    if type(outcome) is not ContinuationOutcome:
++        raise ContinuationError("invalid_continuation_outcome")
++    return {
++        "type": "error",
++        "error": {
++            "code": outcome.reason.value,
++            "message": "Continuation authorization ended the response",
++            "details": {
++                "boundary": outcome.boundary.value,
++                "disposition": outcome.disposition.value,
++                "delivered_output_count": outcome.delivered_output_count,
++                "withheld_output_count": outcome.withheld_output_count,
++                "epoch_digest": outcome.epoch_digest,
++            },
++        },
++    }
++
++
++class GuardedStream:
++    """Single-use stream wrapper that rechecks authority before every chunk.
++
++    Iterate synchronously over an iterable source or asynchronously over an
++    async iterable source. The start boundary is checked before the source is
++    read. Each chunk is pulled, then released only after a fresh protected
++    output check; a denied chunk is discarded and counted as withheld. The
++    source is always closed. Consumer disconnects and task cancellation are
++    recorded as ``continuation_cancelled``.
++
++    Args:
++        guard: Continuation guard built on the injected authority runtime.
++        record: Admitted or restored continuation record.
++        work_id: Identifier of the stream being served.
++        source: Injected chunk source (sync or async iterable).
++        cancellation: Optional existing cooperative cancellation signal.
++        terminal: Optional callable turning the terminal outcome into one last
++            item, for example :func:`continuation_error_event`. Without it a
++            stop raises :class:`ContinuationInterrupted`.
++
++    Attributes:
++        outcome: Terminal outcome once the stream ends, else ``None``.
++    """
++
++    def __init__(
++        self,
++        guard: ContinuationGuard,
++        record: ContinuationRecord,
++        work_id: str,
++        source: Any,
++        *,
++        cancellation: CancellationSignal | None = None,
++        terminal: Callable[[ContinuationOutcome], Any] | None = None,
++    ) -> None:
++        _validate_runner(guard, record, cancellation)
++        work_digest(work_id)
++        if terminal is not None and not callable(terminal):
++            raise ContinuationError("invalid_continuation_stream")
++        self._guard = guard
++        self._record = record
++        self._work_id = work_id
++        self._source = source
++        self._cancellation = cancellation
++        self._terminal = terminal
++        self._claimed = False
++        self._delivered = 0
++        self.outcome: ContinuationOutcome | None = None
++
++    def __iter__(self) -> Iterator[Any]:
++        """Return the guarded synchronous iterator; usable once."""
++
++        self._claim()
++        return self._iterate()
++
++    def __aiter__(self) -> AsyncIterator[Any]:
++        """Return the guarded asynchronous iterator; usable once."""
++
++        self._claim()
++        return self._aiterate()
++
++    def _claim(self) -> None:
++        if self._claimed:
++            raise ContinuationError("invalid_continuation_stream")
++        self._claimed = True
++
++    def _cancelled(self) -> bool:
++        return self._cancellation is not None and self._cancellation.cancelled
++
++    def _gate(
++        self, boundary: ContinuationBoundary, buffered: int
++    ) -> ContinuationOutcome | None:
++        if self._cancelled():
++            outcome = self._guard.cancel(
++                self._record,
++                self._work_id,
++                boundary=boundary,
++                delivered_outputs=self._delivered,
++                buffered_outputs=buffered,
++            )
++        else:
++            outcome = self._guard.check(
++                self._record,
++                self._work_id,
++                boundary,
++                delivered_outputs=self._delivered,
++                buffered_outputs=buffered,
++            )
++        if outcome.disposition is ContinuationDisposition.CONTINUE:
++            return None
++        return outcome
++
++    def _stop(self, reason: ContinuationReason, buffered: int) -> ContinuationOutcome:
++        return self._guard._terminate(
++            self._record,
++            ContinuationBoundary.PROTECTED_OUTPUT,
++            reason,
++            delivered=self._delivered,
++            buffered=buffered,
++            effects=(),
++        )
++
++    def _finish(self) -> ContinuationOutcome:
++        return self._guard._decide(
++            self._record,
++            ContinuationBoundary.PROTECTED_OUTPUT,
++            ContinuationReason.COMPLETED,
++            checkpoint=None,
++            delivered=self._delivered,
++            buffered=0,
++            summary=(0, 0, None),
++        )
++
++    def _disconnected(self) -> None:
++        if self.outcome is None:
++            self.outcome = self._guard.cancel(
++                self._record,
++                self._work_id,
++                boundary=ContinuationBoundary.PROTECTED_OUTPUT,
++                delivered_outputs=self._delivered,
++            )
++
++    def _iterate(self) -> Iterator[Any]:
++        iterator: Any = None
++        try:
++            stop = self._gate(ContinuationBoundary.EXECUTION_START, 0)
++            if stop is None:
++                iterator = iter(self._source)
++            while stop is None:
++                if self._cancelled():
++                    stop = self._gate(ContinuationBoundary.PROTECTED_OUTPUT, 0)
++                    break
++                item = _END_OF_SOURCE
++                failed = False
++                try:
++                    item = next(iterator)
++                except StopIteration:
++                    pass
++                except Exception:
++                    failed = True
++                if failed:
++                    stop = self._stop(ContinuationReason.SOURCE_FAILED, 0)
++                    break
++                if item is _END_OF_SOURCE:
++                    self.outcome = self._finish()
++                    return
++                stop = self._gate(ContinuationBoundary.PROTECTED_OUTPUT, 1)
++                if stop is not None:
++                    item = None
++                    break
++                self._delivered += 1
++                yield item
++                item = None
++            self.outcome = stop
++            if self._terminal is None:
++                raise ContinuationInterrupted(stop)
++            yield self._terminal(stop)
++        except GeneratorExit:
++            self._disconnected()
++            raise
++        finally:
++            _close_sync(iterator if iterator is not None else self._source)
++
++    async def _aiterate(self) -> AsyncIterator[Any]:
++        iterator: Any = None
++        try:
++            stop = self._gate(ContinuationBoundary.EXECUTION_START, 0)
++            if stop is None:
++                iterator = self._source.__aiter__()
++            while stop is None:
++                if self._cancelled():
++                    stop = self._gate(ContinuationBoundary.PROTECTED_OUTPUT, 0)
++                    break
++                item = _END_OF_SOURCE
++                failed = False
++                try:
++                    item = await iterator.__anext__()
++                except StopAsyncIteration:
++                    pass
++                except Exception:
++                    failed = True
++                if failed:
++                    stop = self._stop(ContinuationReason.SOURCE_FAILED, 0)
++                    break
++                if item is _END_OF_SOURCE:
++                    self.outcome = self._finish()
++                    return
++                stop = self._gate(ContinuationBoundary.PROTECTED_OUTPUT, 1)
++                if stop is not None:
++                    item = None
++                    break
++                self._delivered += 1
++                yield item
++                item = None
++            self.outcome = stop
++            if self._terminal is None:
++                raise ContinuationInterrupted(stop)
++            yield self._terminal(stop)
++        except (GeneratorExit, asyncio.CancelledError):
++            self._disconnected()
++            raise
++        finally:
++            await _close_async(iterator if iterator is not None else self._source)
++
++
++def _close_sync(source: Any) -> None:
++    close = getattr(source, "close", None)
++    if callable(close):
++        try:
++            close()
++        except Exception:
++            pass
++
++
++async def _close_async(source: Any) -> None:
++    aclose = getattr(source, "aclose", None)
++    try:
++        if callable(aclose):
++            await aclose()
++        else:
++            _close_sync(source)
++    except Exception:
++        pass
++
++
++__all__ = [
++    "CONTINUATION_OUTCOME_VERSION",
++    "CONTINUATION_RECORD_VERSION",
++    "MAX_CONTINUATION_EFFECTS",
++    "MAX_DECLARED_CHECKPOINTS",
++    "ContinuationBoundary",
++    "ContinuationContext",
++    "ContinuationDisposition",
++    "ContinuationError",
++    "ContinuationGuard",
++    "ContinuationInterrupted",
++    "ContinuationLedger",
++    "ContinuationOutcome",
++    "ContinuationReason",
++    "ContinuationRecord",
++    "ContinuationResult",
++    "GuardedStream",
++    "InMemoryContinuationLedger",
++    "ReconciliationState",
++    "consent_authority",
++    "continuation_error_event",
++    "principal_authority",
++    "run_continuation",
++    "work_digest",
++]
+diff --git a/tests/fixtures/service/continuation_authority.py b/tests/fixtures/service/continuation_authority.py
+new file mode 100644
+index 0000000000..665ccda0c0
+--- /dev/null
++++ b/tests/fixtures/service/continuation_authority.py
+@@ -0,0 +1,160 @@
++"""Synthetic continuation-authority harness; no identity service or network."""
++
++from __future__ import annotations
++
++from openmed.agent.correlation import ActionId, RunId
++from openmed.agent.identifiers import ToolId
++from openmed.agent.permissions.revocation import (
++    AuthorityRuntime,
++    InMemoryAuthorityGenerationStore,
++)
++from openmed.agent.workflows.recovery import (
++    CompensationLimit,
++    EffectKind,
++    EffectRecord,
++)
++from openmed.service.auth import AuthPrincipal
++from openmed.service.continuation_auth import (
++    ContinuationGuard,
++    InMemoryContinuationLedger,
++    consent_authority,
++    principal_authority,
++)
++from tests.fixtures.agent.authority_status import (
++    SyntheticClock,
++    SyntheticStatusProvider,
++)
++
++SENTINEL = "SENTINEL-PHI-Jane-Roe-555-0100"
++WORK_ID = "job-synthetic-0001"
++RUN_ID = RunId("run_" + "7" * 32)
++POLICY_REVISION = "policy:org.example/deid@3"
++CONSENT_DIGEST = "sha256:" + "c" * 64
++COMMIT_EVIDENCE = "sha256:" + "e" * 64
++
++
++class ContinuationAuthority:
++    """One synthetic authority service plus a worker-process guard.
++
++    The provider and clock model the authority service, which outlives a worker
++    restart. The generation store and ledger belong to the worker process unless
++    a test passes durable copies into :meth:`restart`.
++    """
++
++    def __init__(
++        self,
++        *,
++        provider: SyntheticStatusProvider | None = None,
++        clock: SyntheticClock | None = None,
++        store: InMemoryAuthorityGenerationStore | None = None,
++        ledger: InMemoryContinuationLedger | None = None,
++    ) -> None:
++        self.clock = clock if clock is not None else SyntheticClock()
++        self.provider = (
++            provider if provider is not None else SyntheticStatusProvider(self.clock)
++        )
++        self.store = store if store is not None else InMemoryAuthorityGenerationStore()
++        self.ledger = ledger if ledger is not None else InMemoryContinuationLedger()
++        self.runtime = AuthorityRuntime(self.provider, self.store, clock=self.clock)
++        self.guard = ContinuationGuard(self.runtime, ledger=self.ledger)
++        self.principal = AuthPrincipal(
++            subject=SENTINEL,
++            credential_type="api_key",
++            scopes=("deidentify", "jobs"),
++            key_id="synthetic-key",
++        )
++        self.scope = principal_authority(
++            self.principal, policy_revision=POLICY_REVISION, expires_at=100
++        )
++        self.consent = consent_authority(CONSENT_DIGEST, expires_at=100)
++        self.contracts = (self.scope, self.consent)
++        if provider is None:
++            self.provider.register(self.contracts)
++
++    def restart(
++        self,
++        *,
++        store: InMemoryAuthorityGenerationStore | None = None,
++        ledger: InMemoryContinuationLedger | None = None,
++    ) -> "ContinuationAuthority":
++        """Return a new worker process against the same authority service."""
++
++        return ContinuationAuthority(
++            provider=self.provider, clock=self.clock, store=store, ledger=ledger
++        )
++
++
++def pending_effect(ordinal: int) -> EffectRecord:
++    """Return one content-free pending effect for the synthetic run."""
++
++    return EffectRecord.create(
++        ordinal=ordinal,
++        run_id=RUN_ID,
++        action_id=ActionId("act_" + str(ordinal + 1) * 32),
++        tool_id=ToolId("tool:org.example/sink@1.0.0"),
++        kind=EffectKind.LOCAL_TOOL,
++        operation_digest="sha256:" + str(ordinal + 1) * 64,
++        approval_required=False,
++        compensation_limit=CompensationLimit.NONE,
++    )
++
++
++class SyntheticSink:
++    """Effect sink that durably commits once per call and returns evidence."""
++
++    def __init__(self) -> None:
++        self.commits: list[str] = []
++        self.fail = False
++
++    def commit(self, key: str) -> str:
++        if self.fail:
++            raise RuntimeError(SENTINEL)
++        self.commits.append(key)
++        return COMMIT_EVIDENCE
++
++
++class SyntheticSource:
++    """Closable synchronous stream source that records how far it was read."""
++
++    def __init__(self, chunks: list[str], *, fail_at: int | None = None) -> None:
++        self.chunks = chunks
++        self.fail_at = fail_at
++        self.read = 0
++        self.closed = False
++
++    def __iter__(self) -> "SyntheticSource":
++        return self
++
++    def __next__(self) -> str:
++        if self.fail_at is not None and self.read == self.fail_at:
++            raise RuntimeError(SENTINEL)
++        if self.read >= len(self.chunks):
++            raise StopIteration
++        chunk = self.chunks[self.read]
++        self.read += 1
++        return chunk
++
++    def close(self) -> None:
++        self.closed = True
++
++
++class SyntheticAsyncSource:
++    """Closable asynchronous stream source mirroring :class:`SyntheticSource`."""
++
++    def __init__(self, chunks: list[str]) -> None:
++        self.chunks = chunks
++        self.read = 0
++        self.closed = False
++
++    def __aiter__(self) -> "SyntheticAsyncSource":
++        return self
++
++    async def __anext__(self) -> str:
++        if self.read >= len(self.chunks):
++            raise StopAsyncIteration
++        chunk = self.chunks[self.read]
++        self.read += 1
++        return chunk
++
++    async def aclose(self) -> None:
++        self.closed = True
+diff --git a/tests/integration/service/test_continuation_authorization_flow.py b/tests/integration/service/test_continuation_authorization_flow.py
+new file mode 100644
+index 0000000000..b9f93ab37c
+--- /dev/null
++++ b/tests/integration/service/test_continuation_authorization_flow.py
+@@ -0,0 +1,262 @@
++"""Queued job, worker restart and NDJSON stream under continuation authority.
++
++Everything is offline and synthetic: a JSON-file job store stands in for the
++durable queue, JSON-file stores stand in for the durable generation high water
++and closed-epoch ledger, and the authority service is an in-process provider.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++from pathlib import Path
++
++import pytest
++
++from openmed.agent.permissions.revocation import AuthorityRuntime, AuthorityStatus
++from openmed.service.continuation_auth import (
++    ContinuationDisposition,
++    ContinuationGuard,
++    ContinuationReason,
++    ContinuationRecord,
++    GuardedStream,
++    ReconciliationState,
++    continuation_error_event,
++    run_continuation,
++)
++from tests.fixtures.service.continuation_authority import (
++    SENTINEL,
++    ContinuationAuthority,
++    SyntheticSink,
++    pending_effect,
++)
++
++pytestmark = pytest.mark.integration
++
++DOCUMENTS = ("doc-a", "doc-b", "doc-c")
++
++
++class FileGenerations:
++    """Test-only durable implementation of the generation-store contract."""
++
++    def __init__(self, path: Path) -> None:
++        self.path = path
++
++    def observe(self, status: AuthorityStatus) -> bool:
++        state = json.loads(self.path.read_text()) if self.path.exists() else {}
++        key = f"{status.kind.value}:{status.digest}"
++        previous = state.get(key)
++        if previous is not None:
++            generation, revoked = previous
++            if (
++                status.generation < generation
++                or (status.generation == generation and status.revoked != revoked)
++                or (revoked and not status.revoked)
++            ):
++                return False
++        state[key] = [status.generation, status.revoked]
++        self.path.write_text(json.dumps(state, sort_keys=True))
++        return True
++
++
++class FileLedger:
++    """Test-only durable closed-epoch ledger shared by worker processes."""
++
++    def __init__(self, path: Path) -> None:
++        self.path = path
++
++    def _load(self) -> list[str]:
++        return json.loads(self.path.read_text()) if self.path.exists() else []
++
++    def is_closed(self, epoch_digest: str) -> bool:
++        return epoch_digest in self._load()
++
++    def close(self, epoch_digest: str) -> bool:
++        closed = set(self._load()) | {epoch_digest}
++        self.path.write_text(json.dumps(sorted(closed)))
++        return True
++
++
++class JobStore:
++    """JSON-file job queue holding only continuation metadata and outcomes."""
++
++    def __init__(self, path: Path) -> None:
++        self.path = path
++
++    def save(self, job_id: str, record: dict) -> None:
++        jobs = self.load()
++        jobs[job_id] = record
++        self.path.write_text(json.dumps(jobs, sort_keys=True))
++
++    def load(self) -> dict:
++        return json.loads(self.path.read_text()) if self.path.exists() else {}
++
++
++def _worker_process(fixture: ContinuationAuthority, tmp_path: Path):
++    """Build one worker process: fresh runtime over durable stores."""
++
++    runtime = AuthorityRuntime(
++        fixture.provider,
++        FileGenerations(tmp_path / "generations.json"),
++        clock=fixture.clock,
++    )
++    return ContinuationGuard(runtime, ledger=FileLedger(tmp_path / "ledger"))
++
++
++def _document_worker(sink: SyntheticSink, on_document=None):
++    def worker(ctx):
++        for ordinal, document in enumerate(DOCUMENTS):
++            ctx.checkpoint("document")
++            effect = pending_effect(ordinal)
++            ctx.commit_effect(effect, lambda: sink.commit(effect.idempotency_key))
++            ctx.emit({"document": document, "text": SENTINEL})
++            if on_document is not None:
++                on_document(ordinal)
++
++    return worker
++
++
++def test_revoking_consent_mid_job_stops_work_and_survives_restart(tmp_path):
++    authority = ContinuationAuthority()
++    jobs = JobStore(tmp_path / "jobs.json")
++    sink = SyntheticSink()
++
++    # Admission in the API process.
++    api = _worker_process(authority, tmp_path)
++    record = api.admit("job-1", authority.contracts, checkpoints=("document",))
++    jobs.save("job-1", {"status": "queued", "continuation": record.to_dict()})
++
++    # Worker process picks the job up; consent is revoked after document 0.
++    worker_guard = _worker_process(authority, tmp_path)
++    restored = ContinuationRecord.from_dict(jobs.load()["job-1"]["continuation"])
++
++    def revoke_after_first(ordinal):
++        if ordinal == 0:
++            authority.provider.revoke(authority.consent)
++
++    result = run_continuation(
++        worker_guard, restored, "job-1", _document_worker(sink, revoke_after_first)
++    )
++    outcome = result.outcome
++    assert outcome.disposition is ContinuationDisposition.STOPPED
++    assert outcome.reason is ContinuationReason.AUTHORITY_REVOKED
++    assert outcome.checkpoint == "document"
++    assert len(sink.commits) == 1
++    assert outcome.committed_effect_count == 1
++    assert outcome.withheld_output_count == 1
++    assert outcome.reconciliation is ReconciliationState.COMMITTED_EFFECTS_RETAINED
++    assert result.outputs == ()
++    jobs.save(
++        "job-1",
++        {
++            "status": outcome.disposition.value,
++            "continuation": restored.to_dict(),
++            "result": result.to_dict(),
++        },
++    )
++    stored = (tmp_path / "jobs.json").read_text()
++    assert SENTINEL not in stored and "job-1" in stored
++    assert json.loads(stored)["job-1"]["result"]["outcome"]["compensation"] == (
++        "not_attempted"
++    )
++
++    # A restarted worker that trusts only the persisted metadata, or an operator
++    # who resets the status field to "queued", cannot revive the job.
++    jobs.save("job-1", {**jobs.load()["job-1"], "status": "queued"})
++    restarted = _worker_process(authority, tmp_path)
++    again = run_continuation(
++        restarted,
++        ContinuationRecord.from_dict(jobs.load()["job-1"]["continuation"]),
++        "job-1",
++        _document_worker(sink),
++        resumed=True,
++    )
++    assert again.outcome.reason is ContinuationReason.TERMINAL
++    assert len(sink.commits) == 1
++
++    # Even with a lost ledger, the authority service still reports revocation.
++    (tmp_path / "ledger").unlink()
++    fresh = _worker_process(authority, tmp_path)
++    again = run_continuation(
++        fresh,
++        ContinuationRecord.from_dict(jobs.load()["job-1"]["continuation"]),
++        "job-1",
++        _document_worker(sink),
++        resumed=True,
++    )
++    assert again.outcome.reason is ContinuationReason.AUTHORITY_REVOKED
++    assert len(sink.commits) == 1
++
++
++def test_queued_job_revoked_before_pickup_never_runs(tmp_path):
++    authority = ContinuationAuthority()
++    sink = SyntheticSink()
++    api = _worker_process(authority, tmp_path)
++    record = api.admit("job-2", authority.contracts, checkpoints=("document",))
++    authority.provider.revoke(authority.scope)
++
++    worker_guard = _worker_process(authority, tmp_path)
++    result = run_continuation(worker_guard, record, "job-2", _document_worker(sink))
++    assert sink.commits == []
++    assert result.outcome.reason is ContinuationReason.AUTHORITY_REVOKED
++    assert result.outcome.reconciliation is ReconciliationState.NO_EFFECTS
++
++    # An unrevoked job on the same worker completes and releases its outputs.
++    other = ContinuationAuthority()
++    record = other.guard.admit("job-3", other.contracts, checkpoints=("document",))
++    result = run_continuation(other.guard, record, "job-3", _document_worker(sink))
++    assert result.outcome.disposition is ContinuationDisposition.COMPLETED
++    assert len(result.outputs) == len(DOCUMENTS)
++    assert len(sink.commits) == len(DOCUMENTS)
++
++
++def test_ndjson_stream_stops_releasing_chunks_after_revocation(tmp_path):
++    authority = ContinuationAuthority()
++    guard = _worker_process(authority, tmp_path)
++    record = guard.admit("stream-1", authority.contracts)
++
++    class RedactedChunks:
++        def __init__(self) -> None:
++            self.closed = False
++            self.index = 0
++
++        def __aiter__(self):
++            return self
++
++        async def __anext__(self):
++            if self.index >= 4:
++                raise StopAsyncIteration
++            self.index += 1
++            text = "[REDACTED] chunk" if self.index == 1 else SENTINEL
++            return json.dumps({"type": "chunk", "redacted_text": text}) + "\n"
++
++        async def aclose(self):
++            self.closed = True
++
++    async def serve():
++        source = RedactedChunks()
++        stream = GuardedStream(
++            guard,
++            record,
++            "stream-1",
++            source,
++            terminal=lambda outcome: (
++                json.dumps(continuation_error_event(outcome)) + "\n"
++            ),
++        )
++        body = []
++        async for line in stream:
++            body.append(line)
++            authority.provider.revoke(authority.consent)
++        return body, source, stream.outcome
++
++    body, source, outcome = asyncio.run(serve())
++    assert len(body) == 2
++    assert json.loads(body[0])["redacted_text"] == "[REDACTED] chunk"
++    error = json.loads(body[1])["error"]
++    assert error["code"] == ContinuationReason.AUTHORITY_REVOKED.value
++    assert error["details"]["delivered_output_count"] == 1
++    assert SENTINEL not in "".join(body)
++    assert source.closed
++    assert outcome.withheld_output_count == 1
++    assert json.dumps(outcome.to_dict()).count("sha256:") >= 2
+diff --git a/tests/unit/service/test_continuation_auth.py b/tests/unit/service/test_continuation_auth.py
+new file mode 100644
+index 0000000000..6429613440
+--- /dev/null
++++ b/tests/unit/service/test_continuation_auth.py
+@@ -0,0 +1,800 @@
++"""Offline negative controls for service continuation authorization."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import traceback
++
++import pytest
++
++from openmed.agent.permissions.revocation import (
++    AuthorityKind,
++    AuthorityReason,
++    InMemoryAuthorityGenerationStore,
++)
++from openmed.agent.workflows.recovery import EffectState
++from openmed.agent.workflows.scheduler import CancellationSignal
++from openmed.service.auth import AuthPrincipal
++from openmed.service.continuation_auth import (
++    CONTINUATION_OUTCOME_VERSION,
++    CONTINUATION_RECORD_VERSION,
++    ContinuationBoundary,
++    ContinuationDisposition,
++    ContinuationError,
++    ContinuationGuard,
++    ContinuationInterrupted,
++    ContinuationReason,
++    ContinuationRecord,
++    GuardedStream,
++    InMemoryContinuationLedger,
++    ReconciliationState,
++    consent_authority,
++    continuation_error_event,
++    principal_authority,
++    run_continuation,
++    work_digest,
++)
++from tests.fixtures.service.continuation_authority import (
++    CONSENT_DIGEST,
++    POLICY_REVISION,
++    SENTINEL,
++    WORK_ID,
++    ContinuationAuthority,
++    SyntheticAsyncSource,
++    SyntheticSink,
++    SyntheticSource,
++    pending_effect,
++)
++
++_OUTCOME_FIELDS = {
++    "schema_version",
++    "boundary",
++    "disposition",
++    "reason_code",
++    "reconciliation",
++    "compensation",
++    "work_digest",
++    "epoch_digest",
++    "authority_count",
++    "checkpoint",
++    "delivered_output_count",
++    "withheld_output_count",
++    "committed_effect_count",
++    "pending_effect_count",
++    "committed_effect_digest",
++}
++
++
++def _admit(fixture: ContinuationAuthority, checkpoints=("documents", "effects")):
++    return fixture.guard.admit(WORK_ID, fixture.contracts, checkpoints=checkpoints)
++
++
++def _assert_no_sentinel(*values: object) -> None:
++    for value in values:
++        assert SENTINEL not in repr(value)
++        assert SENTINEL not in str(value)
++        if hasattr(value, "to_dict"):
++            assert SENTINEL not in json.dumps(value.to_dict(), sort_keys=True)
++
++
++# -- Admission, epoch binding and persisted metadata -------------------------
++
++
++def test_admission_binds_an_authorization_epoch_to_content_free_metadata():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++
++    payload = record.to_dict()
++    assert payload["schema_version"] == CONTINUATION_RECORD_VERSION
++    assert set(payload) == {
++        "schema_version",
++        "admission_id",
++        "work_digest",
++        "checkpoints",
++        "authority",
++    }
++    assert payload["work_digest"] == work_digest(WORK_ID)
++    assert payload["checkpoints"] == ["documents", "effects"]
++    assert {v["kind"] for v in payload["authority"]["versions"]} == {
++        AuthorityKind.GRANT.value,
++        AuthorityKind.PURPOSE_TICKET.value,
++    }
++    restored = ContinuationRecord.from_dict(json.loads(json.dumps(payload)))
++    assert restored == record
++    assert restored.epoch_digest == record.epoch_digest
++    assert record.epoch_digest.startswith("sha256:")
++    encoded = json.dumps(payload)
++    assert SENTINEL not in encoded and WORK_ID not in encoded
++    assert "Jane" not in repr(record)
++
++    # A second admission of the same work under the same authority is a new
++    # epoch, so cancelling one admission never blocks a fresh resubmission.
++    assert _admit(fixture).epoch_digest != record.epoch_digest
++
++
++def test_admission_requires_active_known_authority():
++    for setup, reason in [
++        ("revoked", ContinuationReason.AUTHORITY_REVOKED),
++        ("unknown", ContinuationReason.AUTHORITY_UNAVAILABLE),
++        ("expired", ContinuationReason.AUTHORITY_EXPIRED),
++    ]:
++        fixture = ContinuationAuthority()
++        if setup == "revoked":
++            fixture.provider.revoke(fixture.consent)
++        elif setup == "unknown":
++            fixture.provider.records.clear()
++        else:
++            fixture.clock.now = 100
++        with pytest.raises(ContinuationInterrupted) as error:
++            _admit(fixture)
++        outcome = error.value.outcome
++        assert outcome.boundary is ContinuationBoundary.ADMISSION
++        assert outcome.reason is reason
++        assert outcome.epoch_digest is None
++        assert error.value.code == reason.value
++        _assert_no_sentinel(error.value, outcome)
++
++
++def test_principal_authority_commits_to_scope_and_policy_revision():
++    fixture = ContinuationAuthority()
++    base = fixture.scope
++    assert base.kind is AuthorityKind.GRANT
++    assert base.expires_at == 100
++    assert SENTINEL not in repr(base)
++    narrowed = AuthPrincipal(
++        subject=SENTINEL,
++        credential_type="api_key",
++        scopes=("deidentify",),
++        key_id="synthetic-key",
++    )
++    variants = [
++        principal_authority(narrowed, policy_revision=POLICY_REVISION, expires_at=100),
++        principal_authority(
++            fixture.principal,
++            policy_revision="policy:org.example/deid@4",
++            expires_at=100,
++        ),
++    ]
++    assert all(v.digest != base.digest for v in variants)
++    reordered = AuthPrincipal(
++        subject=SENTINEL,
++        credential_type="api_key",
++        scopes=("jobs", "deidentify"),
++        key_id="synthetic-key",
++    )
++    assert (
++        principal_authority(reordered, policy_revision=POLICY_REVISION, expires_at=100)
++        == base
++    )
++    consent = consent_authority(CONSENT_DIGEST, expires_at=100)
++    assert consent.kind is AuthorityKind.PURPOSE_TICKET
++    assert consent.digest != CONSENT_DIGEST
++
++
++def test_invalid_inputs_fail_with_fixed_codes_that_never_echo_values():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    cases = [
++        lambda: work_digest(""),
++        lambda: work_digest(SENTINEL * 20),
++        lambda: fixture.guard.admit(WORK_ID, (), checkpoints=()),
++        lambda: fixture.guard.admit(
++            WORK_ID, fixture.contracts, checkpoints=(SENTINEL,)
++        ),
++        lambda: fixture.guard.admit(WORK_ID, fixture.contracts, checkpoints=("a", "a")),
++        lambda: fixture.guard.check(record, WORK_ID, SENTINEL),
++        lambda: fixture.guard.check(SENTINEL, WORK_ID, ContinuationBoundary.RESUME),
++        lambda: consent_authority(SENTINEL, expires_at=100),
++        lambda: principal_authority(
++            fixture.principal, policy_revision=SENTINEL + " x", expires_at=100
++        ),
++        lambda: principal_authority(object(), policy_revision="p", expires_at=100),
++        lambda: ContinuationGuard(object()),
++    ]
++    for case in cases:
++        with pytest.raises(ContinuationError) as error:
++            case()
++        assert error.value.code.startswith("invalid_")
++        _assert_no_sentinel(error.value)
++        assert error.value.__cause__ is None
++
++
++# -- Boundary revalidation ----------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "boundary",
++    [
++        ContinuationBoundary.EXECUTION_START,
++        ContinuationBoundary.RESUME,
++        ContinuationBoundary.CHECKPOINT,
++        ContinuationBoundary.EFFECT_DISPATCH,
++        ContinuationBoundary.PROTECTED_OUTPUT,
++    ],
++)
++def test_every_boundary_performs_a_fresh_lookup_and_stops_on_revocation(boundary):
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    checkpoint = "documents" if boundary is ContinuationBoundary.CHECKPOINT else None
++    calls = fixture.provider.calls
++    outcome = fixture.guard.check(record, WORK_ID, boundary, checkpoint=checkpoint)
++    assert outcome.disposition is ContinuationDisposition.CONTINUE
++    assert outcome.reason is ContinuationReason.ACTIVE
++    assert fixture.provider.calls == calls + len(fixture.contracts)
++
++    fixture.provider.revoke(fixture.consent)
++    outcome = fixture.guard.check(record, WORK_ID, boundary, checkpoint=checkpoint)
++    assert outcome.disposition is ContinuationDisposition.STOPPED
++    assert outcome.reason is ContinuationReason.AUTHORITY_REVOKED
++    assert outcome.boundary is boundary
++    assert outcome.epoch_digest == record.epoch_digest
++    assert set(outcome.to_dict()) == _OUTCOME_FIELDS
++    assert outcome.to_dict()["schema_version"] == CONTINUATION_OUTCOME_VERSION
++
++
++def test_expiry_stops_and_integrity_failures_quarantine():
++    cases = {
++        "expired": (ContinuationReason.AUTHORITY_EXPIRED, "stopped"),
++        "unavailable": (ContinuationReason.AUTHORITY_UNAVAILABLE, "quarantined"),
++        "stale": (ContinuationReason.AUTHORITY_STALE, "quarantined"),
++        "generation": (ContinuationReason.AUTHORITY_GENERATION_CHANGED, "quarantined"),
++        "work_mismatch": (ContinuationReason.WORK_MISMATCH, "quarantined"),
++        "undeclared": (ContinuationReason.UNDECLARED_CHECKPOINT, "quarantined"),
++        "missing_checkpoint": (
++            ContinuationReason.UNDECLARED_CHECKPOINT,
++            "quarantined",
++        ),
++    }
++    for case, (reason, disposition) in cases.items():
++        fixture = ContinuationAuthority()
++        record = _admit(fixture)
++        work_id = WORK_ID
++        boundary = ContinuationBoundary.RESUME
++        checkpoint = None
++        if case == "expired":
++            fixture.clock.now = 100
++        elif case == "unavailable":
++            fixture.provider.unavailable = True
++        elif case == "stale":
++            status = fixture.provider.get_status(
++                fixture.scope.kind, fixture.scope.digest
++            )
++            fixture.provider.override = type(status)(
++                status.kind,
++                status.digest,
++                status.generation,
++                status.revoked,
++                status.observed_at - 1,
++            )
++        elif case == "generation":
++            key = (fixture.scope.kind, fixture.scope.digest)
++            fixture.provider.records[key] = (1, False)
++        elif case == "work_mismatch":
++            work_id = "job-synthetic-other"
++        elif case == "undeclared":
++            boundary = ContinuationBoundary.CHECKPOINT
++            checkpoint = "not_declared"
++        else:
++            boundary = ContinuationBoundary.CHECKPOINT
++        outcome = fixture.guard.check(record, work_id, boundary, checkpoint=checkpoint)
++        assert outcome.reason is reason, case
++        assert outcome.disposition.value == disposition, case
++        _assert_no_sentinel(outcome)
++
++
++def test_every_runtime_denial_reason_maps_to_a_closed_continuation_reason():
++    for reason in AuthorityReason:
++        if reason is AuthorityReason.ACTIVE:
++            continue
++        assert ContinuationReason(reason.value).value == reason.value
++
++
++def test_terminal_epoch_cannot_continue_even_with_active_authority():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    cancelled = fixture.guard.cancel(record, WORK_ID)
++    assert cancelled.disposition is ContinuationDisposition.STOPPED
++    assert cancelled.reason is ContinuationReason.CANCELLED
++    outcome = fixture.guard.check(record, WORK_ID, ContinuationBoundary.RESUME)
++    assert outcome.reason is ContinuationReason.TERMINAL
++    assert outcome.disposition is ContinuationDisposition.STOPPED
++
++
++def test_ledger_failure_quarantines_without_continuing():
++    class BrokenLedger:
++        def is_closed(self, epoch_digest):
++            raise RuntimeError(SENTINEL)
++
++        def close(self, epoch_digest):
++            raise RuntimeError(SENTINEL)
++
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    broken = ContinuationGuard(fixture.runtime, ledger=BrokenLedger())
++    outcome = broken.check(record, WORK_ID, ContinuationBoundary.RESUME)
++    assert outcome.reason is ContinuationReason.LEDGER_UNAVAILABLE
++    assert outcome.disposition is ContinuationDisposition.QUARANTINED
++    _assert_no_sentinel(outcome)
++
++
++# -- Restart cannot revive stale consent ---------------------------------------
++
++
++def test_restarted_worker_cannot_revive_revoked_consent_from_metadata():
++    fixture = ContinuationAuthority()
++    persisted = json.dumps(_admit(fixture).to_dict())
++    fixture.provider.revoke(fixture.consent)
++
++    # Fresh process: empty generation store and ledger, same authority service.
++    restarted = fixture.restart()
++    record = ContinuationRecord.from_dict(json.loads(persisted))
++    outcome = restarted.guard.check(record, WORK_ID, ContinuationBoundary.RESUME)
++    assert outcome.disposition is ContinuationDisposition.STOPPED
++    assert outcome.reason is ContinuationReason.AUTHORITY_REVOKED
++
++    # Re-pinning the restored binding to the provider's current generation is
++    # still revoked: generations never resurrect a tombstoned artifact.
++    payload = json.loads(persisted)
++    for version in payload["authority"]["versions"]:
++        version["generation"] = 1
++    forged = ContinuationRecord.from_dict(payload)
++    outcome = restarted.guard.check(forged, WORK_ID, ContinuationBoundary.RESUME)
++    assert outcome.disposition is not ContinuationDisposition.CONTINUE
++
++
++def test_restored_metadata_cannot_carry_cached_consent_or_status():
++    fixture = ContinuationAuthority()
++    payload = _admit(fixture).to_dict()
++    for extra in [
++        {"authorized": True},
++        {"status": "active"},
++        {"consent_active": True},
++        {"observed_at": 10},
++    ]:
++        with pytest.raises(ContinuationError) as error:
++            ContinuationRecord.from_dict({**payload, **extra})
++        assert error.value.code == "invalid_continuation_record"
++    for missing in list(payload):
++        broken = dict(payload)
++        broken.pop(missing)
++        with pytest.raises(ContinuationError):
++            ContinuationRecord.from_dict(broken)
++    with pytest.raises(ContinuationError):
++        ContinuationRecord.from_dict({**payload, "schema_version": "v0"})
++
++
++def test_restart_with_durable_ledger_keeps_quarantine_and_rollback_detection():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    assert fixture.guard.cancel(record, WORK_ID).reason is ContinuationReason.CANCELLED
++    restarted = fixture.restart(ledger=fixture.ledger)
++    outcome = restarted.guard.check(record, WORK_ID, ContinuationBoundary.RESUME)
++    assert outcome.reason is ContinuationReason.TERMINAL
++
++    # A durable generation store rejects a provider rolling back a revocation.
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    fixture.provider.revoke(fixture.scope)
++    assert (
++        fixture.guard.check(record, WORK_ID, ContinuationBoundary.RESUME).reason
++        is ContinuationReason.AUTHORITY_REVOKED
++    )
++    fixture.provider.records[(fixture.scope.kind, fixture.scope.digest)] = (0, False)
++    restarted = fixture.restart(store=fixture.store)
++    outcome = restarted.guard.check(record, WORK_ID, ContinuationBoundary.RESUME)
++    assert outcome.reason is ContinuationReason.AUTHORITY_ROLLBACK
++    assert outcome.disposition is ContinuationDisposition.QUARANTINED
++
++
++# -- Queued execution ---------------------------------------------------------
++
++
++def test_queued_work_completes_and_releases_outputs_after_final_check():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    sink = SyntheticSink()
++
++    def worker(ctx):
++        ctx.checkpoint("documents")
++        ctx.emit({"document": 0})
++        effect = pending_effect(0)
++        ctx.commit_effect(effect, lambda: sink.commit(effect.idempotency_key))
++        ctx.checkpoint("effects")
++        ctx.emit({"document": 1})
++
++    result = run_continuation(fixture.guard, record, WORK_ID, worker)
++    outcome = result.outcome
++    assert outcome.disposition is ContinuationDisposition.COMPLETED
++    assert outcome.reason is ContinuationReason.COMPLETED
++    assert outcome.boundary is ContinuationBoundary.PROTECTED_OUTPUT
++    assert result.outputs == ({"document": 0}, {"document": 1})
++    assert outcome.delivered_output_count == 2
++    assert outcome.committed_effect_count == 1
++    assert outcome.reconciliation is ReconciliationState.COMMITTED_EFFECTS_RETAINED
++    assert [e.state for e in result.effects] == [EffectState.COMMITTED]
++    assert len(sink.commits) == 1
++    # Completion closes the epoch: the same admission cannot be replayed.
++    again = run_continuation(fixture.guard, record, WORK_ID, worker, resumed=True)
++    assert again.outcome.reason is ContinuationReason.TERMINAL
++    assert again.outputs == ()
++    assert len(sink.commits) == 1
++
++
++def test_revocation_before_queued_execution_never_starts_the_worker():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    fixture.provider.revoke(fixture.scope)
++    started = []
++    result = run_continuation(
++        fixture.guard, record, WORK_ID, lambda ctx: started.append(True)
++    )
++    assert started == []
++    assert result.outcome.boundary is ContinuationBoundary.EXECUTION_START
++    assert result.outcome.reason is ContinuationReason.AUTHORITY_REVOKED
++    assert result.outcome.reconciliation is ReconciliationState.NO_EFFECTS
++
++
++def test_revocation_mid_run_keeps_committed_effects_and_discards_buffer():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    sink = SyntheticSink()
++    reached = []
++
++    def worker(ctx):
++        ctx.emit(SENTINEL)
++        first = pending_effect(0)
++        ctx.commit_effect(first, lambda: sink.commit(first.idempotency_key))
++        fixture.provider.revoke(fixture.consent)
++        ctx.checkpoint("effects")
++        reached.append(True)
++        second = pending_effect(1)
++        ctx.commit_effect(second, lambda: sink.commit(second.idempotency_key))
++
++    result = run_continuation(fixture.guard, record, WORK_ID, worker)
++    outcome = result.outcome
++    assert reached == []
++    assert len(sink.commits) == 1
++    assert result.outputs == ()
++    assert outcome.boundary is ContinuationBoundary.CHECKPOINT
++    assert outcome.checkpoint == "effects"
++    assert outcome.disposition is ContinuationDisposition.STOPPED
++    assert outcome.delivered_output_count == 0
++    assert outcome.withheld_output_count == 1
++    assert outcome.committed_effect_count == 1
++    assert outcome.pending_effect_count == 0
++    assert outcome.reconciliation is ReconciliationState.COMMITTED_EFFECTS_RETAINED
++    assert outcome.to_dict()["compensation"] == "not_attempted"
++    assert outcome.committed_effect_digest.startswith("sha256:")
++    assert [e.state for e in result.effects] == [EffectState.COMMITTED]
++    _assert_no_sentinel(result, outcome)
++
++
++def test_effect_dispatch_is_rechecked_immediately_before_each_effect():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    sink = SyntheticSink()
++
++    def worker(ctx):
++        effect = pending_effect(0)
++        fixture.provider.revoke(fixture.scope)
++        ctx.commit_effect(effect, lambda: sink.commit(effect.idempotency_key))
++
++    result = run_continuation(fixture.guard, record, WORK_ID, worker)
++    assert sink.commits == []
++    assert result.outcome.boundary is ContinuationBoundary.EFFECT_DISPATCH
++    assert result.effects == ()
++    assert result.outcome.reconciliation is ReconciliationState.NO_EFFECTS
++
++
++def test_revocation_after_worker_returns_withholds_all_buffered_output():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++
++    def worker(ctx):
++        ctx.emit(SENTINEL)
++        ctx.emit(SENTINEL)
++        fixture.clock.now = 100
++
++    result = run_continuation(fixture.guard, record, WORK_ID, worker)
++    assert result.outputs == ()
++    assert result.outcome.boundary is ContinuationBoundary.PROTECTED_OUTPUT
++    assert result.outcome.reason is ContinuationReason.AUTHORITY_EXPIRED
++    assert result.outcome.withheld_output_count == 2
++    _assert_no_sentinel(result)
++
++
++def test_worker_and_dispatch_failures_quarantine_without_leaking():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++
++    def failing(ctx):
++        ctx.emit(SENTINEL)
++        raise RuntimeError(SENTINEL)
++
++    result = run_continuation(fixture.guard, record, WORK_ID, failing)
++    assert result.outcome.reason is ContinuationReason.WORKER_FAILED
++    assert result.outcome.disposition is ContinuationDisposition.QUARANTINED
++    assert result.outputs == ()
++    _assert_no_sentinel(result)
++
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    sink = SyntheticSink()
++    sink.fail = True
++
++    def ambiguous(ctx):
++        effect = pending_effect(0)
++        ctx.commit_effect(effect, lambda: sink.commit(effect.idempotency_key))
++
++    result = run_continuation(fixture.guard, record, WORK_ID, ambiguous)
++    outcome = result.outcome
++    assert outcome.reason is ContinuationReason.WORKER_FAILED
++    assert outcome.pending_effect_count == 1
++    assert outcome.committed_effect_count == 0
++    assert outcome.reconciliation is ReconciliationState.PENDING_EFFECTS_UNCONFIRMED
++    assert [e.state for e in result.effects] == [EffectState.PENDING]
++    _assert_no_sentinel(result)
++
++
++def test_invalid_commit_evidence_is_never_recorded_as_committed():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++
++    def worker(ctx):
++        ctx.commit_effect(pending_effect(0), lambda: SENTINEL)
++
++    result = run_continuation(fixture.guard, record, WORK_ID, worker)
++    assert (
++        result.outcome.reconciliation is ReconciliationState.PENDING_EFFECTS_UNCONFIRMED
++    )
++    assert result.outcome.committed_effect_count == 0
++    _assert_no_sentinel(result)
++
++
++def test_cancellation_signal_stops_and_never_claims_to_undo_effects():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    sink = SyntheticSink()
++    signal = CancellationSignal()
++
++    def worker(ctx):
++        effect = pending_effect(0)
++        ctx.commit_effect(effect, lambda: sink.commit(effect.idempotency_key))
++        ctx.emit({"document": 0})
++        signal.cancel()
++        ctx.checkpoint("effects")
++
++    result = run_continuation(
++        fixture.guard, record, WORK_ID, worker, cancellation=signal
++    )
++    outcome = result.outcome
++    assert outcome.reason is ContinuationReason.CANCELLED
++    assert outcome.disposition is ContinuationDisposition.STOPPED
++    assert outcome.committed_effect_count == 1
++    assert outcome.withheld_output_count == 1
++    assert outcome.to_dict()["compensation"] == "not_attempted"
++    assert len(sink.commits) == 1
++    assert result.outputs == ()
++
++
++def test_interruption_from_a_different_epoch_is_not_trusted():
++    first = ContinuationAuthority()
++    other_record = _admit(first)
++    other = first.guard.cancel(other_record, WORK_ID)
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++
++    def worker(ctx):
++        raise ContinuationInterrupted(other)
++
++    result = run_continuation(fixture.guard, record, WORK_ID, worker)
++    assert result.outcome.epoch_digest == record.epoch_digest
++    assert result.outcome.reason is ContinuationReason.WORKER_FAILED
++
++
++# -- Streams ------------------------------------------------------------------
++
++
++def test_revoked_stream_releases_no_later_protected_chunk():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture, checkpoints=())
++    source = SyntheticSource(["chunk-0", "chunk-1", SENTINEL, SENTINEL])
++    stream = GuardedStream(fixture.guard, record, WORK_ID, source)
++    received = []
++    with pytest.raises(ContinuationInterrupted) as error:
++        for chunk in stream:
++            received.append(chunk)
++            if len(received) == 2:
++                fixture.provider.revoke(fixture.consent)
++    assert received == ["chunk-0", "chunk-1"]
++    assert source.closed
++    assert source.read == 3
++    outcome = stream.outcome
++    assert outcome is error.value.outcome
++    assert outcome.boundary is ContinuationBoundary.PROTECTED_OUTPUT
++    assert outcome.reason is ContinuationReason.AUTHORITY_REVOKED
++    assert outcome.delivered_output_count == 2
++    assert outcome.withheld_output_count == 1
++    rendered = "".join(traceback.format_exception(error.value))
++    assert SENTINEL not in rendered
++    _assert_no_sentinel(outcome, error.value)
++
++
++def test_stream_terminal_event_replaces_the_withheld_chunk():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture, checkpoints=())
++    source = SyntheticSource(["chunk-0", SENTINEL])
++    stream = GuardedStream(
++        fixture.guard,
++        record,
++        WORK_ID,
++        source,
++        terminal=continuation_error_event,
++    )
++    received = []
++    for item in stream:
++        received.append(item)
++        fixture.clock.now = 100
++    assert received[0] == "chunk-0"
++    event = received[1]
++    assert event["type"] == "error"
++    assert event["error"]["code"] == ContinuationReason.AUTHORITY_EXPIRED.value
++    assert event["error"]["details"]["delivered_output_count"] == 1
++    assert len(received) == 2
++    assert SENTINEL not in json.dumps(event)
++
++
++def test_stream_start_is_checked_before_reading_the_source():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture, checkpoints=())
++    fixture.provider.revoke(fixture.scope)
++    source = SyntheticSource([SENTINEL])
++    stream = GuardedStream(fixture.guard, record, WORK_ID, source)
++    with pytest.raises(ContinuationInterrupted) as error:
++        list(stream)
++    assert error.value.outcome.boundary is ContinuationBoundary.EXECUTION_START
++    assert source.read == 0
++    assert source.closed
++
++
++def test_stream_completion_source_failure_and_consumer_disconnect():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture, checkpoints=())
++    stream = GuardedStream(fixture.guard, record, WORK_ID, SyntheticSource(["a"]))
++    assert list(stream) == ["a"]
++    assert stream.outcome.disposition is ContinuationDisposition.COMPLETED
++    with pytest.raises(ContinuationError):
++        list(stream)
++    replay = GuardedStream(fixture.guard, record, WORK_ID, SyntheticSource(["a"]))
++    with pytest.raises(ContinuationInterrupted) as error:
++        list(replay)
++    assert error.value.outcome.reason is ContinuationReason.TERMINAL
++
++    fixture = ContinuationAuthority()
++    record = _admit(fixture, checkpoints=())
++    source = SyntheticSource(["a", "b"], fail_at=1)
++    stream = GuardedStream(fixture.guard, record, WORK_ID, source)
++    with pytest.raises(ContinuationInterrupted) as error:
++        list(stream)
++    assert error.value.outcome.reason is ContinuationReason.SOURCE_FAILED
++    assert error.value.outcome.disposition is ContinuationDisposition.QUARANTINED
++    assert error.value.__cause__ is None and error.value.__context__ is None
++    assert source.closed
++
++    fixture = ContinuationAuthority()
++    record = _admit(fixture, checkpoints=())
++    source = SyntheticSource(["a", "b", "c"])
++    stream = GuardedStream(fixture.guard, record, WORK_ID, source)
++    iterator = iter(stream)
++    assert next(iterator) == "a"
++    iterator.close()
++    assert source.closed
++    assert stream.outcome.reason is ContinuationReason.CANCELLED
++    assert stream.outcome.delivered_output_count == 1
++
++
++def test_async_stream_stops_on_revocation_and_on_task_cancellation():
++    async def revoked():
++        fixture = ContinuationAuthority()
++        record = _admit(fixture, checkpoints=())
++        source = SyntheticAsyncSource(["chunk-0", SENTINEL])
++        stream = GuardedStream(
++            fixture.guard, record, WORK_ID, source, terminal=continuation_error_event
++        )
++        received = []
++        async for item in stream:
++            received.append(item)
++            fixture.provider.revoke(fixture.consent)
++        return received, source, stream.outcome
++
++    received, source, outcome = asyncio.run(revoked())
++    assert received[0] == "chunk-0"
++    assert received[1]["error"]["code"] == ContinuationReason.AUTHORITY_REVOKED.value
++    assert source.closed
++    assert outcome.withheld_output_count == 1
++
++    async def cancelled():
++        fixture = ContinuationAuthority()
++        record = _admit(fixture, checkpoints=())
++        source = SyntheticAsyncSource(["a", "b", "c"])
++        stream = GuardedStream(fixture.guard, record, WORK_ID, source)
++        signal = CancellationSignal()
++        stream_with_signal = GuardedStream(
++            fixture.guard,
++            fixture.guard.admit(WORK_ID, fixture.contracts),
++            WORK_ID,
++            SyntheticAsyncSource(["x", "y"]),
++            cancellation=signal,
++        )
++        seen = []
++        iterator = stream.__aiter__()
++        seen.append(await iterator.__anext__())
++        await iterator.aclose()
++        signalled = []
++        with pytest.raises(ContinuationInterrupted) as error:
++            async for item in stream_with_signal:
++                signalled.append(item)
++                signal.cancel()
++        return seen, source, stream.outcome, signalled, error.value.outcome
++
++    seen, source, outcome, signalled, signal_outcome = asyncio.run(cancelled())
++    assert seen == ["a"]
++    assert source.closed
++    assert outcome.reason is ContinuationReason.CANCELLED
++    assert signalled == ["x"]
++    assert signal_outcome.reason is ContinuationReason.CANCELLED
++    assert signal_outcome.withheld_output_count == 0
++
++
++def test_guard_rejects_records_from_another_process_ledger_consistently():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    ledger = InMemoryContinuationLedger()
++    assert ledger.is_closed(record.epoch_digest) is False
++    assert ledger.close(record.epoch_digest) is True
++    assert ledger.is_closed(record.epoch_digest) is True
++    assert ledger.close(record.epoch_digest) is True
++    guard = ContinuationGuard(fixture.runtime, ledger=ledger)
++    outcome = guard.check(record, WORK_ID, ContinuationBoundary.RESUME)
++    assert outcome.reason is ContinuationReason.TERMINAL
++
++
++def test_completion_withholds_outputs_when_the_epoch_cannot_be_closed():
++    class UnclosableLedger:
++        def is_closed(self, epoch_digest):
++            return False
++
++        def close(self, epoch_digest):
++            return False
++
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++    guard = ContinuationGuard(fixture.runtime, ledger=UnclosableLedger())
++    result = run_continuation(guard, record, WORK_ID, lambda ctx: ctx.emit(SENTINEL))
++    assert result.outputs == ()
++    assert result.outcome.reason is ContinuationReason.LEDGER_UNAVAILABLE
++    assert result.outcome.delivered_output_count == 0
++    assert result.outcome.withheld_output_count == 1
++    _assert_no_sentinel(result)
++
++
++def test_worker_swallowing_an_interruption_cannot_release_later_output():
++    fixture = ContinuationAuthority()
++    record = _admit(fixture)
++
++    def worker(ctx):
++        fixture.provider.revoke(fixture.consent)
++        try:
++            ctx.checkpoint("documents")
++        except ContinuationInterrupted:
++            pass
++        ctx.emit(SENTINEL)
++        ctx.emit(SENTINEL)
++
++    result = run_continuation(fixture.guard, record, WORK_ID, worker)
++    assert result.outputs == ()
++    assert result.outcome.reason is ContinuationReason.AUTHORITY_REVOKED
++    assert result.outcome.checkpoint == "documents"
++    assert result.outcome.withheld_output_count == 2
++    _assert_no_sentinel(result)

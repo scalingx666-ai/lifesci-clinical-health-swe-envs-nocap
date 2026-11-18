@@ -1,0 +1,1377 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_14_0/8308-tag-search-filter-on-resolved-tag-id.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_14_0/8308-tag-search-filter-on-resolved-tag-id.yaml
+new file mode 100644
+index 000000000000..e5cbdc433446
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_14_0/8308-tag-search-filter-on-resolved-tag-id.yaml
+@@ -0,0 +1,9 @@
++---
++type: performance
++issue: 8308
++title: "Faster queries using _tag, and _security.
++Previously, searches using the `_tag`, or `_security` parameters resolved the tag
++  through a join to `HFJ_TAG_DEF`, hiding the selective tag id from the database query planner. For
++  high-cardinality tags this led to cardinality underestimates and very slow query plans. This has been
++  fixed by resolving the matching tag id(s) up front and filtering on the indexed `HFJ_RES_TAG.TAG_ID`
++  column directly."
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/ITagDefinitionDao.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/ITagDefinitionDao.java
+index abb8ccb5cda0..73f46f7460c1 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/ITagDefinitionDao.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/ITagDefinitionDao.java
+@@ -26,6 +26,7 @@
+ import org.springframework.data.jpa.repository.Query;
+ import org.springframework.data.repository.query.Param;
+ 
++import java.util.Collection;
+ import java.util.List;
+ 
+ public interface ITagDefinitionDao extends JpaRepository<TagDefinition, Long>, IHapiFhirJpaRepository {
+@@ -41,4 +42,14 @@ List<TagDefinition> findByTagTypeAndSchemeAndTermAndVersionAndUserSelected(
+ 			@Param("version") String version,
+ 			@Param("userSelected") Boolean userSelected,
+ 			Pageable pageable);
++
++	/**
++	 * Fetches all tag definitions of the given types whose code is in the supplied collection. Used to
++	 * batch-resolve the tag ids for a {@code _tag}/{@code _security}/{@code _profile} search in a single
++	 * lookup — including when a search mixes those parameters — so the system/type is matched by the
++	 * caller and this deliberately filters on type + code only.
++	 */
++	@Query("SELECT t FROM TagDefinition t WHERE t.myTagType IN :tagTypes AND t.myCode IN :codes")
++	List<TagDefinition> findByTagTypesAndCodes(
++			@Param("tagTypes") Collection<TagTypeEnum> tagTypes, @Param("codes") Collection<String> codes);
+ }
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/QueryStack.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/QueryStack.java
+index 79b3828736ed..c4256c5eb889 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/QueryStack.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/QueryStack.java
+@@ -25,11 +25,14 @@
+ import ca.uhn.fhir.i18n.Msg;
+ import ca.uhn.fhir.interceptor.model.RequestPartitionId;
+ import ca.uhn.fhir.jpa.api.config.JpaStorageSettings;
++import ca.uhn.fhir.jpa.dao.BaseHapiFhirDao;
+ import ca.uhn.fhir.jpa.dao.BaseStorageDao;
++import ca.uhn.fhir.jpa.dao.data.ITagDefinitionDao;
+ import ca.uhn.fhir.jpa.dao.predicate.SearchFilterParser;
+ import ca.uhn.fhir.jpa.model.config.PartitionSettings;
+ import ca.uhn.fhir.jpa.model.dao.JpaPid;
+ import ca.uhn.fhir.jpa.model.entity.NormalizedQuantitySearchLevel;
++import ca.uhn.fhir.jpa.model.entity.TagDefinition;
+ import ca.uhn.fhir.jpa.model.entity.TagTypeEnum;
+ import ca.uhn.fhir.jpa.model.util.UcumServiceUtil;
+ import ca.uhn.fhir.jpa.search.builder.models.MissingParameterQueryParams;
+@@ -86,6 +89,7 @@
+ import ca.uhn.fhir.rest.param.TokenParam;
+ import ca.uhn.fhir.rest.param.TokenParamModifier;
+ import ca.uhn.fhir.rest.param.UriParam;
++import ca.uhn.fhir.rest.param.UriParamQualifierEnum;
+ import ca.uhn.fhir.rest.server.exceptions.InternalErrorException;
+ import ca.uhn.fhir.rest.server.exceptions.InvalidRequestException;
+ import ca.uhn.fhir.rest.server.exceptions.MethodNotAllowedException;
+@@ -105,7 +109,6 @@
+ import jakarta.annotation.Nonnull;
+ import jakarta.annotation.Nullable;
+ import org.apache.commons.lang3.StringUtils;
+-import org.apache.commons.lang3.tuple.Triple;
+ import org.hl7.fhir.instance.model.api.IAnyResource;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -117,6 +120,7 @@
+ import java.util.Collections;
+ import java.util.EnumSet;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+@@ -155,6 +159,28 @@ public class QueryStack {
+ 	private final JpaStorageSettings myStorageSettings;
+ 	private final EnumSet<PredicateBuilderTypeEnum> myReusePredicateBuilderTypes;
+ 	private final RequestDetails myRequestDetails;
++
++	/**
++	 * Used to resolve tag definition ids up front for {@code _tag}/{@code _security}/{@code _profile}
++	 * searches so the generated SQL filters on {@code HFJ_RES_TAG.TAG_ID} directly instead of joining
++	 * {@code HFJ_TAG_DEF}. May be {@code null}, in which case the legacy join behaviour is used.
++	 */
++	@Nullable
++	private final ITagDefinitionDao myTagDefinitionDao;
++
++	/**
++	 * Tag definitions for this search's {@code _tag}/{@code _security}/{@code _profile} parameters,
++	 * resolved once (across all of them) and cached so mixing those parameters issues a single lookup.
++	 */
++	@Nullable
++	private List<TagDefinition> myResolvedTagDefinitions;
++	/**
++	 * The tag codes included in {@link #myResolvedTagDefinitions}, used to detect a code that was not
++	 * part of the batched lookup so it can safely fall back to the legacy join.
++	 */
++	@Nullable
++	private Set<String> myResolvedTagCodes;
++
+ 	private Map<PredicateBuilderCacheKey, BaseJoiningPredicateBuilder> myJoinMap;
+ 	private Map<String, BaseJoiningPredicateBuilder> myParamNameToPredicateBuilderMap;
+ 	// used for _offset queries with sort, should be removed once the fix is applied to the async path too.
+@@ -171,7 +197,8 @@ public QueryStack(
+ 			FhirContext theFhirContext,
+ 			SearchQueryBuilder theSqlBuilder,
+ 			ISearchParamRegistry theSearchParamRegistry,
+-			PartitionSettings thePartitionSettings) {
++			PartitionSettings thePartitionSettings,
++			@Nullable ITagDefinitionDao theTagDefinitionDao) {
+ 		this(
+ 				theRequestDetails,
+ 				theSearchParameters,
+@@ -180,7 +207,8 @@ public QueryStack(
+ 				theSqlBuilder,
+ 				theSearchParamRegistry,
+ 				thePartitionSettings,
+-				EnumSet.of(PredicateBuilderTypeEnum.DATE, PredicateBuilderTypeEnum.REFERENCE));
++				EnumSet.of(PredicateBuilderTypeEnum.DATE, PredicateBuilderTypeEnum.REFERENCE),
++				theTagDefinitionDao);
+ 	}
+ 
+ 	/**
+@@ -194,7 +222,8 @@ private QueryStack(
+ 			SearchQueryBuilder theSqlBuilder,
+ 			ISearchParamRegistry theSearchParamRegistry,
+ 			PartitionSettings thePartitionSettings,
+-			EnumSet<PredicateBuilderTypeEnum> theReusePredicateBuilderTypes) {
++			EnumSet<PredicateBuilderTypeEnum> theReusePredicateBuilderTypes,
++			@Nullable ITagDefinitionDao theTagDefinitionDao) {
+ 		myRequestDetails = theRequestDetails;
+ 		myPartitionSettings = thePartitionSettings;
+ 		assert theSearchParameters != null;
+@@ -208,6 +237,7 @@ private QueryStack(
+ 		mySqlBuilder = theSqlBuilder;
+ 		mySearchParamRegistry = theSearchParamRegistry;
+ 		myReusePredicateBuilderTypes = theReusePredicateBuilderTypes;
++		myTagDefinitionDao = theTagDefinitionDao;
+ 	}
+ 
+ 	public void addSortOnCoordsNear(String theParamName, boolean theAscending, SearchParameterMap theParams) {
+@@ -2111,18 +2141,31 @@ public Condition createPredicateTag(
+ 			throw new IllegalArgumentException(Msg.code(1217) + "Param name: " + theParamName); // shouldn't happen
+ 		}
+ 
++		// Resolve the tag definitions for the whole search (all _tag/_security/_profile params) in a
++		// single HFJ_TAG_DEF lookup, cached on this QueryStack so mixing those parameters still issues
++		// only one lookup. Null means pre-resolution is unavailable (no DAO wired) and the legacy
++		// HFJ_TAG_DEF join is used.
++		List<TagDefinition> resolvedDefinitions = resolveAllTagDefinitions();
++
+ 		List<Condition> andPredicates = new ArrayList<>();
+ 		for (List<? extends IQueryParameterType> nextAndParams : theList) {
+ 			if (!checkHaveTags(nextAndParams, theParamName)) {
+ 				continue;
+ 			}
+ 
+-			List<Triple<String, String, String>> tokens = Lists.newArrayList();
++			List<TagToken> tokens = Lists.newArrayList();
+ 			boolean paramInverted = populateTokens(tokens, nextAndParams);
+ 			if (tokens.isEmpty()) {
+ 				continue;
+ 			}
+ 
++			// Pick out the resolved tag id(s) for this and-param so the generated SQL can filter on
++			// HFJ_RES_TAG.TAG_ID directly instead of joining HFJ_TAG_DEF. Returns null when
++			// pre-resolution is not possible (no DAO wired, or a :below qualifier forces the legacy join).
++			// An empty (but non-null) list means the tag does not exist: for a positive match this
++			// resolves to an always-false predicate, and for :not it becomes NOT IN (empty) = match all.
++			List<Long> resolvedTagIds = tagIdsForTokens(tagType, tokens, resolvedDefinitions);
++
+ 			Condition tagPredicate;
+ 			BaseJoiningPredicateBuilder join;
+ 			if (paramInverted) {
+@@ -2130,8 +2173,10 @@ public Condition createPredicateTag(
+ 				boolean selectPartitionId = myPartitionSettings.isDatabasePartitionMode();
+ 				SearchQueryBuilder sqlBuilder = mySqlBuilder.newChildSqlBuilder(selectPartitionId);
+ 				TagPredicateBuilder tagSelector = sqlBuilder.addTagPredicateBuilder(null);
+-				sqlBuilder.addPredicate(
+-						tagSelector.createPredicateTag(tagType, tokens, theParamName, theRequestPartitionId));
++				Condition subQueryPredicate = resolvedTagIds != null
++						? tagSelector.createPredicateTagIds(resolvedTagIds)
++						: tagSelector.createPredicateTag(tagType, tokens, theParamName, theRequestPartitionId);
++				sqlBuilder.addPredicate(subQueryPredicate);
+ 
+ 				join = mySqlBuilder.getOrCreateFirstPredicateBuilder();
+ 				tagPredicate = mySqlBuilder
+@@ -2149,7 +2194,9 @@ public Condition createPredicateTag(
+ 								theParamName,
+ 								() -> mySqlBuilder.addTagPredicateBuilder(theSourceJoinColumn))
+ 						.getResult();
+-				tagPredicate = tagJoin.createPredicateTag(tagType, tokens, theParamName, theRequestPartitionId);
++				tagPredicate = resolvedTagIds != null
++						? tagJoin.createPredicateTagIds(resolvedTagIds)
++						: tagJoin.createPredicateTag(tagType, tokens, theParamName, theRequestPartitionId);
+ 				join = tagJoin;
+ 			}
+ 
+@@ -2159,8 +2206,113 @@ public Condition createPredicateTag(
+ 		return toAndPredicate(andPredicates);
+ 	}
+ 
+-	private boolean populateTokens(
+-			List<Triple<String, String, String>> theTokens, List<? extends IQueryParameterType> theAndParams) {
++	/**
++	 * Resolves, in a single {@code HFJ_TAG_DEF} lookup, every tag definition referenced by the
++	 * {@code _tag}, {@code _security} and {@code _profile} parameters of this search. The result is
++	 * cached on this {@link QueryStack} so a search that mixes those parameters still issues only one
++	 * lookup. The type and system are matched per token later in {@link #tagIdsForTokens}.
++	 *
++	 * @return the matching tag definitions (possibly empty), or {@code null} when no
++	 *     {@link ITagDefinitionDao} is wired (in which case the legacy {@code HFJ_TAG_DEF} join is used).
++	 */
++	@Nullable
++	private List<TagDefinition> resolveAllTagDefinitions() {
++		if (myTagDefinitionDao == null) {
++			return null;
++		}
++
++		if (myResolvedTagDefinitions == null) {
++			Set<TagTypeEnum> tagTypes = EnumSet.noneOf(TagTypeEnum.class);
++			myResolvedTagCodes = new HashSet<>();
++			collectTagCodes(Constants.PARAM_TAG, TagTypeEnum.TAG, tagTypes, myResolvedTagCodes);
++			collectTagCodes(Constants.PARAM_PROFILE, TagTypeEnum.PROFILE, tagTypes, myResolvedTagCodes);
++			collectTagCodes(Constants.PARAM_SECURITY, TagTypeEnum.SECURITY_LABEL, tagTypes, myResolvedTagCodes);
++
++			myResolvedTagDefinitions = myResolvedTagCodes.isEmpty()
++					? Collections.emptyList()
++					: myTagDefinitionDao.findByTagTypesAndCodes(tagTypes, myResolvedTagCodes);
++		}
++
++		return myResolvedTagDefinitions;
++	}
++
++	/**
++	 * Adds the codes of every non-{@code :below} token of the given parameter to {@code theCodes} (and
++	 * records its tag type in {@code theTagTypes}), so {@link #resolveAllTagDefinitions()} can batch them
++	 * into one lookup.
++	 */
++	private void collectTagCodes(
++			String theParamName, TagTypeEnum theTagType, Set<TagTypeEnum> theTagTypes, Set<String> theCodes) {
++		List<List<IQueryParameterType>> andOrParams = mySearchParameters.get(theParamName);
++		if (andOrParams == null) {
++			return;
++		}
++		for (List<IQueryParameterType> nextAndParams : andOrParams) {
++			List<TagToken> tokens = Lists.newArrayList();
++			populateTokens(tokens, nextAndParams);
++			for (TagToken next : tokens) {
++				// :below (left-match) can't be resolved to exact ids; that and-param keeps the legacy join.
++				if (!Objects.equals(next.qualifier(), UriParamQualifierEnum.BELOW.getValue())) {
++					theTagTypes.add(theTagType);
++					theCodes.add(next.code());
++				}
++			}
++		}
++	}
++
++	/**
++	 * Resolves the {@code HFJ_TAG_DEF.TAG_ID} value(s) matching the given tag tokens from the
++	 * pre-fetched definitions, so a {@code _tag}/{@code _security}/{@code _profile} search can filter on
++	 * {@code HFJ_RES_TAG.TAG_ID} directly, keeping the selective tag id visible to the query planner
++	 * instead of hiding it behind a join.
++	 *
++	 * @return the matching tag ids (an empty list means none exist), or {@code null} when pre-resolution
++	 *     should not be applied — no {@link ITagDefinitionDao} is wired ({@code theDefinitions} is
++	 *     {@code null}), a token uses the {@code :below} qualifier whose left-match must stay in the
++	 *     legacy join path, or a token's code was not part of the batched lookup (e.g. a nested search).
++	 */
++	@Nullable
++	private List<Long> tagIdsForTokens(
++			TagTypeEnum theTagType, List<TagToken> theTokens, @Nullable List<TagDefinition> theDefinitions) {
++		if (theDefinitions == null) {
++			return null;
++		}
++
++		List<Long> tagIds = new ArrayList<>();
++		for (TagToken next : theTokens) {
++			String system = next.system();
++			String qualifier = next.qualifier();
++			String code = next.code();
++
++			// A left-match (:below) can expand to an unbounded set of tag ids; keep the legacy join.
++			if (Objects.equals(qualifier, UriParamQualifierEnum.BELOW.getValue())) {
++				return null;
++			}
++
++			// If this code was not part of the batched lookup (e.g. a nested search whose parameters are
++			// not in the top-level map), fall back to the legacy join rather than risk a false "no match".
++			if (myResolvedTagCodes == null || !myResolvedTagCodes.contains(code)) {
++				return null;
++			}
++
++			if (theTagType == TagTypeEnum.PROFILE) {
++				system = BaseHapiFhirDao.NS_JPA_PROFILE;
++			}
++
++			for (TagDefinition definition : theDefinitions) {
++				// Match type + code + system; a blank system matches the code in any system, mirroring the
++				// legacy join predicate.
++				if (theTagType == definition.getTagType()
++						&& code.equals(definition.getCode())
++						&& (isBlank(system) || system.equals(definition.getSystem()))) {
++					tagIds.add(definition.getId());
++				}
++			}
++		}
++		return tagIds;
++	}
++
++	private boolean populateTokens(List<TagToken> theTokens, List<? extends IQueryParameterType> theAndParams) {
+ 		boolean paramInverted = false;
+ 
+ 		for (IQueryParameterType nextOrParam : theAndParams) {
+@@ -2184,7 +2336,7 @@ private boolean populateTokens(
+ 			}
+ 
+ 			if (isNotBlank(code)) {
+-				theTokens.add(Triple.of(system, nextOrParam.getQueryParameterQualifier(), code));
++				theTokens.add(new TagToken(system, nextOrParam.getQueryParameterQualifier(), code));
+ 			}
+ 		}
+ 		return paramInverted;
+@@ -2447,7 +2599,8 @@ public QueryStack newChildQueryFactoryWithFullBuilderReuse() {
+ 				mySqlBuilder,
+ 				mySearchParamRegistry,
+ 				myPartitionSettings,
+-				EnumSet.allOf(PredicateBuilderTypeEnum.class));
++				EnumSet.allOf(PredicateBuilderTypeEnum.class),
++				myTagDefinitionDao);
+ 	}
+ 
+ 	@Nullable
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/SearchBuilder.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/SearchBuilder.java
+index 2273b18270a5..5989a1408b18 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/SearchBuilder.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/SearchBuilder.java
+@@ -43,6 +43,7 @@
+ import ca.uhn.fhir.jpa.dao.SearchProgressTracker;
+ import ca.uhn.fhir.jpa.dao.data.IResourceHistoryTableDao;
+ import ca.uhn.fhir.jpa.dao.data.IResourceTagDao;
++import ca.uhn.fhir.jpa.dao.data.ITagDefinitionDao;
+ import ca.uhn.fhir.jpa.dao.search.ResourceNotFoundInIndexException;
+ import ca.uhn.fhir.jpa.interceptor.JpaPreResourceAccessDetails;
+ import ca.uhn.fhir.jpa.model.config.PartitionSettings;
+@@ -262,6 +263,9 @@ public class SearchBuilder implements ISearchBuilder<JpaPid> {
+ 	@Autowired
+ 	private IResourceHistoryTableDao myResourceHistoryTableDao;
+ 
++	@Autowired
++	private ITagDefinitionDao myTagDefinitionDao;
++
+ 	@Autowired
+ 	private BatchResourceLoader myBatchResourceLoader;
+ 
+@@ -842,7 +846,8 @@ private void createChunkedQueryNormalSearch(
+ 				myContext,
+ 				sqlBuilder,
+ 				mySearchParamRegistry,
+-				myPartitionSettings);
++				myPartitionSettings,
++				myTagDefinitionDao);
+ 
+ 		if (theParams.keySet().size() > 1
+ 				|| theParams.getSort() != null
+@@ -993,7 +998,8 @@ private void createChunkedQueryForEverythingSearch(
+ 				myContext,
+ 				sqlBuilder,
+ 				mySearchParamRegistry,
+-				myPartitionSettings);
++				myPartitionSettings,
++				myTagDefinitionDao);
+ 
+ 		JdbcTemplate jdbcTemplate = initializeJdbcTemplate(theSearchQueryProperties.getMaxResultsRequested());
+ 
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/TagToken.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/TagToken.java
+new file mode 100644
+index 000000000000..59160958bcda
+--- /dev/null
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/TagToken.java
+@@ -0,0 +1,29 @@
++/*-
++ * #%L
++ * HAPI FHIR JPA Server
++ * %%
++ * Copyright (C) 2014 - 2026 Smile CDR, Inc.
++ * %%
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ * #L%
++ */
++package ca.uhn.fhir.jpa.search.builder;
++
++/**
++ * A single parsed token from a {@code _tag}/{@code _security}/{@code _profile} search parameter.
++ *
++ * @param system the tag system (may be {@code null}/blank, meaning "any system")
++ * @param qualifier the parameter qualifier (e.g. {@code :below}), or {@code null} if none
++ * @param code the tag code
++ */
++public record TagToken(String system, String qualifier, String code) {}
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/predicate/TagPredicateBuilder.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/predicate/TagPredicateBuilder.java
+index e1194b6acc6a..b4e48aff644e 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/predicate/TagPredicateBuilder.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/builder/predicate/TagPredicateBuilder.java
+@@ -22,7 +22,9 @@
+ import ca.uhn.fhir.interceptor.model.RequestPartitionId;
+ import ca.uhn.fhir.jpa.dao.BaseHapiFhirDao;
+ import ca.uhn.fhir.jpa.model.entity.TagTypeEnum;
++import ca.uhn.fhir.jpa.search.builder.TagToken;
+ import ca.uhn.fhir.jpa.search.builder.sql.SearchQueryBuilder;
++import ca.uhn.fhir.jpa.util.QueryParameterUtils;
+ import ca.uhn.fhir.rest.param.UriParamQualifierEnum;
+ import com.google.common.collect.Lists;
+ import com.healthmarketscience.sqlbuilder.BinaryCondition;
+@@ -30,8 +32,8 @@
+ import com.healthmarketscience.sqlbuilder.Condition;
+ import com.healthmarketscience.sqlbuilder.dbspec.basic.DbColumn;
+ import com.healthmarketscience.sqlbuilder.dbspec.basic.DbTable;
+-import org.apache.commons.lang3.tuple.Triple;
+ 
++import java.util.Collection;
+ import java.util.List;
+ import java.util.Objects;
+ 
+@@ -64,7 +66,7 @@ public TagPredicateBuilder(SearchQueryBuilder theSearchSqlBuilder) {
+ 
+ 	public Condition createPredicateTag(
+ 			TagTypeEnum theTagType,
+-			List<Triple<String, String, String>> theTokens,
++			List<TagToken> theTokens,
+ 			String theParamName,
+ 			RequestPartitionId theRequestPartitionId) {
+ 		if (!myTagDefinitionTableIsJoined) {
+@@ -80,15 +82,37 @@ public Condition createPredicateTag(
+ 		return createPredicateTagList(theTagType, theTokens);
+ 	}
+ 
+-	private Condition createPredicateTagList(TagTypeEnum theTagType, List<Triple<String, String, String>> theTokens) {
++	/**
++	 * Builds a predicate that matches resources carrying one of the given tag definition ids by
++	 * filtering directly on the indexed {@code HFJ_RES_TAG.TAG_ID} column, <b>without</b> joining
++	 * {@code HFJ_TAG_DEF}.
++	 *
++	 * <p>This is the counterpart to {@link #createPredicateTag} for the case where the caller has
++	 * already resolved the {@code TAG_ID}(s) up front. Keeping the selective tag id out of a join
++	 * lets the query planner see it as a bound value and consult per-value statistics, rather than
++	 * underestimating cardinality for a heavy-hitter tag.
++	 *
++	 * @param theTagIds the resolved tag definition ids; an empty collection means the requested tag
++	 *     does not exist, so the predicate matches nothing.
++	 */
++	public Condition createPredicateTagIds(Collection<Long> theTagIds) {
++		if (theTagIds.isEmpty()) {
++			// The requested tag does not exist in HFJ_TAG_DEF, so no resource can carry it. TAG_ID is
++			// a positive sequence value, so this comparison never matches.
++			return BinaryCondition.equalTo(myColumnTagId, generatePlaceholder(-1L));
++		}
++		return QueryParameterUtils.toEqualToOrInPredicate(myColumnTagId, generatePlaceholders(theTagIds));
++	}
++
++	private Condition createPredicateTagList(TagTypeEnum theTagType, List<TagToken> theTokens) {
+ 		Condition typePredicate =
+ 				BinaryCondition.equalTo(myTagDefinitionColumnTagType, generatePlaceholder(theTagType.ordinal()));
+ 
+ 		List<Condition> orPredicates = Lists.newArrayList();
+-		for (Triple<String, String, String> next : theTokens) {
+-			String system = next.getLeft();
+-			String code = next.getRight();
+-			String qualifier = next.getMiddle();
++		for (TagToken next : theTokens) {
++			String system = next.system();
++			String code = next.code();
++			String qualifier = next.qualifier();
+ 
+ 			if (theTagType == TagTypeEnum.PROFILE) {
+ 				system = BaseHapiFhirDao.NS_JPA_PROFILE;
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4QueryCountTest.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4QueryCountTest.java
+index 9132d3a23d01..c1ae4ffb50b6 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4QueryCountTest.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4QueryCountTest.java
+@@ -51,6 +51,7 @@
+ import ca.uhn.fhir.rest.api.RestOperationTypeEnum;
+ import ca.uhn.fhir.rest.api.SortSpec;
+ import ca.uhn.fhir.rest.api.ValidationModeEnum;
++import ca.uhn.fhir.rest.api.Constants;
+ import ca.uhn.fhir.rest.api.server.IBundleProvider;
+ import ca.uhn.fhir.rest.api.server.RequestDetails;
+ import ca.uhn.fhir.rest.api.server.SystemRequestDetails;
+@@ -832,7 +833,6 @@ public void testValidate() {
+ 		ourLog.debug(myFhirContext.newJsonParser().setPrettyPrint(true).encodeResourceToString(cs));
+ 
+ 		Observation obs = new Observation();
+-//		obs.getMeta().addProfile("http://example.com/fhir/StructureDefinition/vitalsigns-2");
+ 		obs.getText().setStatus(Narrative.NarrativeStatus.GENERATED).setDivAsString("<div>Hello</div>");
+ 		obs.getCategoryFirstRep().addCoding().setSystem("http://terminology.hl7.org/CodeSystem/observation-category").setCode("vital-signs");
+ 		obs.setSubject(new Reference("Patient/123"));
+@@ -1180,7 +1180,7 @@ public void testDeleteExpungeStep() {
+ 			.findAll()
+ 			.stream()
+ 			.map(t -> new TypedPidJson(t.getResourceType(), t.getResourceId()))
+-			.collect(Collectors.toList()));
++			.toList());
+ 
+ 		runInTransaction(() -> assertEquals(10, myResourceTableDao.count()));
+ 
+@@ -5214,4 +5214,70 @@ public List<IAuthRule> buildRuleList(RequestDetails theRequestDetails) {
+ 		myConsentInterceptor = new ConsentInterceptor(new IConsentService() {});
+ 		myInterceptorRegistry.registerInterceptor(myConsentInterceptor);
+ 	}
++
++	@Test
++	public void testSearch_MultipleTagParams_UsesSingleTagResolutionQuery() {
++		Patient p = new Patient();
++		p.getMeta().addTag("http://sys", "code-1", "display-1");
++		p.getMeta().addTag("http://sys", "code-2", "display-2");
++		p.getMeta().addTag("http://sys", "code-3", "display-3");
++		p.setActive(true);
++		IIdType id = myPatientDao.create(p, mySrd).getId().toUnqualifiedVersionless();
++
++		myCaptureQueriesListener.clear();
++		SearchParameterMap map = SearchParameterMap.newSynchronous()
++			.add(Constants.PARAM_TAG, new TokenParam("http://sys", "code-1"))
++			.add(Constants.PARAM_TAG, new TokenParam("http://sys", "code-2"))
++			.add(Constants.PARAM_TAG, new TokenParam("http://sys", "code-3"));
++		IBundleProvider outcome = myPatientDao.search(map, mySrd);
++		assertThat(toUnqualifiedVersionlessIdValues(outcome)).containsExactly(id.getValue());
++
++		myCaptureQueriesListener.logSelectQueriesForCurrentThread();
++		assertEquals(4, myCaptureQueriesListener.logSelectQueries().size());
++		assertEquals(4, myCaptureQueriesListener.countSelectQueriesForCurrentThread());
++	}
++
++	@Test
++	public void testSearch_MultipleTagTypeParams_UsesSingleTagResolutionQuery() {
++		Patient p = new Patient();
++		p.getMeta().addTag("http://sys", "code-1", "display-1");
++		p.getMeta().addProfile("test");
++		p.getMeta().addSecurity("http://sys", "code-2", "display-2");
++		p.setActive(true);
++		IIdType id = myPatientDao.create(p, mySrd).getId().toUnqualifiedVersionless();
++
++		myCaptureQueriesListener.clear();
++		SearchParameterMap map = SearchParameterMap.newSynchronous()
++			.add(Constants.PARAM_TAG, new TokenParam("http://sys", "code-1"))
++			.add(Constants.PARAM_PROFILE, new TokenParam("test"))
++			.add(Constants.PARAM_SECURITY, new TokenParam("http://sys", "code-2"));
++		IBundleProvider outcome = myPatientDao.search(map, mySrd);
++		assertThat(toUnqualifiedVersionlessIdValues(outcome)).containsExactly(id.getValue());
++
++		myCaptureQueriesListener.logSelectQueriesForCurrentThread();
++		assertEquals(4, myCaptureQueriesListener.logSelectQueries().size());
++		assertEquals(4, myCaptureQueriesListener.countSelectQueriesForCurrentThread());
++	}
++
++	@Test
++	public void testSearch_MultipleSecurityParams_UsesSingleTagResolutionQuery() {
++		Patient p = new Patient();
++		p.getMeta().addSecurity("http://sys", "code-1", "display-1");
++		p.getMeta().addSecurity("http://sys", "code-2", "display-2");
++		p.getMeta().addSecurity("http://sys", "code-3", "display-3");
++		p.setActive(true);
++		IIdType id = myPatientDao.create(p, mySrd).getId().toUnqualifiedVersionless();
++
++		myCaptureQueriesListener.clear();
++		SearchParameterMap map = SearchParameterMap.newSynchronous()
++			.add(Constants.PARAM_SECURITY, new TokenParam("http://sys", "code-1"))
++			.add(Constants.PARAM_SECURITY, new TokenParam("http://sys", "code-2"))
++			.add(Constants.PARAM_SECURITY, new TokenParam("http://sys", "code-3"));
++		IBundleProvider outcome = myPatientDao.search(map, mySrd);
++		assertThat(toUnqualifiedVersionlessIdValues(outcome)).containsExactly(id.getValue());
++
++		myCaptureQueriesListener.logSelectQueriesForCurrentThread();
++		assertEquals(4, myCaptureQueriesListener.logSelectQueries().size());
++		assertEquals(4, myCaptureQueriesListener.countSelectQueriesForCurrentThread());
++	}
+ }
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4SearchOptimizedTest.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4SearchOptimizedTest.java
+index fd1dd87cbe76..f98d0440428c 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4SearchOptimizedTest.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4SearchOptimizedTest.java
+@@ -101,7 +101,6 @@ public void before() throws Exception {
+ 		mySearchCoordinatorSvcImpl = ProxyUtil.getSingletonTarget(mySearchCoordinatorSvc, SearchCoordinatorSvcImpl.class);
+ 		mySearchCoordinatorSvcImpl.setLoadingThrottleForUnitTests(null);
+ 		mySearchCoordinatorSvcImpl.setSyncSizeForUnitTests(QueryParameterUtils.DEFAULT_SYNC_SIZE);
+-//		myCaptureQueriesListener.setCaptureQueryStackTrace(true);
+ 		myStorageSettings.setHibernateSearchIndexSearchParams(false);
+ 		initResourceTypeCacheFromConfig();
+ 	}
+@@ -273,7 +272,6 @@ public void testFetchTotalAccurateForSlowLoading() {
+ 		String uuid = results.getUuid();
+ 		ourLog.info("** Search returned UUID: {}", uuid);
+ 
+-//		assertEquals(200, myDatabaseBackedPagingProvider.retrieveResultList(mySrd, uuid).size().intValue());
+ 		assertEquals(200, results.size().intValue());
+ 		ourLog.info("** Asking for results");
+ 		List<String> ids = toUnqualifiedVersionlessIdValues(results, 0, 5, true);
+@@ -610,7 +608,7 @@ public void search_whenPastPreFetchLimit_usesDBToDeduplicate() {
+ 	private List<SqlQuery> findGroupByQueries() {
+ 		List<SqlQuery> queries = myCaptureQueriesListener.getSelectQueries();
+ 		queries = queries.stream().filter(q -> q.getSql(true, false).toLowerCase().contains("group by"))
+-			.collect(Collectors.toList());
++			.toList();
+ 		return queries;
+ 	}
+ 
+@@ -649,7 +647,7 @@ public void testFetchMoreThanFirstPageSizeInFirstPage() {
+ 			Search search = mySearchEntityDao.findByUuidAndFetchIncludes(uuid).orElseThrow(() -> new InternalErrorException(""));
+ 			assertEquals(51, search.getNumFound());
+ 			assertEquals(search.getNumFound(), mySearchResultDao.count());
+-			assertEquals(null, search.getTotalCount());
++			assertNull(search.getTotalCount());
+ 			assertEquals(SearchStatusEnum.PASSCMPLET, search.getStatus());
+ 			assertEquals(1, search.getVersion().intValue());
+ 		});
+@@ -839,8 +837,9 @@ public void testSearchForTokenValueOnlyUsesValueHash() {
+ 		myCaptureQueriesListener.logSelectQueries();
+ 
+ 		String selectQuery = myCaptureQueriesListener.getSelectQueries().get(1).getSql(true, true);
+-		assertThat(selectQuery).contains("HASH_VALUE");
+-		assertThat(selectQuery).doesNotContain("HASH_SYS");
++		assertThat(selectQuery)
++			.contains("HASH_VALUE")
++			.doesNotContain("HASH_SYS");
+ 
+ 	}
+ 
+@@ -879,7 +878,7 @@ public void testReferenceOrLinksUseInList() {
+ 			.getSelectQueriesForCurrentThread()
+ 			.stream()
+ 			.map(t -> t.getSql(true, false))
+-			.collect(Collectors.toList());
++			.toList();
+ 
+ 		String resultingQueryNotFormatted = queries.get(0);
+ 		assertThat(StringUtils.countMatches(resultingQueryNotFormatted, "Patient.managingOrganization")).as(resultingQueryNotFormatted).isEqualTo(1);
+@@ -1039,7 +1038,7 @@ public void testSearchOnUnderscoreParams_AvoidHFJResourceJoins() {
+ 		searchParameter1.setExpression("Procedure.extension('Procedure#focalAccess')");
+ 		searchParameter1.setXpathUsage(SearchParameter.XPathUsageType.NORMAL);
+ 		searchParameter1.setStatus(Enumerations.PublicationStatus.ACTIVE);
+-		IIdType sp1Id = mySearchParameterDao.create(searchParameter1).getId().toUnqualifiedVersionless();
++		mySearchParameterDao.create(searchParameter1).getId().toUnqualifiedVersionless();
+ 		// SearchParam - focalAccess
+ 		SearchParameter searchParameter2 = new SearchParameter();
+ 		searchParameter2.addBase("Provenance");
+@@ -1048,7 +1047,7 @@ public void testSearchOnUnderscoreParams_AvoidHFJResourceJoins() {
+ 		searchParameter2.setExpression("Provenance.extension('Provenance#activity')");
+ 		searchParameter2.setXpathUsage(SearchParameter.XPathUsageType.NORMAL);
+ 		searchParameter2.setStatus(Enumerations.PublicationStatus.ACTIVE);
+-		IIdType sp2Id = mySearchParameterDao.create(searchParameter2).getId().toUnqualifiedVersionless();
++		mySearchParameterDao.create(searchParameter2).getId().toUnqualifiedVersionless();
+ 		mySearchParamRegistry.forceRefresh();
+ 
+ 		BodyStructure bs = new BodyStructure();
+@@ -1080,13 +1079,13 @@ public void testSearchOnUnderscoreParams_AvoidHFJResourceJoins() {
+ 		procedure.setSubject(new Reference("Patient/P1"));
+ 		procedure.setStatus(Procedure.ProcedureStatus.COMPLETED);
+ 		procedure.setCategory(categoryCodeableConcept1);
+-		Extension extProcedure = procedure
++		procedure
+ 			.addExtension()
+ 			.setUrl("Procedure#focalAccess")
+ 			.setValue(new UriType("BodyStructure/" + bsId.getIdPartAsLong()));
+ 		procedure.getMeta()
+ 			.addTag("acc_procext_fkc", "1STCANN2NDL", "First Successful Cannulation with 2 Needles");
+-		IIdType procedureId = myProcedureDao.create(procedure).getId().toUnqualifiedVersionless();
++		myProcedureDao.create(procedure).getId().toUnqualifiedVersionless();
+ 
+ 		Device device = new Device();
+ 		device.setManufacturer("Acme");
+@@ -1095,7 +1094,7 @@ public void testSearchOnUnderscoreParams_AvoidHFJResourceJoins() {
+ 		Provenance provenance = new Provenance();
+ 		provenance.setActivity(new CodeableConcept().addCoding(new Coding().setSystem("http://hl7.org/fhir/v3/DocumentCompletion").setCode("PA")));
+ 		provenance.addAgent().setWho(new Reference(deviceId));
+-		IIdType provenanceId = myProvenanceDao.create(provenance).getId().toUnqualifiedVersionless();
++		myProvenanceDao.create(provenance).getId().toUnqualifiedVersionless();
+ 
+ 		logAllResources();
+ 		logAllResourceTags();
+@@ -1119,14 +1118,15 @@ public void testSearchOnUnderscoreParams_AvoidHFJResourceJoins() {
+ 			IBundleProvider outcome = myProcedureDao.search(map, new SystemRequestDetails());
+ 			ourLog.info("Search returned {} resources.", outcome.getResources(0, 999).size());
+ 			myCaptureQueriesListener.logSelectQueriesForCurrentThread();
++			assertEquals(2, myCaptureQueriesListener.logSelectQueries().size());
+ 
+-			String selectQuery = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, false);
++			String selectQuery = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(true, false);
+ 			// Check for a particular WHERE CLAUSE in the generated SQL to make sure we are verifying the correct query
+ 			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), " join hfj_res_link ")).as(selectQuery).isEqualTo(2);
+ 
+ 			// Ensure that we do NOT see a couple of particular WHERE clauses
+-			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), ".res_type = 'procedure'")).as(selectQuery).isEqualTo(0);
+-			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), ".res_deleted_at is null")).as(selectQuery).isEqualTo(0);
++			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), ".res_type = 'procedure'")).as(selectQuery).isZero();
++			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), ".res_deleted_at is null")).as(selectQuery).isZero();
+ 		}
+ 
+ 		// Search example 2:
+@@ -1147,14 +1147,15 @@ public void testSearchOnUnderscoreParams_AvoidHFJResourceJoins() {
+ 			IBundleProvider outcome = myProcedureDao.search(map, new SystemRequestDetails());
+ 			ourLog.info("Search returned {} resources.", outcome.getResources(0, 999).size());
+ 			myCaptureQueriesListener.logSelectQueriesForCurrentThread();
++			assertEquals(2, myCaptureQueriesListener.logSelectQueries().size());
+ 
+-			String selectQuery = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, false);
++			String selectQuery = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(true, false);
+ 			// Check for a particular WHERE CLAUSE in the generated SQL to make sure we are verifying the correct query
+ 			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), " join hfj_res_link ")).as(selectQuery).isEqualTo(1);
+ 
+ 			// Ensure that we do NOT see a couple of particular WHERE clauses
+-			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), ".res_type = 'procedure'")).as(selectQuery).isEqualTo(0);
+-			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), ".res_deleted_at is null")).as(selectQuery).isEqualTo(0);
++			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), ".res_type = 'procedure'")).as(selectQuery).isZero();
++			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), ".res_deleted_at is null")).as(selectQuery).isZero();
+ 		}
+ 
+ 		// Search example 3:
+@@ -1172,13 +1173,13 @@ public void testSearchOnUnderscoreParams_AvoidHFJResourceJoins() {
+ 			myCaptureQueriesListener.clear();
+ 			IBundleProvider outcome = myProvenanceDao.search(map, new SystemRequestDetails());
+ 			ourLog.info("Search returned {} resources.", outcome.getResources(0, 999).size());
+-			//assertEquals(1, outcome.getResources(0, 999).size());
+ 			myCaptureQueriesListener.logSelectQueriesForCurrentThread();
++			assertEquals(1, myCaptureQueriesListener.logSelectQueries().size());
+ 
+ 			String selectQuery = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, false);
+ 			// Ensure that we do NOT see a couple of particular WHERE clauses
+-			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), ".res_type = 'provenance'")).as(selectQuery).isEqualTo(0);
+-			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), ".res_deleted_at is null")).as(selectQuery).isEqualTo(0);
++			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), ".res_type = 'provenance'")).as(selectQuery).isZero();
++			assertThat(StringUtils.countMatches(selectQuery.toLowerCase(), ".res_deleted_at is null")).as(selectQuery).isZero();
+ 		}
+ 	}
+ 
+@@ -1573,7 +1574,7 @@ public void testReferenceOrLinksUseInList_ForcedIds() {
+ 			.getSelectQueriesForCurrentThread()
+ 			.stream()
+ 			.map(t -> t.getSql(true, false))
+-			.collect(Collectors.toList());
++			.toList();
+ 
+ 		// The first query is the forced ID resolution this time
+ 		assertThat(queries).hasSize(3);
+@@ -1591,7 +1592,4 @@ public void testReferenceOrLinksUseInList_ForcedIds() {
+ 		// Ensure that the search actually worked
+ 		assertEquals(5, search.size().intValue());
+ 	}
+-
+-
+-
+ }
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4SearchSqlTest.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4SearchSqlTest.java
+index b5cdc5e168fc..edab52a60292 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4SearchSqlTest.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/FhirResourceDaoR4SearchSqlTest.java
+@@ -11,6 +11,7 @@
+ import ca.uhn.fhir.rest.api.server.IBundleProvider;
+ import ca.uhn.fhir.rest.param.StringParam;
+ import ca.uhn.fhir.rest.param.TokenParam;
++import ca.uhn.fhir.rest.param.TokenParamModifier;
+ import ca.uhn.fhir.rest.param.UriParam;
+ import org.hl7.fhir.instance.model.api.IAnyResource;
+ import org.hl7.fhir.instance.model.api.IIdType;
+@@ -196,15 +197,20 @@ public void testSearchByProfile_VersionedAndNonVersionedMode(JpaStorageSettings.
+ 		SearchParameterMap map = SearchParameterMap.newSynchronous()
+ 			.add(Constants.PARAM_PROFILE, new TokenParam(code));
+ 		IBundleProvider outcome = myPatientDao.search(map, mySrd);
+-		assertEquals(3, myCaptureQueriesListener.logSelectQueries().size());
+-		// Query 1 - Find resources: Make sure we search for tag type+system+code always
++		assertEquals(4, myCaptureQueriesListener.logSelectQueries().size());
++		// Query 1 - Resolve the tag definition id(s) up front so the resource
++		// search can filter on HFJ_RES_TAG.TAG_ID directly instead of hiding the selective tag id
++		// behind a HFJ_TAG_DEF join
+ 		String sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(false, false);
+-		assertEquals("SELECT t0.RES_ID FROM HFJ_RESOURCE t0 INNER JOIN HFJ_RES_TAG t1 ON (t0.RES_ID = t1.RES_ID) INNER JOIN HFJ_TAG_DEF t2 ON (t1.TAG_ID = t2.TAG_ID) WHERE (((t0.RES_TYPE = ?) AND (t0.RES_DELETED_AT IS NULL)) AND ((t2.TAG_TYPE = ?) AND (t2.TAG_SYSTEM = ?) AND (t2.TAG_CODE = ?))) fetch first ? rows only", sql);
+-		// Query 2 - Load resource contents
++		assertEquals("select td1_0.TAG_ID,td1_0.TAG_CODE,td1_0.TAG_DISPLAY,td1_0.TAG_SYSTEM,td1_0.TAG_TYPE,td1_0.TAG_USER_SELECTED,td1_0.TAG_VERSION from HFJ_TAG_DEF td1_0 where td1_0.TAG_TYPE in (?) and td1_0.TAG_CODE in (?)", sql);
++		// Query 2 - Find resources: filter on the resolved tag id, with no HFJ_TAG_DEF join
+ 		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(false, false);
+-		assertThat(sql).contains("where (mrt1_0.RES_ID) in (?)");
+-		// Query 3 - Load tags and definitions
++		assertEquals("SELECT t0.RES_ID FROM HFJ_RESOURCE t0 INNER JOIN HFJ_RES_TAG t1 ON (t0.RES_ID = t1.RES_ID) WHERE (((t0.RES_TYPE = ?) AND (t0.RES_DELETED_AT IS NULL)) AND (t1.TAG_ID = ?)) fetch first ? rows only", sql);
++		// Query 3 - Load resource contents
+ 		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(2).getSql(false, false);
++		assertThat(sql).contains("where (mrt1_0.RES_ID) in (?)");
++		// Query 4 - Load tags and definitions
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(3).getSql(false, false);
+ 		if (theTagStorageModeEnum == JpaStorageSettings.TagStorageModeEnum.VERSIONED) {
+ 			assertThat(sql).contains("from HFJ_HISTORY_TAG rht1_0 left join HFJ_TAG_DEF");
+ 		} else {
+@@ -255,6 +261,297 @@ public void testSearchByProfile_InlineMode() {
+ 		myStorageSettings.setMarkResourcesForReindexingUponSearchParameterChange(reindexParamCache);
+ 	}
+ 
++	/**
++	 * A _tag search combined with another predicate must resolve the tag id up
++	 * front and filter on HFJ_RES_TAG.TAG_ID directly, rather than joining HFJ_TAG_DEF (which hides
++	 * the selective tag id from the query planner and causes cardinality underestimates).
++	 */
++	@Test
++	public void testSearchByTag_filtersOnResolvedTagIdWithoutTagDefJoin() {
++		String system = "http://" + UUID.randomUUID();
++		String code = "some-code";
++
++		Patient p = new Patient();
++		p.getMeta().addTag().setSystem(system).setCode(code);
++		p.setActive(true);
++		IIdType id = myPatientDao.create(p, mySrd).getId().toUnqualifiedVersionless();
++		myMemoryCacheService.invalidateAllCaches();
++
++		myCaptureQueriesListener.clear();
++		SearchParameterMap map = SearchParameterMap.newSynchronous()
++			.add(Constants.PARAM_TAG, new TokenParam(system, code))
++			.add(Patient.SP_ACTIVE, new TokenParam(null, "true"));
++		IBundleProvider outcome = myPatientDao.search(map, mySrd);
++		assertThat(toUnqualifiedVersionlessIds(outcome)).containsExactly(id);
++		assertEquals(4, myCaptureQueriesListener.logSelectQueries().size());
++
++		// Query 1 - Resolve the tag definition id(s) up front
++		String sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(false, false);
++		assertEquals("select td1_0.TAG_ID,td1_0.TAG_CODE,td1_0.TAG_DISPLAY,td1_0.TAG_SYSTEM,td1_0.TAG_TYPE,td1_0.TAG_USER_SELECTED,td1_0.TAG_VERSION from HFJ_TAG_DEF td1_0 where td1_0.TAG_TYPE in (?) and td1_0.TAG_CODE in (?)", sql);
++		// Query 2 - Find resources: filter on the resolved tag id, with no HFJ_TAG_DEF join
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(false, false);
++		assertEquals("SELECT t1.RES_ID FROM HFJ_RESOURCE t1 INNER JOIN HFJ_SPIDX_TOKEN t0 ON (t1.RES_ID = t0.RES_ID) INNER JOIN HFJ_RES_TAG t2 ON (t1.RES_ID = t2.RES_ID) WHERE ((t0.HASH_VALUE = ?) AND (t2.TAG_ID = ?)) fetch first ? rows only", sql);
++		// Query 3 - Load resource contents
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(2).getSql(false, false);
++		assertThat(sql).contains("where (mrt1_0.RES_ID) in (?)");
++		// Query 4 - Load tags and definitions
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(3).getSql(false, false);
++		assertThat(sql).contains("from HFJ_HISTORY_TAG rht1_0 left join HFJ_TAG_DEF");
++	}
++
++	/**
++	 * Two separate `_tag` parameters (ANDed) must each resolve independently and produce their own
++	 * HFJ_RES_TAG join filtered on the resolved tag id, with no HFJ_TAG_DEF join.
++	 */
++	@Test
++	public void testSearchByTwoTagsAnded_filtersOnResolvedTagIdsWithoutTagDefJoin() {
++		String system1 = "http://" + UUID.randomUUID();
++		String system2 = "http://" + UUID.randomUUID();
++		String code1 = "code-1";
++		String code2 = "code-2";
++
++		Patient bothTags = new Patient();
++		bothTags.getMeta().addTag().setSystem(system1).setCode(code1);
++		bothTags.getMeta().addTag().setSystem(system2).setCode(code2);
++		bothTags.setActive(true);
++		IIdType id = myPatientDao.create(bothTags, mySrd).getId().toUnqualifiedVersionless();
++
++		// A patient carrying only one of the two tags must NOT match the AND search
++		Patient oneTag = new Patient();
++		oneTag.getMeta().addTag().setSystem(system1).setCode(code1);
++		oneTag.setActive(true);
++		myPatientDao.create(oneTag, mySrd);
++		myMemoryCacheService.invalidateAllCaches();
++
++		myCaptureQueriesListener.clear();
++		SearchParameterMap map = SearchParameterMap.newSynchronous()
++			.add(Constants.PARAM_TAG, new TokenParam(system1, code1))
++			.add(Constants.PARAM_TAG, new TokenParam(system2, code2));
++		IBundleProvider outcome = myPatientDao.search(map, mySrd);
++		assertThat(toUnqualifiedVersionlessIds(outcome)).containsExactly(id);
++		// Both tags are resolved in a single batched lookup, then the resource search, then the two
++		// result-loading queries.
++		assertEquals(4, myCaptureQueriesListener.logSelectQueries().size());
++
++		// Query 1 - Resolve both tag definition ids in a single batched HFJ_TAG_DEF lookup (one IN query)
++		String sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(false, false);
++		assertEquals("select td1_0.TAG_ID,td1_0.TAG_CODE,td1_0.TAG_DISPLAY,td1_0.TAG_SYSTEM,td1_0.TAG_TYPE,td1_0.TAG_USER_SELECTED,td1_0.TAG_VERSION from HFJ_TAG_DEF td1_0 where td1_0.TAG_TYPE in (?) and td1_0.TAG_CODE in (?,?)", sql);
++		// Query 2 - Find resources: a separate HFJ_RES_TAG join per tag, each filtering on the resolved id, no HFJ_TAG_DEF join
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(false, false);
++		assertEquals("SELECT t0.RES_ID FROM HFJ_RESOURCE t0 INNER JOIN HFJ_RES_TAG t1 ON (t0.RES_ID = t1.RES_ID) INNER JOIN HFJ_RES_TAG t3 ON (t0.RES_ID = t3.RES_ID) WHERE (((t0.RES_TYPE = ?) AND (t0.RES_DELETED_AT IS NULL)) AND ((t1.TAG_ID = ?) AND (t3.TAG_ID = ?))) fetch first ? rows only", sql);
++		// Query 3 - Load resource contents
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(2).getSql(false, false);
++		assertThat(sql).contains("where (mrt1_0.RES_ID) in (?)");
++		// Query 4 - Load tags and definitions
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(3).getSql(false, false);
++		assertThat(sql).contains("from HFJ_HISTORY_TAG rht1_0 left join HFJ_TAG_DEF");
++	}
++
++	/**
++	 * Batched tag resolution is not limited to two tags: three ANDed `_tag` parameters are still
++	 * resolved with a single HFJ_TAG_DEF lookup and produce one HFJ_RES_TAG join per tag.
++	 */
++	@Test
++	public void testSearchByThreeTagsAnded_filtersOnResolvedTagIdsWithoutTagDefJoin() {
++		String system1 = "http://" + UUID.randomUUID();
++		String system2 = "http://" + UUID.randomUUID();
++		String system3 = "http://" + UUID.randomUUID();
++		String code1 = "code-1";
++		String code2 = "code-2";
++		String code3 = "code-3";
++
++		Patient allThreeTags = new Patient();
++		allThreeTags.getMeta().addTag().setSystem(system1).setCode(code1);
++		allThreeTags.getMeta().addTag().setSystem(system2).setCode(code2);
++		allThreeTags.getMeta().addTag().setSystem(system3).setCode(code3);
++		allThreeTags.setActive(true);
++		IIdType id = myPatientDao.create(allThreeTags, mySrd).getId().toUnqualifiedVersionless();
++
++		// A patient carrying only two of the three tags must NOT match the AND search
++		Patient twoTags = new Patient();
++		twoTags.getMeta().addTag().setSystem(system1).setCode(code1);
++		twoTags.getMeta().addTag().setSystem(system2).setCode(code2);
++		twoTags.setActive(true);
++		myPatientDao.create(twoTags, mySrd);
++		myMemoryCacheService.invalidateAllCaches();
++
++		myCaptureQueriesListener.clear();
++		SearchParameterMap map = SearchParameterMap.newSynchronous()
++			.add(Constants.PARAM_TAG, new TokenParam(system1, code1))
++			.add(Constants.PARAM_TAG, new TokenParam(system2, code2))
++			.add(Constants.PARAM_TAG, new TokenParam(system3, code3));
++		IBundleProvider outcome = myPatientDao.search(map, mySrd);
++		assertThat(toUnqualifiedVersionlessIds(outcome)).containsExactly(id);
++		// All three tags are resolved in a single batched lookup, then the resource search, then the two
++		// result-loading queries.
++		assertEquals(4, myCaptureQueriesListener.logSelectQueries().size());
++
++		// Query 1 - Resolve all three tag definition ids in a single batched HFJ_TAG_DEF lookup (one IN query)
++		String sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(false, false);
++		assertEquals("select td1_0.TAG_ID,td1_0.TAG_CODE,td1_0.TAG_DISPLAY,td1_0.TAG_SYSTEM,td1_0.TAG_TYPE,td1_0.TAG_USER_SELECTED,td1_0.TAG_VERSION from HFJ_TAG_DEF td1_0 where td1_0.TAG_TYPE in (?) and td1_0.TAG_CODE in (?,?,?)", sql);
++		// Query 2 - Find resources: one HFJ_RES_TAG join per tag, each filtering on the resolved id, no HFJ_TAG_DEF join
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(false, false);
++		assertEquals("SELECT t0.RES_ID FROM HFJ_RESOURCE t0 INNER JOIN HFJ_RES_TAG t1 ON (t0.RES_ID = t1.RES_ID) INNER JOIN HFJ_RES_TAG t3 ON (t0.RES_ID = t3.RES_ID) INNER JOIN HFJ_RES_TAG t5 ON (t0.RES_ID = t5.RES_ID) WHERE (((t0.RES_TYPE = ?) AND (t0.RES_DELETED_AT IS NULL)) AND ((t1.TAG_ID = ?) AND (t3.TAG_ID = ?) AND (t5.TAG_ID = ?))) fetch first ? rows only", sql);
++		// Query 3 - Load resource contents
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(2).getSql(false, false);
++		assertThat(sql).contains("where (mrt1_0.RES_ID) in (?)");
++		// Query 4 - Load tags and definitions
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(3).getSql(false, false);
++		assertThat(sql).contains("from HFJ_HISTORY_TAG rht1_0 left join HFJ_TAG_DEF");
++	}
++
++	/**
++	 * Batched tag resolution is not limited to two tags: three ANDed `_tag` parameters are still
++	 * resolved with a single HFJ_TAG_DEF lookup and produce one HFJ_RES_TAG join per tag.
++	 */
++	@Test
++	public void testSearchByThreeTagTypesAnded_filtersOnResolvedTagIdsWithoutTagDefJoin() {
++		String system1 = "http://" + UUID.randomUUID();
++		String system2 = "http://" + UUID.randomUUID();
++		String code1 = "code-1";
++		String code2 = "code-2";
++
++		Patient allThreeTags = new Patient();
++		allThreeTags.getMeta().addTag().setSystem(system1).setCode(code1);
++		allThreeTags.getMeta().addSecurity().setSystem(system2).setCode(code2);
++		allThreeTags.getMeta().addProfile("test");
++		allThreeTags.setActive(true);
++		IIdType id = myPatientDao.create(allThreeTags, mySrd).getId().toUnqualifiedVersionless();
++
++		// A patient carrying only two of the three tags must NOT match the AND search
++		Patient twoTags = new Patient();
++		twoTags.getMeta().addTag().setSystem(system1).setCode(code1);
++		twoTags.getMeta().addSecurity().setSystem(system2).setCode(code2);
++		twoTags.setActive(true);
++		myPatientDao.create(twoTags, mySrd);
++		myMemoryCacheService.invalidateAllCaches();
++
++		myCaptureQueriesListener.clear();
++		SearchParameterMap map = SearchParameterMap.newSynchronous()
++			.add(Constants.PARAM_TAG, new TokenParam(system1, code1))
++			.add(Constants.PARAM_SECURITY, new TokenParam(system2, code2))
++			.add(Constants.PARAM_PROFILE, new TokenParam("test"));
++		IBundleProvider outcome = myPatientDao.search(map, mySrd);
++		assertThat(toUnqualifiedVersionlessIds(outcome)).containsExactly(id);
++		// All three tags are resolved in a single batched lookup, then the resource search, then the two
++		// result-loading queries.
++		assertEquals(4, myCaptureQueriesListener.logSelectQueries().size());
++
++		// Query 1 - Resolve all three tag definition ids in a single batched HFJ_TAG_DEF lookup (one IN query)
++		String sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(false, false);
++		assertEquals("select td1_0.TAG_ID,td1_0.TAG_CODE,td1_0.TAG_DISPLAY,td1_0.TAG_SYSTEM,td1_0.TAG_TYPE,td1_0.TAG_USER_SELECTED,td1_0.TAG_VERSION from HFJ_TAG_DEF td1_0 where td1_0.TAG_TYPE in (?,?,?) and td1_0.TAG_CODE in (?,?,?)", sql);
++		// Query 2 - Find resources: one HFJ_RES_TAG join per tag, each filtering on the resolved id, no HFJ_TAG_DEF join
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(false, false);
++		assertEquals("SELECT t0.RES_ID FROM HFJ_RESOURCE t0 INNER JOIN HFJ_RES_TAG t1 ON (t0.RES_ID = t1.RES_ID) INNER JOIN HFJ_RES_TAG t3 ON (t0.RES_ID = t3.RES_ID) INNER JOIN HFJ_RES_TAG t5 ON (t0.RES_ID = t5.RES_ID) WHERE (((t0.RES_TYPE = ?) AND (t0.RES_DELETED_AT IS NULL)) AND (t1.TAG_ID = ?) AND (t3.TAG_ID = ?) AND (t5.TAG_ID = ?)) fetch first ? rows only", sql);
++		// Query 3 - Load resource contents
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(2).getSql(false, false);
++		assertThat(sql).contains("where (mrt1_0.RES_ID) in (?)");
++		// Query 4 - Load tags and definitions
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(3).getSql(false, false);
++		assertThat(sql).contains("from HFJ_HISTORY_TAG rht1_0 left join HFJ_TAG_DEF");
++	}
++
++	/**
++	 * _security searches go through the same tag resolution path as _tag (only the tag type differs),
++	 * so they too filter on HFJ_RES_TAG.TAG_ID directly rather than joining HFJ_TAG_DEF.
++	 */
++	@Test
++	public void testSearchBySecurity_filtersOnResolvedTagIdWithoutTagDefJoin() {
++		String system = "http://" + UUID.randomUUID();
++		String code = "some-code";
++
++		Patient p = new Patient();
++		p.getMeta().addSecurity().setSystem(system).setCode(code);
++		p.setActive(true);
++		IIdType id = myPatientDao.create(p, mySrd).getId().toUnqualifiedVersionless();
++		myMemoryCacheService.invalidateAllCaches();
++
++		myCaptureQueriesListener.clear();
++		SearchParameterMap map = SearchParameterMap.newSynchronous()
++			.add(Constants.PARAM_SECURITY, new TokenParam(system, code))
++			.add(Patient.SP_ACTIVE, new TokenParam(null, "true"));
++		IBundleProvider outcome = myPatientDao.search(map, mySrd);
++		assertThat(toUnqualifiedVersionlessIds(outcome)).containsExactly(id);
++		assertEquals(4, myCaptureQueriesListener.logSelectQueries().size());
++
++		// Query 1 - Resolve the tag definition id(s) up front
++		String sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(false, false);
++		assertEquals("select td1_0.TAG_ID,td1_0.TAG_CODE,td1_0.TAG_DISPLAY,td1_0.TAG_SYSTEM,td1_0.TAG_TYPE,td1_0.TAG_USER_SELECTED,td1_0.TAG_VERSION from HFJ_TAG_DEF td1_0 where td1_0.TAG_TYPE in (?) and td1_0.TAG_CODE in (?)", sql);
++		// Query 2 - Find resources: filter on the resolved tag id, with no HFJ_TAG_DEF join
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(false, false);
++		assertEquals("SELECT t0.RES_ID FROM HFJ_RESOURCE t0 INNER JOIN HFJ_RES_TAG t1 ON (t0.RES_ID = t1.RES_ID) INNER JOIN HFJ_SPIDX_TOKEN t3 ON (t0.RES_ID = t3.RES_ID) WHERE (((t0.RES_TYPE = ?) AND (t0.RES_DELETED_AT IS NULL)) AND (t1.TAG_ID = ?) AND (t3.HASH_VALUE = ?)) fetch first ? rows only", sql);
++		// Query 3 - Load resource contents
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(2).getSql(false, false);
++		assertThat(sql).contains("where (mrt1_0.RES_ID) in (?)");
++		// Query 4 - Load tags and definitions
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(3).getSql(false, false);
++		assertThat(sql).contains("from HFJ_HISTORY_TAG rht1_0 left join HFJ_TAG_DEF");
++	}
++
++	/**
++	 * The _tag:not path must also filter its NOT-IN subquery on the resolved tag
++	 * id rather than joining HFJ_TAG_DEF.
++	 */
++	@Test
++	public void testSearchByTagNot_filtersOnResolvedTagIdWithoutTagDefJoin() {
++		String system = "http://" + UUID.randomUUID();
++		String code = "some-code";
++
++		Patient tagged = new Patient();
++		tagged.getMeta().addTag().setSystem(system).setCode(code);
++		tagged.setActive(true);
++		myPatientDao.create(tagged, mySrd);
++
++		Patient untagged = new Patient();
++		untagged.setActive(true);
++		IIdType untaggedId = myPatientDao.create(untagged, mySrd).getId().toUnqualifiedVersionless();
++		myMemoryCacheService.invalidateAllCaches();
++
++		myCaptureQueriesListener.clear();
++		SearchParameterMap map = SearchParameterMap.newSynchronous()
++			.add(Constants.PARAM_TAG, new TokenParam(system, code).setModifier(TokenParamModifier.NOT));
++		IBundleProvider outcome = myPatientDao.search(map, mySrd);
++		assertThat(toUnqualifiedVersionlessIds(outcome)).containsExactly(untaggedId);
++		assertEquals(3, myCaptureQueriesListener.logSelectQueries().size());
++
++		// Query 1 - Resolve the tag definition id(s) up front
++		String sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(false, false);
++		assertEquals("select td1_0.TAG_ID,td1_0.TAG_CODE,td1_0.TAG_DISPLAY,td1_0.TAG_SYSTEM,td1_0.TAG_TYPE,td1_0.TAG_USER_SELECTED,td1_0.TAG_VERSION from HFJ_TAG_DEF td1_0 where td1_0.TAG_TYPE in (?) and td1_0.TAG_CODE in (?)", sql);
++		// Query 2 - Find resources: exclude those carrying the resolved tag id via a NOT IN subquery, with no HFJ_TAG_DEF join
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(false, false);
++		assertEquals("SELECT t0.RES_ID FROM HFJ_RESOURCE t0 WHERE (((t0.RES_TYPE = ?) AND (t0.RES_DELETED_AT IS NULL)) AND ((t0.RES_ID) NOT IN (SELECT t0.RES_ID FROM HFJ_RES_TAG t0 WHERE (t0.TAG_ID = ?)) )) fetch first ? rows only", sql);
++		// Query 3 - Load resource contents
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(2).getSql(false, false);
++		assertThat(sql).contains("where (mrt1_0.RES_ID) in (?)");
++	}
++
++	/**
++	 * Searching for a tag that does not exist must resolve to no results without
++	 * joining HFJ_TAG_DEF (the resolved id set is empty, so the predicate matches nothing).
++	 */
++	@Test
++	public void testSearchByNonexistentTag_returnsNoResultsWithoutTagDefJoin() {
++		Patient p = new Patient();
++		p.setActive(true);
++		myPatientDao.create(p, mySrd);
++		myMemoryCacheService.invalidateAllCaches();
++
++		myCaptureQueriesListener.clear();
++		SearchParameterMap map = SearchParameterMap.newSynchronous()
++			.add(Constants.PARAM_TAG, new TokenParam("http://example.org/nonexistent", "missing"));
++		IBundleProvider outcome = myPatientDao.search(map, mySrd);
++		assertThat(toUnqualifiedVersionlessIds(outcome)).isEmpty();
++		assertEquals(2, myCaptureQueriesListener.logSelectQueries().size());
++
++		// Query 1 - Resolve the tag definition id(s) up front
++		String sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(false, false);
++		assertEquals("select td1_0.TAG_ID,td1_0.TAG_CODE,td1_0.TAG_DISPLAY,td1_0.TAG_SYSTEM,td1_0.TAG_TYPE,td1_0.TAG_USER_SELECTED,td1_0.TAG_VERSION from HFJ_TAG_DEF td1_0 where td1_0.TAG_TYPE in (?) and td1_0.TAG_CODE in (?)", sql);
++		// Query 2 - Find resources: filter on the resolved tag id, with no HFJ_TAG_DEF join. The tag does
++		// not exist, so the resolved id set is empty and TAG_ID is bound to a never-matching sentinel value.
++		sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(false, false);
++		assertEquals("SELECT t0.RES_ID FROM HFJ_RESOURCE t0 INNER JOIN HFJ_RES_TAG t1 ON (t0.RES_ID = t1.RES_ID) WHERE (((t0.RES_TYPE = ?) AND (t0.RES_DELETED_AT IS NULL)) AND (t1.TAG_ID = ?)) fetch first ? rows only", sql);
++	}
++
+ 	@ParameterizedTest
+ 	@ValueSource(booleans = {true, false})
+ 	public void testSearchByToken_IncludeHashIdentity(boolean theIncludeHashIdentity) {
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/PartitioningSqlR4Test.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/PartitioningSqlR4Test.java
+index 6e057561aaea..47481ee39ae7 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/PartitioningSqlR4Test.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/PartitioningSqlR4Test.java
+@@ -2459,8 +2459,15 @@ void testSearch_TagNotParam_SearchAllPartitions() {
+ 
+ 		String searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, true);
+ 		ourLog.info("Search SQL:\n{}", searchSql);
+-		assertEquals(1, StringUtils.countMatches(searchSql, "PARTITION_ID"));
+-		assertEquals(1, StringUtils.countMatches(searchSql, "TAG_SYSTEM = 'http://system'"));
++		// The tag ids are resolved up front in a batched HFJ_TAG_DEF lookup (system is matched in Java).
++		assertThat(searchSql).contains("HFJ_TAG_DEF");
++
++		searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(true, true);
++		ourLog.info("Search SQL:\n{}", searchSql);
++		assertThat(searchSql)
++			.containsOnlyOnce("TAG_ID")
++			.containsOnlyOnce("PARTITION_ID")
++			.doesNotContain("HFJ_TAG_DEF");
+ 
+ 		// And with another param
+ 
+@@ -2476,11 +2483,15 @@ void testSearch_TagNotParam_SearchAllPartitions() {
+ 
+ 		searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, true);
+ 		ourLog.info("Search SQL:\n{}", searchSql);
+-		assertThat(StringUtils.countMatches(searchSql, "PARTITION_ID")).as(searchSql).isEqualTo(1);
+-		assertThat(StringUtils.countMatches(searchSql, "TAG_SYSTEM = 'http://system'")).as(searchSql).isEqualTo(1);
+-		assertThat(StringUtils.countMatches(searchSql, ".HASH_SYS_AND_VALUE =")).as(searchSql).isEqualTo(1);
+-
++		// The tag ids are resolved up front in a batched HFJ_TAG_DEF lookup (system is matched in Java).
++		assertThat(searchSql).contains("HFJ_TAG_DEF");
+ 
++		searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(true, true);
++		ourLog.info("Search SQL:\n{}", searchSql);
++		assertThat(searchSql)
++			.containsOnlyOnce("PARTITION_ID")
++			.containsOnlyOnce(".HASH_SYS_AND_VALUE =")
++			.doesNotContain("HFJ_TAG_DEF");
+ 	}
+ 
+ 	@Test
+@@ -2500,9 +2511,16 @@ void testSearch_TagNotParam_SearchDefaultPartition() {
+ 
+ 		String searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, true);
+ 		ourLog.info("Search SQL:\n{}", searchSql);
++		// The tag ids are resolved up front in a batched HFJ_TAG_DEF lookup (system is matched in Java).
++		assertThat(searchSql).contains("HFJ_TAG_DEF");
++
++		searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(true, true);
++		ourLog.info("Search SQL:\n{}", searchSql);
++		assertThat(searchSql)
++			.containsOnlyOnce("TAG_ID")
++			.containsOnlyOnce("PARTITION_ID IS NULL")
++			.doesNotContain("HFJ_TAG_DEF");
+ 		assertEquals(2, StringUtils.countMatches(searchSql, "PARTITION_ID"));
+-		assertEquals(1, StringUtils.countMatches(searchSql, "PARTITION_ID IS NULL"));
+-		assertEquals(1, StringUtils.countMatches(searchSql, "TAG_SYSTEM = 'http://system'"));
+ 
+ 		assertThat(ids).as(ids.toString()).containsExactly(patientIdNull);
+ 	}
+@@ -2528,8 +2546,15 @@ void testSearch_TagNotParam_SearchOnePartition() {
+ 
+ 		String searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, true);
+ 		ourLog.info("Search SQL:\n{}", searchSql);
++		// The tag ids are resolved up front in a batched HFJ_TAG_DEF lookup (system is matched in Java).
++		assertThat(searchSql).contains("HFJ_TAG_DEF");
++
++		searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(true, true);
++		ourLog.info("Search SQL:\n{}", searchSql);
++		assertThat(searchSql)
++			.containsOnlyOnce("TAG_ID")
++			.doesNotContain("HFJ_TAG_DEF");
+ 		assertEquals(2, StringUtils.countMatches(searchSql, "PARTITION_ID"));
+-		assertEquals(1, StringUtils.countMatches(searchSql, "TAG_SYSTEM = 'http://system'"));
+ 	}
+ 
+ 	@Test
+@@ -2550,8 +2575,15 @@ void testSearch_TagParam_SearchAllPartitions() {
+ 
+ 		String searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, true);
+ 		ourLog.info("Search SQL:\n{}", searchSql);
+-		assertEquals(1, StringUtils.countMatches(searchSql, "PARTITION_ID"));
+-		assertEquals(1, StringUtils.countMatches(searchSql, "TAG_SYSTEM = 'http://system'"));
++		// The tag ids are resolved up front in a batched HFJ_TAG_DEF lookup (system is matched in Java).
++		assertThat(searchSql).contains("HFJ_TAG_DEF");
++
++		searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(true, true);
++		ourLog.info("Search SQL:\n{}", searchSql);
++		assertThat(searchSql)
++			.containsOnlyOnce("TAG_ID")
++			.containsOnlyOnce("PARTITION_ID")
++			.doesNotContain("HFJ_TAG_DEF");
+ 	}
+ 
+ 	@Test
+@@ -2574,10 +2606,16 @@ void testSearch_TagParam_SearchOnePartition() {
+ 
+ 		String searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, true);
+ 		ourLog.info("Search SQL:\n{}", searchSql);
++		// The tag ids are resolved up front in a batched HFJ_TAG_DEF lookup (system is matched in Java).
++		assertThat(searchSql).contains("HFJ_TAG_DEF");
+ 
+-		assertEquals(2, StringUtils.countMatches(searchSql, "JOIN"));
++		searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(true, true);
++		assertThat(searchSql)
++			.containsOnlyOnce("TAG_ID")
++			.containsOnlyOnce("JOIN")
++			.containsOnlyOnce("INNER JOIN\n        HFJ_RES_TAG")
++			.doesNotContain("HFJ_TAG_DEF");
+ 		assertEquals(2, StringUtils.countMatches(searchSql, "PARTITION_ID"));
+-		assertEquals(1, StringUtils.countMatches(searchSql, "TAG_SYSTEM = 'http://system'"));
+ 	}
+ 
+ 	@Test
+@@ -2601,8 +2639,15 @@ void testSearch_TagParamNot_SearchAllPartitions() {
+ 
+ 		String searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, true);
+ 		ourLog.info("Search SQL:\n{}", searchSql);
+-		assertEquals(1, StringUtils.countMatches(searchSql, "PARTITION_ID"));
+-		assertEquals(1, StringUtils.countMatches(searchSql, "TAG_SYSTEM = 'http://system'"));
++		// The tag ids are resolved up front in a batched HFJ_TAG_DEF lookup (system is matched in Java).
++		assertThat(searchSql).contains("HFJ_TAG_DEF");
++
++		searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(true, true);
++		ourLog.info("Search SQL:\n{}", searchSql);
++		assertThat(searchSql)
++			.containsOnlyOnce("TAG_ID")
++			.containsOnlyOnce("PARTITION_ID")
++			.doesNotContain("HFJ_TAG_DEF");
+ 	}
+ 
+ 	@Test
+@@ -2738,8 +2783,14 @@ void testSearch_TagParamNot_SearchOnePartition() {
+ 
+ 		String searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, true);
+ 		ourLog.info("Search SQL:\n{}", searchSql);
++		// The tag ids are resolved up front in a batched HFJ_TAG_DEF lookup (system is matched in Java).
++		assertThat(searchSql).contains("HFJ_TAG_DEF");
++
++		searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(1).getSql(true, true);
++		assertThat(searchSql)
++			.containsOnlyOnce("TAG_ID")
++			.doesNotContain("HFJ_TAG_DEF");
+ 		assertEquals(2, StringUtils.countMatches(searchSql, "PARTITION_ID"));
+-		assertEquals(1, StringUtils.countMatches(searchSql, "TAG_SYSTEM = 'http://system'"));
+ 	}
+ 
+ 	@Test
+@@ -2762,9 +2813,10 @@ void testSearch_UniqueParam_SearchAllPartitions() {
+ 
+ 		String searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, true);
+ 		ourLog.info("Search SQL:\n{}", searchSql);
+-		assertThat(searchSql).doesNotContain("PARTITION_ID IN");
+-		assertThat(searchSql).doesNotContain("PARTITION_ID =");
+-		assertThat(searchSql).containsOnlyOnce("IDX_STRING = 'Patient?family=FAM&gender=http%3A%2F%2Fhl7.org%2Ffhir%2Fadministrative-gender%7Cmale'");
++		assertThat(searchSql)
++			.containsOnlyOnce("IDX_STRING = 'Patient?family=FAM&gender=http%3A%2F%2Fhl7.org%2Ffhir%2Fadministrative-gender%7Cmale'")
++			.doesNotContain("PARTITION_ID IN")
++			.doesNotContain("PARTITION_ID =");
+ 	}
+ 
+ 
+@@ -2787,8 +2839,9 @@ void testSearch_UniqueParam_SearchOnePartition() {
+ 
+ 		String searchSql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, true);
+ 		ourLog.info("Search SQL:\n{}", searchSql);
+-		assertThat(searchSql).containsOnlyOnce( "PARTITION_ID = '1'");
+-		assertThat(searchSql).containsOnlyOnce("IDX_STRING = 'Patient?family=FAM&gender=http%3A%2F%2Fhl7.org%2Ffhir%2Fadministrative-gender%7Cmale'");
++		assertThat(searchSql)
++			.containsOnlyOnce( "PARTITION_ID = '1'")
++			.containsOnlyOnce("IDX_STRING = 'Patient?family=FAM&gender=http%3A%2F%2Fhl7.org%2Ffhir%2Fadministrative-gender%7Cmale'");
+ 
+ 		// Same query, different partition
+ 		addNextTargetPartitionsForRead(2);
+diff --git a/hapi-fhir-jpaserver-test-r5/src/test/java/ca/uhn/fhir/jpa/dao/r5/dbpartitionmode/TestDefinitions.java b/hapi-fhir-jpaserver-test-r5/src/test/java/ca/uhn/fhir/jpa/dao/r5/dbpartitionmode/TestDefinitions.java
+index 1a082b383a09..1629b04f586d 100644
+--- a/hapi-fhir-jpaserver-test-r5/src/test/java/ca/uhn/fhir/jpa/dao/r5/dbpartitionmode/TestDefinitions.java
++++ b/hapi-fhir-jpaserver-test-r5/src/test/java/ca/uhn/fhir/jpa/dao/r5/dbpartitionmode/TestDefinitions.java
+@@ -1326,38 +1326,36 @@ public void testSearch_Tags_Versioned(boolean theNegate) {
+ 		myCaptureQueriesListener.logSelectQueries();
+ 		assertThat(values).asList().containsExactly("Patient/" + id);
+ 
++		assertThat(getSelectSql(0)).contains("from HFJ_TAG_DEF td1_0 where");
+ 		if (theNegate) {
+ 			if (myIncludePartitionIdsInPks) {
+-				assertThat(getSelectSql(0)).contains("NOT (EXISTS (SELECT s0.PARTITION_ID,s0.RES_ID FROM HFJ_RES_TAG s0");
+-				assertThat(getSelectSql(0)).contains(" INNER JOIN HFJ_TAG_DEF s1 ON (s0.TAG_ID = s1.TAG_ID) ");
++				assertThat(getSelectSql(1)).contains("NOT (EXISTS (SELECT s0.PARTITION_ID,s0.RES_ID FROM HFJ_RES_TAG s0");
+ 			} else {
+-				assertThat(getSelectSql(0)).contains("(t0.RES_ID) NOT IN (SELECT t0.RES_ID FROM HFJ_RES_TAG t0 ");
+-				assertThat(getSelectSql(0)).contains(" INNER JOIN HFJ_TAG_DEF t1 ON (t0.TAG_ID = t1.TAG_ID) ");
++				assertThat(getSelectSql(1)).contains("(t0.RES_ID) NOT IN (SELECT t0.RES_ID FROM HFJ_RES_TAG t0 ");
+ 			}
+ 		} else {
+ 			if (myIncludePartitionIdsInPks) {
+-				assertThat(getSelectSql(0)).contains(" INNER JOIN HFJ_RES_TAG t1 ON ((t0.PARTITION_ID = t1.PARTITION_ID) AND (t0.RES_ID = t1.RES_ID)) INNER");
++				assertThat(getSelectSql(1)).contains(" INNER JOIN HFJ_RES_TAG t1 ON ((t0.PARTITION_ID = t1.PARTITION_ID) AND (t0.RES_ID = t1.RES_ID)) WHERE");
+ 			} else {
+-				assertThat(getSelectSql(0)).contains(" INNER JOIN HFJ_RES_TAG t1 ON (t0.RES_ID = t1.RES_ID) INNER");
++				assertThat(getSelectSql(1)).contains(" INNER JOIN HFJ_RES_TAG t1 ON (t0.RES_ID = t1.RES_ID) WHERE");
+ 			}
+-			assertThat(getSelectSql(0)).contains(" INNER JOIN HFJ_TAG_DEF t2 ON (t1.TAG_ID = t2.TAG_ID) ");
+ 		}
+ 
+ 		if (myIncludePartitionIdsInSql) {
+-			assertThat(getSelectSql(0)).contains("PARTITION_ID = '1')");
++			assertThat(getSelectSql(1)).contains("PARTITION_ID = '1')");
+ 		}
+ 
+-		// Query 1 is the HFJ_RES_VER fetch
+-		assertThat(getSelectSql(1)).contains(" from HFJ_RES_VER ");
++		// Query 3 is the HFJ_RES_VER fetch
++		assertThat(getSelectSql(2)).contains(" from HFJ_RES_VER ");
+ 
+-		assertThat(getSelectSql(2)).contains(" from HFJ_HISTORY_TAG rht1_0 ");
++		assertThat(getSelectSql(3)).contains(" from HFJ_HISTORY_TAG rht1_0 ");
+ 		if (myIncludePartitionIdsInPks) {
+-			assertThat(getSelectSql(2)).contains(" where (rht1_0.PARTITION_ID,rht1_0.RES_VER_PID) in (('1',");
++			assertThat(getSelectSql(3)).contains(" where (rht1_0.PARTITION_ID,rht1_0.RES_VER_PID) in (('1',");
+ 		} else {
+-			assertThat(getSelectSql(2)).contains(" where (rht1_0.RES_VER_PID) in ('");
++			assertThat(getSelectSql(3)).contains(" where (rht1_0.RES_VER_PID) in ('");
+ 		}
+ 
+-		assertEquals(3, myCaptureQueriesListener.countSelectQueries());
++		assertEquals(4, myCaptureQueriesListener.countSelectQueries());
+ 	}
+ 
+ 	@Test
+@@ -1379,27 +1377,28 @@ public void testSearch_Tags_Unversioned() {
+ 		myCaptureQueriesListener.logSelectQueries();
+ 		assertThat(values).asList().containsExactly("Patient/" + id);
+ 
++		assertThat(getSelectSql(0)).contains("from HFJ_TAG_DEF td1_0 where");
+ 		if (myIncludePartitionIdsInPks) {
+-			assertThat(getSelectSql(0)).contains(" INNER JOIN HFJ_RES_TAG t1 ON ((t0.PARTITION_ID = t1.PARTITION_ID) AND (t0.RES_ID = t1.RES_ID)) INNER");
++			assertThat(getSelectSql(1)).contains(" INNER JOIN HFJ_RES_TAG t1 ON ((t0.PARTITION_ID = t1.PARTITION_ID) AND (t0.RES_ID = t1.RES_ID)) WHERE");
+ 		} else {
+-			assertThat(getSelectSql(0)).contains(" INNER JOIN HFJ_RES_TAG t1 ON (t0.RES_ID = t1.RES_ID) INNER");
++			assertThat(getSelectSql(1)).contains(" INNER JOIN HFJ_RES_TAG t1 ON (t0.RES_ID = t1.RES_ID) WHERE");
+ 		}
+-		assertThat(getSelectSql(0)).contains(" INNER JOIN HFJ_TAG_DEF t2 ON (t1.TAG_ID = t2.TAG_ID) ");
++
+ 		if (myIncludePartitionIdsInSql) {
+-			assertThat(getSelectSql(0)).contains("(t1.PARTITION_ID = '1')");
++			assertThat(getSelectSql(1)).contains("(t1.PARTITION_ID = '1')");
+ 		}
+ 
+-		// Query 1 is the HFJ_RES_VER fetch
+-		assertThat(getSelectSql(1)).contains(" from HFJ_RES_VER ");
++		// Query 3
++		assertThat(getSelectSql(2)).contains(" from HFJ_RES_VER ");
+ 
+-		assertThat(getSelectSql(2)).contains(" from HFJ_RES_TAG rt1_0 ");
++		assertThat(getSelectSql(3)).contains(" from HFJ_RES_TAG rt1_0 ");
+ 		if (myIncludePartitionIdsInPks) {
+-			assertThat(getSelectSql(2)).contains(" where (rt1_0.RES_ID,rt1_0.PARTITION_ID) in (('" + id + "','1'))");
++			assertThat(getSelectSql(3)).contains(" where (rt1_0.RES_ID,rt1_0.PARTITION_ID) in (('" + id + "','1'))");
+ 		} else {
+-			assertThat(getSelectSql(2)).contains(" where (rt1_0.RES_ID) in ('" + id + "')");
++			assertThat(getSelectSql(3)).contains(" where (rt1_0.RES_ID) in ('" + id + "')");
+ 		}
+ 
+-		assertEquals(3, myCaptureQueriesListener.countSelectQueries());
++		assertEquals(4, myCaptureQueriesListener.countSelectQueries());
+ 	}
+ 
+ 	@Test

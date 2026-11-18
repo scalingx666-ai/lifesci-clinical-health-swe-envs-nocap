@@ -1,0 +1,314 @@
+diff --git a/erpnext/controllers/buying_controller.py b/erpnext/controllers/buying_controller.py
+index b45b3c829829..24f2efa48064 100644
+--- a/erpnext/controllers/buying_controller.py
++++ b/erpnext/controllers/buying_controller.py
+@@ -1197,6 +1197,137 @@ def has_rejected_stock(self, row) -> bool:
+ 		return self.is_internal_receipt() and bool(get_stock_qty(row, row.rejected_qty))
+ 
+ 	def get_source_warehouse_qty(self, row, accepted_qty):
++		"""Stock qty the row takes out of the source warehouse. An internal receipt takes no more than its
++		delivered row left in transit, so partial receipts that round up add up to the delivery, and its
++		return puts back no more than the receipt took. A cap of nothing left falls back to the row's qty."""
++		qty = self.get_received_stock_qty(row, accepted_qty)
++		if not self.is_capped_in_transit(row):
++			return qty
++
++		if self.docstatus == 2:
++			return -flt(self.get_posted_qty(row.name, row.from_warehouse, outward=not self.is_return)) or qty
++
++		if self.is_return:
++			qty_left = self.get_qty_left_to_return(row)
++			return max(qty, -qty_left) if flt(qty_left) > 0 else qty
++
++		qty_left = self.get_qty_left_in_transit(row)
++		return min(qty, qty_left) if flt(qty_left) > 0 else qty
++
++	def is_capped_in_transit(self, row) -> bool:
++		"""Whether the row moves the stock of a delivered row through transit. A row with a package is not
++		capped, as its package holds the qty."""
++		if not self.is_internal_receipt():
++			return False
++
++		if row.get("serial_and_batch_bundle") or row.get("rejected_serial_and_batch_bundle"):
++			return False
++
++		return bool(row.get("purchase_receipt_item") if self.is_return else row.get("delivery_note_item"))
++
++	def get_qty_left_to_return(self, row) -> float:
++		"""Stock qty the returned receipt row took out of transit that its other returns have not put back.
++		Only the receipt's entry out of transit and the returns' entries into it count, as rejected stock
++		can stay in transit."""
++		receipt_item = frappe.qb.DocType("Purchase Receipt Item")
++		other_returns = (
++			frappe.qb.from_(receipt_item)
++			.select(receipt_item.name)
++			.where(
++				(receipt_item.purchase_receipt_item == row.purchase_receipt_item)
++				& (receipt_item.parent != self.name)
++			)
++		)
++		sle = frappe.qb.DocType("Stock Ledger Entry")
++		moved_qty = (
++			frappe.qb.from_(sle)
++			.select(Sum(sle.actual_qty))
++			.where(
++				(sle.warehouse == row.from_warehouse)
++				& (sle.is_cancelled == 0)
++				& (
++					((sle.voucher_detail_no == row.purchase_receipt_item) & (sle.actual_qty < 0))
++					| (sle.voucher_detail_no.isin(other_returns) & (sle.actual_qty > 0))
++				)
++			)
++			.run()[0][0]
++		)
++		return -flt(moved_qty, row.precision("stock_qty"))
++
++	def get_qty_left_in_transit(self, row) -> float | None:
++		"""Stock qty the delivered row put in transit that its other receipts, net of their returns, have not
++		taken out. None if the receipts take more than was delivered: only rounding is capped."""
++		delivered_qty = self.get_posted_qty(row.delivery_note_item, row.from_warehouse, outward=False)
++		if not delivered_qty:
++			return None
++
++		received_qty, taken_qty = self.get_other_receipts_of_delivered_row(row)
++		received_qty += (flt(row.qty) + flt(row.rejected_qty)) * flt(row.conversion_factor)
++		precision = row.precision("stock_qty")
++		if flt(received_qty, precision) > delivered_qty:
++			return None
++
++		return flt(delivered_qty + taken_qty, precision)
++
++	def get_other_receipts_of_delivered_row(self, row) -> tuple[float, float]:
++		"""Unrounded stock qty the other receipts of the delivered row and their returns received, and the
++		stock qty their entries took out of transit."""
++		receipt_item = frappe.qb.DocType("Purchase Receipt Item")
++		other_receipt_rows = (
++			frappe.qb.from_(receipt_item)
++			.select(receipt_item.name)
++			.where(
++				(receipt_item.delivery_note_item == row.delivery_note_item)
++				& (receipt_item.parent != self.name)
++			)
++		)
++		rows = (
++			frappe.qb.from_(receipt_item)
++			.select(
++				receipt_item.name,
++				((receipt_item.qty + receipt_item.rejected_qty) * receipt_item.conversion_factor).as_("qty"),
++			)
++			.where(
++				(receipt_item.docstatus == 1)
++				& (
++					receipt_item.name.isin(other_receipt_rows)
++					| receipt_item.purchase_receipt_item.isin(other_receipt_rows)
++				)
++			)
++			.run(as_dict=True)
++		)
++		if not rows:
++			return 0.0, 0.0
++
++		sle = frappe.qb.DocType("Stock Ledger Entry")
++		taken_qty = (
++			frappe.qb.from_(sle)
++			.select(Sum(sle.actual_qty))
++			.where(
++				(sle.warehouse == row.from_warehouse)
++				& (sle.is_cancelled == 0)
++				& sle.voucher_detail_no.isin([d.name for d in rows])
++			)
++			.run()[0][0]
++		)
++		return sum(flt(d.qty) for d in rows), flt(taken_qty)
++
++	def get_posted_qty(self, voucher_detail_no, warehouse, outward):
++		"""Qty of the row's entry out of or into the warehouse; a row can have both when rejected stock
++		stays in transit."""
++		return frappe.db.get_value(
++			"Stock Ledger Entry",
++			{
++				"voucher_detail_no": voucher_detail_no,
++				"warehouse": warehouse,
++				"is_cancelled": 0,
++				"actual_qty": ("<", 0) if outward else (">", 0),
++			},
++			"actual_qty",
++		)
++
++	def get_received_stock_qty(self, row, accepted_qty):
++		"""Accepted stock qty, plus the rejected stock qty when rejected stock leaves the source warehouse too."""
+ 		if not self.has_rejected_stock(row):
+ 			return accepted_qty
+ 
+diff --git a/erpnext/stock/doctype/purchase_receipt/test_purchase_receipt.py b/erpnext/stock/doctype/purchase_receipt/test_purchase_receipt.py
+index 604e799f656c..49ce69c26382 100644
+--- a/erpnext/stock/doctype/purchase_receipt/test_purchase_receipt.py
++++ b/erpnext/stock/doctype/purchase_receipt/test_purchase_receipt.py
+@@ -2859,34 +2859,9 @@ def test_internal_transfer_rejected_qty_takes_the_delivered_stock_qty_out_of_tra
+ 		"""Accepted and rejected qty that round up on their own still take only the delivered stock
+ 		qty out of the in-transit warehouse."""
+ 		from erpnext.stock.doctype.delivery_note.delivery_note import make_inter_company_purchase_receipt
+-		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+-
+-		prepare_data_for_internal_transfer()
+-		company = "_Test Company with perpetual inventory"
+-		from_warehouse = create_warehouse("_Test Transfer From", company=company)
+-		transit_warehouse = create_warehouse("_Test Transfer Transit", company=company)
+-		item = make_item(
+-			properties={"is_stock_item": 1, "stock_uom": "Kg"},
+-			uoms=[{"uom": "Box", "conversion_factor": 0.3356}],
+-		).name
+ 
+-		make_purchase_receipt(
+-			item_code=item, company=company, warehouse=from_warehouse, qty=10, rate=100, uom="Kg"
+-		)
+-
+-		dn = create_delivery_note(
+-			item_code=item,
+-			company=company,
+-			customer="_Test Internal Customer 2",
+-			cost_center="Main - TCP1",
+-			expense_account="Cost of Goods Sold - TCP1",
+-			qty=6,
+-			warehouse=from_warehouse,
+-			target_warehouse=transit_warehouse,
+-			do_not_submit=True,
+-		)
+-		dn.items[0].update({"uom": "Box", "conversion_factor": 0.3356})
+-		dn.submit()
++		dn, transit_warehouse = make_internal_delivery_of_fractional_boxes()
++		company = dn.company
+ 
+ 		pr = make_inter_company_purchase_receipt(dn.name)
+ 		pr.items[0].update(
+@@ -3042,6 +3017,89 @@ def test_internal_transfer_pr_with_every_unit_rejected(self):
+ 		self.assertEqual(booked_value[get_inventory_account(company, transit_warehouse)], -1000)
+ 		self.assertEqual(booked_value[get_inventory_account(company, rejected_warehouse)], 1000)
+ 
++	def test_internal_transfer_partial_receipts_take_only_the_delivered_stock_qty_out_of_transit(self):
++		"""Partial receipts whose stock qty rounds up take no more out of the in-transit warehouse
++		than the delivery put there, and cancelling them puts back what they took."""
++		from erpnext.stock.doctype.delivery_note.delivery_note import make_inter_company_purchase_receipt
++
++		dn, transit_warehouse = make_internal_delivery_of_fractional_boxes()
++		transit_bin = {"item_code": dn.items[0].item_code, "warehouse": transit_warehouse}
++		delivered_qty = frappe.db.get_value("Bin", transit_bin, "actual_qty")
++
++		receipts = []
++		for _ in range(2):
++			pr = make_inter_company_purchase_receipt(dn.name)
++			pr.items[0].update(
++				{"warehouse": create_warehouse("_Test Transfer To", company=dn.company), "qty": 3}
++			)
++			pr.submit()
++			receipts.append(pr)
++
++		self.assertEqual(frappe.db.get_value("Bin", transit_bin, "actual_qty"), 0)
++
++		for pr in receipts:
++			pr.cancel()
++
++		self.assertEqual(frappe.db.get_value("Bin", transit_bin, "actual_qty"), delivered_qty)
++
++	def test_internal_transfer_receipt_after_a_return_takes_what_the_return_put_back(self):
++		"""A return of a partial receipt puts its stock qty back in transit, so the next receipt can
++		take it again."""
++		from erpnext.controllers.sales_and_purchase_return import make_return_doc
++		from erpnext.stock.doctype.delivery_note.delivery_note import make_inter_company_purchase_receipt
++
++		dn, transit_warehouse = make_internal_delivery_of_fractional_boxes()
++		to_warehouse = create_warehouse("_Test Transfer To", company=dn.company)
++
++		pr = make_inter_company_purchase_receipt(dn.name)
++		pr.items[0].update({"warehouse": to_warehouse, "qty": 3})
++		pr.submit()
++		make_return_doc("Purchase Receipt", pr.name).submit()
++
++		pr = make_inter_company_purchase_receipt(dn.name)
++		pr.set_posting_time = 0
++		pr.items[0].update({"warehouse": to_warehouse, "qty": 3})
++		pr.submit()
++
++		sle_filters = {"voucher_no": pr.name, "warehouse": transit_warehouse, "is_cancelled": 0}
++		self.assertEqual(frappe.db.get_value("Stock Ledger Entry", sle_filters, "actual_qty"), -1.01)
++
++	def test_internal_transfer_returns_put_back_only_what_the_receipts_took(self):
++		"""Returns of partial receipts put back what each receipt took out of transit, not their own
++		rounded stock qty."""
++		from erpnext.controllers.sales_and_purchase_return import make_return_doc
++		from erpnext.stock.doctype.delivery_note.delivery_note import make_inter_company_purchase_receipt
++
++		dn, transit_warehouse = make_internal_delivery_of_fractional_boxes()
++		transit_bin = {"item_code": dn.items[0].item_code, "warehouse": transit_warehouse}
++		delivered_qty = frappe.db.get_value("Bin", transit_bin, "actual_qty")
++
++		receipts = []
++		for _ in range(2):
++			pr = make_inter_company_purchase_receipt(dn.name)
++			pr.items[0].update(
++				{"warehouse": create_warehouse("_Test Transfer To", company=dn.company), "qty": 3}
++			)
++			pr.submit()
++			receipts.append(pr)
++
++		for pr in receipts:
++			make_return_doc("Purchase Receipt", pr.name).submit()
++
++		self.assertEqual(frappe.db.get_value("Bin", transit_bin, "actual_qty"), delivered_qty)
++
++	@ERPNextTestSuite.change_settings("Stock Settings", {"over_delivery_receipt_allowance": 50})
++	def test_internal_transfer_over_receipt_takes_its_own_stock_qty_out_of_transit(self):
++		"""Over-received stock did not come from the delivery, so it is not capped to what is in transit."""
++		from erpnext.stock.doctype.delivery_note.delivery_note import make_inter_company_purchase_receipt
++		from erpnext.stock.stock_ledger import NegativeStockError
++
++		dn, _ = make_internal_delivery_of_fractional_boxes()
++		pr = make_inter_company_purchase_receipt(dn.name)
++		pr.items[0].update({"warehouse": create_warehouse("_Test Transfer To", company=dn.company), "qty": 7})
++
++		self.assertRaises(NegativeStockError, pr.submit)
++
+ 	def test_internal_transfer_rejected_qty_for_serial_item(self):
+ 		"""Rejected serial numbers leave the in-transit warehouse and stay out of the package of
+ 		accepted material."""
+@@ -9809,6 +9867,40 @@ def add_valuation_freight(doc, amount):
+ 	)
+ 
+ 
++def make_internal_delivery_of_fractional_boxes():
++	"""Internal Delivery Note of 6 Box at 0.3356 Kg into an in-transit warehouse, so its stock qty (2.01 Kg)
++	is less than the rounded stock qty of two halves (1.01 Kg each)."""
++	from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
++
++	prepare_data_for_internal_transfer()
++	company = "_Test Company with perpetual inventory"
++	from_warehouse = create_warehouse("_Test Transfer From", company=company)
++	transit_warehouse = create_warehouse("_Test Transfer Transit", company=company)
++	item = make_item(
++		properties={"is_stock_item": 1, "stock_uom": "Kg"},
++		uoms=[{"uom": "Box", "conversion_factor": 0.3356}],
++	).name
++
++	make_purchase_receipt(
++		item_code=item, company=company, warehouse=from_warehouse, qty=10, rate=100, uom="Kg"
++	)
++
++	dn = create_delivery_note(
++		item_code=item,
++		company=company,
++		customer="_Test Internal Customer 2",
++		cost_center="Main - TCP1",
++		expense_account="Cost of Goods Sold - TCP1",
++		qty=6,
++		warehouse=from_warehouse,
++		target_warehouse=transit_warehouse,
++		do_not_submit=True,
++	)
++	dn.items[0].update({"uom": "Box", "conversion_factor": 0.3356})
++	dn.submit()
++	return dn, transit_warehouse
++
++
+ def make_purchase_receipt(**args):
+ 	if not frappe.db.exists("Location", "Test Location"):
+ 		frappe.get_doc({"doctype": "Location", "location_name": "Test Location"}).insert()

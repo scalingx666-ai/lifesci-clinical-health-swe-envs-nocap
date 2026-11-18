@@ -1,0 +1,302 @@
+diff --git a/backend/app/constants/celery_tasks.py b/backend/app/constants/celery_tasks.py
+index 2192c01a2a..365cad4392 100644
+--- a/backend/app/constants/celery_tasks.py
++++ b/backend/app/constants/celery_tasks.py
+@@ -26,6 +26,7 @@ class CeleryTask(StrEnum):
+     PROCESS_AWS_UPLOAD = f"{_PREFIX}.process_aws_upload_task.process_aws_upload"
+     COMPLETE_AND_PROCESS_AWS_UPLOAD = f"{_PREFIX}.process_aws_upload_task.complete_and_process_aws_upload"
+     PROCESS_SDK_UPLOAD = f"{_PREFIX}.process_sdk_upload_task.process_sdk_upload"
++    SAVE_SDK_SLEEP = f"{_PREFIX}.save_sdk_sleep_task.save_sdk_sleep"
+     PROCESS_XML_UPLOAD = f"{_PREFIX}.process_xml_upload_task.process_xml_upload"
+     RECONCILE_PROVIDER_WEBHOOKS = f"{_PREFIX}.provider_webhooks_task.reconcile_provider_webhooks"
+     REFRESH_DASHBOARD_TOTAL_DATA_POINTS = f"{_PREFIX}.refresh_dashboard_stats_task.refresh_dashboard_total_data_points"
+diff --git a/backend/app/integrations/celery/core.py b/backend/app/integrations/celery/core.py
+index 8d29f8e730..2bb6056803 100644
+--- a/backend/app/integrations/celery/core.py
++++ b/backend/app/integrations/celery/core.py
+@@ -194,6 +194,7 @@ def create_celery() -> Celery:
+         task_queues={queue: {} for queue in CeleryQueue},
+         task_routes={
+             CeleryTask.PROCESS_SDK_UPLOAD: {"queue": CeleryQueue.SDK_SYNC},
++            CeleryTask.SAVE_SDK_SLEEP: {"queue": CeleryQueue.SDK_SYNC},
+             CeleryTask.PROCESS_AWS_UPLOAD: {"queue": CeleryQueue.XML_SYNC},
+             CeleryTask.COMPLETE_AND_PROCESS_AWS_UPLOAD: {"queue": CeleryQueue.XML_SYNC},
+             CeleryTask.PROCESS_XML_UPLOAD: {"queue": CeleryQueue.XML_SYNC},
+diff --git a/backend/app/integrations/celery/tasks/process_aws_upload_task.py b/backend/app/integrations/celery/tasks/process_aws_upload_task.py
+index 1f08833b59..0bbc6d8f8e 100644
+--- a/backend/app/integrations/celery/tasks/process_aws_upload_task.py
++++ b/backend/app/integrations/celery/tasks/process_aws_upload_task.py
+@@ -17,7 +17,7 @@
+ from app.services.providers.apple.apple_xml.aws_service import get_s3_client
+ from app.services.providers.apple.apple_xml.multipart_upload_service import multipart_upload_service
+ from app.services.providers.apple.apple_xml.xml_service import XMLService
+-from app.services.sdk.sleep_service import handle_sleep_data
++from app.services.sdk.sleep_service import save_sleep
+ from app.services.sync_status_service import (
+     emit_sync_completed,
+     emit_sync_failed,
+@@ -399,4 +399,4 @@ def _import_xml_data(db: Session, xml_source: str | Path | BinaryIO, user_id: st
+             timeseries_service.bulk_create_samples(db, time_series_records)
+             db.commit()
+         if sync_request and sync_request.data.sleep:
+-            handle_sleep_data(db, sync_request, user_id)
++            save_sleep(db, sync_request, user_id)
+diff --git a/backend/app/integrations/celery/tasks/process_xml_upload_task.py b/backend/app/integrations/celery/tasks/process_xml_upload_task.py
+index 58c2f3d01c..a05ff9bbad 100644
+--- a/backend/app/integrations/celery/tasks/process_xml_upload_task.py
++++ b/backend/app/integrations/celery/tasks/process_xml_upload_task.py
+@@ -20,7 +20,7 @@
+ )
+ from app.services import event_record_service
+ from app.services.providers.apple.apple_xml.xml_service import XMLService
+-from app.services.sdk.sleep_service import handle_sleep_data
++from app.services.sdk.sleep_service import save_sleep
+ from app.services.sync_status_service import (
+     emit_sync_completed,
+     emit_sync_failed,
+@@ -208,6 +208,6 @@ def _import_xml_data(db: Session, xml_path: str, user_id: str) -> XMLParseStats:
+             db.commit()
+ 
+         if sync_request and sync_request.data.sleep:
+-            handle_sleep_data(db, sync_request, user_id)
++            save_sleep(db, sync_request, user_id)
+ 
+     return xml_service.stats
+diff --git a/backend/app/integrations/celery/tasks/save_sdk_sleep_task.py b/backend/app/integrations/celery/tasks/save_sdk_sleep_task.py
+new file mode 100644
+index 0000000000..a829317f98
+--- /dev/null
++++ b/backend/app/integrations/celery/tasks/save_sdk_sleep_task.py
+@@ -0,0 +1,33 @@
++from typing import Any
++
++from celery import Task, shared_task
++from redis.exceptions import LockError
++
++from app.constants.celery_tasks import CeleryTask
++from app.database import SessionLocal
++from app.schemas.providers.mobile_sdk import SyncRequest
++from app.services.sdk.sleep_service import SLEEP_RETRY_SECONDS, handle_sleep_data
++from app.utils.structured_logging import get_logger
++
++logger = get_logger(__name__)
++
++
++@shared_task(name=CeleryTask.SAVE_SDK_SLEEP, bind=True, max_retries=4)
++def save_sdk_sleep(self: Task, request_json: str, user_id: str) -> dict[str, Any]:
++    """Save the sleep of an upload whose user's sleep lock was busy, once the lock frees up."""
++    request = SyncRequest.model_validate_json(request_json)
++    try:
++        with SessionLocal() as db:
++            handle_sleep_data(db, request, user_id)
++    except LockError as exc:
++        if self.request.retries >= (self.max_retries or 0):
++            logger.error(
++                "Sleep dropped: the sleep lock stayed busy",
++                alert=True,
++                provider=request.provider,
++                user_id=user_id,
++                sleep_count=len(request.data.sleep),
++            )
++            return {"status": "dropped", "sleep_count": len(request.data.sleep)}
++        raise self.retry(exc=exc, countdown=SLEEP_RETRY_SECONDS * (self.request.retries + 2)) from exc
++    return {"status": "saved", "sleep_count": len(request.data.sleep)}
+diff --git a/backend/app/services/sdk/import_service.py b/backend/app/services/sdk/import_service.py
+index 32d3dc907d..bd184875e3 100644
+--- a/backend/app/services/sdk/import_service.py
++++ b/backend/app/services/sdk/import_service.py
+@@ -56,7 +56,7 @@
+ from app.utils.structured_logging import get_logger
+ 
+ from .device_resolution import extract_device_ids, extract_device_info, extract_device_type
+-from .sleep_service import handle_sleep_data
++from .sleep_service import save_sleep
+ 
+ logger = get_logger(__name__)
+ 
+@@ -683,8 +683,8 @@ def widen(data_type: str, start: datetime, end: datetime) -> None:
+         db_session.commit()
+ 
+         # Process sleep (count sleep segments from input)
+-        if request.data.sleep:
+-            handle_sleep_data(db_session, request, user_id)
++        # Sleep a busy lock deferred to a retrying task is not counted as saved here.
++        if request.data.sleep and save_sleep(db_session, request, user_id):
+             sleep_saved = len(request.data.sleep)
+             for segment in request.data.sleep:
+                 widen("sleep", segment.startDate, segment.endDate)
+diff --git a/backend/app/services/sdk/sleep_service.py b/backend/app/services/sdk/sleep_service.py
+index 4043b67483..80f6844152 100644
+--- a/backend/app/services/sdk/sleep_service.py
++++ b/backend/app/services/sdk/sleep_service.py
+@@ -6,6 +6,7 @@
+ from uuid import UUID, uuid4
+ 
+ from celery import current_app as celery_app
++from redis.exceptions import LockError
+ 
+ from app.config import settings
+ from app.constants.celery_tasks import CeleryTask
+@@ -29,6 +30,7 @@
+     SLEEP_START_STATES,
+     SleepState,
+     SleepStateStage,
++    SyncRequestData,
+ )
+ from app.schemas.providers.mobile_sdk import (
+     SyncRequest as SDKSyncRequest,
+@@ -42,6 +44,9 @@
+ 
+ logger = get_logger(__name__)
+ 
++# Seconds before a sleep the lock kept out is tried again, growing with each attempt.
++SLEEP_RETRY_SECONDS = 30
++
+ _STAGE_TO_METRIC: dict[str, str] = {
+     "awake": "awake_seconds",
+     "sleeping": "sleeping_seconds",
+@@ -327,8 +332,7 @@ def handle_sleep_data(
+     try:
+         acquired = lock.acquire()
+         if not acquired:
+-            logger.warning("Could not acquire sleep processing lock; skipping batch", user_id=user_id)
+-            return
++            raise LockError(f"Could not acquire sleep processing lock for user {user_id}")
+ 
+         states = load_sleep_states(user_id)
+         provider = request.provider
+@@ -432,6 +436,26 @@ def handle_sleep_data(
+     celery_app.send_task(CeleryTask.FINALIZE_STALE_SLEEPS)
+ 
+ 
++def save_sleep(db_session: DbSession, request: SDKSyncRequest, user_id: str) -> bool:
++    """Save the request's sleep now, or, while another batch of the user holds the sleep lock, in a task that
++    retries it; True when saved now. The lock is per user, so waiting for it is what a busy export needs."""
++    try:
++        handle_sleep_data(db_session, request, user_id)
++        return True
++    except LockError:
++        sleep_only = request.model_copy(update={"data": SyncRequestData(sleep=request.data.sleep)})
++        celery_app.send_task(
++            CeleryTask.SAVE_SDK_SLEEP, args=[sleep_only.model_dump_json(), user_id], countdown=SLEEP_RETRY_SECONDS
++        )
++        logger.warning(
++            "Sleep lock busy; sleep saved by a retrying task",
++            provider=request.provider,
++            user_id=user_id,
++            sleep_count=len(request.data.sleep),
++        )
++        return False
++
++
+ def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[SleepStage]]:
+     """
+     Recalculate metrics from stages, handling overlaps by prioritizing earlier segments.
+diff --git a/backend/tests/integrations/test_sdk_import.py b/backend/tests/integrations/test_sdk_import.py
+index c1d3db5685..b0ae66e705 100644
+--- a/backend/tests/integrations/test_sdk_import.py
++++ b/backend/tests/integrations/test_sdk_import.py
+@@ -13,6 +13,7 @@
+ import pytest
+ from sqlalchemy.orm import Session
+ 
++from app.constants.celery_tasks import CeleryTask
+ from app.constants.series_types.sdk import get_series_type_from_metric_type
+ from app.models import DataSource, EventRecord, EventRecordAggregate, MealDetails, SeriesSample, WorkoutDetails
+ from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
+@@ -174,6 +175,29 @@ def test_import_workout_with_statistics(
+         assert details.energy_burned == Decimal("180.00")  # 131.41 + 48.59
+         assert details.total_elevation_gain == Decimal("15.57")
+ 
++    def test_sleep_a_busy_lock_keeps_out_is_saved_by_a_retrying_task(
++        self,
++        db: Session,
++        import_service: ImportService,
++        sample_sdk_payload: dict[str, Any],
++        mock_sleep_redis: MagicMock,
++    ) -> None:
++        """Another batch of the user holds the sleep lock: the rest is saved now, the sleep goes to a task."""
++        mock_sleep_redis.lock.return_value.acquire.return_value = False
++
++        with patch("app.services.sdk.sleep_service.celery_app") as celery:
++            result = import_service.load_data(db, sample_sdk_payload, str(UserFactory().id))
++
++        assert (result["workouts_saved"], result["sleep_saved"], result["dropped"]) == (1, 0, [])
++        task, (request_json, _) = celery.send_task.call_args.args[0], celery.send_task.call_args.kwargs["args"]
++        assert task == CeleryTask.SAVE_SDK_SLEEP
++        deferred = SDKSyncRequest.model_validate_json(request_json)
++        assert (len(deferred.data.sleep), deferred.data.records, deferred.data.workouts) == (
++            len(sample_sdk_payload["data"]["sleep"]),
++            [],
++            [],
++        )
++
+     def test_spans_cover_only_types_the_device_exports_itself(
+         self,
+         db: Session,
+diff --git a/backend/tests/tasks/test_save_sdk_sleep_task.py b/backend/tests/tasks/test_save_sdk_sleep_task.py
+new file mode 100644
+index 0000000000..3f34889e5b
+--- /dev/null
++++ b/backend/tests/tasks/test_save_sdk_sleep_task.py
+@@ -0,0 +1,60 @@
++from unittest.mock import MagicMock, patch
++
++import pytest
++from celery.exceptions import Retry
++from redis.exceptions import LockError
++
++from app.integrations.celery.tasks import save_sdk_sleep_task as task
++from app.schemas.providers.mobile_sdk import SyncRequest
++
++REQUEST = SyncRequest.model_validate(
++    {
++        "provider": "apple",
++        "sdkVersion": "1.0.0",
++        "syncTimestamp": "2026-01-01T08:00:00Z",
++        "data": {
++            "sleep": [
++                {
++                    "id": "s1",
++                    "stage": "asleep_core",
++                    "startDate": "2026-01-01T01:00:00Z",
++                    "endDate": "2026-01-01T02:00:00Z",
++                }
++            ]
++        },
++    }
++).model_dump_json()
++
++
++def _run(retries: int, outcome: Exception | None) -> object:
++    with (
++        patch.object(task, "SessionLocal", MagicMock()),
++        patch.object(task, "handle_sleep_data", side_effect=outcome) as handle,
++        patch.object(task.save_sdk_sleep, "retry", side_effect=Retry()),
++        patch.object(task.logger, "error") as error,
++    ):
++        task.save_sdk_sleep.push_request(retries=retries)
++        try:
++            return task.save_sdk_sleep.run(REQUEST, "user-1"), handle, error
++        finally:
++            task.save_sdk_sleep.pop_request()
++
++
++def test_the_sleep_is_saved_once_the_lock_frees_up() -> None:
++    result, handle, error = _run(0, None)
++
++    assert result == {"status": "saved", "sleep_count": 1}
++    handle.assert_called_once()
++    error.assert_not_called()
++
++
++def test_a_busy_lock_is_retried() -> None:
++    with pytest.raises(Retry):
++        _run(1, LockError("busy"))
++
++
++def test_after_the_last_attempt_the_loss_is_reported() -> None:
++    result, _, error = _run(task.save_sdk_sleep.max_retries, LockError("busy"))
++
++    assert result == {"status": "dropped", "sleep_count": 1}
++    assert error.call_args.kwargs["alert"] is True

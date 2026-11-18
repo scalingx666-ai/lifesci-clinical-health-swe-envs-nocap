@@ -1,0 +1,936 @@
+diff --git a/js/openmedkit-web/README.md b/js/openmedkit-web/README.md
+index 6aa98489de..5b9d65b53b 100644
+--- a/js/openmedkit-web/README.md
++++ b/js/openmedkit-web/README.md
+@@ -34,9 +34,10 @@ console.log(result.spans);
+ 
+ Without a `model` or `pipeline` option, `deidentify()` and `extractPii()` load
+ `OpenMed/OpenMed-PII-ClinicalE5-Small-33M-v1-onnx-android` (exported as
+-`DEFAULT_MODEL_ID`): the root INT8 artifact of a 33M-parameter clinical PII
+-model, about 70 MB, served through Transformers.js. Pass `model` to pick any
+-other public `OpenMed/<model>-onnx-android` repository, or load one yourself:
++`DEFAULT_MODEL_ID`) at the commit pinned by `DEFAULT_MODEL_REVISION`: the root
++INT8 artifact of a 33M-parameter clinical PII model, about 70 MB, served
++through Transformers.js. Pass `model` to pick any other public
++`OpenMed/<model>-onnx-android` repository, or load one yourself:
+ 
+ ```ts
+ import { deidentify, loadOnnxModel } from "openmed";
+@@ -52,6 +53,80 @@ const result = await deidentify(
+ `{ variant: "fp32" }` or `{ variant: "fp16" }` when a different published
+ variant is appropriate.
+ 
++### Model Acquisition and Offline-Only Mode
++
++`DEFAULT_MODEL_REVISION` is the full Hub commit
++(`79f7db205869b1be4be23ac4f42aa95bdedc5aee`) published with the default
++model's current model card, so a later push to that repository does not change
++existing deployments. On first use Transformers.js downloads that revision from
++the Hugging Face Hub and caches it. Set `loaderOptions.revision` to request
++another commit. Other Hub models load the revision you pass, or `main` if you
++pass none, so pin one in production.
++
++Explicit local paths (`/`, `./`, `../`, `~`, `file://` or a Windows drive)
++always load with `local_files_only` and `allowRemoteModels: false`, whatever the
++loader options say. A path that only looks local but names another host, such
++as `//host/...`, is refused.
++
++Offline-only mode makes every OpenMed loader refuse remote model references and
++remote runtime asset locations before anything is fetched; absolute, relative
++and same-origin paths count as local. Turn it on for the whole package, or per
++call with `offlineOnly: true` on `extractPii()`, `deidentify()`,
++`loadOnnxModel()` or `loadTokenClassificationPipeline()`. A call cannot opt out
++of the package-wide setting. A custom `modelLoader` still receives only local
++references, but what it or a supplied `pipeline` fetches is up to your code.
++
++```ts
++import { deidentify, setOfflineOnly } from "openmed";
++
++setOfflineOnly(true);
++
++const result = await deidentify(clinicalNote, {
++  model: "/models/openmed-pii-clinicale5-small",
++  loaderOptions: { wasmPaths: "/assets/onnxruntime/" },
++});
++```
++
++In offline-only mode:
++
++- Hub IDs and URLs, including the default model, are refused before any loader,
++  runtime import or fetch runs. Serve a local copy and pass its path as `model`.
++- Transformers.js loads with `allowRemoteModels: false` and
++  `local_files_only: true`.
++- ONNX Runtime WebAssembly files must be local. In browsers Transformers.js
++  points `env.backends.onnx.wasm.wasmPaths` at jsDelivr by default, so pass
++  `wasmPaths` (a directory prefix or `{ mjs, wasm }` file paths) or the load is
++  refused. The value stays set, because ONNX Runtime reads it once, when its
++  WebAssembly backend starts. A remote `env.localModelPath` is refused too.
++- Missing or unreadable local assets fail closed.
++
++The ONNX Runtime Web loader and the WebGPU session accept only local model and
++runtime paths in every mode. With the package-wide setting on, their load
++failures also surface as `OpenMedOfflineError`.
++
++Refusals from `extractPii()`, `deidentify()` and the Transformers.js loaders,
++and offline-only load failures from every loader, throw `OpenMedOfflineError`.
++Its `code` is `remote_model_refused`, `remote_asset_refused` or
++`local_assets_unavailable`, and its message is fixed. It carries no input text,
++path, URL or underlying runtime error (there is no `cause`), so it is safe to
++log.
++
++To prepare a local copy, download the pinned revision once and copy the
++`onnxruntime-web` `dist/*.wasm` and `dist/*.mjs` files next to your app:
++
++```bash
++hf download OpenMed/OpenMed-PII-ClinicalE5-Small-33M-v1-onnx-android \
++  --revision 79f7db205869b1be4be23ac4f42aa95bdedc5aee \
++  --local-dir public/models/openmed-pii-clinicale5-small
++```
++
++Downloading the default model implicitly on the first call is deprecated. A
++future major release will require explicit preparation: a local `model` path or
++a `pipeline` you load yourself. Prepare models that way now, and turn on
++offline-only mode to catch any download that remains.
++
++### Token Offsets
++
+ Transformers.js token-classification output carries no character offsets.
+ OpenMed aligns every token back to the source text before decoding spans
+ (case- and accent-insensitive, WordPiece `##`, SentencePiece `▁`, and
+diff --git a/js/openmedkit-web/src/index.ts b/js/openmedkit-web/src/index.ts
+index 83f769092b..78302dba34 100644
+--- a/js/openmedkit-web/src/index.ts
++++ b/js/openmedkit-web/src/index.ts
+@@ -1,9 +1,15 @@
+ import { decodeBioTokenSpans } from "./decoder";
+-import { loadOnnxModel, loadTokenClassificationPipeline } from "./model-loader";
++import {
++  assertLocalModelReference,
++  loadOnnxModel,
++  loadTokenClassificationPipeline,
++} from "./model-loader";
++import { resolveOfflineOnly } from "./offline";
+ import {
+   OPENMED_SPAN_SCHEMA_VERSION,
+   type DeidentifyOptions,
+   type ExtractPiiOptions,
++  type LoadModelOptions,
+   type ModelLoader,
+   type OpenMedDeidentifyResult,
+   type OpenMedSpan,
+@@ -24,6 +30,7 @@ export type {
+   LoadModelOptions,
+   LoadOnnxModelOptions,
+   ModelLoader,
++  OnnxWasmPaths,
+   OpenMedOnnxVariant,
+   OpenMedDeidentifyResult,
+   OpenMedSpan,
+@@ -54,6 +61,8 @@ export {
+   loadOnnxModel,
+   loadTokenClassificationPipeline,
+ } from "./model-loader";
++export { OpenMedOfflineError, isOfflineOnly, setOfflineOnly } from "./offline";
++export type { OpenMedOfflineErrorCode } from "./offline";
+ export {
+   detectOrtWebCapabilities,
+   probeOrtWebCapabilities,
+@@ -128,12 +137,15 @@ export type {
+ 
+ export const DEFAULT_MODEL_ID =
+   "OpenMed/OpenMed-PII-ClinicalE5-Small-33M-v1-onnx-android";
++/** Hub commit of `DEFAULT_MODEL_ID` that the default path requests. */
++export const DEFAULT_MODEL_REVISION = "79f7db205869b1be4be23ac4f42aa95bdedc5aee";
+ const ONNX_ANDROID_REPO_PATTERN = /-onnx-android$/i;
+ 
+ export async function extractPii(
+   text: string,
+   options: ExtractPiiOptions = {},
+ ): Promise<OpenMedSpan[]> {
++  options = withAcquisitionPolicy(options);
+   const hashSecret =
+     options.hashSecret == null
+       ? await ephemeralHashSecret()
+@@ -195,6 +207,26 @@ function defaultModelLoaderFor(model: string): ModelLoader {
+     : loadTokenClassificationPipeline;
+ }
+ 
++/** Pin the default model and refuse remote references before any loader runs. */
++function withAcquisitionPolicy(options: ExtractPiiOptions): ExtractPiiOptions {
++  if (options.pipeline !== undefined) {
++    return options;
++  }
++  const model = options.model ?? DEFAULT_MODEL_ID;
++  const loaderOptions: LoadModelOptions = { ...options.loaderOptions };
++  if (
++    resolveOfflineOnly(options.offlineOnly) ||
++    loaderOptions.offlineOnly === true
++  ) {
++    assertLocalModelReference(model);
++    loaderOptions.offlineOnly = true;
++  }
++  if (model === DEFAULT_MODEL_ID && loaderOptions.revision === undefined) {
++    loaderOptions.revision = DEFAULT_MODEL_REVISION;
++  }
++  return { ...options, loaderOptions };
++}
++
+ export async function deidentify(
+   text: string,
+   options: DeidentifyOptions = {},
+diff --git a/js/openmedkit-web/src/model-loader.ts b/js/openmedkit-web/src/model-loader.ts
+index eea252746e..70fde3f2c9 100644
+--- a/js/openmedkit-web/src/model-loader.ts
++++ b/js/openmedkit-web/src/model-loader.ts
+@@ -1,7 +1,17 @@
++import {
++  failClosedWhenOffline,
++  OpenMedOfflineError,
++  resolveOfflineOnly,
++} from "./offline";
+ import { alignTokenOffsets } from "./offsets";
++import {
++  assertOfflineAssetPath,
++  normalizeOrtAssetPath,
++} from "./runtime/ort-web-loader";
+ import type {
+   LoadModelOptions,
+   LoadOnnxModelOptions,
++  OnnxWasmPaths,
+   RawTokenClassificationEntity,
+   RawTransformersRuntime,
+   TokenClassificationPipeline,
+@@ -34,7 +44,14 @@ export async function loadTokenClassificationPipeline(
+   model: string,
+   options: LoadModelOptions = {},
+ ): Promise<TokenClassificationPipeline> {
++  const offlineOnly = resolveOfflineOnly(options.offlineOnly);
++  if (offlineOnly || isLocalModelReference(model)) {
++    // Explicit local paths and offline-only loads never fall back to the Hub.
++    assertLocalModelReference(model);
++    options = { ...options, localFilesOnly: true, allowRemoteModels: false };
++  }
+   const runtime = await resolveRuntime(options.runtime);
++  configureLocalRuntimeAssets(runtime, options.wasmPaths, offlineOnly);
+   const localReference = isLocalModelReference(model);
+   const localFilesOnly = options.localFilesOnly ?? localReference;
+   const allowRemoteModels = options.allowRemoteModels ?? !localFilesOnly;
+@@ -56,10 +73,8 @@ export async function loadTokenClassificationPipeline(
+       local_files_only: localFilesOnly,
+       localFilesOnly,
+     };
+-    const pipeline = await runtime.pipeline(
+-      "token-classification",
+-      model,
+-      pipelineOptions,
++    const pipeline = await failClosedWhenOffline(offlineOnly, () =>
++      runtime.pipeline("token-classification", model, pipelineOptions),
+     );
+     // Preserve runtime properties and resource disposal while normalizing calls.
+     return new Proxy(pipeline, {
+@@ -129,3 +144,119 @@ async function resolveRuntime(
+     );
+   }
+ }
++
++/** Throw unless `model` is a canonical local path; the error never names it. */
++export function assertLocalModelReference(model: string): void {
++  if (!isLocalModelReference(model) || !isLocalLocation(model)) {
++    throw new OpenMedOfflineError("remote_model_refused");
++  }
++}
++
++/**
++ * Point ONNX Runtime Web at caller-supplied local WebAssembly assets and, in
++ * offline-only mode, refuse runtime settings that would fetch from a CDN or
++ * another host. Transformers.js defaults `wasmPaths` to jsDelivr in browsers.
++ */
++function configureLocalRuntimeAssets(
++  runtime: RawTransformersRuntime,
++  wasmPaths: OnnxWasmPaths | undefined,
++  offlineOnly: boolean,
++): void {
++  const localWasmPaths =
++    wasmPaths === undefined ? undefined : toLocalWasmPaths(wasmPaths);
++  const env = runtime.env;
++  if (env === undefined) {
++    return;
++  }
++  if (offlineOnly) {
++    const { localModelPath } = env;
++    const remoteModelPath =
++      localModelPath !== undefined &&
++      localModelPath !== "" &&
++      (typeof localModelPath !== "string" || !isLocalLocation(localModelPath));
++    const remoteWasmPaths =
++      localWasmPaths === undefined &&
++      !isLocalWasmPaths(onnxWasmEnv(env, false)?.wasmPaths);
++    if (remoteModelPath || remoteWasmPaths) {
++      throw new OpenMedOfflineError("remote_asset_refused");
++    }
++  }
++  if (localWasmPaths !== undefined) {
++    // ONNX Runtime reads this once, when its WebAssembly backend starts.
++    onnxWasmEnv(env, true)!.wasmPaths = localWasmPaths;
++  }
++}
++
++function toLocalWasmPaths(paths: OnnxWasmPaths): OnnxWasmPaths {
++  if (typeof paths !== "string" && (typeof paths !== "object" || paths === null)) {
++    throw new TypeError("wasmPaths must be a string or an object of strings.");
++  }
++  try {
++    if (typeof paths === "string") {
++      return normalizeOrtAssetPath(paths);
++    }
++    const local: { mjs?: string; wasm?: string } = {};
++    if (paths.mjs !== undefined) {
++      local.mjs = assertOfflineAssetPath(paths.mjs, "wasm asset path");
++    }
++    if (paths.wasm !== undefined) {
++      local.wasm = assertOfflineAssetPath(paths.wasm, "wasm asset path");
++    }
++    return local;
++  } catch {
++    throw new OpenMedOfflineError("remote_asset_refused");
++  }
++}
++
++function isLocalWasmPaths(value: unknown): boolean {
++  if (value === undefined || value === "") {
++    return true;
++  }
++  if (typeof value === "string") {
++    return isLocalWasmLocation(value);
++  }
++  if (
++    typeof value === "object" &&
++    value !== null &&
++    Object.getPrototypeOf(value) === Object.prototype
++  ) {
++    return Object.values(value).every(
++      (entry) =>
++        entry === undefined ||
++        (typeof entry === "string" && isLocalWasmLocation(entry)),
++    );
++  }
++  return false;
++}
++
++function isLocalWasmLocation(location: string): boolean {
++  // Transformers.js swaps a cached WebAssembly factory in as a blob: URL.
++  return location.startsWith("blob:") || isLocalLocation(location);
++}
++
++function isLocalLocation(path: string): boolean {
++  try {
++    assertOfflineAssetPath(path);
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++function onnxWasmEnv(
++  env: NonNullable<RawTransformersRuntime["env"]>,
++  create: boolean,
++): Record<string, unknown> | undefined {
++  let node: Record<string, unknown> = env;
++  for (const key of ["backends", "onnx", "wasm"]) {
++    const child = node[key];
++    if (typeof child === "object" && child !== null) {
++      node = child as Record<string, unknown>;
++    } else if (create) {
++      node = node[key] = {};
++    } else {
++      return undefined;
++    }
++  }
++  return node;
++}
+diff --git a/js/openmedkit-web/src/offline.ts b/js/openmedkit-web/src/offline.ts
+new file mode 100644
+index 0000000000..bc49ffc92c
+--- /dev/null
++++ b/js/openmedkit-web/src/offline.ts
+@@ -0,0 +1,66 @@
++/** Value-free reason codes carried by {@link OpenMedOfflineError}. */
++export type OpenMedOfflineErrorCode =
++  | "remote_model_refused"
++  | "remote_asset_refused"
++  | "local_assets_unavailable";
++
++const OFFLINE_ERROR_MESSAGES: Record<OpenMedOfflineErrorCode, string> = {
++  remote_model_refused: "OpenMed refused a model reference that is not local.",
++  remote_asset_refused:
++    "OpenMed refused a runtime asset location that is not local.",
++  local_assets_unavailable:
++    "OpenMed could not load the local model or runtime assets.",
++};
++
++/**
++ * Raised when a load would leave the device or local assets cannot be loaded
++ * in offline-only mode. The message and `code` never include input text,
++ * paths, URLs or the underlying runtime error.
++ */
++export class OpenMedOfflineError extends Error {
++  readonly code: OpenMedOfflineErrorCode;
++
++  constructor(code: OpenMedOfflineErrorCode) {
++    super(OFFLINE_ERROR_MESSAGES[code]);
++    this.name = "OpenMedOfflineError";
++    this.code = code;
++  }
++}
++
++let packageOfflineOnly = false;
++
++/**
++ * Turn package-wide offline-only loading on or off. While it is on, every
++ * loader refuses Hub IDs and remote asset locations before any fetch, and a
++ * call option cannot opt back out.
++ */
++export function setOfflineOnly(enabled: boolean): void {
++  packageOfflineOnly = enabled === true;
++}
++
++/** Report whether package-wide offline-only loading is on. */
++export function isOfflineOnly(): boolean {
++  return packageOfflineOnly;
++}
++
++export function resolveOfflineOnly(option: boolean | undefined): boolean {
++  return packageOfflineOnly || option === true;
++}
++
++/** Run a load and, in offline-only mode, replace any failure with a typed one. */
++export async function failClosedWhenOffline<T>(
++  offlineOnly: boolean,
++  load: () => T | Promise<T>,
++): Promise<T> {
++  if (!offlineOnly) {
++    return load();
++  }
++  try {
++    return await load();
++  } catch (error) {
++    if (error instanceof OpenMedOfflineError) {
++      throw error;
++    }
++    throw new OpenMedOfflineError("local_assets_unavailable");
++  }
++}
+diff --git a/js/openmedkit-web/src/runtime/ort-web-loader.ts b/js/openmedkit-web/src/runtime/ort-web-loader.ts
+index 70b979e777..2c561ec148 100644
+--- a/js/openmedkit-web/src/runtime/ort-web-loader.ts
++++ b/js/openmedkit-web/src/runtime/ort-web-loader.ts
+@@ -3,6 +3,7 @@ import type {
+   TokenClassificationOutput,
+   TokenClassificationPipeline,
+ } from "../types";
++import { isOfflineOnly, OpenMedOfflineError } from "../offline";
+ import {
+   detectOrtWebCapabilities,
+   selectOrtWebBackend,
+@@ -122,6 +123,11 @@ export function assertOfflineAssetPath(path: string, label = "asset path"): stri
+   if (/^[A-Za-z]:[\\/]/.test(trimmed)) {
+     return trimmed;
+   }
++  // URL parsers fold "\" into "/" and drop tab/CR/LF, so outside Windows drive
++  // paths these characters make a path non-canonical; refuse them outright.
++  if (/[\\\u0000-\u001f\u007f]/.test(trimmed)) {
++    throw new Error(`ONNX Runtime Web ${label} must be local/offline, not remote.`);
++  }
+   if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(trimmed)) {
+     if (!trimmed.startsWith("file://")) {
+       throw new Error(
+@@ -195,7 +201,9 @@ export async function loadOrtWebSession(
+     if (cache.get(cacheKey) === promise) {
+       cache.delete(cacheKey);
+     }
+-    throw error;
++    throw isOfflineOnly()
++      ? new OpenMedOfflineError("local_assets_unavailable")
++      : error;
+   });
+   cache.set(cacheKey, promise);
+   return promise;
+diff --git a/js/openmedkit-web/src/types.ts b/js/openmedkit-web/src/types.ts
+index f73eb363e5..ee5085d4ca 100644
+--- a/js/openmedkit-web/src/types.ts
++++ b/js/openmedkit-web/src/types.ts
+@@ -162,6 +162,8 @@ export interface ExtractPiiOptions {
+   regulatoryTags?: string[];
+   metadata?: Record<string, unknown>;
+   pipelineOptions?: TokenClassificationCallOptions;
++  /** Refuse Hub IDs and remote assets before any loader runs. */
++  offlineOnly?: boolean;
+ }
+ 
+ export interface DeidentifyOptions extends ExtractPiiOptions {
+@@ -183,8 +185,15 @@ export interface LoadModelOptions {
+   device?: string;
+   runtime?: RawTransformersRuntime | (() => Promise<RawTransformersRuntime>);
+   pipelineOptions?: Record<string, unknown>;
++  /** Load from local files only; Hub IDs and remote assets are refused. */
++  offlineOnly?: boolean;
++  /** Local ONNX Runtime WebAssembly location; replaces the CDN default. */
++  wasmPaths?: OnnxWasmPaths;
+ }
+ 
++/** Directory prefix, or `{ mjs, wasm }` file locations, for ONNX Runtime Web. */
++export type OnnxWasmPaths = string | { mjs?: string; wasm?: string };
++
+ export type OpenMedOnnxVariant = "int8" | "fp32" | "fp16";
+ 
+ export interface LoadOnnxModelOptions extends LoadModelOptions {
+diff --git a/tests/web/__snapshots__/openmedkit-web-public-api.json b/tests/web/__snapshots__/openmedkit-web-public-api.json
+index 9eb147d7ba..b184b71f2d 100644
+--- a/tests/web/__snapshots__/openmedkit-web-public-api.json
++++ b/tests/web/__snapshots__/openmedkit-web-public-api.json
+@@ -3,9 +3,11 @@
+     "CANONICAL_LABELS",
+     "CLASSIFY_WGSL_SOURCE",
+     "DEFAULT_MODEL_ID",
++    "DEFAULT_MODEL_REVISION",
+     "DEFAULT_WEBGPU_LOGIT_TOLERANCE",
+     "DEFAULT_WEBGPU_MAX_RECALL_DELTA",
+     "OPENMED_SPAN_SCHEMA_VERSION",
++    "OpenMedOfflineError",
+     "POLICY_LABELS",
+     "SPAN_ACTIONS",
+     "WEBGPU_BENCHMARK_SUITE",
+@@ -27,6 +29,7 @@
+     "flattenTokenClassificationOutput",
+     "hmacTextHash",
+     "isLocalModelReference",
++    "isOfflineOnly",
+     "loadOnnxModel",
+     "loadOrtWebSession",
+     "loadOrtWebTokenClassificationPipeline",
+@@ -38,6 +41,7 @@
+     "probeOrtWebCapabilities",
+     "refinePrivacyFilterSpan",
+     "selectOrtWebBackend",
++    "setOfflineOnly",
+     "spansToRedactedText",
+     "trimSpanWhitespace"
+   ],
+diff --git a/tests/web/test_npm_deidentify.spec.ts b/tests/web/test_npm_deidentify.spec.ts
+index ad95eddf0a..f4d4b42ba7 100644
+--- a/tests/web/test_npm_deidentify.spec.ts
++++ b/tests/web/test_npm_deidentify.spec.ts
+@@ -221,6 +221,320 @@ test("default model is a public -onnx-android repo loaded through loadOnnxModel"
+   assert.equal(result.spans[0]?.metadata.model, api.DEFAULT_MODEL_ID);
+ });
+ 
++test("default path requests only the pinned model revision", async () => {
++  const api = await loadApi();
++  assert.match(api.DEFAULT_MODEL_REVISION, /^[0-9a-f]{40}$/);
++
++  const requests: Array<{ model: string; revision: unknown }> = [];
++  const runtime: RawTransformersRuntime = {
++    pipeline: async (_task, model, options) => {
++      requests.push({ model, revision: options?.revision });
++      return transformersJsFixturePipeline;
++    },
++  };
++  await api.deidentify(goldenText, { loaderOptions: { runtime } });
++  await api.extractPii(goldenText, {
++    model: api.DEFAULT_MODEL_ID,
++    loaderOptions: { runtime },
++  });
++  await api.extractPii(goldenText, {
++    loaderOptions: { runtime, revision: "a".repeat(40) },
++  });
++  await api.extractPii(goldenText, {
++    model: "OpenMed/example-v1-onnx-android",
++    loaderOptions: { runtime },
++  });
++  assert.deepEqual(requests, [
++    { model: api.DEFAULT_MODEL_ID, revision: api.DEFAULT_MODEL_REVISION },
++    { model: api.DEFAULT_MODEL_ID, revision: api.DEFAULT_MODEL_REVISION },
++    { model: api.DEFAULT_MODEL_ID, revision: "a".repeat(40) },
++    { model: "OpenMed/example-v1-onnx-android", revision: undefined },
++  ]);
++
++  let loaderRevision: unknown;
++  await api.extractPii(goldenText, {
++    modelLoader: async (_model: string, options?: { revision?: string }) => {
++      loaderRevision = options?.revision;
++      return () => [];
++    },
++  });
++  assert.equal(loaderRevision, api.DEFAULT_MODEL_REVISION);
++});
++
++test("offline-only mode refuses Hub IDs and URLs before any loader runs", async () => {
++  const api = await loadApi();
++  const recorder = recordingRuntime();
++  const remoteModels = [
++    undefined,
++    api.DEFAULT_MODEL_ID,
++    "OpenMed/example-v1-onnx-android",
++    "https://models.example.invalid/openmed",
++  ];
++  const attempts = (offlineOnly: boolean | undefined) =>
++    remoteModels.flatMap((model) => [
++      () =>
++        api.deidentify(goldenText, {
++          ...(model === undefined ? {} : { model }),
++          ...(offlineOnly === undefined ? {} : { offlineOnly }),
++          modelLoader: recorder.modelLoader,
++        }),
++      () =>
++        api.extractPii(goldenText, {
++          ...(model === undefined ? {} : { model }),
++          loaderOptions: {
++            runtime: recorder.runtimeProvider,
++            ...(offlineOnly === undefined ? {} : { offlineOnly }),
++          },
++        }),
++      () =>
++        api.loadOnnxModel(model ?? api.DEFAULT_MODEL_ID, {
++          runtime: recorder.runtimeProvider,
++          ...(offlineOnly === undefined ? {} : { offlineOnly }),
++        }),
++      () =>
++        api.loadTokenClassificationPipeline(model ?? api.DEFAULT_MODEL_ID, {
++          runtime: recorder.runtimeProvider,
++          ...(offlineOnly === undefined ? {} : { offlineOnly }),
++        }),
++    ]);
++
++  for (const attempt of attempts(true)) {
++    await assertOfflineError(api, attempt(), "remote_model_refused");
++  }
++  assert.equal(api.isOfflineOnly(), false);
++  api.setOfflineOnly(true);
++  try {
++    assert.equal(api.isOfflineOnly(), true);
++    // A call cannot opt back out of the package-wide setting.
++    for (const attempt of [...attempts(undefined), ...attempts(false)]) {
++      await assertOfflineError(api, attempt(), "remote_model_refused");
++    }
++  } finally {
++    api.setOfflineOnly(false);
++  }
++  assert.deepEqual(recorder.calls, []);
++});
++
++test("offline-only mode refuses remote WASM and model-path settings", async () => {
++  const api = await loadApi();
++  const cdnWasmPaths = {
++    mjs: "https://cdn.example.invalid/ort/ort-wasm-simd-threaded.asyncify.mjs",
++    wasm: "https://cdn.example.invalid/ort/ort-wasm-simd-threaded.asyncify.wasm",
++  };
++  const remoteSettings = [
++    { env: { backends: { onnx: { wasm: { wasmPaths: cdnWasmPaths } } } } },
++    { env: { backends: { onnx: { wasm: { wasmPaths: "//cdn.example.invalid/" } } } } },
++    {
++      env: {
++        backends: {
++          onnx: { wasm: { wasmPaths: new URL("https://cdn.example.invalid/") } },
++        },
++      },
++    },
++    { env: { localModelPath: "https://models.example.invalid/" } },
++    { env: {}, wasmPaths: "https://cdn.example.invalid/ort/" },
++    { env: {}, wasmPaths: "/\\cdn.example.invalid/ort/" },
++    { env: {}, wasmPaths: { wasm: "https://cdn.example.invalid/ort.wasm" } },
++  ];
++  for (const { env, wasmPaths } of remoteSettings as Array<{
++    env: Record<string, unknown>;
++    wasmPaths?: unknown;
++  }>) {
++    const recorder = recordingRuntime(env);
++    await assertOfflineError(
++      api,
++      api.loadOnnxModel("/models/openmed", {
++        runtime: recorder.runtime,
++        offlineOnly: true,
++        ...(wasmPaths === undefined ? {} : { wasmPaths }),
++      }),
++      "remote_asset_refused",
++    );
++    assert.deepEqual(recorder.calls, []);
++  }
++
++  // A remote override is refused even when offline-only mode is off.
++  await assertOfflineError(
++    api,
++    api.loadTokenClassificationPipeline("/models/openmed", {
++      runtime: recordingRuntime().runtime,
++      wasmPaths: "https://cdn.example.invalid/ort/",
++    }),
++    "remote_asset_refused",
++  );
++
++  // Local WebAssembly assets replace the CDN default before the runtime loads.
++  for (const [wasmPaths, expected] of [
++    ["/assets/onnxruntime", "/assets/onnxruntime/"],
++    [
++      { mjs: "/assets/ort.mjs", wasm: "/assets/ort.wasm" },
++      { mjs: "/assets/ort.mjs", wasm: "/assets/ort.wasm" },
++    ],
++  ] as const) {
++    const recorder = recordingRuntime({
++      backends: { onnx: { wasm: { wasmPaths: cdnWasmPaths } } },
++    });
++    await api.loadOnnxModel("/models/openmed", {
++      runtime: recorder.runtime,
++      offlineOnly: true,
++      wasmPaths,
++    });
++    assert.deepEqual(recorder.calls, [
++      {
++        model: "/models/openmed",
++        localFilesOnly: true,
++        allowRemoteModels: false,
++        wasmPaths: expected,
++      },
++    ]);
++  }
++});
++
++test("explicit local paths stay local-only in every mode", async () => {
++  const api = await loadApi();
++  const recorder = recordingRuntime();
++  for (const offlineOnly of [false, true]) {
++    await api.loadTokenClassificationPipeline("/models/openmed", {
++      runtime: recorder.runtime,
++      localFilesOnly: false,
++      allowRemoteModels: true,
++      offlineOnly,
++    });
++    await api.deidentify(goldenText, {
++      model: "./models/openmed",
++      offlineOnly,
++      loaderOptions: {
++        runtime: recorder.runtime,
++        localFilesOnly: false,
++        allowRemoteModels: true,
++      },
++    });
++  }
++  assert.deepEqual(
++    recorder.calls.map(({ localFilesOnly, allowRemoteModels }) => ({
++      localFilesOnly,
++      allowRemoteModels,
++    })),
++    Array(4).fill({ localFilesOnly: true, allowRemoteModels: false }),
++  );
++
++  // Paths that only look local but resolve to another host are refused.
++  for (const model of [
++    "//models.example.invalid/openmed",
++    "/\\models.example.invalid/openmed",
++    "file://models.example.invalid/openmed",
++  ]) {
++    await assertOfflineError(
++      api,
++      api.loadTokenClassificationPipeline(model, { runtime: recorder.runtime }),
++      "remote_model_refused",
++    );
++  }
++  assert.equal(recorder.calls.length, 4);
++});
++
++test("offline-only loads fail closed with value-free errors on missing assets", async () => {
++  const api = await loadApi();
++  const secretPath = "/private/synthetic-patient-dir/model_int8.onnx";
++  const failingRuntime: RawTransformersRuntime = {
++    env: {},
++    pipeline: async () => {
++      throw new Error(`file was not found locally at "${secretPath}"`);
++    },
++  };
++  await assert.rejects(
++    api.loadOnnxModel("/models/openmed", { runtime: failingRuntime }),
++    (error: Error) => error.message.includes(secretPath),
++  );
++  await assertOfflineError(
++    api,
++    api.loadOnnxModel("/models/openmed", {
++      runtime: failingRuntime,
++      offlineOnly: true,
++    }),
++    "local_assets_unavailable",
++    [secretPath, "synthetic-patient-dir"],
++  );
++  await assertOfflineError(
++    api,
++    api.deidentify("Patient Synthetic Person", {
++      model: "/models/openmed",
++      offlineOnly: true,
++      loaderOptions: { runtime: failingRuntime },
++    }),
++    "local_assets_unavailable",
++    [secretPath, "Synthetic Person"],
++  );
++
++  // The ONNX Runtime Web loader is local-only in every mode; offline-only mode
++  // also replaces its load failures with the typed error.
++  const createCalls: string[] = [];
++  const ortRuntime = {
++    env: {},
++    InferenceSession: {
++      create: (modelPath: string) => {
++        createCalls.push(modelPath);
++        throw new Error(`failed to load model from ${secretPath}`);
++      },
++    },
++  };
++  const ortOptions = {
++    modelPath: secretPath,
++    assetPath: "/assets/onnxruntime/",
++    runtime: ortRuntime,
++    capabilities: {
++      webgpu: false,
++      wasm: true,
++      wasmSimd: true,
++      sharedArrayBuffer: false,
++      crossOriginIsolated: false,
++      hardwareConcurrency: 1,
++    },
++  };
++  const originalFetch = globalThis.fetch;
++  let fetchCalls = 0;
++  globalThis.fetch = (() => {
++    fetchCalls += 1;
++    throw new Error("network fetch is not allowed in this test");
++  }) as typeof fetch;
++  api.setOfflineOnly(true);
++  try {
++    await assertOfflineError(
++      api,
++      api.loadOrtWebSession({ ...ortOptions, cache: new Map() }),
++      "local_assets_unavailable",
++      [secretPath, "synthetic-patient-dir"],
++    );
++    await assertOfflineError(
++      api,
++      api.loadWebGpuTokenClassificationSession({
++        ...ortOptions,
++        cache: new Map(),
++        probeAdapter: false,
++      }),
++      "local_assets_unavailable",
++      [secretPath, "synthetic-patient-dir"],
++    );
++    await assert.rejects(
++      api.loadOrtWebSession({
++        ...ortOptions,
++        modelPath: "https://models.example.invalid/model.onnx",
++        cache: new Map(),
++      }),
++      /local\/offline/,
++    );
++  } finally {
++    api.setOfflineOnly(false);
++    globalThis.fetch = originalFetch;
++  }
++  assert.deepEqual(createCalls, [secretPath, secretPath]);
++  assert.equal(fetchCalls, 0);
++  await assert.rejects(
++    api.loadOrtWebSession({ ...ortOptions, cache: new Map() }),
++    (error: Error) => error.message.includes(secretPath),
++  );
++});
++
+ test("extractPii keeps O tokens so offset alignment sees the full sequence", async () => {
+   const api = await loadApi();
+   let seenOptions: Record<string, unknown> | undefined;
+@@ -470,6 +784,58 @@ async function loadApi() {
+   return import(distUrl);
+ }
+ 
++// Records every runtime, loader and pipeline request a load makes.
++function recordingRuntime(env: Record<string, unknown> = {}) {
++  const calls: Array<Record<string, unknown>> = [];
++  const runtime: RawTransformersRuntime = {
++    env: env as RawTransformersRuntime["env"],
++    pipeline: async (_task, model, options) => {
++      const backends = env.backends as
++        | { onnx?: { wasm?: { wasmPaths?: unknown } } }
++        | undefined;
++      calls.push({
++        model,
++        localFilesOnly: options?.local_files_only,
++        allowRemoteModels: env.allowRemoteModels,
++        wasmPaths: backends?.onnx?.wasm?.wasmPaths,
++      });
++      return transformersJsFixturePipeline;
++    },
++  };
++  return {
++    calls,
++    runtime,
++    runtimeProvider: async () => {
++      calls.push({ runtimeProvider: true });
++      return runtime;
++    },
++    modelLoader: async (model: string) => {
++      calls.push({ modelLoader: model });
++      return transformersJsFixturePipeline;
++    },
++  };
++}
++
++async function assertOfflineError(
++  api: Awaited<ReturnType<typeof loadApi>>,
++  promise: Promise<unknown>,
++  code: string,
++  forbidden: string[] = [],
++) {
++  await assert.rejects(promise, (error: Error & { code?: string }) => {
++    assert.ok(error instanceof api.OpenMedOfflineError);
++    assert.equal(error.name, "OpenMedOfflineError");
++    assert.equal(error.code, code);
++    assert.equal("cause" in error, false);
++    // Controlled messages carry no paths, URLs, schemes or source text.
++    assert.doesNotMatch(error.message, /[\\/:]/);
++    for (const value of forbidden) {
++      assert.equal(String(error).includes(value), false);
++    }
++    return true;
++  });
++}
++
+ const goldenText =
+   "Patient Alice Nguyen, DOB 1979-04-12, email alice@example.org.";
+ const goldenRedactedText =
+diff --git a/tests/web/test_ort_web_loader.spec.ts b/tests/web/test_ort_web_loader.spec.ts
+index 387f03e389..305c29f5ef 100644
+--- a/tests/web/test_ort_web_loader.spec.ts
++++ b/tests/web/test_ort_web_loader.spec.ts
+@@ -142,6 +142,29 @@ test("does not fetch when loading local offline assets", async () => {
+   assert.equal(runtime.createCalls[0]?.modelPath, "/models/openmed/model.onnx");
+ });
+ 
++test("rejects backslash-mixed and control-character path prefixes", () => {
++  for (const path of [
++    "/\\models.example.invalid/share/model.onnx",
++    "\\/models.example.invalid/share/model.onnx",
++    "/\t/models.example.invalid/share/model.onnx",
++    "/\n/models.example.invalid/share/model.onnx",
++    "\u0000//models.example.invalid/share/model.onnx",
++    "models\\openmed\\model.onnx",
++    "file:\\\\models.example.invalid\\share\\model.onnx",
++  ]) {
++    assert.throws(() => assertOfflineAssetPath(path), /local\/offline/);
++  }
++
++  for (const path of [
++    "/models/openmed/model.onnx",
++    "./models/openmed/model.onnx",
++    "C:\\models\\openmed\\model.onnx",
++    "file:///models/openmed/model.onnx",
++  ]) {
++    assert.equal(assertOfflineAssetPath(path), path);
++  }
++});
++
+ test("synthetic note spans are identical across wasm and WebGPU loaders", async () => {
+   const note = "Patient Alice Nguyen emailed alice@example.org.";
+   const tokenizer = (text: string): OrtFeeds => ({

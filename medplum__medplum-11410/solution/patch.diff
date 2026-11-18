@@ -1,0 +1,141 @@
+diff --git a/packages/server/src/mcp/routes.test.ts b/packages/server/src/mcp/routes.test.ts
+index 2f754aebe27..849564b6199 100644
+--- a/packages/server/src/mcp/routes.test.ts
++++ b/packages/server/src/mcp/routes.test.ts
+@@ -184,6 +184,56 @@ describe('MCP Routes', () => {
+       // reach an external host; it is handled as an ordinary same-origin FHIR request.
+       const protoRel = await fhirRequest<OperationOutcome>('GET', '//169.254.169.254/latest/meta-data/');
+       expect(protoRel.resourceType).toBe('OperationOutcome');
++
++      // 11. Paths that resolve outside /fhir/R4 on the same origin are rejected
++      for (const path of [
++        '../../auth/me',
++        '%2e%2e/%2e%2e/auth/me',
++        `http://localhost:${port}/auth/me`,
++        '../R4x/Patient',
++      ]) {
++        const outside = await fhirRequest<OperationOutcome>('GET', path);
++        expect(outside.issue?.[0].severity).toBe('error');
++      }
++    } finally {
++      await client.close();
++    }
++  });
++
++  test('SSE ignores messages posted by a different membership', async () => {
++    const owner = await createTestProject({ withAccessToken: true });
++    const other = await createTestProject({ withAccessToken: true });
++
++    const transport = new SSEClientTransport(new URL(`http://localhost:${port}/mcp/sse`), {
++      requestInit: { headers: { Authorization: `Bearer ${owner.accessToken}` } },
++    });
++    const client = new Client({ name: 'example-client', version: '1.0.0' });
++    await client.connect(transport);
++
++    try {
++      const family = randomUUID();
++      const sessionId = (transport as any)._endpoint.searchParams.get('sessionId');
++      const res = await request(app)
++        .post(`/mcp/sse?sessionId=${sessionId}`)
++        .set('Authorization', 'Bearer ' + other.accessToken)
++        .send({
++          jsonrpc: '2.0',
++          id: 999,
++          method: 'tools/call',
++          params: {
++            name: 'fhir-request',
++            arguments: { method: 'POST', path: 'Patient', body: { resourceType: 'Patient', name: [{ family }] } },
++          },
++        });
++      expect(res).toHaveStatus(202);
++
++      // Messages on a session are delivered in order, so this runs after the other membership's message
++      const search = (await client.callTool({
++        name: 'fhir-request',
++        arguments: { method: 'GET', path: `Patient?name=${family}` },
++      })) as CallToolResult;
++      const bundle = JSON.parse((search.content[0] as { text: string }).text) as Bundle;
++      expect(bundle.entry ?? []).toHaveLength(0);
+     } finally {
+       await client.close();
+     }
+diff --git a/packages/server/src/mcp/routes.ts b/packages/server/src/mcp/routes.ts
+index 67e5806225b..6ab2e3769fb 100644
+--- a/packages/server/src/mcp/routes.ts
++++ b/packages/server/src/mcp/routes.ts
+@@ -6,6 +6,7 @@ import type { Request, Response } from 'express';
+ import { Router } from 'express';
+ import { body, query, validationResult } from 'express-validator';
+ import type { IncomingMessage } from 'node:http';
++import { getAuthenticatedContext } from '../context';
+ import { heartbeat } from '../heartbeat';
+ import { getLogger } from '../logger';
+ import { authenticateRequest } from '../oauth/middleware';
+@@ -33,16 +34,22 @@ mcpRouter.all('/stream', async (req: Request, res: Response) => {
+ // MCP SSE is technically deprecated, but most major LLM clients still use it
+ mcpRouter.get('/sse', async (req, res) => {
+   const transport = new SSEServerTransport('/mcp/sse', res);
++  const membershipId = getAuthenticatedContext().membership.id;
+ 
+   const redisSubscriber = getPubSubRedisSubscriber();
+   redisSubscriber.on('message', async (_channel: string, data: string) => {
+     try {
++      const envelope = JSON.parse(data) as SseEnvelope;
++      if (envelope.membershipId !== membershipId) {
++        getLogger().warn('Rejected MCP SSE message from a different membership', { sessionId: transport.sessionId });
++        return;
++      }
+       const dummyReq = { headers: { 'content-type': 'application/json' } } as IncomingMessage;
+       const dummyRes = {
+         writeHead: (_statusCode: number, _headers?: Record<string, string>) => dummyRes,
+         end: (_data?: string) => {},
+       } as unknown as Response;
+-      await transport.handlePostMessage(dummyReq, dummyRes, data);
++      await transport.handlePostMessage(dummyReq, dummyRes, envelope.message);
+     } catch (err: any) {
+       getLogger().error('Error handling MCP SSE message', err);
+     }
+@@ -76,12 +83,17 @@ mcpRouter.post(
+       return;
+     }
+     const sessionId = req.query?.sessionId as string;
+-    const body = req.body;
+-    await publish(getRedisChannelForSessionId(sessionId), JSON.stringify(body));
++    const envelope: SseEnvelope = { membershipId: getAuthenticatedContext().membership.id, message: req.body };
++    await publish(getRedisChannelForSessionId(sessionId), JSON.stringify(envelope));
+     res.status(202).end('Accepted');
+   }
+ );
+ 
++interface SseEnvelope {
++  membershipId: string;
++  message: unknown;
++}
++
+ function getRedisChannelForSessionId(sessionId: string): string {
+   return `medplum:mcp:sse:${sessionId}`;
+ }
+diff --git a/packages/server/src/mcp/server.ts b/packages/server/src/mcp/server.ts
+index 37f78aa8151..557d76865fc 100644
+--- a/packages/server/src/mcp/server.ts
++++ b/packages/server/src/mcp/server.ts
+@@ -62,12 +62,13 @@ export function getMcpServer(): McpServer {
+       const baseFhirUrl = concatUrls(baseUrl, 'fhir/R4');
+       const fhirUrl = concatUrls(baseFhirUrl, path);
+ 
+-      // SSRF / token-exfiltration guard (GHSA-fjgc-c3pj-xx2c).
+-      // concatUrls() is new URL(path, base); an absolute or protocol-absolute `path`
+-      // discards the base and points the proxy at an attacker-controlled URL. Because
+-      // the proxy request carries the caller's bearer token, an off-origin URL both
+-      // performs SSRF and leaks the token. Pin the resolved URL to the server origin.
+-      if (new URL(fhirUrl).origin !== new URL(baseUrl).origin) {
++      // The proxy request carries the caller's token, so keep it on this server and under the FHIR base
++      const resolved = new URL(fhirUrl);
++      const fhirBase = new URL(baseFhirUrl);
++      if (
++        resolved.origin !== fhirBase.origin ||
++        (resolved.pathname !== fhirBase.pathname && !resolved.pathname.startsWith(fhirBase.pathname + '/'))
++      ) {
+         throw new Error('Invalid path: must be relative to the FHIR base URL');
+       }
+ 

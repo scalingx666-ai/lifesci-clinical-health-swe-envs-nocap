@@ -1,0 +1,133 @@
+diff --git a/mirobody/agent/code_tool.py b/mirobody/agent/code_tool.py
+index a218ca70..4f14b173 100644
+--- a/mirobody/agent/code_tool.py
++++ b/mirobody/agent/code_tool.py
+@@ -60,6 +60,15 @@ def executor_ready() -> bool:
+     return True
+ 
+ 
++class NoSource(ValueError):
++    """Nothing in this turn to compute on. The message is written for the
++    model and carries no value, so the tool returns it (`_no_source`) instead
++    of raising: raised, it reached the fault middleware, which never passes an
++    exception's message on, and the model read "check the tool's parameter
++    list". Asked "画个图看看" after a lookup in the turn before, MiniCPM5-2B
++    then sent the same numbers to code_exec five times (2026-11-10)."""
++
++
+ def source_results(messages: list, *, computation_tool: str = TOOL_NAME) -> list[dict]:
+     """Original results in this turn, in call order, including their methodology."""
+     start = user_turn_start(messages)
+@@ -70,14 +79,25 @@ def source_results(messages: list, *, computation_tool: str = TOOL_NAME) -> list
+         and message.name != computation_tool
+     ]
+     if not available:
+-        raise ValueError("Call a record tool before computing; no original result exists in this turn")
++        raise NoSource(
++            "no original result exists in this turn. code_exec computes only on what a record tool returned "
++            "in this turn, never on numbers written into the code or remembered from an earlier turn: call "
++            "the record tool again for the readings you need, then compute on data. To chart readings "
++            "already in the conversation, write the chart block in your answer; that needs no code_exec")
+     if available[-1]["status"] == tools.STATUS_ERROR:
+-        raise ValueError("A source lookup failed; obtain a successful result before computing")
++        raise NoSource("the source lookup failed; obtain a successful result before computing")
+     if not available[-1]["data"]:
+-        raise ValueError("The source returned no rows; missing readings must not become a zero result")
++        raise NoSource("the source returned no rows; missing readings must not become a zero result")
+     return [result for result in available if result["status"] != tools.STATUS_ERROR]
+ 
+ 
++def _no_source(exc: NoSource) -> tuple[str, dict]:
++    """What the model reads when there is nothing to compute on, and the
++    artifact retry governance reads: recoverable, by doing what it says."""
++    return f"error: {exc}", {"status": tools.STATUS_ERROR, "error_class": tools.ERROR_RECOVERABLE,
++                             "error_kind": "no_source"}
++
++
+ def _inputs(runtime: ToolRuntime) -> tuple[list[dict], dict]:
+     results = source_results(runtime.state.get("messages", []))
+     return results, {"data": results[-1]["data"], "results": results}
+@@ -124,7 +144,10 @@ async def python_code(code: str, runtime: ToolRuntime, timeout_s: int = 15) -> t
+     and results; you may load that file instead of using the injected variables.
+     For example: values = [float(row['value']) for row in data]; print(sum(values) / len(values)).
+     """
+-    results, inputs = _inputs(runtime)
++    try:
++        results, inputs = _inputs(runtime)
++    except NoSource as exc:
++        return _no_source(exc)
+     seconds = _seconds(timeout_s)
+     try:
+         sandbox = await asyncio.to_thread(LocalPythonSandbox, timeout=seconds)
+@@ -166,7 +189,10 @@ async def javascript_code(code: str, runtime: ToolRuntime, timeout_s: int = 15)
+     are available; there is no network, file system, require or import.
+     For example: const values = data.map(row => Number(row.value)); console.log(values.reduce((a, b) => a + b, 0) / values.length);
+     """
+-    results, inputs = _inputs(runtime)
++    try:
++        results, inputs = _inputs(runtime)
++    except NoSource as exc:
++        return _no_source(exc)
+     seconds = _seconds(timeout_s)
+     # The engine stops itself at `seconds`; this deadline is for the rare run
+     # it overshoots (a loop of large allocations ran to 4x its limit).
+diff --git a/mirobody/tests/test_code_exec_says_why.py b/mirobody/tests/test_code_exec_says_why.py
+new file mode 100644
+index 00000000..15174375
+--- /dev/null
++++ b/mirobody/tests/test_code_exec_says_why.py
+@@ -0,0 +1,54 @@
++"""`code_exec` with nothing in this turn to compute on says why, as a result.
++
++Asked "画个图看看" right after a cholesterol lookup, MiniCPM5-2B sent the
++numbers from the turn before to `code_exec`. The tool refused by raising, the
++fault middleware (which never passes an exception's message on) turned that
++into "check the tool's parameter list", and the model sent the same call five
++times (2026-11-10, a local stack on the 1.6.0-fix.1 image).
++"""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++import pytest
++
++pytest.importorskip("deepagents")
++pytest.importorskip("langchain")
++
++from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
++
++from mirobody.agent.code_tool import javascript_code, python_code
++from mirobody.kernel import tools
++
++#: The chart call the model made, numbers typed into the code.
++TYPED = 'console.log(JSON.stringify([{time: "2025-03-10", value: 5.48}, {time: "2026-06-20", value: 4.9}]))'
++
++
++def _follow_up() -> SimpleNamespace:
++    """A lookup answered in the turn before, then a new question."""
++    lookup = ToolMessage(content="rid|value", name="query_health_indicators", tool_call_id="lookup",
++                         artifact=tools.Envelope(tools.STATUS_OK, data=[{"rid": "r1", "value": 5.48}]))
++    return SimpleNamespace(state={"messages": [
++        HumanMessage("我的总胆固醇这几次检查有什么变化？"), lookup, AIMessage("5.48 → 4.90 mmol/L"),
++        HumanMessage("画个图看看"),
++    ]})
++
++
++@pytest.mark.parametrize("calculator", [javascript_code, python_code], ids=["javascript", "python"])
++async def test_a_follow_up_without_a_lookup_is_told_what_to_do(calculator):
++    text, artifact = await calculator.coroutine(code=TYPED, runtime=_follow_up())
++    assert artifact == {"status": tools.STATUS_ERROR, "error_class": tools.ERROR_RECOVERABLE,
++                        "error_kind": "no_source"}
++    assert "no original result exists in this turn" in text
++    assert "call the record tool again" in text and "chart block" in text
++    assert "parameter list" not in text
++
++
++async def test_a_failed_or_empty_lookup_is_said_too():
++    for artifact, said in ((tools.invalid_arguments("synthetic"), "lookup failed"),
++                           (tools.Envelope(tools.STATUS_OK, data=[]), "no rows")):
++        lookup = ToolMessage(content="x", name="query_health_indicators", tool_call_id="t", artifact=artifact)
++        text, result = await javascript_code.coroutine(
++            code="data.length", runtime=SimpleNamespace(state={"messages": [HumanMessage("Calculate"), lookup]}))
++        assert said in text and result["error_kind"] == "no_source"

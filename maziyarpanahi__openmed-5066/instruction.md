@@ -1,0 +1,19 @@
+# Issue
+
+**Title:** Make model download, verification, activation, and rollback transactional
+
+## Description
+
+. Depends on #3552.
+
+Adds `openmed/service/model_activation.py`, a `ModelActivationManager` that runs each slot activation as one journaled transaction: acquire, stage, verify, load, warm, commit, then retire, with rollback possible at any step. It reuses the pieces that already exist instead of copying them. `prefetch_model` does the download (`HubArtifactSource`, into a private staging workspace, never the shared cache). `verify_artifact_manifest` checks the staged tree, which must also contain no unlisted files and no links that leave the workspace. `build_rollback_compatibility_report` must show that the retained last-green generation is still a safe rollback target. The active pointer and generation number are published with one fsynced atomic state write under the slot lock, and the in-process generation table swaps in the same step, so a reader always sees one complete generation. Last green stays resident until the health window passes. A failed or unproven window rolls back to it after it is re-verified. Artifacts that fail verification are quarantined and never loaded. `start()` resolves every interrupted journal by quarantining it, rolling it back or resuming it, then reconciles orphaned staging within fixed bounds. `GenerationLease` and `WarmPoolGenerationLoader` key warm-pool handles per generation, so in-flight requests finish on the generation they leased. Results, journals, state, events and hash-chained receipts hold only transaction ids, digests, generation numbers, phases, timestamps and reason codes. In `openmed/core/model_integrity.py`, `ModelIntegrityError` gains a value-free `code`, and `write_local_artifact_manifest` writes a relocatable manifest, so a staged tree can be renamed as a unit.
+
+The security-profile self-check from #3552 is not imported. Its registry exists only in unmerged #4439. Once it lands it can plug in as an `ActivationPolicy.validators` entry in a follow-up.
+
+Not covered: the tests simulate a process kill with a `BaseException` and a full disk with injected `ENOSPC` through the manager's `fault_hook` at every recorded boundary. They do not use a real SIGKILL or a filesystem that is actually full, and they do not depend on the unmerged #4448 `tests/faults/` seams. The Hub path is tested with a monkeypatched `prefetch_model`, and loading uses fake loaders plus the real `WarmPool` with a stub backend, not real checkpoints. The Windows `msvcrt` lock branch and Windows file-sharing behaviour were not run locally (macOS only); the symlink-dependent tests skip where links cannot be created. The manager is not wired into service startup, REST admin routes or the drain coordinator yet (follow-ups #3576 and V34-14).
+
+Validation: `pytest tests/unit/service/test_model_activation.py tests/integration/service/test_model_activation_recovery.py tests/unit/core/test_model_integrity.py` (78 passed), `pytest tests/ -q -m "not slow and not fuzz" --ignore=tests/unit/training/synthetic/test_dicom_overlays.py` (27052 passed, 224 skipped; the ignored file needs `pydicom`, which the shared venv does not have), `pytest tests/unit/service tests/integration/service tests/unit/core/test_model_integrity.py tests/unit/test_no_telemetry.py tests/unit/test_no_raw_text_logging.py` rerun on the final commit (820 passed, 5 skipped), `ruff check .` and `ruff format --check .` (clean), `python scripts/security/check_effect_paths.py --check` (effect_paths_verified), `mypy` (no issues in 4 source files), `python scripts/release/check_repo_policy.py --commits origin/master HEAD` (passed).
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `201f570abb25`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

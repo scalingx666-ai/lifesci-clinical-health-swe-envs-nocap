@@ -1,0 +1,423 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8266-fix-conditional-update-in-patient-id-partition-mode.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8266-fix-conditional-update-in-patient-id-partition-mode.yaml
+new file mode 100644
+index 000000000000..0005b34ac67b
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8266-fix-conditional-update-in-patient-id-partition-mode.yaml
+@@ -0,0 +1,5 @@
++---
++type: fix
++issue: 8266
++title: "Previously, in Patient ID partition mode, a conditional update outside a transaction Bundle failed with
++  HAPI-1321 when the resource body carried no id. This is now fixed for systems that support all-partition search."
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/BaseHapiFhirResourceDao.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/BaseHapiFhirResourceDao.java
+index 5e7450806778..f23744fddfc8 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/BaseHapiFhirResourceDao.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/BaseHapiFhirResourceDao.java
+@@ -2794,8 +2794,7 @@ public DaoMethodOutcome update(
+ 		};
+ 		theTransactionDetails.addRollbackUndoAction(onRollback);
+ 
+-		RequestPartitionId requestPartitionId = myRequestPartitionHelperService.determineCreatePartitionForRequest(
+-				theRequest, theResource, getResourceName());
++		RequestPartitionId requestPartitionId = determineCreatePartitionForUpdate(theResource, theMatchUrl, theRequest);
+ 
+ 		boolean rewriteHistory = theRequest != null && theRequest.isRewriteHistory();
+ 		if (rewriteHistory && !myStorageSettings.isUpdateWithHistoryRewriteEnabled()) {
+@@ -2827,6 +2826,33 @@ public DaoMethodOutcome update(
+ 				.execute(updateCallback);
+ 	}
+ 
++	/**
++	 * Determines the partition to open the write transaction for.
++	 *
++	 * <p>Partition selection is driven by the resource body, but a conditional update sends no id in the body and
++	 * some strategies need one - patient compartment partitioning derives a Patient's partition from its own id.
++	 * Where the body alone cannot be routed, the write is deferred to all partitions and settled once the
++	 * conditional URL has resolved: a matched update writes to the partition its match already lives in, and
++	 * {@link #doCreateForPostOrPut} re-derives and validates the target partition, which remains the authoritative
++	 * gate. This mirrors how the transaction path handles the same situation in
++	 * {@code BaseTransactionProcessor#tryDetermineCreatePartitionForWriteEntryBeforePrefetch}.
++	 *
++	 * @throws PreFetchSkippableMethodNotAllowedException if the body cannot be routed and either the write is not
++	 *     conditional, or storage cannot search across all partitions and so the partition must be fixed up front
++	 */
++	private RequestPartitionId determineCreatePartitionForUpdate(
++			T theResource, String theMatchUrl, RequestDetails theRequest) {
++		try {
++			return myRequestPartitionHelperService.determineCreatePartitionForRequest(
++					theRequest, theResource, getResourceName());
++		} catch (PreFetchSkippableMethodNotAllowedException e) {
++			if (isBlank(theMatchUrl) || !myPartitionSettings.isAllPartitionSearchSupported()) {
++				throw e;
++			}
++			return RequestPartitionId.allPartitions();
++		}
++	}
++
+ 	private DaoMethodOutcome doUpdate(
+ 			T theResource,
+ 			String theMatchUrl,
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/interceptor/PatientIdPartitionInterceptorR4Test.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/interceptor/PatientIdPartitionInterceptorR4Test.java
+index 33766618c388..51e70a80b0a3 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/interceptor/PatientIdPartitionInterceptorR4Test.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/interceptor/PatientIdPartitionInterceptorR4Test.java
+@@ -59,6 +59,9 @@
+ import org.apache.http.client.methods.CloseableHttpResponse;
+ import org.apache.http.client.methods.HttpGet;
+ import org.apache.http.client.methods.HttpPost;
++import org.apache.http.client.methods.HttpPut;
++import org.apache.http.entity.ContentType;
++import org.apache.http.entity.StringEntity;
+ import org.hl7.fhir.instance.model.api.IBaseBundle;
+ import org.hl7.fhir.instance.model.api.IBaseReference;
+ import org.hl7.fhir.instance.model.api.IBaseResource;
+@@ -89,6 +92,7 @@
+ import org.junit.jupiter.params.ParameterizedTest;
+ import org.junit.jupiter.params.provider.ArgumentsSource;
+ import org.junit.jupiter.params.provider.CsvSource;
++import org.junit.jupiter.params.provider.EnumSource;
+ import org.junit.jupiter.params.provider.ValueSource;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.context.annotation.Bean;
+@@ -97,6 +101,7 @@
+ import org.springframework.transaction.annotation.Propagation;
+ 
+ import java.io.IOException;
++import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.HashMap;
+@@ -1179,6 +1184,142 @@ void testTransaction_ConditionalUpdatePatientByIdentifier_updatesInPlace(boolean
+ 		assertThat(myPatientDao.read(new IdType("Patient/A"), mySrd).getActive()).isFalse();
+ 	}
+ 
++	/**
++	 * A conditional update whose body carries no id updates the Patient matched by the conditional URL, in that
++	 * Patient's own compartment. Covered under both server id strategies.
++	 */
++	// Created by Claude Opus 5
++	@ParameterizedTest
++	@EnumSource(JpaStorageSettings.IdStrategyEnum.class)
++	void testConditionalUpdate_patientIdlessBodyOneMatch_updatesInPlace(JpaStorageSettings.IdStrategyEnum theIdStrategy) {
++		// setup
++		myPartitionSettings.setAllPartitionSearchSupported(true);
++		myStorageSettings.setResourceServerIdStrategy(theIdStrategy);
++
++		createPatient(withId("A"), withIdentifier("http://patient", "1"), withActiveTrue());
++
++		Patient patientToUpdate = new Patient();
++		patientToUpdate.addIdentifier().setSystem("http://patient").setValue("1");
++		patientToUpdate.addName().setFamily("Smith").addGiven("John");
++
++		// execute
++		DaoMethodOutcome outcome = myPatientDao.update(patientToUpdate, "Patient?identifier=http://patient|1", mySrd);
++
++		// verify
++		assertThat(outcome.getId().getIdPart()).isEqualTo("A");
++		assertThat(outcome.getCreated()).isFalse();
++		assertPatientCountInDatabase(1);
++		assertResourceIsInPartition(PATIENT_A_COMPARTMENT_ID, outcome.getId().toUnqualifiedVersionless());
++		assertThat(myPatientDao.read(new IdType("Patient/A"), mySrd).getNameFirstRep().getFamily())
++			.isEqualTo("Smith");
++	}
++
++	/**
++	 * The same conditional update over HTTP, so the response status is covered and not just the DAO outcome.
++	 */
++	// Created by Claude Opus 5
++	@Test
++	void testConditionalUpdate_patientIdlessBodyOneMatchOverRest_updatesInPlace() throws IOException {
++		// setup
++		myPartitionSettings.setAllPartitionSearchSupported(true);
++
++		createPatient(withId("A"), withIdentifier("http://patient", "1"), withActiveTrue());
++
++		Patient patientToUpdate = new Patient();
++		patientToUpdate.addIdentifier().setSystem("http://patient").setValue("1");
++		patientToUpdate.addName().setFamily("Smith").addGiven("John");
++
++		HttpPut httpPut = new HttpPut(myServer.getBaseUrl() + "/Patient?identifier=http://patient%7C1");
++		httpPut.setEntity(new StringEntity(
++			myFhirContext.newJsonParser().encodeResourceToString(patientToUpdate),
++			ContentType.parse("application/json+fhir")));
++
++		// execute
++		try (CloseableHttpResponse status = ourHttpClient.execute(httpPut)) {
++			String responseContent = IOUtils.toString(status.getEntity().getContent(), StandardCharsets.UTF_8);
++			ourLog.info("{}\n{}", status.getStatusLine(), responseContent);
++
++			// verify
++			assertThat(status.getStatusLine().getStatusCode()).isEqualTo(200);
++		}
++
++		assertThat(myTestDaoSearch.searchForIds("Patient?identifier=http://patient|1")).containsExactly("A");
++		assertThat(myPatientDao.read(new IdType("Patient/A"), mySrd).getNameFirstRep().getFamily())
++			.isEqualTo("Smith");
++	}
++
++	/**
++	 * An id-less Patient that matches nothing has no compartment to be routed to, so it is rejected rather than
++	 * created.
++	 */
++	// Created by Claude Opus 5
++	@Test
++	void testConditionalUpdate_patientIdlessBodyNoMatch_rejectedWith1321() {
++		// setup
++		myPartitionSettings.setAllPartitionSearchSupported(true);
++
++		Patient patientToUpdate = new Patient();
++		patientToUpdate.addIdentifier().setSystem("http://patient").setValue("1");
++		patientToUpdate.addName().setFamily("Smith").addGiven("John");
++
++		// execute & verify
++		assertThatThrownBy(() -> myPatientDao.update(patientToUpdate, "Patient?identifier=http://patient|1", mySrd))
++			.isInstanceOf(MethodNotAllowedException.class)
++			.hasMessageContaining("HAPI-1321");
++
++		assertPatientCountInDatabase(0);
++	}
++
++	/**
++	 * A conditional URL matching more than one Patient is ambiguous, so the update is rejected and nothing is
++	 * written.
++	 */
++	// Created by Claude Opus 5
++	@Test
++	void testConditionalUpdate_patientIdlessBodyMultipleMatches_preconditionFailed() {
++		// setup
++		myPartitionSettings.setAllPartitionSearchSupported(true);
++
++		createPatient(withId("A"), withIdentifier("http://patient", "1"), withActiveTrue());
++		createPatient(withId("B"), withIdentifier("http://patient", "1"), withActiveTrue());
++
++		Patient patientToUpdate = new Patient();
++		patientToUpdate.addIdentifier().setSystem("http://patient").setValue("1");
++		patientToUpdate.addName().setFamily("Smith").addGiven("John");
++
++		// execute & verify
++		assertThatThrownBy(() -> myPatientDao.update(patientToUpdate, "Patient?identifier=http://patient|1", mySrd))
++			.isInstanceOf(PreconditionFailedException.class)
++			.hasMessageContaining("HAPI-0988");
++
++		assertPatientCountInDatabase(2);
++	}
++
++	/**
++	 * A body id that disagrees with the Patient matched by the conditional URL is rejected, so resolving the match
++	 * to fill in an absent id never overrides an id the caller supplied.
++	 */
++	// Created by Claude Opus 5
++	@Test
++	void testConditionalUpdate_patientDifferentBodyId_rejectedWith2279() {
++		// setup
++		myPartitionSettings.setAllPartitionSearchSupported(true);
++
++		createPatient(withId("A"), withIdentifier("http://patient", "1"), withActiveTrue());
++
++		Patient patientToUpdate = new Patient();
++		patientToUpdate.setId("B");
++		patientToUpdate.addIdentifier().setSystem("http://patient").setValue("1");
++		patientToUpdate.addName().setFamily("Smith").addGiven("John");
++
++		// execute & verify
++		assertThatThrownBy(() -> myPatientDao.update(patientToUpdate, "Patient?identifier=http://patient|1", mySrd))
++			.isInstanceOf(InvalidRequestException.class)
++			.hasMessageContaining("HAPI-2279");
++
++		assertPatientCountInDatabase(1);
++	}
++
+ 	@Test
+ 	public void testTransaction_SplitAncillaryAndPatient_NewTransactionPerPartition() {
+ 		myStorageSettings.setResourceServerIdStrategy(JpaStorageSettings.IdStrategyEnum.UUID);
+@@ -2246,15 +2387,15 @@ void testTransaction_unconditionalTwinWithInlineMatchUrl_existingPatient_referen
+ 	}
+ 
+ 	/**
+-	 * A conditional Patient write whose match URL is non-token resolves in pre-fetch as "matched, id
+-	 * unknowable" ({@code PatientIdPartitionInterceptor}'s matched-without-reverse-mapped-id branch): the
+-	 * hook must leave the entry untouched, and in patient-id mode the id-less body is then rejected at
+-	 * partition identification. With a urn-referencing entry in the bundle, the referencer's never-substituted
+-	 * subject is rejected first (POSTs process before PUTs).
++	 * A conditional Patient write whose match URL is non-token resolves in pre-fetch as "matched, id unknowable"
++	 * ({@code PatientIdPartitionInterceptor}'s matched-without-reverse-mapped-id branch), so the hook leaves the
++	 * entry untouched. The match URL is instead resolved when the write reaches the DAO, and the matched Patient
++	 * is updated in place, in its own compartment.
+ 	 */
+ 	// Created by Claude Fable 5
+ 	@Test
+-	void testTransaction_matchedNonTokenConditionalPatientUrl_rejected() {
++	void testTransaction_matchedNonTokenConditionalPatientUrl_updatesInPlace() {
++		// setup
+ 		myStorageSettings.setResourceServerIdStrategy(JpaStorageSettings.IdStrategyEnum.UUID);
+ 		myStorageSettings.setAutoCreatePlaceholderReferenceTargets(true);
+ 		createPatient(withId("patSmith"), withFamily("Smith"));
+@@ -2269,10 +2410,33 @@ void testTransaction_matchedNonTokenConditionalPatientUrl_rejected() {
+ 				]
+ 			}
+ 			""";
+-		assertThatThrownBy(() -> mySystemDao.transaction(mySrd, myFhirContext.newJsonParser().parseResource(Bundle.class, alone)))
+-			.isInstanceOf(MethodNotAllowedException.class)
+-			.hasMessage("HAPI-1321: Patient resource IDs must be client-assigned in patient compartment mode, "
+-				+ "or server id strategy must be UUID");
++
++		// execute
++		Bundle aloneResponse = mySystemDao.transaction(
++			mySrd, myFhirContext.newJsonParser().parseResource(Bundle.class, alone));
++
++		// verify
++		IIdType aloneId = new IdType(aloneResponse.getEntry().get(0).getResponse().getLocation())
++			.toUnqualifiedVersionless();
++		assertThat(aloneId.getValue()).isEqualTo("Patient/patSmith");
++		assertPatientCountInDatabase(1);
++		assertResourceIsInPartition(PatientIdPartitionInterceptor.defaultPartitionAlgorithm("patSmith"), aloneId);
++	}
++
++	/**
++	 * Leaving a matched non-token conditional Patient entry untouched means the hook registers no id
++	 * substitution for it. Another entry referencing that Patient by urn therefore keeps its placeholder subject
++	 * and is rejected for having nothing that places it in a Patient compartment — whether the Patient entry is a
++	 * conditional PUT or a conditional POST. Resolving the match at the DAO comes too late to help, since POSTs
++	 * process before PUTs and the resolved id is never published to the bundle's reference substitutions.
++	 */
++	// Created by Claude Fable 5
++	@Test
++	void testTransaction_urnReferencerToNonTokenConditionalPatient_rejected() {
++		// setup
++		myStorageSettings.setResourceServerIdStrategy(JpaStorageSettings.IdStrategyEnum.UUID);
++		myStorageSettings.setAutoCreatePlaceholderReferenceTargets(true);
++		createPatient(withId("patSmith"), withFamily("Smith"));
+ 
+ 		String withUrnReferencer = """
+ 			{ "resourceType" : "Bundle", "type" : "transaction",
+@@ -2292,6 +2456,7 @@ void testTransaction_matchedNonTokenConditionalPatientUrl_rejected() {
+ 				]
+ 			}
+ 			""";
++		// execute & verify - the referenced Patient entry is a conditional PUT
+ 		assertThatThrownBy(() -> mySystemDao.transaction(
+ 				mySrd, myFhirContext.newJsonParser().parseResource(Bundle.class, withUrnReferencer)))
+ 			.isInstanceOf(MethodNotAllowedException.class)
+@@ -2315,6 +2480,7 @@ void testTransaction_matchedNonTokenConditionalPatientUrl_rejected() {
+ 				]
+ 			}
+ 			""";
++		// execute & verify - the referenced Patient entry is a conditional POST
+ 		assertThatThrownBy(() -> mySystemDao.transaction(
+ 				mySrd, myFhirContext.newJsonParser().parseResource(Bundle.class, ifNoneExistVariant)))
+ 			.isInstanceOf(MethodNotAllowedException.class)
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/r4/ResourceProviderR4Test.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/r4/ResourceProviderR4Test.java
+index d18c40e3a5ca..f1a3a1a4d4b9 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/r4/ResourceProviderR4Test.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/r4/ResourceProviderR4Test.java
+@@ -60,6 +60,7 @@
+ import ca.uhn.fhir.rest.server.exceptions.InvalidRequestException;
+ import ca.uhn.fhir.rest.server.exceptions.PreconditionFailedException;
+ import ca.uhn.fhir.rest.server.exceptions.ResourceGoneException;
++import ca.uhn.fhir.rest.server.exceptions.ResourceNotFoundException;
+ import ca.uhn.fhir.rest.server.exceptions.UnprocessableEntityException;
+ import ca.uhn.fhir.rest.server.interceptor.RequestValidatingInterceptor;
+ import ca.uhn.fhir.rest.server.servlet.ServletRequestDetails;
+@@ -1498,6 +1499,102 @@ public void testCreateConditional() {
+ 		assertEquals(output1.getId().getIdPart(), output2.getId().getIdPart());
+ 	}
+ 
++	/**
++	 * A conditional update whose body carries an id that disagrees with the resource its conditional URL matched
++	 * must be rejected with a 400 and an OperationOutcome (http://hl7.org/fhir/http.html#cond-update).
++	 * <p>
++	 * TODO-TG: characterization test of a known-wrong behaviour. It asserts what the spec requires and is
++	 * {@link Disabled} because HAPI diverges: the REST layer discards the conditional-PUT body id in
++	 * {@code UpdateMethodBinding.validateResourceIdAndUrlIdForNonConditionalOperation}, so the mismatch never
++	 * reaches the HAPI-2279 check in {@code BaseHapiFhirResourceDao.doUpdate} and the match is updated with a 200
++	 * instead. Re-enable once the id stripping is fixed.
++	 * <p>
++	 * Raw HTTP is used deliberately — the generic client must not be able to drop the id on our behalf, or the
++	 * test would be measuring the client rather than the server.
++	 */
++	// Created by Claude Opus 5
++	@Test
++	@Disabled("TODO-TG: known divergence - REST discards the conditional PUT body id, so the mismatch is never rejected")
++	public void testConditionalUpdate_OneMatch_DifferentBodyId_shouldRejectWith2279_specDivergence() throws IOException {
++		Patient existing = new Patient();
++		existing.addIdentifier().setSystem("http://acme.org/mrn").setValue("PT1");
++		IIdType existingId = myClient.create().resource(existing).execute().getId().toUnqualifiedVersionless();
++
++		Patient update = new Patient();
++		update.setId("some-other-id");
++		update.addIdentifier().setSystem("http://acme.org/mrn").setValue("PT1");
++		update.setActive(true);
++
++		HttpPut httpPut = new HttpPut(myServerBase + "/Patient?identifier=http://acme.org/mrn%7CPT1");
++		httpPut.setEntity(new StringEntity(
++			myFhirContext.newJsonParser().encodeResourceToString(update),
++			ContentType.parse("application/json+fhir")));
++
++		try (CloseableHttpResponse status = ourHttpClient.execute(httpPut)) {
++			String responseContent = IOUtils.toString(status.getEntity().getContent(), StandardCharsets.UTF_8);
++			ourLog.info("{}\n{}", status.getStatusLine(), responseContent);
++
++			assertThat(status.getStatusLine().getStatusCode())
++				.as("spec case 5 requires 400 Bad Request when the body id does not match the conditional match")
++				.isEqualTo(400);
++			assertThat(responseContent)
++				.as("the OperationOutcome should identify the id mismatch")
++				.contains("HAPI-2279");
++		}
++
++		Patient matched = myClient.read().resource(Patient.class).withId(existingId).execute();
++		assertThat(matched.hasActive())
++			.as("the rejected conditional update must not have modified the matched resource")
++			.isFalse();
++
++		assertThatThrownBy(() -> myClient.read().resource(Patient.class).withId("some-other-id").execute())
++			.as("the rejected conditional update must not have created anything under the body id")
++			.isInstanceOf(ResourceNotFoundException.class);
++	}
++
++	/**
++	 * A conditional update that matches nothing must create the resource using the client-supplied body id and
++	 * return 201 (http://hl7.org/fhir/http.html#cond-update).
++	 * <p>
++	 * TODO-TG: characterization test of a known-wrong behaviour. It asserts what the spec requires and is
++	 * {@link Disabled} because HAPI diverges: the REST layer discards the conditional-PUT body id in
++	 * {@code UpdateMethodBinding.validateResourceIdAndUrlIdForNonConditionalOperation}, so the resource is created
++	 * with a server-assigned id instead. Re-enable once the id stripping is fixed.
++	 * <p>
++	 * Raw HTTP is used deliberately — see the sibling test above.
++	 */
++	// Created by Claude Opus 5
++	@Test
++	@Disabled("TODO-TG: known divergence - REST discards the conditional PUT body id, so the supplied id is not used")
++	public void testConditionalUpdate_NoMatch_ClientAssignedBodyId_shouldCreateWithThatId_specDivergence() throws IOException {
++		Patient create = new Patient();
++		// alphanumeric: the default ClientIdStrategyEnum.ALPHANUMERIC rejects purely-numeric client ids (Msg 960)
++		create.setId("custom-id-1");
++		create.addIdentifier().setSystem("http://acme.org/mrn").setValue("PT-NOMATCH");
++		create.setActive(true);
++
++		HttpPut httpPut = new HttpPut(myServerBase + "/Patient?identifier=http://acme.org/mrn%7CPT-NOMATCH");
++		httpPut.setEntity(new StringEntity(
++			myFhirContext.newJsonParser().encodeResourceToString(create),
++			ContentType.parse("application/json+fhir")));
++
++		try (CloseableHttpResponse status = ourHttpClient.execute(httpPut)) {
++			String responseContent = IOUtils.toString(status.getEntity().getContent(), StandardCharsets.UTF_8);
++			ourLog.info("{}\n{}", status.getStatusLine(), responseContent);
++
++			assertEquals(201, status.getStatusLine().getStatusCode());
++		}
++
++		Bundle found = myClient.search().forResource(Patient.class)
++			.where(Patient.IDENTIFIER.exactly().systemAndCode("http://acme.org/mrn", "PT-NOMATCH"))
++			.returnBundle(Bundle.class).execute();
++
++		assertThat(found.getEntry()).hasSize(1);
++		assertThat(found.getEntryFirstRep().getResource().getIdElement().getIdPart())
++			.as("spec case 2 requires the resource to be created with the client-supplied id")
++			.isEqualTo("custom-id-1");
++	}
++
+ 	@Test
+ 	public void testCreateIncludesRequestValidatorInterceptorOutcome() {
+ 		RequestValidatingInterceptor interceptor = new RequestValidatingInterceptor();

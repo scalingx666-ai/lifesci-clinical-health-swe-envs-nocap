@@ -1,0 +1,522 @@
+diff --git a/grails-app/conf/runtime.groovy b/grails-app/conf/runtime.groovy
+index 47dac2ed5ec..e3574b1706c 100644
+--- a/grails-app/conf/runtime.groovy
++++ b/grails-app/conf/runtime.groovy
+@@ -124,6 +124,7 @@ openboxes.security.rbac.rules = [
+     [controller: 'stockMovementApi', actions: ['delete'], accessRules: [ minimumRequiredRole: RoleType.ROLE_ASSISTANT]],
+     [controller: 'product', actions: ['merge'], accessRules: [ minimumRequiredRole: RoleType.ROLE_ADMIN]],
+     [controller: 'user', actions: ['changePassword'], accessRules: [ minimumRequiredRole: RoleType.ROLE_AUTHENTICATED]],
++    [controller: 'requisition', actions: ['unassignPicker', 'reassignPicker', 'reassignPickerDialog'], accessRules: [ minimumRequiredRole: RoleType.ROLE_ADMIN ]],
+     // Other controller actions that might need explicit rules
+     //[controller: 'putawayItemApi', actions: ['removingItem'], access: [RoleType.ROLE_MANAGER]],
+ ]
+diff --git a/grails-app/controllers/org/pih/warehouse/inventory/StockMovementController.groovy b/grails-app/controllers/org/pih/warehouse/inventory/StockMovementController.groovy
+index 04dcd71c338..ca8cff5b837 100755
+--- a/grails-app/controllers/org/pih/warehouse/inventory/StockMovementController.groovy
++++ b/grails-app/controllers/org/pih/warehouse/inventory/StockMovementController.groovy
+@@ -182,6 +182,7 @@ class StockMovementController {
+                     stockMovement: stockMovement,
+                     currentLocation: currentLocation,
+                     latestHistoryItem: latestHistoryItem,
++                    currentAssignee: pickTaskService.getCurrentAssignee(stockMovement?.requisition),
+             ])
+         }
+     }
+diff --git a/grails-app/controllers/org/pih/warehouse/requisition/RequisitionController.groovy b/grails-app/controllers/org/pih/warehouse/requisition/RequisitionController.groovy
+index 9bc78c39061..52b7ef8ee6f 100755
+--- a/grails-app/controllers/org/pih/warehouse/requisition/RequisitionController.groovy
++++ b/grails-app/controllers/org/pih/warehouse/requisition/RequisitionController.groovy
+@@ -23,6 +23,7 @@ import org.pih.warehouse.core.Location
+ import org.pih.warehouse.core.Person
+ import org.pih.warehouse.core.User
+ import org.pih.warehouse.inventory.StockMovementService
++import org.pih.warehouse.picking.PickTaskService
+ import org.pih.warehouse.picklist.Picklist
+ import org.pih.warehouse.picklist.PicklistItem
+ import org.pih.warehouse.product.Product
+@@ -39,8 +40,9 @@ class RequisitionController {
+     def inventoryService
+     def productService
+     StockMovementService stockMovementService
++    PickTaskService pickTaskService
+ 
+-    static allowedMethods = [save: "POST", update: "POST"]
++    static allowedMethods = [save: "POST", update: "POST", unassignPicker: "POST", reassignPicker: "POST"]
+ 
+     def index() {
+         redirect(action: "list", params: params)
+@@ -357,6 +359,43 @@ class RequisitionController {
+         redirect(action: "pick", id: requisition?.id)
+     }
+ 
++    def unassignPicker() {
++        Requisition requisition = Requisition.get(params?.id)
++        if (!requisition) {
++            flash.error = warehouse.message(code: 'default.not.found.message', args: [warehouse.message(code: 'requisition.label', default: 'Requisition'), params.id])
++            redirect(controller: "stockMovement", action: "show", id: params.id)
++            return
++        }
++        try {
++            pickTaskService.unassign(requisition)
++            flash.message = g.message(code: 'picklist.unassign.success.message', default: 'Picker was unassigned and the order was returned to the pick queue')
++        } catch (Exception e) {
++            flash.error = g.message(code: 'picklist.unassign.error.message', args: [e.message], default: 'Unable to unassign picker: {0}')
++        }
++        redirect(controller: "stockMovement", action: "show", id: params.id)
++    }
++
++    def reassignPicker() {
++        Requisition requisition = Requisition.get(params?.id)
++        if (!requisition) {
++            flash.error = warehouse.message(code: 'default.not.found.message', args: [warehouse.message(code: 'requisition.label', default: 'Requisition'), params.id])
++            redirect(controller: "stockMovement", action: "show", id: params.id)
++            return
++        }
++        try {
++            pickTaskService.reassign(requisition, params?.assigneeId)
++            flash.message = g.message(code: 'picklist.reassign.success.message', default: 'Picker was reassigned')
++        } catch (Exception e) {
++            flash.error = g.message(code: 'picklist.reassign.error.message', args: [e.message], default: 'Unable to reassign picker: {0}')
++        }
++        redirect(controller: "stockMovement", action: "show", id: params.id)
++    }
++
++    def reassignPickerDialog() {
++        def requisition = Requisition.get(params?.id)
++        render(template: "reassignPickerDialog", model: [requisition: requisition])
++    }
++
+     def showPicklistDialog() {
+         def location = Location.get(session.warehouse.id)
+         def requisitionItem = RequisitionItem.get(params.id)
+diff --git a/grails-app/domain/org/pih/warehouse/requisition/Requisition.groovy b/grails-app/domain/org/pih/warehouse/requisition/Requisition.groovy
+index 3f56bfd8afe..c024625456f 100644
+--- a/grails-app/domain/org/pih/warehouse/requisition/Requisition.groovy
++++ b/grails-app/domain/org/pih/warehouse/requisition/Requisition.groovy
+@@ -591,16 +591,18 @@ class Requisition implements Comparable<Requisition>, Serializable, Historizable
+     }
+ 
+     /**
+-     * Whether the requisition needs manual intervention: its most recent EventLog is an ERROR_OCCURRED and it
+-     * hasn't since reached a terminal success state (ISSUED). In practice this rests at CREATED (allocation
+-     * failed, will retry) or PICKING (issuance failed, awaiting a person) - status itself keeps reflecting
+-     * lifecycle state only, so this is derived rather than stored.
++     * Whether the requisition needs manual intervention: its most recent EventLog - ignoring purely
++     * informational entries (e.g. INFO_OCCURRED audit notes like a picker reassignment), which must never mask
++     * an unresolved error just by being more recent - is an ERROR_OCCURRED. In practice this rests at CREATED
++     * (allocation failed, will retry) or PICKING (issuance failed, awaiting a person) - status itself keeps
++     * reflecting lifecycle state only, so this is derived rather than stored.
+      */
+     Boolean isInErrorState() {
+         if (!(status in [RequisitionStatus.CREATED, RequisitionStatus.PICKING])) {
+             return false
+         }
+-        EventLog mostRecentEventLog = eventLogs?.max { it.dateCreated }
++        EventLog mostRecentEventLog = eventLogs?.findAll { it.eventLogCode != EventLogCode.INFO_OCCURRED }
++                ?.max { it.dateCreated }
+         return mostRecentEventLog?.eventLogCode == EventLogCode.ERROR_OCCURRED
+     }
+ 
+diff --git a/grails-app/i18n/messages.properties b/grails-app/i18n/messages.properties
+index 6a673a09d21..196cd251a29 100644
+--- a/grails-app/i18n/messages.properties
++++ b/grails-app/i18n/messages.properties
+@@ -891,6 +891,7 @@ enum.EventCode.CUSTOM=Custom
+ enum.EventLogCode.EVENT_OCCURRED=Event occurred
+ enum.EventLogCode.EVENT_ROLLBACK_OCCURRED=Event rolled back
+ enum.EventLogCode.ERROR_OCCURRED=Error occurred
++enum.EventLogCode.INFO_OCCURRED=Info
+ enum.FulfillmentStatusCode.CREATED=Created
+ enum.FulfillmentStatusCode.PARTIALLY_ALLOCATED=Partially Allocated
+ enum.FulfillmentStatusCode.ALLOCATED=Allocated
+@@ -2837,6 +2838,11 @@ requisition.receivedBy.label=Received by
+ requisition.received.label=Received
+ requisition.pickedBy.label=Picked by
+ requisition.picked.label=Picked
++picklist.assignee.label=Picker
++picklist.unassign.success.message=Picker was unassigned and the order was returned to the pick queue
++picklist.unassign.error.message=Unable to unassign picker: {0}
++picklist.reassign.success.message=Picker was reassigned
++picklist.reassign.error.message=Unable to reassign picker: {0}
+ requisition.verifiedBy.invalid.message=You must specify the person who verified the requisition before continuing
+ requisition.invalid.duplicate.message=System has prevented a duplicate requisition from being created. In the future, please avoid submitting the form more than once.
+ requisition.wizard.create.label=Create
+diff --git a/grails-app/migrations/views/stock-movement-list-item.sql b/grails-app/migrations/views/stock-movement-list-item.sql
+index d4b515ab571..e93ff5558c2 100644
+--- a/grails-app/migrations/views/stock-movement-list-item.sql
++++ b/grails-app/migrations/views/stock-movement-list-item.sql
+@@ -45,6 +45,7 @@ CREATE OR REPLACE VIEW stock_movement_list_item AS
+             FROM requisition_event_log rel
+                 INNER JOIN event_log el ON el.id = rel.event_log_id
+             WHERE rel.requisition_id = r.id
++                AND el.event_log_code != 'INFO_OCCURRED'
+             ORDER BY el.date_created DESC, el.id DESC
+             LIMIT 1
+         )
+diff --git a/grails-app/services/org/pih/warehouse/picking/PickTaskService.groovy b/grails-app/services/org/pih/warehouse/picking/PickTaskService.groovy
+index 781b6dc4251..b8311802983 100644
+--- a/grails-app/services/org/pih/warehouse/picking/PickTaskService.groovy
++++ b/grails-app/services/org/pih/warehouse/picking/PickTaskService.groovy
+@@ -8,7 +8,9 @@ import org.hibernate.criterion.CriteriaSpecification
+ import org.pih.warehouse.api.AvailableItem
+ import org.pih.warehouse.api.PickTaskStatus
+ import org.pih.warehouse.api.picking.SearchPickTaskCommand
++import org.pih.warehouse.auth.AuthService
+ import org.pih.warehouse.core.ActivityCode
++import org.pih.warehouse.core.history.EventLogCode
+ import org.pih.warehouse.core.DeliveryTypeCode
+ import org.pih.warehouse.core.Location
+ import org.pih.warehouse.core.RequisitionEvent
+@@ -560,6 +562,66 @@ class PickTaskService {
+         return true
+     }
+ 
++    /**
++     * `.find` returns only the first picklist item that has an assignee, on the assumption that any item being
++     * assigned means the whole order is assigned to that same person. Unassign/reassign (below) act on this
++     * same assumption, clearing or overwriting the assignee on ALL picklist items at once.
++     *
++     * That assumption can currently be violated by the mobile app, which assigns one picklist item at a time
++     * and could let different items on the same order end up with different assignees. Unassign/reassign exist
++     * precisely to let an admin recover from that kind of stuck/inconsistent state from the web app.
++     */
++    Person getCurrentAssignee(Requisition requisition) {
++        return requisition?.picklist?.picklistItems?.find { PicklistItem item ->
++            item.assignee && (!item.status || item.status in [PickTaskStatus.PENDING.name(), PickTaskStatus.PICKING.name()])
++        }?.assignee
++    }
++
++    void unassign(Requisition requisition) {
++        validateAssignmentChangeAllowed(requisition)
++
++        Person previousAssignee = getCurrentAssignee(requisition)
++        if (!previousAssignee) {
++            return
++        }
++
++        requisition.picklist?.picklistItems?.each { PicklistItem item ->
++            if (item.assignee) {
++                item.assignee = null
++                item.dateAssigned = null
++                item.save(failOnError: true)
++            }
++        }
++
++        requisitionService.logRequisitionEvent(requisition.id, "Picker ${previousAssignee.name} was unassigned", EventLogCode.INFO_OCCURRED)
++    }
++
++    void reassign(Requisition requisition, String assigneeId) {
++        validateAssignmentChangeAllowed(requisition)
++
++        Person newAssignee = Person.get(assigneeId)
++        if (!newAssignee) {
++            throw new IllegalArgumentException("Assignee ${assigneeId} not found")
++        }
++
++        Person previousAssignee = getCurrentAssignee(requisition)
++        Date now = new Date()
++        requisition.picklist?.picklistItems?.each { PicklistItem item ->
++            item.assignee = newAssignee
++            item.dateAssigned = now
++            item.save(failOnError: true)
++        }
++
++        requisitionService.logRequisitionEvent(requisition.id,
++                "Picker was reassigned from ${previousAssignee?.name ?: 'Unassigned'} to ${newAssignee.name}", EventLogCode.INFO_OCCURRED)
++    }
++
++    private void validateAssignmentChangeAllowed(Requisition requisition) {
++        if (requisition.status >= RequisitionStatus.ISSUED) {
++            throw new IllegalStateException("Cannot change picker assignment for requisition with status: ${requisition.status}")
++        }
++    }
++
+     private List<String> findRequisitionIdsForPicking(SearchPickTaskCommand command) {
+         Integer ordersCount = command.ordersCount
+         if (!ordersCount) {
+@@ -600,11 +662,18 @@ class PickTaskService {
+     }
+ 
+     private List<String> findRequisitionIdsWithPickTaskAssigned(Location facility, List<PickTaskStatus> statusesToSearch) {
++        // A requisition assigned to the current mobile user should still be offered to them (e.g. after
++        // navigating back out of it), so only requisitions assigned to someone else are excluded here.
++        Person currentUser = AuthService.currentUser
++
+         List<Requisition> requisitions = PickTask.createCriteria().list {
+             projections {
+                 distinct("requisition")
+             }
+             isNotNull("assignee")
++            if (currentUser) {
++                ne("assignee.id", currentUser.id)
++            }
+             if (statusesToSearch) {
+                 'in'("status", statusesToSearch)
+             }
+diff --git a/grails-app/services/org/pih/warehouse/requisition/RequisitionService.groovy b/grails-app/services/org/pih/warehouse/requisition/RequisitionService.groovy
+index dbf5a9817b9..cb51ae1e8ec 100644
+--- a/grails-app/services/org/pih/warehouse/requisition/RequisitionService.groovy
++++ b/grails-app/services/org/pih/warehouse/requisition/RequisitionService.groovy
+@@ -966,18 +966,22 @@ class RequisitionService {
+      * Writes an EventLog in the caller's transaction. Use {@link #logRequisitionEvent} instead when the
+      * caller is about to roll back and the entry still has to survive.
+      */
+-    void addSystemEventLog(Requisition requisition, String message) {
++    void addSystemEventLog(Requisition requisition, String message, EventLogCode eventLogCode = EventLogCode.ERROR_OCCURRED) {
+         // TODO: event_log.message is a VARCHAR(255) column; expand the column (and remove this cap) if longer
+         //  messages are needed.
+         String truncatedMessage = message?.length() > 255 ? message.take(255) : message
+ 
+         requisition.addToEventLogs(new EventLog(
+-                eventLogCode: EventLogCode.ERROR_OCCURRED,
++                eventLogCode: eventLogCode,
+                 eventDate: Instant.now(),
+                 message: truncatedMessage,
+         ))
+         requisition.save(failOnError: true)
+-        log.warn("Requisition ${requisition.id}: ${message}")
++        if (eventLogCode == EventLogCode.ERROR_OCCURRED) {
++            log.warn("Requisition ${requisition.id}: ${message}")
++        } else {
++            log.info("Requisition ${requisition.id}: ${message}")
++        }
+     }
+ 
+     /**
+@@ -1000,14 +1004,14 @@ class RequisitionService {
+      * though the caller is about to roll back and rethrow the triggering exception.
+      */
+     @Transactional(propagation = Propagation.REQUIRES_NEW)
+-    void logRequisitionEvent(String requisitionId, String message) {
++    void logRequisitionEvent(String requisitionId, String message, EventLogCode eventLogCode = EventLogCode.ERROR_OCCURRED) {
+         Requisition requisition = Requisition.get(requisitionId)
+         if (!requisition) {
+             log.warn("Unable to log requisition error - requisition ${requisitionId} not found: ${message}")
+             return
+         }
+ 
+-        addSystemEventLog(requisition, message)
++        addSystemEventLog(requisition, message, eventLogCode)
+     }
+ 
+     RequisitionItem buildRequisitionItem(Map params) {
+diff --git a/grails-app/views/requisition/_reassignPickerDialog.gsp b/grails-app/views/requisition/_reassignPickerDialog.gsp
+new file mode 100644
+index 00000000000..e298da364b7
+--- /dev/null
++++ b/grails-app/views/requisition/_reassignPickerDialog.gsp
+@@ -0,0 +1,25 @@
++<g:form controller="requisition" action="reassignPicker">
++    <g:hiddenField name="id" value="${requisition?.id}"/>
++
++    <div class="message">
++        Select a user to reassign this order's picker to.
++    </div>
++
++    <table>
++        <tr class="prop">
++            <td class="name">
++                <label for="reassignAssigneeId">Reassign to</label>
++            </td>
++            <td class="value">
++                <g:selectPerson id="reassignAssigneeId" name="assigneeId" noSelection="['null':'']" size="30" class="chzn-select-deselect"/>
++            </td>
++        </tr>
++    </table>
++
++    <div class="buttons">
++        <button class="button">
++            <img src="${resource(dir: 'images/icons/silk', file: 'user_add.png')}" />&nbsp;
++            Reassign picker
++        </button>
++    </div>
++</g:form>
+diff --git a/grails-app/views/stockMovement/show.gsp b/grails-app/views/stockMovement/show.gsp
+index e30fa9f5f7b..f3227fe17a2 100644
+--- a/grails-app/views/stockMovement/show.gsp
++++ b/grails-app/views/stockMovement/show.gsp
+@@ -203,59 +203,78 @@
+                 </g:if>
+ 
+                 <g:isUserAdmin>
+-                    <g:if test="${isSameOrigin && stockMovement?.canGeneratePickList()}">
+-                        <g:link
+-                            controller="stockMovement"
+-                            action="allocate"
+-                            id="${stockMovement?.requisition?.id}"
+-                            class="button"
+-                        >
+-                            <img src="${resource(dir: 'images/icons/', file: 'handtruck.png')}" />&nbsp;
+-                            <warehouse:message code="stockMovement.allocate.label" default="Allocate"/>
+-                        </g:link>
+-                    </g:if>
+-                    <g:if test="${stockMovement?.requisition?.picklist?.picklistItems && stockMovement?.requisition?.status < RequisitionStatus.ISSUED}">
+-                        <g:if test="${stockMovement?.requisition?.picklist?.picklistItems?.any {pi -> ['PICKED', 'STAGED'].any {pi.status == it}}}">
+-                            <g:link
+-                                    controller="stockMovement"
+-                                    action="clearPicklist"
+-                                    id="${stockMovement?.requisition?.id}"
+-                                    class="button"
+-                            >
+-                               <img src="${resource(dir: 'images/icons/silk/', file: 'bin.png')}" />&nbsp;
+-                                <warehouse:message code="stockMovement.rollbackPicklist.label" default="Rollback picklist"/>
+-                            </g:link>
++                        <g:if test="${isSameOrigin && stockMovement?.canGeneratePickList()}">
+                             <g:link
+-                                    controller="stockMovement"
+-                                    action="redoAutopick"
+-                                    id="${stockMovement?.requisition?.id}"
+-                                    class="button"
++                                controller="stockMovement"
++                                action="allocate"
++                                id="${stockMovement?.requisition?.id}"
++                                class="button"
+                             >
+-                                <img src="${resource(dir: 'images/icons/silk/', file: 'arrow_redo.png')}" />&nbsp;
+-                                <warehouse:message code="stockMovement.redoAllocation.label" default="Redo Allocation"/>
++                                <img src="${resource(dir: 'images/icons/', file: 'handtruck.png')}" />&nbsp;
++                                <warehouse:message code="stockMovement.allocate.label" default="Allocate"/>
+                             </g:link>
+                         </g:if>
+-                        <g:else>
+-                            <g:link
+-                                    controller="allocation"
+-                                    action="deallocate"
+-                                    id="${stockMovement?.requisition?.id}"
+-                                    class="button"
+-                            >
+-                                <img src="${resource(dir: 'images/icons/silk/', file: 'bin.png')}" />&nbsp;
+-                                <warehouse:message code="stockMovement.clearAllocation.label" default="Clear Allocation"/>
+-                            </g:link>
+-                            <g:link
+-                                    controller="allocation"
+-                                    action="redoAutopick"
+-                                    id="${stockMovement?.requisition?.id}"
+-                                    class="button"
+-                            >
+-                                <img src="${resource(dir: 'images/icons/silk/', file: 'arrow_redo.png')}" />&nbsp;
+-                                <warehouse:message code="stockMovement.redoAllocation.label" default="Redo Allocation"/>
+-                            </g:link>
+-                        </g:else>
+-                    </g:if>
++                        <g:if test="${stockMovement?.requisition?.picklist?.picklistItems && stockMovement?.requisition?.status < RequisitionStatus.ISSUED}">
++                            <g:if test="${stockMovement?.requisition?.picklist?.picklistItems?.any {pi -> ['PICKED', 'STAGED'].any {pi.status == it}}}">
++                                <g:link
++                                        controller="stockMovement"
++                                        action="clearPicklist"
++                                        id="${stockMovement?.requisition?.id}"
++                                        class="button"
++                                >
++                                   <img src="${resource(dir: 'images/icons/silk/', file: 'bin.png')}" />&nbsp;
++                                    <warehouse:message code="stockMovement.rollbackPicklist.label" default="Rollback picklist"/>
++                                </g:link>
++                                <g:link
++                                        controller="stockMovement"
++                                        action="redoAutopick"
++                                        id="${stockMovement?.requisition?.id}"
++                                        class="button"
++                                >
++                                    <img src="${resource(dir: 'images/icons/silk/', file: 'arrow_redo.png')}" />&nbsp;
++                                    <warehouse:message code="stockMovement.redoAllocation.label" default="Redo Allocation"/>
++                                </g:link>
++                            </g:if>
++                            <g:else>
++                                <g:link
++                                        controller="allocation"
++                                        action="deallocate"
++                                        id="${stockMovement?.requisition?.id}"
++                                        class="button"
++                                >
++                                    <img src="${resource(dir: 'images/icons/silk/', file: 'bin.png')}" />&nbsp;
++                                    <warehouse:message code="stockMovement.clearAllocation.label" default="Clear Allocation"/>
++                                </g:link>
++                                <g:link
++                                        controller="allocation"
++                                        action="redoAutopick"
++                                        id="${stockMovement?.requisition?.id}"
++                                        class="button"
++                                >
++                                    <img src="${resource(dir: 'images/icons/silk/', file: 'arrow_redo.png')}" />&nbsp;
++                                    <warehouse:message code="stockMovement.redoAllocation.label" default="Redo Allocation"/>
++                                </g:link>
++                            </g:else>
++                            <g:if test="${currentAssignee}">
++                                <g:form controller="requisition" action="unassignPicker" style="display:inline-block; float:left; margin: 0;">
++                                    <g:hiddenField name="id" value="${stockMovement?.requisition?.id}"/>
++                                    <button
++                                            class="button"
++                                            onclick="return confirm('${warehouse.message(code: 'default.button.delete.confirm.message', default: 'Are you sure?')}');"
++                                    >
++                                        <img src="${resource(dir: 'images/icons/silk/', file: 'user_delete.png')}" />&nbsp;
++                                        Unassign picker
++                                    </button>
++                                </g:form>
++                            </g:if>
++                            <a href="javascript:void(0);" class="button btn-show-dialog"
++                               data-height="200" data-width="500"
++                               data-title="Reassign picker"
++                               data-url="${request.contextPath}/requisition/reassignPickerDialog/${stockMovement?.requisition?.id}">
++                                <img src="${resource(dir: 'images/icons/silk/', file: 'user_add.png')}" />&nbsp;
++                                Reassign picker
++                            </a>
++                        </g:if>
+                 </g:isUserAdmin>
+ 
+                 <g:isSuperuser>
+@@ -340,6 +359,16 @@
+                                 ${stockMovement?.displayStatus?.label}
+                             </td>
+                         </tr>
++                        <g:if test="${stockMovement?.requisition?.status in [RequisitionStatus.PICKING, RequisitionStatus.PICKED, RequisitionStatus.CHECKING, RequisitionStatus.STAGED]}">
++                            <tr class="prop">
++                                <td class="name">
++                                    <warehouse:message code="picklist.assignee.label" default="Picker"/>
++                                </td>
++                                <td class="value">
++                                    ${currentAssignee?.name ?: 'Unassigned'}
++                                </td>
++                            </tr>
++                        </g:if>
+                         <g:if test="${stockMovement?.fulfillmentStatus}">
+                             <tr class="prop">
+                                 <td class="name">
+diff --git a/src/main/groovy/org/pih/warehouse/core/history/EventLogCode.groovy b/src/main/groovy/org/pih/warehouse/core/history/EventLogCode.groovy
+index 86e526cf87b..931cdefe83e 100644
+--- a/src/main/groovy/org/pih/warehouse/core/history/EventLogCode.groovy
++++ b/src/main/groovy/org/pih/warehouse/core/history/EventLogCode.groovy
+@@ -28,4 +28,10 @@ enum EventLogCode {
+      *  The proper solution is a dedicated classification subtype on EventLog.
+      */
+     ERROR_OCCURRED,
++
++    /**
++     * Logs a non-error, informational system message. The message holds the details; event is always null
++     * since there is no corresponding {@link org.pih.warehouse.core.Event}.
++     */
++    INFO_OCCURRED,
+ }
+diff --git a/src/test/groovy/org/pih/warehouse/requisition/RequisitionSpec.groovy b/src/test/groovy/org/pih/warehouse/requisition/RequisitionSpec.groovy
+index 4a4bfc1ad34..ba23cfc1354 100644
+--- a/src/test/groovy/org/pih/warehouse/requisition/RequisitionSpec.groovy
++++ b/src/test/groovy/org/pih/warehouse/requisition/RequisitionSpec.groovy
+@@ -78,6 +78,20 @@ class RequisitionSpec extends Specification implements DomainUnitTest<Requisitio
+         RequisitionStatus.CREATED     | null                               || false
+     }
+ 
++    void 'isInErrorState should still be true when an informational event log is recorded after an unresolved error'() {
++        given:
++        Requisition requisition = new Requisition(status: RequisitionStatus.CREATED)
++
++        EventLog error = new EventLog(eventLogCode: EventLogCode.ERROR_OCCURRED, message: "Allocation failed: boom")
++        error.dateCreated = Instant.now().minusSeconds(60)
++        EventLog info = new EventLog(eventLogCode: EventLogCode.INFO_OCCURRED, message: "Picker was unassigned")
++        info.dateCreated = Instant.now()
++        requisition.eventLogs = [error, info]
++
++        expect:
++        requisition.isInErrorState() == true
++    }
++
+     void 'getMostRecentErrorMessage should return the message of the latest ERROR_OCCURRED event log'() {
+         given:
+         Requisition requisition = new Requisition(status: RequisitionStatus.CREATED)

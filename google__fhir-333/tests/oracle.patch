@@ -1,0 +1,958 @@
+diff --git a/java/com/google/fhir/common/BUILD b/java/com/google/fhir/common/BUILD
+index 72f58371333..140d7d408d3 100644
+--- a/java/com/google/fhir/common/BUILD
++++ b/java/com/google/fhir/common/BUILD
+@@ -180,3 +180,16 @@ java_library(
+         "@maven//:com_google_guava_guava",
+     ],
+ )
++
++java_library(
++    name = "terminology_expander",
++    srcs = ["TerminologyExpander.java"],
++    deps = [
++        ":exceptions",
++        "//java/com/google/fhir/protogen:fhir_package",
++        "//proto/google/fhir/proto/r4/core:datatypes_java_proto",
++        "//proto/google/fhir/proto/r4/core/resources:code_system_java_proto",
++        "//proto/google/fhir/proto/r4/core/resources:value_set_java_proto",
++        "@maven//:com_google_guava_guava",
++    ],
++)
+diff --git a/java/com/google/fhir/common/TerminologyExpander.java b/java/com/google/fhir/common/TerminologyExpander.java
+new file mode 100644
+index 00000000000..60892b92432
+--- /dev/null
++++ b/java/com/google/fhir/common/TerminologyExpander.java
+@@ -0,0 +1,313 @@
++//    Copyright 2024 Google LLC
++//
++//    Licensed under the Apache License, Version 2.0 (the "License");
++//    you may not use this file except in compliance with the License.
++//    You may obtain a copy of the License at
++//
++//        https://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS,
++//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//    See the License for the specific language governing permissions and
++//    limitations under the License.
++
++package com.google.fhir.common;
++
++import static com.google.common.collect.ImmutableList.toImmutableList;
++import static com.google.common.collect.ImmutableSet.toImmutableSet;
++
++import com.google.common.base.Splitter;
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.ImmutableSet;
++import com.google.fhir.protogen.FhirPackage;
++import com.google.fhir.r4.core.Canonical;
++import com.google.fhir.r4.core.CodeSystem;
++import com.google.fhir.r4.core.CodeSystem.ConceptDefinition;
++import com.google.fhir.r4.core.ValueSet;
++import com.google.fhir.r4.core.ValueSet.Compose.ConceptSet;
++import com.google.fhir.r4.core.ValueSet.Compose.ConceptSet.Filter;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Objects;
++import java.util.Optional;
++import java.util.Set;
++import java.util.stream.Stream;
++
++/**
++ * Utility for expanding CodeSystems and ValueSets into flattened lists. Uses a FhirPackage to
++ * manage dependencies.
++ */
++public final class TerminologyExpander {
++
++  private final FhirPackage fhirPackage;
++
++  public TerminologyExpander(FhirPackage fhirPackage) {
++    this.fhirPackage = fhirPackage;
++  }
++
++  /** Class representing a code, along with data about what CodeSystem it comes from. */
++  public static class ValueSetCode {
++    public final String code;
++    public final String display;
++
++    // To support conversion of legacy profiled protos, ValueSet enums need metadata about the
++    // system that a code came from. Once support for generating profiled protos is eliminated, this
++    // can be eliminated.
++    public final String sourceSystem;
++
++    public ValueSetCode(String code, String display, String sourceSystem) {
++      this.code = code;
++      this.display = display;
++      this.sourceSystem = sourceSystem;
++    }
++
++    @Override
++    public boolean equals(Object other) {
++      if (other == null) {
++        return false;
++      }
++      if (!(other instanceof ValueSetCode)) {
++        return false;
++      }
++      ValueSetCode otherCode = (ValueSetCode) other;
++      return code.equals(otherCode.code) && sourceSystem.equals(otherCode.sourceSystem);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(code, sourceSystem);
++    }
++
++    @Override
++    public String toString() {
++      return String.format(
++          "{code: %s, display: %s, sourceSystem: %s}", code, display, sourceSystem);
++    }
++  }
++
++  /**
++   * Returns all codes included in `valueSet`, expanding any referenced ValueSets and CodeSystems.
++   */
++  public ImmutableList<ValueSetCode> expandValueSet(ValueSet valueSet) {
++    return getCodeStreamForValueSet(valueSet).collect(toImmutableList());
++  }
++
++  /**
++   * Gets a flattened list of all concepts in a CodeSystem.
++   *
++   * <p>Note this is static, since it doesn't require access to any other resources.
++   */
++  public static List<ConceptDefinition> expandCodeSystem(CodeSystem system) {
++    return getFlattenedCodesForConcepts(
++        system.getConceptList(),
++        new HashSet<>() /* at top level of system - codes have no ancestors */,
++        new ArrayList<>() /* no filters */);
++  }
++
++  /**
++   * Given a stream of `Contains` codes, each of which can contain child codes, returns a flattened
++   * stream containing all codes in the expanded hierarchy.
++   */
++  private static Stream<ValueSet.Expansion.Contains> flattenContainsStream(
++      Stream<ValueSet.Expansion.Contains> containsList) {
++    return containsList.flatMap(
++        element ->
++            Stream.concat(
++                Stream.of(element), flattenContainsStream(element.getContainsList().stream())));
++  }
++
++  /**
++   * Given a `valueSet` and a list of `filters`, returns a stream of all codes in `valueSet`
++   * matching `filter`, expanding any referenced ValueSets CodeSystems.
++   */
++  private Stream<ValueSetCode> getCodeStreamForValueSet(ValueSet valueSet) {
++    if (valueSet.hasExpansion()) {
++      // If the ValueSet is already expanded, trust the expansion, and ignore anything else.
++      return flattenContainsStream(valueSet.getExpansion().getContainsList().stream())
++          .map(
++              element ->
++                  new ValueSetCode(
++                      element.getCode().getValue(),
++                      element.getDisplay().getValue(),
++                      element.getSystem().getValue()));
++    }
++
++    Stream<ValueSetCode> allIncludeCodes =
++        valueSet.getCompose().getIncludeList().stream().flatMap(this::expandConceptSet);
++
++    ImmutableSet<ValueSetCode> allExcludeCodes =
++        valueSet.getCompose().getExcludeList().stream()
++            .flatMap(this::expandConceptSet)
++            .collect(toImmutableSet());
++
++    return allIncludeCodes.filter(code -> !allExcludeCodes.contains(code));
++  }
++
++  /**
++   * Given a list of ConceptDefinitions, that may have child concepts, returns a flattened list of
++   * all ConceptDefinitions in the trees that match a given list of filters.
++   *
++   * <p>The `ancestors` param contains any codes that these concepts are children of. This allows
++   * evaluating filters like `descendent-of`.
++   */
++  private static List<ConceptDefinition> getFlattenedCodesForConcepts(
++      List<ConceptDefinition> concepts, Set<String> ancestors, List<Filter> filters) {
++    ArrayList<ConceptDefinition> filteredConcepts = new ArrayList<>();
++    for (ConceptDefinition concept : concepts) {
++      if (applyAllFilters(concept, ancestors, filters)) {
++        // Since this is a flattened list, clear any child concepts.
++        filteredConcepts.add(concept.toBuilder().clearConcept().build());
++      }
++      if (!concept.getConceptList().isEmpty()) {
++        // This concept has child concepts.
++        // Recurse to child concepts, including this node as an ancestor.
++        HashSet<String> newAncestors = new HashSet<>(ancestors);
++        newAncestors.add(concept.getCode().getValue());
++        filteredConcepts.addAll(
++            getFlattenedCodesForConcepts(concept.getConceptList(), newAncestors, filters));
++      }
++    }
++
++    return filteredConcepts;
++  }
++
++  /** Expands a given `conceptSet`. */
++  private Stream<ValueSetCode> expandConceptSet(ConceptSet conceptSet) {
++    // Per https://www.hl7.org/fhir/valueset.html#compositions, there are three cases to consider:
++    // * valueSet(s) only: Include all codes from the intersection of ValueSets
++    // * System only: Include codes specified by system, or a subset if `concept` is also specified.
++    // * valueSet and System: Include all codes from the system that are in the ValueSet
++    // In all cases, we should apply any filters specified the the resulting set.
++    boolean hasValueSets = !conceptSet.getValueSetList().isEmpty();
++    boolean hasSystem = conceptSet.hasSystem();
++    if (hasValueSets && !hasSystem) {
++      return getCodesFromValueSetIntersection(conceptSet);
++    } else if (hasSystem && !hasValueSets) {
++      return getCodesFromReferencedSystem(conceptSet);
++    } else if (hasValueSets && hasSystem) {
++      ImmutableSet<ValueSetCode> codeSetFromValueSets =
++          getCodesFromValueSetIntersection(conceptSet).collect(toImmutableSet());
++      return getCodesFromReferencedSystem(conceptSet)
++          .filter(code -> codeSetFromValueSets.contains(code));
++    } else {
++      throw new IllegalArgumentException(
++          "Invalid composition of ConceptSets " + hasValueSets + " " + hasSystem);
++    }
++  }
++
++  private Stream<ValueSetCode> getCodesFromValueSetIntersection(ConceptSet conceptSet) {
++    // Get a set containing the unordered expansion of all ValueSets.
++    Set<ImmutableSet<ValueSetCode>> includedValueSets = new HashSet<>();
++    for (Canonical canonical : conceptSet.getValueSetList()) {
++      try {
++        ValueSet valueSet =
++            fhirPackage
++                .getValueSet(canonical.getValue())
++                .orElseThrow(
++                    () ->
++                        new IllegalArgumentException(
++                            "Unable to resolve ValueSet: " + canonical.getValue()));
++        includedValueSets.add(getCodeStreamForValueSet(valueSet).collect(toImmutableSet()));
++      } catch (InvalidFhirException e) {
++        throw new IllegalArgumentException(e);
++      }
++    }
++
++    // Flatten the set of sets to a single stream, and then filter to elements that are present in
++    // each of the sets.
++    return includedValueSets.stream()
++        .flatMap(valueSet -> valueSet.stream())
++        .filter(code -> includedValueSets.stream().allMatch(list -> list.contains(code)));
++  }
++
++  private Stream<ValueSetCode> getCodesFromReferencedSystem(ConceptSet conceptSet) {
++    if (conceptSet.hasSystem()) {
++      if (conceptSet.getConceptList().isEmpty()) {
++        // No concept list specified - Include all codes from this system that match the filter.
++        try {
++          Optional<CodeSystem> system =
++              fhirPackage.getCodeSystem(conceptSet.getSystem().getValue());
++          if (system.isEmpty()) {
++            // This system cannot be expanded (e.g., ICD10)
++            return Stream.empty();
++          }
++          return getFlattenedCodesForConcepts(
++                  system.get().getConceptList(),
++                  new HashSet<>() /* at top level of system - codes have no ancestors */,
++                  conceptSet.getFilterList())
++              .stream()
++              .map(
++                  element ->
++                      new ValueSetCode(
++                          element.getCode().getValue(),
++                          element.getDisplay().getValue(),
++                          system.get().getUrl().getValue()));
++        } catch (InvalidFhirException e) {
++          throw new IllegalArgumentException(e);
++        }
++      } else {
++        // There is an explicit list of codes from that system to use.  Trust it.
++        return conceptSet.getConceptList().stream()
++            .map(
++                element ->
++                    new ValueSetCode(
++                        element.getCode().getValue(),
++                        element.getDisplay().getValue(),
++                        conceptSet.getSystem().getValue()));
++      }
++    }
++    return Stream.empty();
++  }
++
++  /**
++   * Applies a list of filters to a code, and returns true if all filters return true. This is
++   * equivalent to "anding" all of the filters together.
++   */
++  private static boolean applyAllFilters(
++      ConceptDefinition code, Set<String> ancestors, List<ConceptSet.Filter> filters) {
++    return filters.stream().allMatch(filter -> applyFilter(code, ancestors, filter));
++  }
++
++  private static boolean applyFilter(
++      ConceptDefinition concept, Set<String> ancestors, ConceptSet.Filter filter) {
++    // Filter properties other than "concept" are not well-defined by the spec.  Ignore them here,
++    // but print a warning.
++    if (!filter.getProperty().getValue().equals("concept")) {
++      System.err.println(
++          "Warning: value filters by property other than concept are not supported. "
++              + " Found: "
++              + filter.getProperty().getValue());
++      return true;
++    }
++
++    String codeString = concept.getCode().getValue();
++    String filterValue = filter.getValue().getValue();
++    switch (filter.getOp().getValue()) {
++      case EQUALS:
++        return codeString.equals(filterValue);
++      case IS_A:
++        return codeString.equals(filterValue) || ancestors.contains(filterValue);
++      case DESCENDENT_OF:
++        return ancestors.contains(filterValue);
++      case IS_NOT_A:
++        return !codeString.equals(filterValue) && !ancestors.contains(filterValue);
++      case REGEX:
++        return codeString.matches(filterValue);
++      case IN:
++        return Splitter.on(",").splitToList(filterValue).contains(codeString);
++      case NOT_IN:
++        return !Splitter.on(",").splitToList(filterValue).contains(codeString);
++      case EXISTS:
++        return filterValue.equals("true") == codeString.isEmpty();
++      case GENERALIZES:
++        // "generalizes" is not supported - default to returning true so we're overly permissive
++        // rather than rejecting valid codes.
++        return true;
++      default:
++        throw new IllegalArgumentException(
++            "Unrecognized filter operator: " + filter.getOp().getValue());
++    }
++  }
++}
+diff --git a/java/com/google/fhir/protogen/BUILD b/java/com/google/fhir/protogen/BUILD
+index d07a927bd27..856257dd151 100644
+--- a/java/com/google/fhir/protogen/BUILD
++++ b/java/com/google/fhir/protogen/BUILD
+@@ -187,6 +187,7 @@ java_library(
+         "//java/com/google/fhir/common:annotation_utils",
+         "//java/com/google/fhir/common:codes",
+         "//java/com/google/fhir/common:exceptions",
++        "//java/com/google/fhir/common:terminology_expander",
+         "//proto/google/fhir/proto:annotations_java_proto",
+         "//proto/google/fhir/proto:profile_config_java_proto",
+         "//proto/google/fhir/proto:protogenerator_annotations_java_proto",
+diff --git a/java/com/google/fhir/protogen/FhirPackage.java b/java/com/google/fhir/protogen/FhirPackage.java
+index c0d02cd1016..ffd9c490ad4 100644
+--- a/java/com/google/fhir/protogen/FhirPackage.java
++++ b/java/com/google/fhir/protogen/FhirPackage.java
+@@ -14,6 +14,7 @@
+ 
+ package com.google.fhir.protogen;
+ 
++import static com.google.common.collect.ImmutableMap.toImmutableMap;
+ import static java.nio.charset.StandardCharsets.UTF_8;
+ 
+ import com.google.common.base.Ascii;
+@@ -98,6 +99,40 @@ private FhirPackage(
+     this.valueSetCollection = valueSets;
+   }
+ 
++  public FhirPackage(
++      List<StructureDefinition> structureDefinitions,
++      List<SearchParameter> searchParameters,
++      List<CodeSystem> codeSystems,
++      List<ValueSet> valueSets) {
++    packageInfo = null;
++    packageJson = null;
++    this.structureDefinitionCollection =
++        new ResourceCollection<StructureDefinition>(
++            structureDefinitions.stream()
++                .collect(
++                    toImmutableMap(resource -> resource.getUrl().getValue(), resource -> resource)),
++            StructureDefinition.class);
++
++    this.searchParameterCollection =
++        new ResourceCollection<SearchParameter>(
++            searchParameters.stream()
++                .collect(
++                    toImmutableMap(resource -> resource.getUrl().getValue(), resource -> resource)),
++            SearchParameter.class);
++    this.codeSystemCollection =
++        new ResourceCollection<CodeSystem>(
++            codeSystems.stream()
++                .collect(
++                    toImmutableMap(resource -> resource.getUrl().getValue(), resource -> resource)),
++            CodeSystem.class);
++    this.valueSetCollection =
++        new ResourceCollection<ValueSet>(
++            valueSets.stream()
++                .collect(
++                    toImmutableMap(resource -> resource.getUrl().getValue(), resource -> resource)),
++            ValueSet.class);
++  }
++
+   @Override
+   public boolean equals(Object other) {
+     return other instanceof FhirPackage
+diff --git a/java/com/google/fhir/protogen/ResourceCollection.java b/java/com/google/fhir/protogen/ResourceCollection.java
+index 6534ef0fdb0..0b45b86c263 100644
+--- a/java/com/google/fhir/protogen/ResourceCollection.java
++++ b/java/com/google/fhir/protogen/ResourceCollection.java
+@@ -49,6 +49,12 @@ class ResourceCollection<T extends Message> implements Iterable<T> {
+     this.protoClass = protoClass;
+   }
+ 
++  ResourceCollection(Map<String, T> parsedResourcesByUri, Class<T> protoClass) {
++    this.jsonParser = null;
++    this.parsedResourcesByUri.putAll(parsedResourcesByUri);
++    this.protoClass = protoClass;
++  }
++
+   /**
+    * Sets a filter for the collection.
+    *
+diff --git a/javatests/com/google/fhir/common/BUILD b/javatests/com/google/fhir/common/BUILD
+index f7bd89b5e56..28a07605a6c 100644
+--- a/javatests/com/google/fhir/common/BUILD
++++ b/javatests/com/google/fhir/common/BUILD
+@@ -201,3 +201,19 @@ java_test(
+         "@maven//:junit_junit",
+     ],
+ )
++
++java_test(
++    name = "TerminologyExpanderTest",
++    size = "small",
++    srcs = ["TerminologyExpanderTest.java"],
++    deps = [
++        "//java/com/google/fhir/common:terminology_expander",
++        "//java/com/google/fhir/protogen:fhir_package",
++        "//proto/google/fhir/proto/r4/core:codes_java_proto",
++        "//proto/google/fhir/proto/r4/core:datatypes_java_proto",
++        "//proto/google/fhir/proto/r4/core/resources:code_system_java_proto",
++        "//proto/google/fhir/proto/r4/core/resources:value_set_java_proto",
++        "@maven//:com_google_truth_truth",
++        "@maven//:junit_junit",
++    ],
++)
+diff --git a/javatests/com/google/fhir/common/TerminologyExpanderTest.java b/javatests/com/google/fhir/common/TerminologyExpanderTest.java
+new file mode 100644
+index 00000000000..33546534c2e
+--- /dev/null
++++ b/javatests/com/google/fhir/common/TerminologyExpanderTest.java
+@@ -0,0 +1,506 @@
++//    Copyright 2024 Google LLC
++//
++//    Licensed under the Apache License, Version 2.0 (the "License");
++//    you may not use this file except in compliance with the License.
++//    You may obtain a copy of the License at
++//
++//        https://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS,
++//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//    See the License for the specific language governing permissions and
++//    limitations under the License.
++
++package com.google.fhir.common;
++
++import static com.google.common.truth.Truth.assertThat;
++
++import com.google.fhir.common.TerminologyExpander.ValueSetCode;
++import com.google.fhir.protogen.FhirPackage;
++import com.google.fhir.r4.core.Canonical;
++import com.google.fhir.r4.core.Code;
++import com.google.fhir.r4.core.CodeSystem;
++import com.google.fhir.r4.core.CodeSystem.ConceptDefinition;
++import com.google.fhir.r4.core.FilterOperatorCode;
++import com.google.fhir.r4.core.Uri;
++import com.google.fhir.r4.core.ValueSet;
++import java.util.Arrays;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++@RunWith(JUnit4.class)
++public final class TerminologyExpanderTest {
++
++  private ConceptDefinition.Builder makeConceptDefinition(
++      String code, String display, ConceptDefinition.Builder... children) {
++    ConceptDefinition.Builder builder =
++        ConceptDefinition.newBuilder()
++            .setCode(Code.newBuilder().setValue(code))
++            .setDisplay(com.google.fhir.r4.core.String.newBuilder().setValue(display));
++    for (ConceptDefinition.Builder child : children) {
++      builder.addConcept(child);
++    }
++    return builder;
++  }
++
++  private ValueSet.Expansion.Contains.Builder makeContains(
++      String code, String display, String system) {
++    return ValueSet.Expansion.Contains.newBuilder()
++        .setSystem(Uri.newBuilder().setValue(system))
++        .setCode(Code.newBuilder().setValue(code))
++        .setDisplay(com.google.fhir.r4.core.String.newBuilder().setValue(display));
++  }
++
++  private ValueSet.Compose.ConceptSet.ConceptReference.Builder makeConceptReference(
++      String code, String display) {
++    return ValueSet.Compose.ConceptSet.ConceptReference.newBuilder()
++        .setCode(Code.newBuilder().setValue(code))
++        .setDisplay(com.google.fhir.r4.core.String.newBuilder().setValue(display));
++  }
++
++  private ValueSet.Compose.ConceptSet.ConceptReference.Builder makeConceptReference(String code) {
++    return ValueSet.Compose.ConceptSet.ConceptReference.newBuilder()
++        .setCode(Code.newBuilder().setValue(code));
++  }
++
++  private Uri.Builder makeUri(String url) {
++    return Uri.newBuilder().setValue(url);
++  }
++
++  private ValueSetCode makeValueSetCode(String code, String display, String sourceSystem) {
++    return new ValueSetCode(code, display, sourceSystem);
++  }
++
++  private ValueSet.Compose.ConceptSet.Filter makeFilter(FilterOperatorCode.Value op, String value) {
++    return ValueSet.Compose.ConceptSet.Filter.newBuilder()
++        .setOp(ValueSet.Compose.ConceptSet.Filter.OpCode.newBuilder().setValue(op))
++        .setValue(com.google.fhir.r4.core.String.newBuilder().setValue(value))
++        .setProperty(Code.newBuilder().setValue("concept"))
++        .build();
++  }
++
++  @Test
++  public void expandCodeSystem_returnsAllFlattenedCodes() {
++    CodeSystem system =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("foo-system"))
++            .addConcept(
++                makeConceptDefinition(
++                    "foo",
++                    "f",
++                    makeConceptDefinition("sub foo 1", "sf1"),
++                    makeConceptDefinition(
++                        "sub foo 2", "sf2", makeConceptDefinition("sub sub foo 2", "ssf2"))))
++            .addConcept(makeConceptDefinition("bar", "b"))
++            .build();
++
++    assertThat(TerminologyExpander.expandCodeSystem(system))
++        .containsExactly(
++            makeConceptDefinition("foo", "f").build(),
++            makeConceptDefinition("sub foo 1", "sf1").build(),
++            makeConceptDefinition("sub foo 2", "sf2").build(),
++            makeConceptDefinition("sub sub foo 2", "ssf2").build(),
++            makeConceptDefinition("bar", "b").build());
++  }
++
++  @Test
++  public void expandCodeSystem_noExpansionReturnsEmpty() {
++    CodeSystem system = CodeSystem.getDefaultInstance();
++    assertThat(TerminologyExpander.expandCodeSystem(system)).isEmpty();
++  }
++
++  @Test
++  public void expandValueSet_oneToOneWithCodeSystem() throws Exception {
++    CodeSystem system =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("foo-system"))
++            .addConcept(
++                makeConceptDefinition(
++                    "foo",
++                    "f",
++                    makeConceptDefinition("sub foo 1", "sf1"),
++                    makeConceptDefinition(
++                        "sub foo 2", "sf2", makeConceptDefinition("sub sub foo 2", "ssf2"))))
++            .addConcept(makeConceptDefinition("bar", "b"))
++            .build();
++
++    ValueSet.Builder valueSet = ValueSet.newBuilder();
++    valueSet
++        .getComposeBuilder()
++        .addInclude(ValueSet.Compose.ConceptSet.newBuilder().setSystem(makeUri("foo-system")));
++
++    FhirPackage fhirPackage =
++        new FhirPackage(Arrays.asList(), Arrays.asList(), Arrays.asList(system), Arrays.asList());
++
++    // No filters - get entire code system
++    assertThat(new TerminologyExpander(fhirPackage).expandValueSet(valueSet.build()))
++        .containsExactly(
++            makeValueSetCode("foo", "f", "foo-system"),
++            makeValueSetCode("sub foo 1", "sf1", "foo-system"),
++            makeValueSetCode("sub foo 2", "sf2", "foo-system"),
++            makeValueSetCode("sub sub foo 2", "ssf2", "foo-system"),
++            makeValueSetCode("bar", "b", "foo-system"));
++  }
++
++  @Test
++  public void expandValueSet_withEqualsFilter() throws Exception {
++    CodeSystem system =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("foo-system"))
++            .addConcept(
++                makeConceptDefinition(
++                    "foo",
++                    "f",
++                    makeConceptDefinition("sub foo 1", "sf1"),
++                    makeConceptDefinition(
++                        "sub foo 2", "sf2", makeConceptDefinition("sub sub foo 2", "ssf2"))))
++            .addConcept(makeConceptDefinition("bar", "b"))
++            .build();
++    FhirPackage fhirPackage =
++        new FhirPackage(Arrays.asList(), Arrays.asList(), Arrays.asList(system), Arrays.asList());
++
++    // "equals" filter
++    ValueSet.Builder valueSet = ValueSet.newBuilder();
++    valueSet
++        .getComposeBuilder()
++        .addInclude(
++            ValueSet.Compose.ConceptSet.newBuilder()
++                .setSystem(makeUri("foo-system"))
++                .addFilter(makeFilter(FilterOperatorCode.Value.EQUALS, "sub foo 1")));
++
++    assertThat(new TerminologyExpander(fhirPackage).expandValueSet(valueSet.build()))
++        .containsExactly(makeValueSetCode("sub foo 1", "sf1", "foo-system"));
++  }
++
++  @Test
++  public void expandValueSet_withIsAFilter() throws Exception {
++    CodeSystem system =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("foo-system"))
++            .addConcept(
++                makeConceptDefinition(
++                    "foo",
++                    "f",
++                    makeConceptDefinition("sub foo 1", "sf1"),
++                    makeConceptDefinition(
++                        "sub foo 2", "sf2", makeConceptDefinition("sub sub foo 2", "ssf2"))))
++            .addConcept(makeConceptDefinition("bar", "b"))
++            .build();
++    FhirPackage fhirPackage =
++        new FhirPackage(Arrays.asList(), Arrays.asList(), Arrays.asList(system), Arrays.asList());
++
++    // "is-a" filter
++    ValueSet.Builder valueSet = ValueSet.newBuilder();
++    valueSet
++        .getComposeBuilder()
++        .addInclude(
++            ValueSet.Compose.ConceptSet.newBuilder()
++                .setSystem(makeUri("foo-system"))
++                .addFilter(makeFilter(FilterOperatorCode.Value.IS_A, "sub foo 2")));
++
++    assertThat(new TerminologyExpander(fhirPackage).expandValueSet(valueSet.build()))
++        .containsExactly(
++            makeValueSetCode("sub foo 2", "sf2", "foo-system"),
++            makeValueSetCode("sub sub foo 2", "ssf2", "foo-system"));
++  }
++
++  @Test
++  public void expandValueSet_withIsDescendentOfFilter() throws Exception {
++    CodeSystem system =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("foo-system"))
++            .addConcept(
++                makeConceptDefinition(
++                    "foo",
++                    "f",
++                    makeConceptDefinition("sub foo 1", "sf1"),
++                    makeConceptDefinition(
++                        "sub foo 2", "sf2", makeConceptDefinition("sub sub foo 2", "ssf2"))))
++            .addConcept(makeConceptDefinition("bar", "b"))
++            .build();
++    FhirPackage fhirPackage =
++        new FhirPackage(Arrays.asList(), Arrays.asList(), Arrays.asList(system), Arrays.asList());
++
++    // "descendent-of" filter
++    ValueSet.Builder valueSet = ValueSet.newBuilder();
++    valueSet
++        .getComposeBuilder()
++        .addInclude(
++            ValueSet.Compose.ConceptSet.newBuilder()
++                .setSystem(makeUri("foo-system"))
++                .addFilter(makeFilter(FilterOperatorCode.Value.DESCENDENT_OF, "foo")));
++
++    assertThat(new TerminologyExpander(fhirPackage).expandValueSet(valueSet.build()))
++        .containsExactly(
++            makeValueSetCode("sub foo 1", "sf1", "foo-system"),
++            makeValueSetCode("sub foo 2", "sf2", "foo-system"),
++            makeValueSetCode("sub sub foo 2", "ssf2", "foo-system"));
++  }
++
++  @Test
++  public void expandValueSet_withIsNotAFilter() throws Exception {
++    CodeSystem system =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("foo-system"))
++            .addConcept(
++                makeConceptDefinition(
++                    "foo",
++                    "f",
++                    makeConceptDefinition("sub foo 1", "sf1"),
++                    makeConceptDefinition(
++                        "sub foo 2", "sf2", makeConceptDefinition("sub sub foo 2", "ssf2"))))
++            .addConcept(makeConceptDefinition("bar", "b"))
++            .build();
++    FhirPackage fhirPackage =
++        new FhirPackage(Arrays.asList(), Arrays.asList(), Arrays.asList(system), Arrays.asList());
++
++    ValueSet.Builder valueSet = ValueSet.newBuilder();
++    valueSet
++        .getComposeBuilder()
++        .addInclude(
++            ValueSet.Compose.ConceptSet.newBuilder()
++                .setSystem(makeUri("foo-system"))
++                .addFilter(makeFilter(FilterOperatorCode.Value.IS_NOT_A, "foo")));
++
++    assertThat(new TerminologyExpander(fhirPackage).expandValueSet(valueSet.build()))
++        .containsExactly(makeValueSetCode("bar", "b", "foo-system"));
++  }
++
++  @Test
++  public void expandValueSet_withRegexFilter() throws Exception {
++    CodeSystem system =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("foo-system"))
++            .addConcept(
++                makeConceptDefinition(
++                    "foo",
++                    "f",
++                    makeConceptDefinition("sub foo 1", "sf1"),
++                    makeConceptDefinition(
++                        "sub foo 2", "sf2", makeConceptDefinition("sub sub foo 2", "ssf2"))))
++            .addConcept(makeConceptDefinition("bar", "b"))
++            .build();
++    FhirPackage fhirPackage =
++        new FhirPackage(Arrays.asList(), Arrays.asList(), Arrays.asList(system), Arrays.asList());
++
++    ValueSet.Builder valueSet = ValueSet.newBuilder();
++    valueSet
++        .getComposeBuilder()
++        .addInclude(
++            ValueSet.Compose.ConceptSet.newBuilder()
++                .setSystem(makeUri("foo-system"))
++                .addFilter(makeFilter(FilterOperatorCode.Value.REGEX, "^sub foo.*")));
++
++    assertThat(new TerminologyExpander(fhirPackage).expandValueSet(valueSet.build()))
++        .containsExactly(
++            makeValueSetCode("sub foo 1", "sf1", "foo-system"),
++            makeValueSetCode("sub foo 2", "sf2", "foo-system"));
++  }
++
++  @Test
++  public void expandValueSet_withInFilter() throws Exception {
++    CodeSystem system =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("foo-system"))
++            .addConcept(
++                makeConceptDefinition(
++                    "foo",
++                    "f",
++                    makeConceptDefinition("sub foo 1", "sf1"),
++                    makeConceptDefinition(
++                        "sub foo 2", "sf2", makeConceptDefinition("sub sub foo 2", "ssf2"))))
++            .addConcept(makeConceptDefinition("bar", "b"))
++            .build();
++    FhirPackage fhirPackage =
++        new FhirPackage(Arrays.asList(), Arrays.asList(), Arrays.asList(system), Arrays.asList());
++
++    ValueSet.Builder valueSet = ValueSet.newBuilder();
++    valueSet
++        .getComposeBuilder()
++        .addInclude(
++            ValueSet.Compose.ConceptSet.newBuilder()
++                .setSystem(makeUri("foo-system"))
++                .addFilter(makeFilter(FilterOperatorCode.Value.IN, "foo,bar")));
++
++    assertThat(new TerminologyExpander(fhirPackage).expandValueSet(valueSet.build()))
++        .containsExactly(
++            makeValueSetCode("foo", "f", "foo-system"), makeValueSetCode("bar", "b", "foo-system"));
++  }
++
++  @Test
++  public void expandValueSet_withNotInFilter() throws Exception {
++    CodeSystem system =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("foo-system"))
++            .addConcept(
++                makeConceptDefinition(
++                    "foo",
++                    "f",
++                    makeConceptDefinition("sub foo 1", "sf1"),
++                    makeConceptDefinition(
++                        "sub foo 2", "sf2", makeConceptDefinition("sub sub foo 2", "ssf2"))))
++            .addConcept(makeConceptDefinition("bar", "b"))
++            .build();
++    FhirPackage fhirPackage =
++        new FhirPackage(Arrays.asList(), Arrays.asList(), Arrays.asList(system), Arrays.asList());
++
++    ValueSet.Builder valueSet = ValueSet.newBuilder();
++    valueSet
++        .getComposeBuilder()
++        .addInclude(
++            ValueSet.Compose.ConceptSet.newBuilder()
++                .setSystem(makeUri("foo-system"))
++                .addFilter(makeFilter(FilterOperatorCode.Value.NOT_IN, "foo,bar")));
++
++    assertThat(new TerminologyExpander(fhirPackage).expandValueSet(valueSet.build()))
++        .containsExactly(
++            makeValueSetCode("sub foo 1", "sf1", "foo-system"),
++            makeValueSetCode("sub foo 2", "sf2", "foo-system"),
++            makeValueSetCode("sub sub foo 2", "ssf2", "foo-system"));
++  }
++
++  @Test
++  public void expandValueSet_withExplicitExpansion() throws Exception {
++
++    ValueSet.Builder valueSet = ValueSet.newBuilder();
++    valueSet.getExpansionBuilder().addContains(makeContains("foo", "f", "foo-system"));
++
++    ValueSet.Expansion.Contains.Builder containsWithSubCode =
++        makeContains("bar", "b", "bar-system");
++    containsWithSubCode.addContains(makeContains("sub bar", "sb", "bar-system"));
++    valueSet.getExpansionBuilder().addContains(containsWithSubCode);
++
++    FhirPackage fhirPackage =
++        new FhirPackage(Arrays.asList(), Arrays.asList(), Arrays.asList(), Arrays.asList());
++
++    assertThat(new TerminologyExpander(fhirPackage).expandValueSet(valueSet.build()))
++        .containsExactly(
++            makeValueSetCode("foo", "f", "foo-system"),
++            makeValueSetCode("bar", "b", "bar-system"),
++            makeValueSetCode("sub bar", "sb", "bar-system"));
++  }
++
++  @Test
++  public void expandValueSet_withSystemAndConcepts() throws Exception {
++    CodeSystem system =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("foo-system"))
++            .addConcept(makeConceptDefinition("foo", "f"))
++            .addConcept(makeConceptDefinition("bar", "b"))
++            .addConcept(makeConceptDefinition("quux", "q"))
++            .build();
++    FhirPackage fhirPackage =
++        new FhirPackage(Arrays.asList(), Arrays.asList(), Arrays.asList(system), Arrays.asList());
++
++    ValueSet.Builder valueSet = ValueSet.newBuilder();
++    valueSet
++        .getComposeBuilder()
++        .addInclude(
++            ValueSet.Compose.ConceptSet.newBuilder()
++                .setSystem(makeUri("foo-system"))
++                .addConcept(makeConceptReference("foo", "f"))
++                .addConcept(makeConceptReference("quux", "q")));
++
++    assertThat(new TerminologyExpander(fhirPackage).expandValueSet(valueSet.build()))
++        .containsExactly(
++            makeValueSetCode("foo", "f", "foo-system"),
++            makeValueSetCode("quux", "q", "foo-system"));
++  }
++
++  @Test
++  public void expandValueSet_multipleIncludesAreCumulative() throws Exception {
++    CodeSystem fooSystem =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("foo-system"))
++            .addConcept(makeConceptDefinition("foo1", "f1"))
++            .addConcept(makeConceptDefinition("foo2", "f2"))
++            .build();
++    CodeSystem barSystem =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("bar-system"))
++            .addConcept(makeConceptDefinition("bar1", "b1"))
++            .addConcept(makeConceptDefinition("bar2", "b2"))
++            .build();
++    FhirPackage fhirPackage =
++        new FhirPackage(
++            Arrays.asList(), Arrays.asList(), Arrays.asList(fooSystem, barSystem), Arrays.asList());
++
++    ValueSet.Builder valueSet = ValueSet.newBuilder();
++    valueSet
++        .getComposeBuilder()
++        .addInclude(ValueSet.Compose.ConceptSet.newBuilder().setSystem(makeUri("foo-system")))
++        .addInclude(ValueSet.Compose.ConceptSet.newBuilder().setSystem(makeUri("bar-system")));
++
++    assertThat(new TerminologyExpander(fhirPackage).expandValueSet(valueSet.build()))
++        .containsExactly(
++            makeValueSetCode("foo1", "f1", "foo-system"),
++            makeValueSetCode("foo2", "f2", "foo-system"),
++            makeValueSetCode("bar1", "b1", "bar-system"),
++            makeValueSetCode("bar2", "b2", "bar-system"));
++  }
++
++  @Test
++  public void expandValueSet_withinAConceptSetAllConstraintsMustApply() throws Exception {
++    CodeSystem fooSystem =
++        CodeSystem.newBuilder()
++            .setUrl(makeUri("foo-system"))
++            .addConcept(makeConceptDefinition("foo1", "f1"))
++            .addConcept(makeConceptDefinition("foo2", "f2"))
++            .addConcept(makeConceptDefinition("foo3", "f3"))
++            .addConcept(makeConceptDefinition("foo4", "f4"))
++            .addConcept(makeConceptDefinition("foo5", "f5"))
++            .addConcept(makeConceptDefinition("foo6", "f6"))
++            .addConcept(makeConceptDefinition("foo7", "f7"))
++            .build();
++
++    ValueSet largeFoos =
++        ValueSet.newBuilder()
++            .setUrl(makeUri("large-foos"))
++            .setCompose(
++                ValueSet.Compose.newBuilder()
++                    .addInclude(
++                        ValueSet.Compose.ConceptSet.newBuilder()
++                            .setSystem(makeUri("foo-system"))
++                            .addConcept(makeConceptReference("foo4"))
++                            .addConcept(makeConceptReference("foo5"))
++                            .addConcept(makeConceptReference("foo6"))
++                            .addConcept(makeConceptReference("foo7"))))
++            .build();
++
++    ValueSet evenFoos =
++        ValueSet.newBuilder()
++            .setUrl(makeUri("even-foos"))
++            .setCompose(
++                ValueSet.Compose.newBuilder()
++                    .addInclude(
++                        ValueSet.Compose.ConceptSet.newBuilder()
++                            .setSystem(makeUri("foo-system"))
++                            .addConcept(makeConceptReference("foo2"))
++                            .addConcept(makeConceptReference("foo4"))
++                            .addConcept(makeConceptReference("foo6"))))
++            .build();
++
++    FhirPackage fhirPackage =
++        new FhirPackage(
++            Arrays.asList(),
++            Arrays.asList(),
++            Arrays.asList(fooSystem),
++            Arrays.asList(largeFoos, evenFoos));
++
++    ValueSet.Builder largeEvenFoos = ValueSet.newBuilder();
++    largeEvenFoos
++        .getComposeBuilder()
++        .addInclude(
++            ValueSet.Compose.ConceptSet.newBuilder()
++                .setSystem(makeUri("foo-system"))
++                .addValueSet(Canonical.newBuilder().setValue("large-foos"))
++                .addValueSet(Canonical.newBuilder().setValue("even-foos")));
++
++    assertThat(new TerminologyExpander(fhirPackage).expandValueSet(largeEvenFoos.build()))
++        .containsExactly(
++            makeValueSetCode("foo4", "f4", "foo-system"),
++            makeValueSetCode("foo6", "f6", "foo-system"));
++  }
++}

@@ -1,0 +1,340 @@
+diff --git a/backend/app/repositories/user_connection_repository.py b/backend/app/repositories/user_connection_repository.py
+index 9177d30225..4fc0c04c4f 100644
+--- a/backend/app/repositories/user_connection_repository.py
++++ b/backend/app/repositories/user_connection_repository.py
+@@ -3,7 +3,7 @@
+ from typing import cast
+ from uuid import UUID, uuid4
+ 
+-from sqlalchemy import CursorResult, and_, func, select, tuple_, update
++from sqlalchemy import CursorResult, and_, func, or_, select, tuple_, update
+ from sqlalchemy.orm import Query
+ from sqlalchemy.orm.exc import MultipleResultsFound
+ 
+@@ -268,7 +268,12 @@ def get_expiring_tokens(self, db_session: DbSession, minutes_threshold: int = 5)
+         )
+ 
+     def disconnect(self, db_session: DbSession, user_id: UUID, provider: str) -> int:
+-        """Disconnect a provider in a single UPDATE query. Returns number of rows updated."""
++        """Revoke a provider connection and clear its tokens.
++
++        Returns the number of connections that went from non-revoked to revoked. Tokens are
++        cleared even on an already revoked connection, e.g. one revoked by a failed token
++        refresh during provider deregistration.
++        """
+         result = cast(
+             CursorResult[tuple[()]],
+             db_session.execute(
+@@ -289,6 +294,17 @@ def disconnect(self, db_session: DbSession, user_id: UUID, provider: str) -> int
+                 ),
+             ),
+         )
++        db_session.execute(
++            update(UserConnection)
++            .where(
++                and_(
++                    UserConnection.user_id == user_id,
++                    UserConnection.provider == provider,
++                    or_(UserConnection.access_token.is_not(None), UserConnection.refresh_token.is_not(None)),
++                ),
++            )
++            .values(access_token=None, refresh_token=None, token_expires_at=None),
++        )
+         db_session.commit()
+         return result.rowcount
+ 
+diff --git a/backend/app/services/providers/api_client.py b/backend/app/services/providers/api_client.py
+index 2bcf362ce6..79464dd2f3 100644
+--- a/backend/app/services/providers/api_client.py
++++ b/backend/app/services/providers/api_client.py
+@@ -23,7 +23,7 @@
+ RETRY_BASE_DELAY = 15.0  # Base delay for exponential backoff (seconds): 15s, 30s, 60s
+ 
+ 
+-def _get_valid_token(
++def get_valid_token(
+     db: DbSession,
+     user_id: UUID,
+     provider_name: str,
+@@ -32,7 +32,8 @@ def _get_valid_token(
+ ) -> str:
+     """Get a valid access token, refreshing if necessary.
+ 
+-    Private function used internally by make_authenticated_request.
++    Used by make_authenticated_request and by calls that send the token outside
++    of it, e.g. provider deregistration.
+     """
+     connection = connection_repo.get_by_user_and_provider(db, user_id, provider_name)
+     if not connection:
+@@ -149,7 +150,7 @@ def make_authenticated_request(
+         raise ValueError("form_data and json_data are mutually exclusive")
+ 
+     # Get valid token (will auto-refresh if needed)
+-    access_token = _get_valid_token(db, user_id, provider_name, connection_repo, oauth)
++    access_token = get_valid_token(db, user_id, provider_name, connection_repo, oauth)
+ 
+     # Prepare headers
+     request_headers = {
+@@ -309,7 +310,7 @@ def download_binary_content(
+     The URL may contain additional auth params (e.g. token=...) alongside the Bearer header.
+     Retries up to MAX_RETRIES times on 429 with exponential backoff.
+     """
+-    access_token = _get_valid_token(db, user_id, provider_name, connection_repo, oauth)
++    access_token = get_valid_token(db, user_id, provider_name, connection_repo, oauth)
+     headers = {"Authorization": f"Bearer {access_token}"}
+ 
+     for attempt in range(MAX_RETRIES + 1):
+diff --git a/backend/app/services/user_connection_service.py b/backend/app/services/user_connection_service.py
+index 88a4fa769c..396f42af5a 100644
+--- a/backend/app/services/user_connection_service.py
++++ b/backend/app/services/user_connection_service.py
+@@ -10,6 +10,7 @@
+ from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
+ from app.schemas.responses.upload import ConnectionsCoverage, ProviderConnectionCount
+ from app.services.outgoing_webhooks.events import on_connection_created, on_connection_revoked
++from app.services.providers.api_client import get_valid_token
+ from app.services.providers.templates.base_oauth import BaseOAuthTemplate
+ from app.services.services import AppService
+ from app.utils.exceptions import ResourceNotFoundError, handle_exceptions
+@@ -115,7 +116,7 @@ def disconnect(
+         ``reason`` reaches the log line and the ``connection.revoked`` webhook.
+         """
+         if oauth:
+-            self._deregister_from_provider(db_session, user_id, provider, oauth)
++            self.deregister_from_provider(db_session, user_id, provider, oauth)
+ 
+         updated = self.crud.disconnect(db_session, user_id, provider)
+         if updated:
+@@ -173,17 +174,23 @@ def stamp_last_synced_at(self, db_session: DbSession, user_id: UUID, provider: s
+         if connection:
+             self.crud.update_last_synced_at(db_session, connection)
+ 
+-    def _deregister_from_provider(
++    def deregister_from_provider(
+         self, db_session: DbSession, user_id: UUID, provider: str, oauth: BaseOAuthTemplate
+     ) -> None:
+-        """Best-effort call to provider's deregistration API."""
++        """Best-effort call to provider's deregistration API.
++
++        Refreshes the access token first if it is expired. Push-based providers like Garmin
++        rarely call their API after the initial backfill, so the stored token is usually stale
++        by the time the user disconnects.
++        """
+         connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
+         if not connection or not connection.access_token:
+             return
+ 
+         try:
++            access_token = get_valid_token(db_session, user_id, provider, self.crud, oauth)
+             oauth.deregister_user(
+-                connection.access_token,
++                access_token,
+                 provider_user_id=connection.provider_user_id,
+             )
+             log_structured(
+diff --git a/backend/app/services/user_service.py b/backend/app/services/user_service.py
+index 1860e2ca23..76cb4eb092 100644
+--- a/backend/app/services/user_service.py
++++ b/backend/app/services/user_service.py
+@@ -80,7 +80,7 @@ def delete(self, db_session: DbSession, object_id: UUID | str | int, raise_404:
+             try:
+                 strategy = provider_factory.get_provider(connection.provider)
+                 if oauth := strategy.oauth:
+-                    oauth.deregister_user(connection.access_token, provider_user_id=connection.provider_user_id)
++                    user_connection_service.deregister_from_provider(db_session, user.id, connection.provider, oauth)
+             except Exception as e:
+                 log_structured(
+                     self.logger,
+diff --git a/backend/tests/api/v1/test_connections.py b/backend/tests/api/v1/test_connections.py
+index 246e107aba..185dfb747f 100644
+--- a/backend/tests/api/v1/test_connections.py
++++ b/backend/tests/api/v1/test_connections.py
+@@ -13,6 +13,7 @@
+ from unittest.mock import MagicMock, patch
+ from uuid import UUID
+ 
++import httpx
+ from fastapi.testclient import TestClient
+ from sqlalchemy.orm import Session
+ 
+@@ -332,7 +333,7 @@ def test_disconnect_clears_tokens(self, client: TestClient, db: Session) -> None
+             status=ConnectionStatus.ACTIVE,
+             access_token="secret_access",
+             refresh_token="secret_refresh",
+-            token_expires_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
++            token_expires_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+         )
+         api_key = ApiKeyFactory()
+         headers = api_key_headers(api_key.plain_key)
+@@ -863,3 +864,60 @@ def test_disconnect_skips_deregistration_when_no_token(
+         # Assert
+         assert response.status_code == 204
+         mock_httpx_delete.assert_not_called()
++
++    @patch("httpx.post")
++    @patch("httpx.delete")
++    def test_disconnect_refreshes_expired_token_before_deregistration(
++        self, mock_httpx_delete: MagicMock, mock_httpx_post: MagicMock, client: TestClient, db: Session
++    ) -> None:
++        """An expired access token is refreshed so Garmin accepts the deregistration call."""
++        mock_httpx_post.return_value.json.return_value = {
++            "access_token": "fresh_token",
++            "refresh_token": "fresh_refresh",
++            "token_type": "Bearer",
++            "expires_in": 86400,
++        }
++        user = UserFactory()
++        UserConnectionFactory(
++            user=user,
++            provider="garmin",
++            status=ConnectionStatus.ACTIVE,
++            access_token="stale_token",
++            token_expires_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
++        )
++        headers = api_key_headers(ApiKeyFactory().plain_key)
++
++        response = client.delete(f"/api/v1/users/{user.id}/connections/garmin", headers=headers)
++
++        assert response.status_code == 204
++        assert mock_httpx_delete.call_args.kwargs["headers"] == {"Authorization": "Bearer fresh_token"}
++        conn = db.query(UserConnection).filter_by(user_id=user.id, provider="garmin").one()
++        assert conn.status == ConnectionStatus.REVOKED
++        assert conn.access_token is None
++
++    @patch("httpx.post")
++    @patch("httpx.delete")
++    def test_disconnect_clears_tokens_when_refresh_is_rejected(
++        self, mock_httpx_delete: MagicMock, mock_httpx_post: MagicMock, client: TestClient, db: Session
++    ) -> None:
++        """A rejected refresh revokes the connection; disconnect must still clear its tokens."""
++        mock_httpx_post.return_value.raise_for_status.side_effect = httpx.HTTPStatusError(
++            "401", request=MagicMock(), response=MagicMock(status_code=401, text="invalid_grant")
++        )
++        user = UserFactory()
++        UserConnectionFactory(
++            user=user,
++            provider="garmin",
++            status=ConnectionStatus.ACTIVE,
++            token_expires_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
++        )
++        headers = api_key_headers(ApiKeyFactory().plain_key)
++
++        response = client.delete(f"/api/v1/users/{user.id}/connections/garmin", headers=headers)
++
++        assert response.status_code == 204
++        mock_httpx_delete.assert_not_called()
++        conn = db.query(UserConnection).filter_by(user_id=user.id, provider="garmin").one()
++        assert conn.status == ConnectionStatus.REVOKED
++        assert conn.access_token is None
++        assert conn.refresh_token is None
+diff --git a/backend/tests/factories.py b/backend/tests/factories.py
+index b19ae555b8..71e61aac49 100644
+--- a/backend/tests/factories.py
++++ b/backend/tests/factories.py
+@@ -9,7 +9,7 @@
+ 
+ from __future__ import annotations
+ 
+-from datetime import datetime, timezone
++from datetime import datetime, timedelta, timezone
+ from decimal import Decimal
+ from typing import Any
+ from uuid import uuid4
+@@ -398,7 +398,8 @@ class Meta:
+     provider_username = factory.Faker("user_name")
+     access_token = LazyFunction(lambda: f"access_{uuid4().hex}")  # Optional for SDK providers
+     refresh_token = LazyFunction(lambda: f"refresh_{uuid4().hex}")
+-    token_expires_at = LazyFunction(lambda: datetime(2025, 12, 31, tzinfo=timezone.utc))  # Optional for SDK providers
++    # Optional for SDK providers
++    token_expires_at = LazyFunction(lambda: datetime.now(timezone.utc) + timedelta(days=1))
+     scope = "read_all"
+     status = ConnectionStatus.ACTIVE
+     last_synced_at = None
+diff --git a/backend/tests/providers/withings/test_withings_rpc_client.py b/backend/tests/providers/withings/test_withings_rpc_client.py
+index 17d205f3a1..8f1db10b84 100644
+--- a/backend/tests/providers/withings/test_withings_rpc_client.py
++++ b/backend/tests/providers/withings/test_withings_rpc_client.py
+@@ -69,7 +69,7 @@ def _http_response(envelope: dict[str, Any]) -> MagicMock:
+ 
+ 
+ @patch("app.services.providers.withings.handlers.rpc_client.time.sleep")
+-@patch("app.services.providers.api_client._get_valid_token", return_value="token")
++@patch("app.services.providers.api_client.get_valid_token", return_value="token")
+ @patch("app.services.providers.api_client.httpx.Client")
+ def test_throttle_is_retried_through_the_shared_client(
+     mock_client: MagicMock, mock_token: MagicMock, mock_sleep: MagicMock
+@@ -86,7 +86,7 @@ def test_throttle_is_retried_through_the_shared_client(
+ 
+ 
+ @patch("app.services.providers.withings.handlers.rpc_client.time.sleep")
+-@patch("app.services.providers.api_client._get_valid_token", return_value="token")
++@patch("app.services.providers.api_client.get_valid_token", return_value="token")
+ @patch("app.services.providers.api_client.httpx.Client")
+ def test_throttle_that_persists_is_a_rate_limit_error(
+     mock_client: MagicMock, mock_token: MagicMock, mock_sleep: MagicMock
+diff --git a/backend/tests/services/test_user_connection_service.py b/backend/tests/services/test_user_connection_service.py
+index 89e2160686..2bf5f5f381 100644
+--- a/backend/tests/services/test_user_connection_service.py
++++ b/backend/tests/services/test_user_connection_service.py
+@@ -9,7 +9,7 @@
+ """
+ 
+ from datetime import datetime, timedelta, timezone
+-from unittest.mock import patch
++from unittest.mock import MagicMock, patch
+ from uuid import uuid4
+ 
+ from sqlalchemy.orm import Session
+@@ -482,3 +482,52 @@ def test_repeated_calls_emit_once_with_stable_key(self, db: Session) -> None:
+ 
+         assert emit.call_count == 1
+         assert emit.call_args.kwargs["connected_at"] == first.created_at.isoformat()
++
++
++class TestUserConnectionServiceDeregisterFromProvider:
++    """Deregistration must use a valid token, refreshing a stale one first."""
++
++    def test_refreshes_expired_token_before_deregistering(self, db: Session) -> None:
++        user = UserFactory()
++        connection = UserConnectionFactory(
++            user=user,
++            provider="garmin",
++            access_token="stale",
++            token_expires_at=datetime.now(timezone.utc) - timedelta(days=30),
++        )
++        oauth = MagicMock()
++        oauth.refresh_access_token.return_value.access_token = "fresh"
++
++        user_connection_service.deregister_from_provider(db, user.id, "garmin", oauth)
++
++        oauth.refresh_access_token.assert_called_once_with(db, user.id, connection.refresh_token)
++        oauth.deregister_user.assert_called_once_with("fresh", provider_user_id=connection.provider_user_id)
++
++    def test_uses_stored_token_when_still_valid(self, db: Session) -> None:
++        user = UserFactory()
++        connection = UserConnectionFactory(
++            user=user,
++            provider="garmin",
++            access_token="valid",
++            token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
++        )
++        oauth = MagicMock()
++
++        user_connection_service.deregister_from_provider(db, user.id, "garmin", oauth)
++
++        oauth.refresh_access_token.assert_not_called()
++        oauth.deregister_user.assert_called_once_with("valid", provider_user_id=connection.provider_user_id)
++
++    def test_refresh_failure_skips_deregistration_without_raising(self, db: Session) -> None:
++        user = UserFactory()
++        UserConnectionFactory(
++            user=user,
++            provider="garmin",
++            token_expires_at=datetime.now(timezone.utc) - timedelta(days=30),
++        )
++        oauth = MagicMock()
++        oauth.refresh_access_token.side_effect = RuntimeError("refresh rejected")
++
++        user_connection_service.deregister_from_provider(db, user.id, "garmin", oauth)
++
++        oauth.deregister_user.assert_not_called()

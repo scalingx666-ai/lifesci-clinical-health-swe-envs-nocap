@@ -1,0 +1,944 @@
+diff --git a/backend/app/services/providers/apple/apple_xml/xml_service.py b/backend/app/services/providers/apple/apple_xml/xml_service.py
+index 013f7e39c3..8147b6ae91 100644
+--- a/backend/app/services/providers/apple/apple_xml/xml_service.py
++++ b/backend/app/services/providers/apple/apple_xml/xml_service.py
+@@ -8,7 +8,7 @@
+ from app.config import settings
+ from app.constants.series_types.sdk import SleepPhase, get_series_type_from_metric_type
+ from app.constants.workout_types import get_unified_apple_workout_type_xml
+-from app.schemas.enums import EventCategory, SeriesType, daily_total_flag
++from app.schemas.enums import EventCategory, SeriesType, daily_total_flag, get_series_type_unit
+ from app.schemas.model_crud.activities import (
+     EventRecordCreate,
+     EventRecordDetailCreate,
+@@ -26,6 +26,7 @@
+ )
+ from app.utils.dates import window_seconds
+ from app.utils.structured_logging import get_logger
++from app.utils.units import EnergyUnit, UnitConverter
+ 
+ logger = get_logger(__name__)
+ 
+@@ -212,6 +213,21 @@ def _create_record(
+             self.stats.records.skip(f"missing_startDate:{metric_type}")
+             return None
+ 
++        # Apple exports values in the user's display unit (km, lb, mmol/L, degF...); one in a unit that
++        # can't be converted to the series unit is skipped rather than stored in the wrong unit.
++        raw_unit = document.get("unit")
++        if raw_unit is not None:
++            converted = UnitConverter.to_series_unit(series_type, value, raw_unit)
++            if converted is None:
++                self.stats.records.skip(f"unconvertible_unit:{series_type.value}:{raw_unit}")
++                return None
++            value = converted
++
++        # HealthKit's "%" is a 0-1 fraction while percent series hold 0-100. Kept here
++        # rather than as a "%" unit alias, since Health Connect reports "%" as 0-100.
++        if raw_unit == "%" and get_series_type_unit(series_type) == "percent":
++            value *= 100
++
+         device_info = self._extract_device_info(document.get("device", ""))
+ 
+         sample = TimeSeriesSampleCreate(
+@@ -313,6 +329,16 @@ def _update_metrics_from_stat(self, metrics: EventRecordMetrics, statistic: dict
+ 
+         # Summed across the energy statistics, and left unset when the export reports none
+         energy = self._decimal_from_stat(statistic.get("sum")) if "energyburned" in lowered else None
++        raw_unit = statistic.get("unit")
++        if energy is not None and raw_unit is not None:
++            energy = UnitConverter.convert_raw(energy, raw_unit, EnergyUnit.kcal)
++            if energy is None:
++                logger.warning(
++                    "Workout energy in an unconvertible unit left out",
++                    provider="apple_xml",
++                    task="process_xml_upload",
++                    unit=raw_unit,
++                )
+         if energy is not None:
+             current = metrics["energy_burned"]
+             metrics["energy_burned"] = energy if current is None else current + energy
+diff --git a/backend/app/services/sdk/import_service.py b/backend/app/services/sdk/import_service.py
+index bd184875e3..ac29b5cf67 100644
+--- a/backend/app/services/sdk/import_service.py
++++ b/backend/app/services/sdk/import_service.py
+@@ -54,16 +54,13 @@
+ from app.services.timeseries_service import timeseries_service
+ from app.utils.dates import window_seconds
+ from app.utils.structured_logging import get_logger
++from app.utils.units import BloodGlucoseUnit, EnergyUnit, UnitConverter, VolumeUnit
+ 
+ from .device_resolution import extract_device_ids, extract_device_info, extract_device_type
+ from .sleep_service import save_sleep
+ 
+ logger = get_logger(__name__)
+ 
+-# Health Connect's own mg/dL converter uses exactly 18.0, so values written to HC
+-# in mg/dL round-trip with a ~0.1% offset under this factor.
+-MMOL_L_TO_MG_DL = Decimal("18.0182")
+-
+ # Energy series stored in kcal.
+ _KCAL_SERIES = frozenset({SeriesType.dietary_energy_consumed, SeriesType.dietary_energy_from_fat})
+ 
+@@ -427,16 +424,16 @@ def _build_statistic_bundles(
+ 
+             # Health Connect reports blood glucose in mmol/L; the series unit is mg/dL.
+             if series_type == SeriesType.blood_glucose and unit.startswith("mmol"):
+-                value = value * MMOL_L_TO_MG_DL
++                value = UnitConverter.blood_glucose(value, BloodGlucoseUnit.mmol_l, BloodGlucoseUnit.mg_dl)
+ 
+             # Convert hydration units to mL
+             if series_type == SeriesType.hydration and unit in ("l", "liter", "liters", "litre", "litres"):
+-                value *= 1000
++                value = UnitConverter.volume(value, VolumeUnit.liter, VolumeUnit.ml)
+ 
+             # Energy is stored in kcal. Case matters: "cal" is a small calorie (1/1000 kcal),
+             # "Cal" is the food Calorie (= kcal).
+             if series_type in _KCAL_SERIES and (rjson.unit or "").strip() == "cal":
+-                value = value / 1000
++                value = UnitConverter.energy(value, EnergyUnit.cal, EnergyUnit.kcal)
+ 
+             # Extract device info
+             device_model, software_version, original_source_name = extract_device_info(rjson.source, provider)
+diff --git a/backend/app/utils/units.py b/backend/app/utils/units.py
+new file mode 100644
+index 0000000000..2ff61c7f6e
+--- /dev/null
++++ b/backend/app/utils/units.py
+@@ -0,0 +1,290 @@
++"""Unit conversion for values stored under a fixed series unit.
++
++Each physical quantity has a StrEnum of the units we can convert between. Where
++a unit is also a series unit, its value is the same string used in
++SERIES_TYPE_DEFINITIONS (e.g. LengthUnit.m == "meters"), so the series unit maps
++straight onto a member. Raw unit strings from providers (Apple's "km", "degF",
++"mmol<180.15588000005408>/L") are mapped through parse_unit.
++"""
++
++from decimal import Decimal
++from enum import StrEnum
++
++from app.schemas.enums.series_types import SeriesType, get_series_type_unit
++
++
++class LengthUnit(StrEnum):
++    mm = "mm"
++    cm = "cm"
++    m = "meters"
++    km = "km"
++    inch = "in"
++    ft = "ft"
++    yd = "yd"
++    mi = "mi"
++
++
++class MassUnit(StrEnum):
++    mcg = "mcg"
++    mg = "mg"
++    g = "g"
++    kg = "kg"
++    oz = "oz"
++    lb = "lb"
++    st = "st"
++
++
++class VolumeUnit(StrEnum):
++    ml = "mL"
++    liter = "liters"
++    fl_oz_us = "fl_oz_us"
++    fl_oz_imp = "fl_oz_imp"
++    cup_us = "cup_us"
++
++
++class EnergyUnit(StrEnum):
++    j = "j"
++    cal = "cal"
++    kj = "kj"
++    kcal = "kcal"
++
++
++class SpeedUnit(StrEnum):
++    m_per_s = "m_per_s"
++    km_per_h = "km_per_h"
++    mi_per_h = "mi_per_h"
++    ft_per_s = "ft_per_s"
++
++
++class TemperatureUnit(StrEnum):
++    celsius = "celsius"
++    fahrenheit = "fahrenheit"
++    kelvin = "kelvin"
++
++
++class BloodGlucoseUnit(StrEnum):
++    mg_dl = "mg_dl"
++    mmol_l = "mmol_l"
++
++
++type Unit = LengthUnit | MassUnit | VolumeUnit | EnergyUnit | SpeedUnit | TemperatureUnit | BloodGlucoseUnit
++
++# Factors to the first unit of each table: value_in_base = value * factor[unit].
++# Energy and speed use J and m/h as base so every factor is exact: with a kcal or
++# m/s base, kJ and km/h factors would be repeating decimals (41.84 kJ -> 9.999... kcal).
++_LENGTH_TO_M: dict[LengthUnit, Decimal] = {
++    LengthUnit.m: Decimal(1),
++    LengthUnit.mm: Decimal("0.001"),
++    LengthUnit.cm: Decimal("0.01"),
++    LengthUnit.km: Decimal(1000),
++    LengthUnit.inch: Decimal("0.0254"),
++    LengthUnit.ft: Decimal("0.3048"),
++    LengthUnit.yd: Decimal("0.9144"),
++    LengthUnit.mi: Decimal("1609.344"),
++}
++
++_MASS_TO_G: dict[MassUnit, Decimal] = {
++    MassUnit.g: Decimal(1),
++    MassUnit.mcg: Decimal("0.000001"),
++    MassUnit.mg: Decimal("0.001"),
++    MassUnit.kg: Decimal(1000),
++    MassUnit.oz: Decimal("28.349523125"),
++    MassUnit.lb: Decimal("453.59237"),
++    MassUnit.st: Decimal("6350.29318"),
++}
++
++_VOLUME_TO_ML: dict[VolumeUnit, Decimal] = {
++    VolumeUnit.ml: Decimal(1),
++    VolumeUnit.liter: Decimal(1000),
++    VolumeUnit.fl_oz_us: Decimal("29.5735295625"),
++    VolumeUnit.fl_oz_imp: Decimal("28.4130625"),
++    VolumeUnit.cup_us: Decimal("236.5882365"),
++}
++
++_ENERGY_TO_J: dict[EnergyUnit, Decimal] = {
++    EnergyUnit.j: Decimal(1),
++    EnergyUnit.cal: Decimal("4.184"),
++    EnergyUnit.kj: Decimal(1000),
++    EnergyUnit.kcal: Decimal(4184),
++}
++
++_SPEED_TO_M_PER_H: dict[SpeedUnit, Decimal] = {
++    SpeedUnit.m_per_s: Decimal(3600),
++    SpeedUnit.km_per_h: Decimal(1000),
++    SpeedUnit.mi_per_h: Decimal("1609.344"),
++    SpeedUnit.ft_per_s: Decimal("1097.28"),
++}
++
++# Health Connect's own mg/dL converter uses exactly 18.0, so values written to HC
++# in mg/dL round-trip with a ~0.1% offset under this factor. Apple's mmol unit
++# encodes glucose's molar mass (180.15588 g/mol, i.e. 18.015588), ~0.015% off.
++_BLOOD_GLUCOSE_TO_MG_DL: dict[BloodGlucoseUnit, Decimal] = {
++    BloodGlucoseUnit.mg_dl: Decimal(1),
++    BloodGlucoseUnit.mmol_l: Decimal("18.0182"),
++}
++
++_UNIT_ENUMS: tuple[type[Unit], ...] = (
++    LengthUnit,
++    MassUnit,
++    VolumeUnit,
++    EnergyUnit,
++    SpeedUnit,
++    TemperatureUnit,
++    BloodGlucoseUnit,
++)
++
++# Raw unit strings as providers write them. Case matters: "cal" is a small calorie
++# (1/1000 kcal), "Cal" is the food Calorie (= kcal).
++_UNIT_ALIASES: dict[str, Unit] = {
++    "m": LengthUnit.m,
++    "meter": LengthUnit.m,
++    "mile": LengthUnit.mi,
++    "lbs": MassUnit.lb,
++    "ml": VolumeUnit.ml,
++    "L": VolumeUnit.liter,
++    "l": VolumeUnit.liter,
++    "liter": VolumeUnit.liter,
++    "litre": VolumeUnit.liter,
++    "litres": VolumeUnit.liter,
++    "J": EnergyUnit.j,
++    "kJ": EnergyUnit.kj,
++    "Cal": EnergyUnit.kcal,
++    "m/s": SpeedUnit.m_per_s,
++    "km/hr": SpeedUnit.km_per_h,
++    "km/h": SpeedUnit.km_per_h,
++    "mi/hr": SpeedUnit.mi_per_h,
++    "mph": SpeedUnit.mi_per_h,
++    "ft/s": SpeedUnit.ft_per_s,
++    "degC": TemperatureUnit.celsius,
++    "°C": TemperatureUnit.celsius,
++    "degF": TemperatureUnit.fahrenheit,
++    "°F": TemperatureUnit.fahrenheit,
++    "K": TemperatureUnit.kelvin,
++    "mg/dL": BloodGlucoseUnit.mg_dl,
++}
++
++_UNITS_BY_NAME: dict[str, Unit] = {unit.value: unit for enum in _UNIT_ENUMS for unit in enum} | _UNIT_ALIASES
++
++# Series whose unit names a quantity we can convert to. blood_alcohol_content is
++# also stored in mg_dl, but glucose's molar factor doesn't apply to it; the
++# deviation series hold temperature differences, which the affine °F formula breaks.
++_NON_CONVERTIBLE_SERIES = frozenset(
++    {
++        SeriesType.blood_alcohol_content,
++        SeriesType.skin_temperature_deviation,
++        SeriesType.skin_temperature_trend_deviation,
++        SeriesType.garmin_skin_temperature,
++    }
++)
++
++_SERIES_UNITS: dict[SeriesType, Unit] = {
++    series_type: unit
++    for series_type in SeriesType
++    if series_type not in _NON_CONVERTIBLE_SERIES
++    if (unit := _UNITS_BY_NAME.get(get_series_type_unit(series_type))) is not None
++}
++
++
++def parse_unit(raw_unit: str | None) -> Unit | None:
++    """Map a provider's unit string to a Unit; None if missing or unknown."""
++    if not raw_unit:
++        return None
++    raw_unit = raw_unit.strip()
++    # Apple encodes the molar mass in the unit, e.g. "mmol<180.15588000005408>/L".
++    if raw_unit.lower().startswith("mmol"):
++        return BloodGlucoseUnit.mmol_l
++    return _UNITS_BY_NAME.get(raw_unit)
++
++
++def _scale[UnitT: Unit](value: Decimal, from_unit: UnitT, to_unit: UnitT, factors: dict[UnitT, Decimal]) -> Decimal:
++    if from_unit == to_unit:
++        return value
++    return value * factors[from_unit] / factors[to_unit]
++
++
++class UnitConverter:
++    """Convert values between units of one physical quantity."""
++
++    @staticmethod
++    def length(value: Decimal, from_unit: LengthUnit, to_unit: LengthUnit) -> Decimal:
++        return _scale(value, from_unit, to_unit, _LENGTH_TO_M)
++
++    @staticmethod
++    def mass(value: Decimal, from_unit: MassUnit, to_unit: MassUnit) -> Decimal:
++        return _scale(value, from_unit, to_unit, _MASS_TO_G)
++
++    @staticmethod
++    def volume(value: Decimal, from_unit: VolumeUnit, to_unit: VolumeUnit) -> Decimal:
++        return _scale(value, from_unit, to_unit, _VOLUME_TO_ML)
++
++    @staticmethod
++    def energy(value: Decimal, from_unit: EnergyUnit, to_unit: EnergyUnit) -> Decimal:
++        return _scale(value, from_unit, to_unit, _ENERGY_TO_J)
++
++    @staticmethod
++    def speed(value: Decimal, from_unit: SpeedUnit, to_unit: SpeedUnit) -> Decimal:
++        return _scale(value, from_unit, to_unit, _SPEED_TO_M_PER_H)
++
++    @staticmethod
++    def blood_glucose(value: Decimal, from_unit: BloodGlucoseUnit, to_unit: BloodGlucoseUnit) -> Decimal:
++        return _scale(value, from_unit, to_unit, _BLOOD_GLUCOSE_TO_MG_DL)
++
++    @staticmethod
++    def temperature(value: Decimal, from_unit: TemperatureUnit, to_unit: TemperatureUnit) -> Decimal:
++        # Affine, so it goes through celsius rather than a factor table.
++        if from_unit == to_unit:
++            return value
++        match from_unit:
++            case TemperatureUnit.fahrenheit:
++                celsius = (value - 32) * 5 / 9
++            case TemperatureUnit.kelvin:
++                celsius = value - Decimal("273.15")
++            case TemperatureUnit.celsius:
++                celsius = value
++        match to_unit:
++            case TemperatureUnit.fahrenheit:
++                return celsius * 9 / 5 + 32
++            case TemperatureUnit.kelvin:
++                return celsius + Decimal("273.15")
++            case TemperatureUnit.celsius:
++                return celsius
++
++    @classmethod
++    def convert(cls, value: Decimal, from_unit: Unit, to_unit: Unit) -> Decimal | None:
++        """Convert between any two units; None if they measure different quantities."""
++        match from_unit, to_unit:
++            case LengthUnit(), LengthUnit():
++                return cls.length(value, from_unit, to_unit)
++            case MassUnit(), MassUnit():
++                return cls.mass(value, from_unit, to_unit)
++            case VolumeUnit(), VolumeUnit():
++                return cls.volume(value, from_unit, to_unit)
++            case EnergyUnit(), EnergyUnit():
++                return cls.energy(value, from_unit, to_unit)
++            case SpeedUnit(), SpeedUnit():
++                return cls.speed(value, from_unit, to_unit)
++            case TemperatureUnit(), TemperatureUnit():
++                return cls.temperature(value, from_unit, to_unit)
++            case BloodGlucoseUnit(), BloodGlucoseUnit():
++                return cls.blood_glucose(value, from_unit, to_unit)
++            case _:
++                return None
++
++    @classmethod
++    def convert_raw(cls, value: Decimal, raw_unit: str | None, to_unit: Unit) -> Decimal | None:
++        """Convert from a provider's unit string; None if it is unknown or measures something else."""
++        from_unit = parse_unit(raw_unit)
++        return cls.convert(value, from_unit, to_unit) if from_unit is not None else None
++
++    @classmethod
++    def to_series_unit(cls, series_type: SeriesType, value: Decimal, raw_unit: str | None) -> Decimal | None:
++        """Convert a value reported in raw_unit to the unit its series is stored in.
++
++        Series stored in a unit with no conversion (bpm, count, percent, ...) are
++        returned unchanged. None means the series has a convertible unit but
++        raw_unit is missing, unknown or measures something else.
++        """
++        series_unit = _SERIES_UNITS.get(series_type)
++        if series_unit is None:
++            return value
++        return cls.convert_raw(value, raw_unit, series_unit)
+diff --git a/backend/scripts/data_migrations/scale_apple_xml_percentages.py b/backend/scripts/data_migrations/scale_apple_xml_percentages.py
+new file mode 100644
+index 0000000000..c72eb8fd98
+--- /dev/null
++++ b/backend/scripts/data_migrations/scale_apple_xml_percentages.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++"""Scale Apple Health XML percentages stored as 0-1 fractions to 0-100.
++
++HealthKit exports its "%" values as fractions (0.97 for 97% blood oxygen), and the XML import stored
++them as they came, while percent series hold 0-100. The import now scales them; this scales the
++stored ones: the percent series HealthKit reports in "%", from Apple Health XML sources, at most 1.
++Every value the import stored before is a fraction, so the bound only keeps a value already scaled
++from being scaled twice; a walking percentage under 1% imported by the fixed code before this has
++run would be, the one case it can't tell apart.
++
++The changed days are queued for the rollup. Runs once per instance (data_migration), in one
++transaction with the record of the run: scaling is not idempotent, so a run that fails commits
++nothing and the next startup tries again.
++
++Usage (inside Docker):
++    docker compose exec app uv run python scripts/data_migrations/scale_apple_xml_percentages.py --dry-run
++    docker compose exec app uv run python scripts/data_migrations/scale_apple_xml_percentages.py
++"""
++
++import argparse
++
++from sqlalchemy import text
++from sqlalchemy.orm import Session
++
++from app.constants.series_types.sdk.metric_types import APPLE_METRIC_TYPE_TO_SERIES_TYPE
++from app.database import engine
++from app.integrations.rollup_queue import mark_dirty_days
++from app.repositories.local_day import sample_day_sql
++from app.schemas.enums import get_series_type_id, get_series_type_unit
++from app.services.data_migration_service import data_migration_service
++
++XML_SOURCE = "apple_health_xml"
++
++PERCENT_TYPE_IDS = sorted(
++    {
++        get_series_type_id(series_type)
++        for series_type in APPLE_METRIC_TYPE_TO_SERIES_TYPE.values()
++        if get_series_type_unit(series_type) == "percent"
++    }
++)
++
++_FRACTIONS = """
++    s.data_source_id IN (SELECT id FROM data_source WHERE source = :source)
++    AND s.series_type_definition_id = ANY(:types)
++    AND s.value <= 1
++"""
++_COUNT = text(f"SELECT count(*) FROM series_sample s WHERE {_FRACTIONS}")
++_SCALE = text(f"""
++    WITH scaled AS (
++        UPDATE series_sample s SET value = s.value * 100
++        WHERE {_FRACTIONS}
++        RETURNING s.data_source_id, s.recorded_at, s.zone_offset
++    )
++    SELECT data_source_id, {sample_day_sql("scaled")} AS day, count(*) AS samples
++    FROM scaled
++    GROUP BY 1, 2
++""")
++
++
++def scale_apple_xml_percentages(db: Session, *, dry_run: bool) -> int:
++    """Does not commit; the caller owns the transaction. Returns the number of samples scaled."""
++    params = {"source": XML_SOURCE, "types": PERCENT_TYPE_IDS}
++    if dry_run:
++        found = db.execute(_COUNT, params).scalar() or 0
++        print(f"Would scale {found} Apple Health XML percentage(s).\n\nDry run: no changes made.")
++        return found
++    days = db.execute(_SCALE, params).all()
++    mark_dirty_days(db, [(row.data_source_id, row.day) for row in days])
++    scaled = sum(row.samples for row in days)
++    print(f"Scaled {scaled} Apple Health XML percentage(s) on {len(days)} day(s).")
++    return scaled
++
++
++def _migrate(db: Session, dry_run: bool) -> bool:
++    scale_apple_xml_percentages(db, dry_run=dry_run)
++    return not dry_run
++
++
++def main(dry_run: bool) -> None:
++    with engine.connect() as connection, Session(bind=connection) as db:
++        data_migration_service.run(db, "scale_apple_xml_percentages", lambda: _migrate(db, dry_run), dry_run=dry_run)
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--dry-run", action="store_true", help="Preview affected rows without modifying data")
++    args = parser.parse_args()
++    main(dry_run=args.dry_run)
+diff --git a/backend/scripts/start/app.sh b/backend/scripts/start/app.sh
+index 75ccaa0495..15d4d982d4 100755
+--- a/backend/scripts/start/app.sh
++++ b/backend/scripts/start/app.sh
+@@ -182,6 +182,13 @@ echo 'Running Polar sleep efficiency backfill...'
+ uv run python scripts/data_migrations/backfill_polar_sleep_efficiency.py \
+     || echo "Warning: Polar sleep efficiency backfill failed — will retry on next startup."
+ 
++# TODO: Remove this after ~2027-05-01 once all deployments have migrated.
++# Scales Apple Health XML percentages stored as 0-1 fractions to 0-100. Runs once per instance
++# (data_migration).
++echo 'Running Apple Health XML percentage scaling...'
++uv run python scripts/data_migrations/scale_apple_xml_percentages.py \
++    || echo "Warning: Apple Health XML percentage scaling failed — will retry on next startup."
++
+ # Initialize archival settings
+ echo 'Initializing archival settings...'
+ uv run python scripts/init/seed_archival_settings.py
+diff --git a/backend/tests/providers/apple/test_xml_units.py b/backend/tests/providers/apple/test_xml_units.py
+new file mode 100644
+index 0000000000..dfecea197f
+--- /dev/null
++++ b/backend/tests/providers/apple/test_xml_units.py
+@@ -0,0 +1,186 @@
++"""Apple Health XML values are converted from the export's display unit to the series unit."""
++
++from decimal import Decimal
++from io import BytesIO
++from pathlib import Path
++from typing import Any
++from uuid import uuid4
++
++import pytest
++
++from app.schemas.enums import SeriesType
++from app.services.providers.apple.apple_xml.xml_service import XMLService
++
++
++def _record(record_type: str, unit: str | None, value: str) -> dict[str, Any]:
++    document = {
++        "type": record_type,
++        "sourceName": "iPhone",
++        "startDate": "2025-03-01 08:00:00 +0100",
++        "endDate": "2025-03-01 08:05:00 +0100",
++        "value": value,
++    }
++    if unit is not None:
++        document["unit"] = unit
++    return document
++
++
++class TestAppleXmlRecordUnits:
++    @pytest.fixture
++    def service(self) -> XMLService:
++        return XMLService(Path("export.xml"))
++
++    @pytest.mark.parametrize(
++        ("record_type", "unit", "value", "series_type", "expected"),
++        [
++            (
++                "HKQuantityTypeIdentifierBloodGlucose",
++                "mmol<180.15588000005408>/L",
++                "6.1",
++                SeriesType.blood_glucose,
++                Decimal("109.91102"),
++            ),
++            ("HKQuantityTypeIdentifierBloodGlucose", "mg/dL", "110", SeriesType.blood_glucose, Decimal("110")),
++            (
++                "HKQuantityTypeIdentifierDistanceWalkingRunning",
++                "km",
++                "0.021",
++                SeriesType.distance_walking_running,
++                Decimal("21"),
++            ),
++            ("HKQuantityTypeIdentifierBodyMass", "lb", "150", SeriesType.weight, Decimal("68.0388555")),
++            ("HKQuantityTypeIdentifierBodyTemperature", "degF", "98.6", SeriesType.body_temperature, Decimal("37")),
++            ("HKQuantityTypeIdentifierHeight", "cm", "175", SeriesType.height, Decimal("175")),
++            ("HKQuantityTypeIdentifierHeartRate", "count/min", "72", SeriesType.heart_rate, Decimal("72")),
++        ],
++    )
++    def test_converts_to_series_unit(
++        self,
++        service: XMLService,
++        record_type: str,
++        unit: str,
++        value: str,
++        series_type: SeriesType,
++        expected: Decimal,
++    ) -> None:
++        sample = service._create_record(_record(record_type, unit, value), uuid4())
++
++        assert sample is not None
++        assert sample.series_type == series_type
++        assert sample.value == pytest.approx(expected, abs=Decimal("0.000001"))
++        assert not service.stats.records.skipped
++
++    @pytest.mark.parametrize("unit", ["furlong", "km/hr"])
++    def test_skips_a_value_whose_unit_cant_be_converted(self, service: XMLService, unit: str) -> None:
++        sample = service._create_record(_record("HKQuantityTypeIdentifierDistanceWalkingRunning", unit, "5"), uuid4())
++
++        assert sample is None
++        assert service.stats.records.reasons == {f"unconvertible_unit:distance_walking_running:{unit}": 1}
++
++    def test_a_value_without_a_unit_is_kept(self, service: XMLService) -> None:
++        sample = service._create_record(_record("HKQuantityTypeIdentifierDistanceWalkingRunning", None, "5"), uuid4())
++
++        assert sample is not None
++        assert sample.value == Decimal("5")
++
++    @pytest.mark.parametrize(
++        ("record_type", "value", "series_type", "expected"),
++        [
++            ("HKQuantityTypeIdentifierOxygenSaturation", "0.97", SeriesType.oxygen_saturation, Decimal("97")),
++            ("HKQuantityTypeIdentifierBodyFatPercentage", "0.215", SeriesType.body_fat_percentage, Decimal("21.5")),
++            (
++                "HKQuantityTypeIdentifierWalkingDoubleSupportPercentage",
++                "0.28",
++                SeriesType.walking_double_support_percentage,
++                Decimal("28"),
++            ),
++            (
++                "HKQuantityTypeIdentifierWalkingAsymmetryPercentage",
++                "0.05",
++                SeriesType.walking_asymmetry_percentage,
++                Decimal("5"),
++            ),
++            ("HKQuantityTypeIdentifierAppleWalkingSteadiness", "0.86", SeriesType.walking_steadiness, Decimal("86")),
++        ],
++    )
++    def test_scales_healthkit_fraction_to_percent(
++        self,
++        service: XMLService,
++        record_type: str,
++        value: str,
++        series_type: SeriesType,
++        expected: Decimal,
++    ) -> None:
++        sample = service._create_record(_record(record_type, "%", value), uuid4())
++
++        assert sample is not None
++        assert sample.series_type == series_type
++        assert sample.value == expected
++
++    def test_does_not_scale_percent_unit_on_non_percent_series(self, service: XMLService) -> None:
++        sample = service._create_record(_record("HKQuantityTypeIdentifierBloodAlcoholContent", "%", "0.08"), uuid4())
++
++        assert sample is not None
++        assert sample.series_type == SeriesType.blood_alcohol_content
++        assert sample.value == Decimal("0.08")
++
++    def test_a_record_skipped_earlier_is_skipped_once(self, service: XMLService) -> None:
++        document = _record("HKQuantityTypeIdentifierDistanceWalkingRunning", "furlong", "5")
++        document["startDate"] = "not a date"
++
++        assert service._create_record(document, uuid4()) is None
++        assert service.stats.records.reasons == {"invalid_date:HKQuantityTypeIdentifierDistanceWalkingRunning": 1}
++
++
++class TestAppleXmlWorkoutEnergyUnits:
++    def test_converts_kilojoules_to_kcal(self) -> None:
++        service = XMLService(Path("export.xml"))
++        metrics = service._init_metrics()
++
++        service._update_metrics_from_stat(
++            metrics, {"type": "HKQuantityTypeIdentifierActiveEnergyBurned", "sum": "418.4", "unit": "kJ"}
++        )
++
++        assert metrics["energy_burned"] == pytest.approx(Decimal("100"))
++
++    def test_leaves_out_energy_in_an_unknown_unit(self) -> None:
++        service = XMLService(Path("export.xml"))
++        metrics = service._init_metrics()
++
++        service._update_metrics_from_stat(
++            metrics, {"type": "HKQuantityTypeIdentifierActiveEnergyBurned", "sum": "100", "unit": "BTU"}
++        )
++
++        assert metrics["energy_burned"] is None
++
++
++EXPORT_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
++<HealthData locale="pl_PL">
++ <Record type="HKQuantityTypeIdentifierBloodGlucose" sourceName="Health" unit="mmol&lt;180.15588000005408&gt;/L"
++  startDate="2025-03-01 08:00:00 +0100" endDate="2025-03-01 08:00:00 +0100" value="6.1"/>
++ <Record type="HKQuantityTypeIdentifierDistanceWalkingRunning" sourceName="iPhone" unit="km"
++  startDate="2025-03-01 09:00:00 +0100" endDate="2025-03-01 09:05:00 +0100" value="0.4"/>
++ <Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="30" durationUnit="min" sourceName="Watch"
++  startDate="2025-03-01 10:00:00 +0100" endDate="2025-03-01 10:30:00 +0100">
++  <WorkoutStatistics type="HKQuantityTypeIdentifierActiveEnergyBurned"
++   startDate="2025-03-01 10:00:00 +0100" endDate="2025-03-01 10:30:00 +0100" sum="418.4" unit="kJ"/>
++ </Workout>
++</HealthData>
++"""
++
++
++class TestAppleXmlParseUnits:
++    def test_parse_xml_converts_record_and_workout_units(self) -> None:
++        service = XMLService(BytesIO(EXPORT_XML))
++
++        chunks = list(service.parse_xml(str(uuid4())))
++        records = [record for time_series, _, _ in chunks for record in time_series]
++        workouts = [workout for _, chunk_workouts, _ in chunks for workout in chunk_workouts]
++
++        values = {record.series_type: record.value for record in records}
++        assert values[SeriesType.blood_glucose] == pytest.approx(Decimal("109.91102"))
++        assert values[SeriesType.distance_walking_running] == Decimal("400")
++        assert len(workouts) == 1
++        _, detail = workouts[0]
++        assert detail.energy_burned == pytest.approx(Decimal("100"))
++        assert not service.stats.any_skipped()
+diff --git a/backend/tests/scripts/test_scale_apple_xml_percentages.py b/backend/tests/scripts/test_scale_apple_xml_percentages.py
+new file mode 100644
+index 0000000000..39ffafe698
+--- /dev/null
++++ b/backend/tests/scripts/test_scale_apple_xml_percentages.py
+@@ -0,0 +1,82 @@
++import importlib.util
++from datetime import date, datetime, timezone
++from decimal import Decimal
++from pathlib import Path
++from types import ModuleType
++
++from sqlalchemy.orm import Session
++
++from app.integrations.rollup_queue import pop_dirty_days
++from app.models import DataSource, SeriesSample, SeriesTypeDefinition
++from app.schemas.enums import ProviderName, SeriesType
++from tests.factories import DataPointSeriesFactory, DataSourceFactory
++
++_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "data_migrations" / "scale_apple_xml_percentages.py"
++
++
++def _load_module() -> ModuleType:
++    spec = importlib.util.spec_from_file_location("scale_apple_xml_percentages", _SCRIPT_PATH)
++    assert spec is not None
++    assert spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++scale_apple_xml_percentages = _load_module().scale_apple_xml_percentages
++
++AT = datetime(2025, 3, 1, 23, 30, tzinfo=timezone.utc)
++
++
++def _xml_source() -> DataSource:
++    return DataSourceFactory(provider=ProviderName.APPLE, source="apple_health_xml")
++
++
++def _sample(db: Session, source: DataSource, series_type: SeriesType, value: str) -> SeriesSample:
++    definition = db.query(SeriesTypeDefinition).filter_by(code=series_type.value).one()
++    return DataPointSeriesFactory(
++        data_source=source, series_type=definition, value=Decimal(value), recorded_at=AT, zone_offset="+01:00"
++    )
++
++
++def _value(db: Session, sample: SeriesSample) -> Decimal:
++    db.expire_all()
++    return db.get(SeriesSample, sample.id).value
++
++
++class TestScaleAppleXmlPercentages:
++    def test_scales_the_xml_fractions_of_percent_series(self, db: Session) -> None:
++        source = _xml_source()
++        oxygen = _sample(db, source, SeriesType.oxygen_saturation, "0.97")
++        asymmetry = _sample(db, source, SeriesType.walking_asymmetry_percentage, "0.05")
++
++        assert scale_apple_xml_percentages(db, dry_run=False) == 2
++        assert _value(db, oxygen) == Decimal("97")
++        assert _value(db, asymmetry) == Decimal("5")
++
++    def test_leaves_other_sources_series_and_scaled_values_alone(self, db: Session) -> None:
++        source = _xml_source()
++        sdk = _sample(db, DataSourceFactory(source="apple_health_sdk"), SeriesType.oxygen_saturation, "0.97")
++        heart_rate = _sample(db, source, SeriesType.heart_rate, "1")
++        scaled = _sample(db, source, SeriesType.body_fat_percentage, "21.5")
++
++        assert scale_apple_xml_percentages(db, dry_run=False) == 0
++        assert _value(db, sdk) == Decimal("0.97")
++        assert _value(db, heart_rate) == Decimal("1")
++        assert _value(db, scaled) == Decimal("21.5")
++
++    def test_queues_the_local_days_for_the_rollup(self, db: Session) -> None:
++        source = _xml_source()
++        _sample(db, source, SeriesType.oxygen_saturation, "0.97")
++        pop_dirty_days(100)
++
++        scale_apple_xml_percentages(db, dry_run=False)
++        db.commit()
++
++        assert pop_dirty_days(100) == [(source.id, date(2025, 3, 2))]
++
++    def test_dry_run_changes_nothing(self, db: Session) -> None:
++        oxygen = _sample(db, _xml_source(), SeriesType.oxygen_saturation, "0.97")
++
++        assert scale_apple_xml_percentages(db, dry_run=True) == 1
++        assert _value(db, oxygen) == Decimal("0.97")
+diff --git a/backend/tests/utils_tests/test_units.py b/backend/tests/utils_tests/test_units.py
+new file mode 100644
+index 0000000000..89fc1b5fbb
+--- /dev/null
++++ b/backend/tests/utils_tests/test_units.py
+@@ -0,0 +1,148 @@
++"""Tests for unit conversion between provider units and series units."""
++
++from decimal import Decimal
++
++import pytest
++
++from app.schemas.enums import SeriesType
++from app.utils.units import (
++    BloodGlucoseUnit,
++    EnergyUnit,
++    LengthUnit,
++    MassUnit,
++    SpeedUnit,
++    TemperatureUnit,
++    Unit,
++    UnitConverter,
++    VolumeUnit,
++    parse_unit,
++)
++
++
++class TestParseUnit:
++    @pytest.mark.parametrize(
++        ("raw", "expected"),
++        [
++            ("km", LengthUnit.km),
++            ("m", LengthUnit.m),
++            ("meters", LengthUnit.m),
++            ("ft", LengthUnit.ft),
++            ("lb", MassUnit.lb),
++            ("mcg", MassUnit.mcg),
++            ("L", VolumeUnit.liter),
++            ("mL", VolumeUnit.ml),
++            ("fl_oz_us", VolumeUnit.fl_oz_us),
++            ("kJ", EnergyUnit.kj),
++            ("km/hr", SpeedUnit.km_per_h),
++            ("ft/s", SpeedUnit.ft_per_s),
++            ("degF", TemperatureUnit.fahrenheit),
++            ("°C", TemperatureUnit.celsius),
++            ("mg/dL", BloodGlucoseUnit.mg_dl),
++            ("mmol<180.15588000005408>/L", BloodGlucoseUnit.mmol_l),
++            (" km ", LengthUnit.km),
++        ],
++    )
++    def test_maps_provider_strings(self, raw: str, expected: Unit) -> None:
++        assert parse_unit(raw) == expected
++
++    def test_small_calorie_and_food_calorie_differ(self) -> None:
++        assert parse_unit("cal") == EnergyUnit.cal
++        assert parse_unit("Cal") == EnergyUnit.kcal
++
++    @pytest.mark.parametrize("raw", [None, "", "count/min", "furlong"])
++    def test_unknown_or_missing_is_none(self, raw: str | None) -> None:
++        assert parse_unit(raw) is None
++
++
++class TestUnitConverter:
++    @pytest.mark.parametrize(
++        ("value", "from_unit", "to_unit", "expected"),
++        [
++            (Decimal("0.021"), LengthUnit.km, LengthUnit.m, Decimal("21")),
++            (Decimal("1.75"), LengthUnit.m, LengthUnit.cm, Decimal("175")),
++            (Decimal("6"), LengthUnit.ft, LengthUnit.cm, Decimal("182.88")),
++            (Decimal("1"), LengthUnit.mi, LengthUnit.m, Decimal("1609.344")),
++            (Decimal("150"), MassUnit.lb, MassUnit.kg, Decimal("68.0388555")),
++            (Decimal("1"), MassUnit.st, MassUnit.kg, Decimal("6.35029318")),
++            (Decimal("0.5"), VolumeUnit.liter, VolumeUnit.ml, Decimal("500")),
++            (Decimal("500"), EnergyUnit.cal, EnergyUnit.kcal, Decimal("0.5")),
++            (Decimal("36"), SpeedUnit.km_per_h, SpeedUnit.m_per_s, Decimal("10")),
++            (Decimal("1"), SpeedUnit.ft_per_s, SpeedUnit.m_per_s, Decimal("0.3048")),
++            (Decimal("6.25"), SpeedUnit.mi_per_h, SpeedUnit.m_per_s, Decimal("2.794")),
++            (Decimal("98.6"), TemperatureUnit.fahrenheit, TemperatureUnit.celsius, Decimal("37")),
++            (Decimal("37"), TemperatureUnit.celsius, TemperatureUnit.fahrenheit, Decimal("98.6")),
++            (Decimal("310.15"), TemperatureUnit.kelvin, TemperatureUnit.celsius, Decimal("37")),
++            (Decimal("6.1"), BloodGlucoseUnit.mmol_l, BloodGlucoseUnit.mg_dl, Decimal("109.91102")),
++        ],
++    )
++    def test_converts(self, value: Decimal, from_unit: Unit, to_unit: Unit, expected: Decimal) -> None:
++        result = UnitConverter.convert(value, from_unit, to_unit)
++
++        assert result is not None
++        assert result == pytest.approx(expected, abs=Decimal("0.000001"))
++
++    @pytest.mark.parametrize(
++        ("value", "from_unit", "to_unit", "expected"),
++        [
++            (Decimal("41.84"), EnergyUnit.kj, EnergyUnit.kcal, Decimal("10")),
++            (Decimal("418.4"), EnergyUnit.kj, EnergyUnit.kcal, Decimal("100")),
++            (Decimal("4184"), EnergyUnit.j, EnergyUnit.kcal, Decimal("1")),
++            (Decimal("36"), SpeedUnit.km_per_h, SpeedUnit.m_per_s, Decimal("10")),
++        ],
++    )
++    def test_round_values_stay_exact(self, value: Decimal, from_unit: Unit, to_unit: Unit, expected: Decimal) -> None:
++        assert UnitConverter.convert(value, from_unit, to_unit) == expected
++
++    def test_same_unit_is_unchanged(self) -> None:
++        assert UnitConverter.length(Decimal("1.234"), LengthUnit.cm, LengthUnit.cm) == Decimal("1.234")
++
++    def test_different_quantities_do_not_convert(self) -> None:
++        assert UnitConverter.convert(Decimal(1), LengthUnit.km, MassUnit.kg) is None
++
++    def test_convert_raw_unknown_unit_is_none(self) -> None:
++        assert UnitConverter.convert_raw(Decimal(1), "furlong", LengthUnit.m) is None
++
++
++class TestToSeriesUnit:
++    @pytest.mark.parametrize(
++        ("series_type", "value", "raw_unit", "expected"),
++        [
++            (SeriesType.blood_glucose, Decimal("6.1"), "mmol<180.15588000005408>/L", Decimal("109.91102")),
++            (SeriesType.blood_glucose, Decimal("110"), "mg/dL", Decimal("110")),
++            (SeriesType.distance_walking_running, Decimal("0.021"), "km", Decimal("21")),
++            (SeriesType.distance_cycling, Decimal("1"), "mi", Decimal("1609.344")),
++            (SeriesType.height, Decimal("175"), "cm", Decimal("175")),
++            (SeriesType.height, Decimal("6"), "ft", Decimal("182.88")),
++            (SeriesType.weight, Decimal("150"), "lb", Decimal("68.0388555")),
++            (SeriesType.body_temperature, Decimal("98.6"), "degF", Decimal("37")),
++            (SeriesType.walking_speed, Decimal("3.6"), "km/hr", Decimal("1")),
++            (SeriesType.stair_ascent_speed, Decimal("1.17239"), "ft/s", Decimal("0.357344472")),
++            (SeriesType.hydration, Decimal("0.25"), "L", Decimal("250")),
++            (SeriesType.dietary_energy_consumed, Decimal("1000"), "kJ", Decimal("239.005736")),
++            (SeriesType.dietary_sodium, Decimal("0.5"), "g", Decimal("500")),
++        ],
++    )
++    def test_converts_to_series_unit(
++        self, series_type: SeriesType, value: Decimal, raw_unit: str, expected: Decimal
++    ) -> None:
++        result = UnitConverter.to_series_unit(series_type, value, raw_unit)
++
++        assert result is not None
++        assert result == pytest.approx(expected, abs=Decimal("0.000001"))
++
++    @pytest.mark.parametrize(
++        ("series_type", "raw_unit"),
++        [
++            (SeriesType.heart_rate, "count/min"),
++            (SeriesType.steps, "count"),
++            (SeriesType.blood_alcohol_content, "%"),
++            (SeriesType.skin_temperature_deviation, "degF"),
++            (SeriesType.garmin_skin_temperature, "degF"),
++        ],
++    )
++    def test_series_without_convertible_unit_is_unchanged(self, series_type: SeriesType, raw_unit: str) -> None:
++        assert UnitConverter.to_series_unit(series_type, Decimal("72"), raw_unit) == Decimal("72")
++
++    @pytest.mark.parametrize("raw_unit", [None, "", "furlong", "kg"])
++    def test_unknown_or_mismatched_unit_is_none(self, raw_unit: str | None) -> None:
++        assert UnitConverter.to_series_unit(SeriesType.distance_walking_running, Decimal("1"), raw_unit) is None

@@ -1,0 +1,248 @@
+diff --git a/packages/docs/content/docs/api/fhir/operations/claim-export.md b/packages/docs/content/docs/api/fhir/operations/claim-export.md
+index 5c1b36183ec..6f25702beea 100644
+--- a/packages/docs/content/docs/api/fhir/operations/claim-export.md
++++ b/packages/docs/content/docs/api/fhir/operations/claim-export.md
+@@ -139,6 +139,7 @@ Accept: application/pdf
+ | Status Code | Description |
+ |-------------|-------------|
+ | `400 Bad Request` | Claim ID is required (GET) or resource parameter missing (POST) |
++| `400 Bad Request` | Claim type is `oral`, `institutional` or `pharmacy`. These claims are billed on the ADA dental claim form, the UB-04 and NCPDP respectively, not the CMS-1500 |
+ | `404 Not Found` | Claim not found |
+ | `403 Forbidden` | Insufficient permissions |
+ 
+@@ -146,6 +147,7 @@ Accept: application/pdf
+ 
+ - This operation is marked as **experimental**
+ - The generated PDF follows the CMS-1500 form format
++- Only claims that belong on a CMS-1500 can be exported. Claims with no `type`, or a `professional` or `vision` type, are supported
+ - The Binary resource containing the PDF is automatically created during the operation
+ 
+ ## Related Documentation
+diff --git a/packages/server/src/fhir/operations/claimexport.test.ts b/packages/server/src/fhir/operations/claimexport.test.ts
+index 4016ae1d917..86994114398 100644
+--- a/packages/server/src/fhir/operations/claimexport.test.ts
++++ b/packages/server/src/fhir/operations/claimexport.test.ts
+@@ -130,8 +130,70 @@ describe('CMS 1500 PDF', () => {
+     expect(response.body.resourceType).toBe('OperationOutcome');
+     expect(response.body.issue[0].severity).toBe('error');
+   });
++
++  test.each(['oral', 'institutional', 'pharmacy'])(
++    'Bad request - %s claim cannot be exported as CMS-1500 (POST)',
++    async (type) => {
++      const claim = withClaimType(getFixtureClaim(), type);
++
++      const response = await request(app)
++        .post(`/fhir/R4/Claim/$export`)
++        .set('Authorization', 'Bearer ' + accessToken)
++        .set('Accept', 'application/fhir+json')
++        .send({
++          resourceType: 'Parameters',
++          parameter: [{ name: 'resource', resource: claim }],
++        });
++
++      expect(response).toHaveStatus(400);
++      expect(response.body.resourceType).toBe('OperationOutcome');
++      expect(response.body.issue[0].details.text).toContain(`Claim type '${type}' cannot be exported as a CMS-1500`);
++    }
++  );
++
++  test('Bad request - oral claim cannot be exported as CMS-1500 (GET)', async () => {
++    const bundle = structuredClone(fullAnswer);
++    const entry = bundle.entry?.find((e) => e.resource?.resourceType === 'Claim');
++    if (!entry) {
++      throw new Error('fixture has no Claim');
++    }
++    entry.resource = {
++      ...withClaimType(entry.resource as Claim, 'oral'),
++      identifier: [{ value: 'example-claim-oral' }],
++    };
++
++    const bundleRes = await request(app)
++      .post(`/fhir/R4`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .set('Content-Type', 'application/fhir+json')
++      .send(bundle);
++    expect(bundleRes).toHaveStatus(200);
++
++    const searchRes = await request(app)
++      .get(`/fhir/R4/Claim?identifier=example-claim-oral`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .set('Accept', 'application/fhir+json');
++    expect(searchRes).toHaveStatus(200);
++    const claim = searchRes.body.entry[0].resource as Claim;
++
++    const response = await request(app)
++      .get(`/fhir/R4/Claim/${claim.id}/$export`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .set('Accept', 'application/fhir+json');
++
++    expect(response).toHaveStatus(400);
++    expect(response.body.issue[0].details.text).toContain('ADA dental claim form');
++  });
+ });
+ 
++function getFixtureClaim(): Claim {
++  return fullAnswer.entry?.find((e) => e.resource?.resourceType === 'Claim')?.resource as Claim;
++}
++
++function withClaimType(claim: Claim, code: string): Claim {
++  return { ...claim, type: { coding: [{ system: 'http://terminology.hl7.org/CodeSystem/claim-type', code }] } };
++}
++
+ export const fullAnswer: Bundle = {
+   resourceType: 'Bundle',
+   type: 'transaction',
+diff --git a/packages/server/src/fhir/operations/claimexport.ts b/packages/server/src/fhir/operations/claimexport.ts
+index 2798635147d..ec670ad1a8e 100644
+--- a/packages/server/src/fhir/operations/claimexport.ts
++++ b/packages/server/src/fhir/operations/claimexport.ts
+@@ -8,7 +8,7 @@ import { getAuthenticatedContext } from '../../context';
+ import { getBinaryStorage } from '../../storage/loader';
+ import { createPdf } from '../../util/pdf';
+ import { makeOperationDefinition } from './definitions';
+-import { getClaimPDFDocDefinition } from './utils/cms1500pdf';
++import { getClaimPDFDocDefinition, getCms1500ClaimTypeError } from './utils/cms1500pdf';
+ import { parseInputParameters } from './utils/parameters';
+ 
+ /**
+@@ -54,6 +54,11 @@ interface ClaimExportParameters {
+ async function handleClaimExport(claim: Claim): Promise<FhirResponse> {
+   const { repo } = getAuthenticatedContext();
+ 
++  const claimTypeError = getCms1500ClaimTypeError(claim);
++  if (claimTypeError) {
++    return [badRequest(claimTypeError)];
++  }
++
+   try {
+     // Generate PDF from claim
+     const docDefinition = await getClaimPDFDocDefinition(claim);
+diff --git a/packages/server/src/fhir/operations/utils/cms1500pdf.test.ts b/packages/server/src/fhir/operations/utils/cms1500pdf.test.ts
+index b46ffdf9aa7..a889921d91f 100644
+--- a/packages/server/src/fhir/operations/utils/cms1500pdf.test.ts
++++ b/packages/server/src/fhir/operations/utils/cms1500pdf.test.ts
+@@ -1,7 +1,13 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+-import type { ClaimItem, HumanName } from '@medplum/fhirtypes';
+-import { formatDiagnosisPointers, formatHumanName, getPlaceOfService, getSimplePhone } from './cms1500pdf';
++import type { Claim, ClaimItem, HumanName } from '@medplum/fhirtypes';
++import {
++  formatDiagnosisPointers,
++  formatHumanName,
++  getCms1500ClaimTypeError,
++  getPlaceOfService,
++  getSimplePhone,
++} from './cms1500pdf';
+ 
+ describe('CMS 1500 PDF Utils', () => {
+   test('formats full name with middle name', () => {
+@@ -159,4 +165,58 @@ describe('CMS 1500 PDF Utils', () => {
+     const item: ClaimItem = { sequence: 1, productOrService: {} };
+     expect(getPlaceOfService(item)).toBeUndefined();
+   });
++
++  describe('getCms1500ClaimTypeError', () => {
++    const CLAIM_TYPE_SYSTEM = 'http://terminology.hl7.org/CodeSystem/claim-type';
++
++    function claimWithType(type?: Claim['type']): Claim {
++      return {
++        resourceType: 'Claim',
++        status: 'active',
++        type: type as Claim['type'],
++        use: 'claim',
++        patient: { reference: 'Patient/123' },
++        created: '2026-01-01',
++        provider: { reference: 'Organization/456' },
++        priority: { coding: [{ code: 'normal' }] },
++        insurance: [],
++      };
++    }
++
++    test.each(['professional', 'vision'])('allows %s claims', (code) => {
++      expect(
++        getCms1500ClaimTypeError(claimWithType({ coding: [{ system: CLAIM_TYPE_SYSTEM, code }] }))
++      ).toBeUndefined();
++    });
++
++    test('allows claims with no type coding', () => {
++      expect(getCms1500ClaimTypeError(claimWithType())).toBeUndefined();
++      expect(getCms1500ClaimTypeError(claimWithType({ text: 'Dental' }))).toBeUndefined();
++    });
++
++    test.each([
++      ['oral', 'the ADA dental claim form'],
++      ['institutional', 'the UB-04'],
++      ['pharmacy', 'an NCPDP claim'],
++    ])('rejects %s claims', (code, form) => {
++      expect(getCms1500ClaimTypeError(claimWithType({ coding: [{ system: CLAIM_TYPE_SYSTEM, code }] }))).toBe(
++        `Claim type '${code}' cannot be exported as a CMS-1500. These claims are billed on ${form}.`
++      );
++    });
++
++    test('ignores codes from other systems', () => {
++      const claim = claimWithType({ coding: [{ system: 'http://example.com/claim-type', code: 'oral' }] });
++      expect(getCms1500ClaimTypeError(claim)).toBeUndefined();
++    });
++
++    test('finds the claim-type coding regardless of its position', () => {
++      const claim = claimWithType({
++        coding: [
++          { system: 'http://example.com/claim-type', code: 'D' },
++          { system: CLAIM_TYPE_SYSTEM, code: 'oral' },
++        ],
++      });
++      expect(getCms1500ClaimTypeError(claim)).toContain("'oral'");
++    });
++  });
+ });
+diff --git a/packages/server/src/fhir/operations/utils/cms1500pdf.ts b/packages/server/src/fhir/operations/utils/cms1500pdf.ts
+index a919da1dc68..81b3567564b 100644
+--- a/packages/server/src/fhir/operations/utils/cms1500pdf.ts
++++ b/packages/server/src/fhir/operations/utils/cms1500pdf.ts
+@@ -7,6 +7,7 @@ import {
+   formatQuantity,
+   getDisplayString,
+   HTTP_HL7_ORG,
++  HTTP_TERMINOLOGY_HL7_ORG,
+ } from '@medplum/core';
+ import type { Address, Claim, ClaimItem, HumanName, Practitioner, RelatedPerson } from '@medplum/fhirtypes';
+ import type { Content, TDocumentDefinitions } from 'pdfmake/interfaces';
+@@ -365,6 +366,36 @@ export function formatDiagnosisPointers(diagnosisSequence: number[] | undefined)
+     .join('');
+ }
+ 
++const CLAIM_TYPE_SYSTEM = `${HTTP_TERMINOLOGY_HL7_ORG}/CodeSystem/claim-type`;
++
++// Claim types that payers expect on a different form. Rendering them as a CMS-1500 silently
++// drops data the other form carries, such as tooth and surface for dental claims.
++const NON_CMS1500_CLAIM_FORMS = new Map<string, string>([
++  ['oral', 'the ADA dental claim form'],
++  ['institutional', 'the UB-04'],
++  ['pharmacy', 'an NCPDP claim'],
++]);
++
++/**
++ * Checks whether a claim can be rendered as a CMS-1500.
++ *
++ * Dental, institutional and pharmacy claims are billed on other forms. Claims with no type,
++ * or with a type outside the HL7 claim-type code system, are allowed.
++ *
++ * @param claim - The claim to check.
++ * @returns An error message when the claim belongs on another form, otherwise undefined.
++ */
++export function getCms1500ClaimTypeError(claim: Claim): string | undefined {
++  for (const coding of claim.type?.coding ?? []) {
++    const form =
++      coding.system === CLAIM_TYPE_SYSTEM && coding.code ? NON_CMS1500_CLAIM_FORMS.get(coding.code) : undefined;
++    if (form) {
++      return `Claim type '${coding.code}' cannot be exported as a CMS-1500. These claims are billed on ${form}.`;
++    }
++  }
++  return undefined;
++}
++
+ export function getSimplePhone(phone: string | undefined): string | undefined {
+   if (!phone) {
+     return undefined;

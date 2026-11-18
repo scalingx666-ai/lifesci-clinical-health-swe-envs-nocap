@@ -1,0 +1,395 @@
+diff --git a/api/src/main/java/org/openmrs/api/impl/EncounterServiceImpl.java b/api/src/main/java/org/openmrs/api/impl/EncounterServiceImpl.java
+index 0991fabbe47d..569ed648ecdd 100644
+--- a/api/src/main/java/org/openmrs/api/impl/EncounterServiceImpl.java
++++ b/api/src/main/java/org/openmrs/api/impl/EncounterServiceImpl.java
+@@ -703,8 +703,10 @@ public List<Encounter> getEncountersByVisit(Visit visit, boolean includeVoided)
+ 	@Override
+ 	@Transactional(readOnly = true)
+ 	public List<EncounterVisitHandler> getEncounterVisitHandlers() {
+-
+-		return HandlerUtil.getHandlersForType(EncounterVisitHandler.class, null);
++		// copied because HandlerUtil hands out the shared, unmodifiable list it caches, while this method
++		// has promised callers an ordinary List since 1.9. The path is cold enough for the copy not to
++		// matter
++		return new ArrayList<>(HandlerUtil.getHandlersForType(EncounterVisitHandler.class, null));
+ 	}
+ 
+ 	/**
+diff --git a/api/src/main/java/org/openmrs/util/HandlerUtil.java b/api/src/main/java/org/openmrs/util/HandlerUtil.java
+index 5c2aecd2acbd..565b8400c9de 100644
+--- a/api/src/main/java/org/openmrs/util/HandlerUtil.java
++++ b/api/src/main/java/org/openmrs/util/HandlerUtil.java
+@@ -10,10 +10,11 @@
+ package org.openmrs.util;
+ 
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.List;
+-import java.util.Map;
+-import java.util.WeakHashMap;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
+ 
+ import org.openmrs.annotation.Handler;
+ import org.openmrs.api.APIException;
+@@ -35,7 +36,18 @@ public class HandlerUtil implements ApplicationListener<ContextRefreshedEvent> {
+ 
+ 	private static final Logger log = LoggerFactory.getLogger(HandlerUtil.class);
+ 
+-	private static volatile Map<Key, List<?>> cachedHandlers = new WeakHashMap<>();
++	/**
++	 * Handler lists keyed by the handler type and the type they must support. A miss collects every
++	 * bean of the handler type from the service application context and its parents and reflects over
++	 * each one, and RequiredDataAdvice and HibernateAdministrationDAO drive that lookup once per object
++	 * in the graph being saved or validated. Entries therefore live until the application context is
++	 * refreshed, which is also what makes module-contributed handlers visible.
++	 * <p>
++	 * Invalidation replaces the map instead of clearing it, so that a lookup already in flight writes
++	 * its result into the map it read from; no lookup starting after the invalidation can reach that
++	 * map, so handlers from the outgoing context cannot reappear in the live cache.
++	 */
++	private static volatile ConcurrentMap<Key, List<?>> cachedHandlers = new ConcurrentHashMap<>();
+ 
+ 	private static class Key {
+ 
+@@ -86,7 +98,7 @@ public boolean equals(Object obj) {
+ 	}
+ 
+ 	public static void clearCachedHandlers() {
+-		cachedHandlers = new WeakHashMap<>();
++		cachedHandlers = new ConcurrentHashMap<>();
+ 	}
+ 
+ 	/**
+@@ -97,7 +109,9 @@ public static void clearCachedHandlers() {
+ 	 * <li>The passed type is null - this effectively returns all components of the passed
+ 	 * handlerType</li>
+ 	 * </ul>
+-	 * The returned handlers are ordered in the list based upon the order property.
++	 * The returned handlers are ordered in the list based upon the order property. The list is
++	 * unmodifiable because it is shared with the other callers asking for the same handlerType and
++	 * type: copy it before sorting or filtering. Its identity is not stable across context refreshes.
+ 	 * <p>
+ 	 * <strong>Should</strong> return a list of all classes that can handle the passed type<br/>
+ 	 * <strong>Should</strong> return classes registered in a module<br/>
+@@ -105,10 +119,17 @@ public static void clearCachedHandlers() {
+ 	 *
+ 	 * @param handlerType Indicates the type of class to return
+ 	 * @param type Indicates the type that the given handlerType must support (or null for any)
+-	 * @return a List of all matching Handlers for the given parameters, ordered by Handler#order
++	 * @return an unmodifiable List of all matching Handlers for the given parameters, ordered by
++	 *         Handler#order
+ 	 */
++	@SuppressWarnings("unchecked")
+ 	public static <H, T> List<H> getHandlersForType(Class<H> handlerType, Class<T> type) {
+-		List<?> list = cachedHandlers.get(new Key(handlerType, type));
++		// snapshot the cache so the lookup and the write below land in the same map: if it is
++		// invalidated while we are scanning, our result goes into the map that was discarded rather than
++		// into the live one. Do not replace this local with direct reads of the field
++		ConcurrentMap<Key, List<?>> handlerCache = cachedHandlers;
++		Key key = new Key(handlerType, type);
++		List<?> list = handlerCache.get(key);
+ 		if (list != null) {
+ 			return (List<H>) list;
+ 		}
+@@ -142,11 +163,17 @@ public static <H, T> List<H> getHandlersForType(Class<H> handlerType, Class<T> t
+ 		// Return the list of handlers based on the order specified in the Handler annotation
+ 		handlers.sort(Comparator.comparing(o -> getOrderOfHandler(o.getClass())));
+ 
+-		Map<Key, List<?>> newCachedHandlers = new WeakHashMap<>(cachedHandlers);
+-		newCachedHandlers.put(new Key(handlerType, type), handlers);
+-		cachedHandlers = newCachedHandlers;
+-
+-		return handlers;
++		List<H> sharedHandlers = Collections.unmodifiableList(handlers);
++		// an entry sticks until the next context refresh, so record what is being frozen: a list that is
++		// unexpectedly empty is otherwise invisible, since callers read it as "nothing to do"
++		log.debug("Caching {} handler(s) of type {} for type {}", handlers.size(), handlerType, type);
++		// deliberately scanned outside computeIfAbsent, whose mapping function "should be short and
++		// simple, and must not attempt to update any other mappings of this map": the scan is neither,
++		// since it calls back into Spring, which may instantiate beans that look up handlers of their own
++		List<?> winner = handlerCache.putIfAbsent(key, sharedHandlers);
++		// threads that missed together normally compute equal lists, so hand back whichever one got
++		// cached and let every caller share a single instance
++		return winner == null ? sharedHandlers : (List<H>) winner;
+ 	}
+ 
+ 	/**
+@@ -202,6 +229,10 @@ public static Integer getOrderOfHandler(Class<?> handlerClass) {
+ 		return annotation.order();
+ 	}
+ 
++	/**
++	 * Invalidates the cache when an application context is refreshed, so that handlers contributed by
++	 * modules started since the last refresh are picked up.
++	 */
+ 	@Override
+ 	public void onApplicationEvent(ContextRefreshedEvent event) {
+ 		clearCachedHandlers();
+diff --git a/api/src/test/java/org/openmrs/api/context/ContextMockHelper.java b/api/src/test/java/org/openmrs/api/context/ContextMockHelper.java
+index 981c123c8265..96c4f5a3d479 100644
+--- a/api/src/test/java/org/openmrs/api/context/ContextMockHelper.java
++++ b/api/src/test/java/org/openmrs/api/context/ContextMockHelper.java
+@@ -34,6 +34,7 @@
+ import org.openmrs.api.VisitService;
+ import org.openmrs.api.db.ContextDAO;
+ import org.openmrs.messagesource.MessageSourceService;
++import org.openmrs.util.HandlerUtil;
+ import org.openmrs.util.RoleConstants;
+ import org.springframework.context.ApplicationContext;
+ 
+@@ -159,12 +160,14 @@ public void revertMocks() {
+ 		}
+ 
+ 		if (applicationContextMocked) {
+-			if (realApplicationContext != null) {
+-				Context.getServiceContext().setApplicationContext(realApplicationContext);
+-				realApplicationContext = null;
+-			}
++			// restored even when there was nothing there before: leaving a dead mock installed in the
++			// singleton ServiceContext makes every later lookup in this JVM resolve against it
++			Context.getServiceContext().setApplicationContext(realApplicationContext);
++			realApplicationContext = null;
+ 			applicationContextMocked = false;
+ 			applicationContext = null;
++			// the mock's half of the handler cache goes with it; see setApplicationContext
++			HandlerUtil.clearCachedHandlers();
+ 		}
+ 
+ 	}
+@@ -184,6 +187,13 @@ public void setService(Class<?> type, Object service) {
+ 		Context.getServiceContext().setService(type, service);
+ 	}
+ 
++	/**
++	 * Swapping the application context changes which beans
++	 * {@link Context#getRegisteredComponents(Class)} sees, so the handler cache, which is static and is
++	 * cleared only by context lifecycle events that no mock publishes, has to be dropped here and again
++	 * in {@link #revertMocks()}. Otherwise handlers built from this mock are served to whatever runs
++	 * next in the same JVM.
++	 */
+ 	public void setApplicationContext(ApplicationContext context) {
+ 		if (!applicationContextMocked) {
+ 			realApplicationContext = Context.getServiceContext().getApplicationContext();
+@@ -192,6 +202,7 @@ public void setApplicationContext(ApplicationContext context) {
+ 
+ 		Context.getServiceContext().setApplicationContext(context);
+ 		this.applicationContext = context;
++		HandlerUtil.clearCachedHandlers();
+ 	}
+ 
+ 	public void setAdministrationService(AdministrationService administrationService) {
+diff --git a/api/src/test/java/org/openmrs/util/HandlerUtilTest.java b/api/src/test/java/org/openmrs/util/HandlerUtilTest.java
+index 2e121bf271e9..cc971155fe98 100644
+--- a/api/src/test/java/org/openmrs/util/HandlerUtilTest.java
++++ b/api/src/test/java/org/openmrs/util/HandlerUtilTest.java
+@@ -9,8 +9,15 @@
+  */
+ package org.openmrs.util;
+ 
++import java.util.ArrayList;
+ import java.util.List;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
+ 
++import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.Test;
+ import org.openmrs.DrugOrder;
+ import org.openmrs.Order;
+@@ -18,25 +25,43 @@
+ import org.openmrs.Person;
+ import org.openmrs.api.APIException;
+ import org.openmrs.api.context.Context;
++import org.openmrs.api.context.ServiceContext;
+ import org.openmrs.test.jupiter.BaseContextSensitiveTest;
+ import org.openmrs.validator.DrugOrderValidator;
+ import org.openmrs.validator.OrderValidator;
+ import org.openmrs.validator.PatientValidator;
+ import org.openmrs.validator.PersonValidator;
++import org.springframework.beans.factory.support.RootBeanDefinition;
++import org.springframework.context.ApplicationContext;
++import org.springframework.context.support.GenericApplicationContext;
+ import org.springframework.validation.Validator;
+ 
+ import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.greaterThan;
+ import static org.hamcrest.Matchers.instanceOf;
+ import static org.hamcrest.Matchers.is;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNotSame;
++import static org.junit.jupiter.api.Assertions.assertSame;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
+ 
+ /**
+  * Tests the methods in {@link HandlerUtil}
+  */
+ public class HandlerUtilTest extends BaseContextSensitiveTest {
+ 
++	/**
++	 * The handler cache is static and outlives garbage collection, so anything this class leaves in it
++	 * would be served to the rest of the fork.
++	 */
++	@AfterEach
++	public void clearHandlerCache() {
++		HandlerUtil.clearCachedHandlers();
++	}
++
+ 	/**
+ 	 * @see HandlerUtil#getHandlerForType(Class, Class)
+ 	 */
+@@ -93,4 +118,148 @@ public void getPreferredHandler_shouldReturnPersonValidatorForPerson() {
+ 
+ 		assertThat(handler, is(instanceOf(PersonValidator.class)));
+ 	}
++
++	@Test
++	public void getHandlersForType_shouldServeRepeatedLookupsFromTheCache() {
++		HandlerUtil.clearCachedHandlers();
++
++		List<Validator> first = HandlerUtil.getHandlersForType(Validator.class, Order.class);
++		List<Validator> second = HandlerUtil.getHandlersForType(Validator.class, Order.class);
++
++		assertSame(first, second);
++	}
++
++	@Test
++	public void getHandlersForType_shouldKeepCachedHandlersAcrossGarbageCollection() {
++		HandlerUtil.clearCachedHandlers();
++		List<Validator> cached = HandlerUtil.getHandlersForType(Validator.class, Order.class);
++
++		// TRUNK-6697: the cache keys are built inside the lookup and are reachable from nothing but the
++		// cache, so weakly held entries are collectible here. System.gc() is only a hint, so this can
++		// pass without proving anything - it cannot, however, pass on an entry that was collected
++		System.gc();
++
++		assertSame(cached, HandlerUtil.getHandlersForType(Validator.class, Order.class));
++	}
++
++	@Test
++	public void getHandlersForType_shouldCacheHandlersForANullTypeSeparately() {
++		HandlerUtil.clearCachedHandlers();
++
++		List<Validator> anyType = HandlerUtil.getHandlersForType(Validator.class, null);
++		List<Validator> orderOnly = HandlerUtil.getHandlersForType(Validator.class, Order.class);
++
++		assertNotSame(anyType, orderOnly);
++		assertThat(anyType.size(), greaterThan(orderOnly.size()));
++		assertSame(anyType, HandlerUtil.getHandlersForType(Validator.class, null));
++	}
++
++	@Test
++	public void getHandlersForType_shouldReturnAnUnmodifiableList() {
++		HandlerUtil.clearCachedHandlers();
++
++		List<Validator> handlers = HandlerUtil.getHandlersForType(Validator.class, Order.class);
++
++		assertThrows(UnsupportedOperationException.class, () -> handlers.add(null));
++	}
++
++	@Test
++	public void getHandlersForType_shouldNotPublishHandlersScannedBeforeAnInvalidation() {
++		ServiceContext serviceContext = ServiceContext.getInstance();
++		ApplicationContext realContext = serviceContext.getApplicationContext();
++		ApplicationContext contextRefreshingMidScan = mock(ApplicationContext.class);
++		when(contextRefreshingMidScan.getBeansOfType(Validator.class)).thenAnswer(invocation -> {
++			// a module starting, and so a context refresh, while the scan is still running
++			HandlerUtil.clearCachedHandlers();
++			return realContext.getBeansOfType(Validator.class);
++		});
++
++		List<Validator> scannedBeforeInvalidation;
++		try {
++			serviceContext.setApplicationContext(contextRefreshingMidScan);
++			HandlerUtil.clearCachedHandlers();
++			scannedBeforeInvalidation = HandlerUtil.getHandlersForType(Validator.class, Order.class);
++		} finally {
++			serviceContext.setApplicationContext(realContext);
++		}
++
++		// the invalidated lookup must have written into the map it read from, not into the live cache
++		assertNotSame(scannedBeforeInvalidation, HandlerUtil.getHandlersForType(Validator.class, Order.class));
++	}
++
++	@Test
++	public void getHandlersForType_shouldReturnTheSameHandlerListToConcurrentCallers() throws Exception {
++		HandlerUtil.clearCachedHandlers();
++
++		int callers = 8;
++		ExecutorService executor = Executors.newFixedThreadPool(callers);
++		try {
++			// release every caller at once so they race on the empty cache. They call Context from pool
++			// threads, which works because looking up registered components needs no user context
++			CountDownLatch startLine = new CountDownLatch(1);
++			List<Future<List<Validator>>> results = new ArrayList<>(callers);
++			for (int i = 0; i < callers; i++) {
++				results.add(executor.submit(() -> {
++					startLine.await();
++					return HandlerUtil.getHandlersForType(Validator.class, DrugOrder.class);
++				}));
++			}
++			startLine.countDown();
++
++			// whoever won the race, the losers are handed the winner's list rather than their own copy,
++			// so all eight callers and every later lookup share one instance
++			List<Validator> expected = null;
++			for (Future<List<Validator>> result : results) {
++				List<Validator> handlers = result.get(30, TimeUnit.SECONDS);
++				assertEquals(2, handlers.size());
++				if (expected == null) {
++					expected = handlers;
++				} else {
++					assertSame(expected, handlers);
++				}
++			}
++
++			assertSame(expected, HandlerUtil.getHandlersForType(Validator.class, DrugOrder.class));
++		} finally {
++			executor.shutdownNow();
++		}
++	}
++
++	@Test
++	public void clearCachedHandlers_shouldForceHandlersToBeLookedUpAgain() {
++		List<Validator> before = HandlerUtil.getHandlersForType(Validator.class, Order.class);
++
++		HandlerUtil.clearCachedHandlers();
++
++		List<Validator> after = HandlerUtil.getHandlersForType(Validator.class, Order.class);
++		assertNotSame(before, after);
++		assertEquals(before, after);
++	}
++
++	/**
++	 * Calling onApplicationEvent directly would prove only that the method body clears the cache. What
++	 * has to hold is that Spring delivers the event at all, which it decides from the type argument of
++	 * the ApplicationListener the bean implements.
++	 */
++	@Test
++	public void onApplicationEvent_shouldBeDeliveredBySpringOnRefreshButNotOnClose() {
++		GenericApplicationContext listenerContext = new GenericApplicationContext();
++		listenerContext.registerBeanDefinition("handlerUtil", new RootBeanDefinition(HandlerUtil.class));
++		try {
++			List<Validator> beforeRefresh = HandlerUtil.getHandlersForType(Validator.class, Order.class);
++
++			listenerContext.refresh();
++
++			List<Validator> afterRefresh = HandlerUtil.getHandlersForType(Validator.class, Order.class);
++			assertNotSame(beforeRefresh, afterRefresh);
++
++			// closing must leave the cache alone: between a close and the refresh that follows it there
++			// is no application context to rescan, so a miss there would fail rather than serve handlers
++			listenerContext.close();
++
++			assertSame(afterRefresh, HandlerUtil.getHandlersForType(Validator.class, Order.class));
++		} finally {
++			listenerContext.close();
++		}
++	}
+ }

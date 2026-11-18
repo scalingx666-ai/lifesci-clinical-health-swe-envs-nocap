@@ -1,0 +1,178 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c1002cc126..b89a83125b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Fixed
+ 
++- Reject missing, repeated, or unsupported content types on the local privacy
++  proxy's chat routes before reading the request body (#5185).
++
+ - Discover nested public multimodal packages in the API compatibility gate,
+   require committed baseline coverage, and document baseline updates for new
+   packages. Private packages and unavailable optional shims are skipped
+diff --git a/docs/service/privacy-proxy.md b/docs/service/privacy-proxy.md
+index b4665680e1..25d5cbfd9c 100644
+--- a/docs/service/privacy-proxy.md
++++ b/docs/service/privacy-proxy.md
+@@ -6,7 +6,13 @@ listens locally, redacts text before calling an injected inference transport,
+ and restores the placeholders only in the local response.
+ 
+ The proxy exposes both `POST /v1/chat/completions` and
+-`POST /chat/completions`. A request uses the familiar shape:
++`POST /chat/completions`. Both routes require a single
++`Content-Type: application/json` header and accept parameters such as
++`charset=utf-8`. A missing, repeated, or unsupported content type returns
++HTTP 415 with the reason `unsupported_content_type` before the proxy reads
++the request body.
++
++Send requests using this JSON shape.
+ 
+ ```json
+ {
+diff --git a/openmed/service/privacy_proxy/app.py b/openmed/service/privacy_proxy/app.py
+index 839d25424a..45b798d564 100644
+--- a/openmed/service/privacy_proxy/app.py
++++ b/openmed/service/privacy_proxy/app.py
+@@ -37,6 +37,7 @@
+     InboundRestorationError,
+     InboundRestorationState,
+ )
++from .outbound import UnsupportedContentTypeError, _normalize_content_type
+ 
+ DEFAULT_MODEL = "openmed-local"
+ DEFAULT_REDACTION_MODEL = "OpenMed/OpenMed-PII-SuperClinical-Small-44M-v1"
+@@ -78,6 +79,13 @@ class PrivacyProxyRequestError(PrivacyProxyError):
+     reason_code = "invalid_request"
+ 
+ 
++class _UnsupportedRequestMediaTypeError(PrivacyProxyRequestError):
++    """Raised when the chat request lacks a single supported media type."""
++
++    status_code = 415
++    reason_code = "unsupported_content_type"
++
++
+ class PrivacyProxyConfigurationError(PrivacyProxyError):
+     """Raised when no local transport has been injected."""
+ 
+@@ -460,6 +468,13 @@ async def health() -> dict[str, Any]:
+ 
+     async def chat_completions(request: Request) -> Any:
+         try:
++            content_types = request.headers.getlist("content-type")
++            if len(content_types) != 1:
++                raise _UnsupportedRequestMediaTypeError()
++            try:
++                _normalize_content_type(content_types[0])
++            except UnsupportedContentTypeError:
++                raise _UnsupportedRequestMediaTypeError() from None
+             try:
+                 payload = await request.json()
+             except (TypeError, ValueError):
+diff --git a/tests/unit/service/privacy_proxy/test_app.py b/tests/unit/service/privacy_proxy/test_app.py
+index 2242206a2e..2b6a5b5701 100644
+--- a/tests/unit/service/privacy_proxy/test_app.py
++++ b/tests/unit/service/privacy_proxy/test_app.py
+@@ -5,6 +5,8 @@
+ import json
+ from typing import Any
+ 
++import pytest
++from fastapi import Request
+ from fastapi.testclient import TestClient
+ 
+ from openmed.service.privacy_proxy.app import create_app
+@@ -227,3 +229,91 @@ def test_unconfigured_proxy_is_local_and_fails_closed_without_echoing_input():
+     assert health.json()["transport_configured"] is False
+     assert response.status_code == 503
+     assert prompt not in response.text
++
++
++@pytest.mark.parametrize(
++    "content_type",
++    ["application/json; charset=utf-8", "Application/JSON; Charset=UTF-8"],
++)
++def test_chat_completion_accepts_json_content_type_with_charset(content_type: str):
++    seen_payloads: list[dict[str, Any]] = []
++
++    def transport(payload: dict[str, Any], **_: Any) -> str:
++        seen_payloads.append(payload)
++        return payload["messages"][0]["content"]
++
++    prompt = f"Contact {SYNTHETIC_NAME} at {SYNTHETIC_PHONE}."
++    body = json.dumps(
++        {
++            "model": "local-fixture",
++            "messages": [{"role": "user", "content": prompt}],
++        }
++    ).encode("utf-8")
++
++    with _client(transport) as client:
++        response = client.post(
++            "/v1/chat/completions",
++            content=body,
++            headers={"Content-Type": content_type},
++        )
++
++    assert response.status_code == 200
++    assert response.json()["choices"][0]["message"]["content"] == prompt
++    assert len(seen_payloads) == 1
++
++
++@pytest.mark.parametrize("path", ["/v1/chat/completions", "/chat/completions"])
++@pytest.mark.parametrize(
++    "headers",
++    [
++        [("Content-Type", "text/plain")],
++        [],
++        [("Content-Type", "application/json"), ("Content-Type", "text/plain")],
++    ],
++    ids=["non-json", "missing", "conflicting"],
++)
++def test_chat_completion_rejects_unsupported_media_type_without_reading_body(
++    path: str, headers: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
++):
++    def read_body(_request: Request) -> None:
++        pytest.fail("Unsupported media type reached the request body reader")
++
++    def transport(*_args: Any, **_kwargs: Any) -> str:
++        pytest.fail("Unsupported media type reached the transport")
++
++    monkeypatch.setattr(Request, "stream", read_body)
++    prompt = f"Contact {SYNTHETIC_NAME} at {SYNTHETIC_PHONE}."
++    body = json.dumps(
++        {
++            "model": "local-fixture",
++            "messages": [{"role": "user", "content": prompt}],
++        }
++    ).encode("utf-8")
++
++    with _client(transport) as client:
++        response = client.post(path, content=body, headers=headers)
++
++    assert response.status_code == 415
++    assert response.json() == {
++        "error": {
++            "code": "privacy_proxy_invalid_request",
++            "message": "Privacy proxy request failed",
++            "details": {"reason": "unsupported_content_type"},
++        }
++    }
++    assert SYNTHETIC_NAME not in response.text
++    assert SYNTHETIC_PHONE not in response.text
++    assert prompt not in response.text
++
++
++def test_chat_completion_returns_safe_400_for_malformed_json():
++    with TestClient(create_app()) as client:
++        response = client.post(
++            "/v1/chat/completions",
++            content=f'{{"messages": "{SYNTHETIC_NAME}',
++            headers={"Content-Type": "application/json"},
++        )
++
++    assert response.status_code == 400
++    assert response.json()["error"]["details"]["reason"] == "invalid_json"
++    assert SYNTHETIC_NAME not in response.text

@@ -9,9 +9,9 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: clinical-health.
 | Domain candidates (deduped) | 523 |
 | After active+star+noise filter | 271 |
 | Final target list (cap unlimited) | 271 |
-| Repos with >=1 task | 2 |
-| Repos with 0 tasks | 248 |
-| Total tasks (unlimited (no per-repo cap)) | 14 |
+| Repos with >=1 task | 36 |
+| Repos with 0 tasks | 214 |
+| Total tasks (unlimited (no per-repo cap)) | 2959 |
 
 ## Generation
 
@@ -23,49 +23,18 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: clinical-health.
 - Overlap with the 3 published cancer editions is allowed (user decision);
   domains are independent selections, not a partition of one repo set.
 
-## Zero-yield repos (informational, 248)
+## Zero-yield repos (informational, 214)
 
-- frappe/erpnext
-- maziyarpanahi/openmed
-- OpenHealthForAll/open-health
-- synthetichealth/synthea
-- medplum/medplum
-- the-momentum/open-wearables
-- hapifhir/hapi-fhir
-- openmrs/openmrs-core
-- thetahealth/mirobody
-- bowang-lab/MedRAX
-- ubicomplab/rPPG-Toolbox
-- dromara/skyeye
-- nextgenhealthcare/connect
 - xinxuxin/keystone-bench
-- zatosource/zato
 - MoH-Malaysia/covid19-public
-- google/fhir
 - FirelyTeam/firely-net-sdk
-- openboxes/openboxes
-- metriport/metriport
-- HL7/fhir
 - zou-group/sleepfm-clinical
 - hms-dbmi/CHIEF
-- smart-on-fhir/client-py
-- ohcnetwork/care_fe
-- NativeSensors/EyeGestures
 - informatici/openhospital
 - xjtulyc/MedgeClaw
-- ohs-foundation/android-fhir
-- avestura/EyesGuard
 - re-search/DocProduct
-- earthians/marley
-- TheAlphamerc/flutter_healthcare_app
-- opensource-emr/hospital-management-emr
-- dicoogle/dicoogle
-- microsoft/FHIR-Converter
-- MIC-DKFZ/nnInteractive
 - OpenClinica/OpenClinica
 - microsoft/dicom-server
-- StanfordMIMI/Merlin
-- Georgetown-IR-Lab/QuickUMLS
 - ohcnetwork/care
 - bluehalo/node-fhir-server-core
 - MIT-LCP/eicu-code
@@ -88,7 +57,6 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: clinical-health.
 - nHapiNET/nHapi
 - LibreHealthIO/lh-ehr
 - google/ground-android
-- aramis-lab/clinica
 - hgraph-os/hGraph
 - openhealthcare/opal
 - the-momentum/apple-health-mcp-server
@@ -135,12 +103,10 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: clinical-health.
 - vanderschaarlab/autoprognosis
 - HiLab-git/WORD
 - Clinical-Genomics/scout
-- mne-tools/mne-cpp
 - cds-hooks/docs
 - FredHutch/Oncoscape
 - SiyuanYan1/PanDerm
 - inferno-framework/fhir_client
-- predictive-clinical-neuroscience/PCNtoolkit
 - healthsites/healthsites
 - healthymind-tech/Taiwan-Health-MCP
 - bluehalo/graphql-fhir

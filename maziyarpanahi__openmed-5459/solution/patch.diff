@@ -1,0 +1,4935 @@
+diff --git a/docs/brand/system/publication.yml b/docs/brand/system/publication.yml
+index f5c9c57ce..cc961e6f4 100644
+--- a/docs/brand/system/publication.yml
++++ b/docs/brand/system/publication.yml
+@@ -663,6 +663,7 @@ classification:
+     - security/key-management.md
+     - security/key-custody-metadata.md
+     - security/audit-key-rotation.md
++    - security/audit-continuity.md
+     - security/encrypted-surrogate-vault.md
+     - security/access-review.md
+     - security/surrogate-key-providers.md
+diff --git a/docs/security/audit-continuity.md b/docs/security/audit-continuity.md
+new file mode 100644
+index 000000000..1bc432be0
+--- /dev/null
++++ b/docs/security/audit-continuity.md
+@@ -0,0 +1,207 @@
++# Audit continuity across rotation, retention, and restore
++
++A [tamper-evident audit chain](tamper-evident-audit-log.md) proves that its
++retained entries still link to each other. On its own it cannot prove that
++nothing was silently removed when entries aged out, that a chain restored from a
++backup is the chain that was backed up, or which signing key vouched for which
++part of the history. `openmed.core.audit_continuity` adds a versioned
++*continuity manifest* beside the chain that records those facts, and an offline
++verifier that checks them and fails closed with a stable, value-free reason
++code.
++
++The manifest and verifier make no network calls and never hold audit payloads,
++source text, identifiers, or key material.
++
++## The continuity manifest
++
++The manifest (`openmed.audit-continuity`, version 1) is a JSON document with an
++opaque `chain_id`, the chain format and genesis hash it is bound to, the digest
++and signature algorithms, and an ordered, hash-linked list of events. Every
++event commits to the previous event digest, to the chain identifier, and to the
++chain state when it was written: the next sequence number and the head hash.
++
++| Event | Records | Signed by |
++| --- | --- | --- |
++| `genesis` | Opens signer epoch 0 with a key ID | the epoch 0 key |
++| `anchor` | A periodic signed digest of the chain head | the active key |
++| `rotation` | Closes the active epoch and opens the next one | the outgoing **and** incoming keys |
++| `retention` | A pruning tombstone (below) | the active key |
++| `restore` | A restore from backup; opens a restore epoch | the restore epoch key |
++
++The header also carries a derived summary of the signer epochs. Each epoch has
++a key ID, the event that opened it, and a sequence validity window
++`[start_sequence, end_sequence)`; the active epoch has no end. Rotation windows
++are contiguous, so every chain entry belongs to exactly one epoch and the
++rotation event signs the boundary with both keys: there is no unsigned gap.
++
++### Pruning tombstones
++
++A `retention` event is a non-reversible tombstone for one pruned segment: the
++first and last sequence, the record count, the hash the first pruned entry
++linked to, the hash of the last pruned entry, a digest of the segment's entry
++hashes, and the fingerprint of the approving retention policy (plus the
++integrity digest of the approving retention report, when one is supplied).
++It holds no entry content. Tombstones must be contiguous from sequence 0, and
++the pruned chain must link to the last tombstone's boundary hash.
++
++A pruned chain document uses `openmed.audit-chain` version 2, which adds
++`base_sequence` and `base_hash`. Unpruned chains keep the version 1 layout.
++
++## Use the store
++
++`AuditContinuityStore` keeps the chain and the manifest in step. Key custody
++stays with the caller, exactly as for
++[audit-report signing key rotation](audit-key-rotation.md): the provider is a
++callback or mapping that resolves a non-secret key ID.
++
++```python
++from openmed.core.audit_continuity import AuditContinuityStore
++from openmed.risk.audit_retention import AuditRetentionPolicy, RetentionRule
++
++store = AuditContinuityStore(
++    "audit/chain-0001.json",
++    key_provider=caller_owned_key_provider,
++    anchor_interval=500,
++)
++store.initialize(key_id="audit-2026")
++
++store.append(report)              # commit an AuditReport to the chain
++store.anchor()                    # sign the current chain head
++store.rotate("audit-2027")        # atomic rollover to a new signing key
++
++policy = AuditRetentionPolicy(rules={"audit": RetentionRule.days(365)})
++store.prune_through(last_expired_sequence, policy=policy)
++
++report = store.verify()
++assert report.valid, report.code
++evidence = report.to_json()       # bounded, value-free release evidence
++```
++
++The manifest defaults to `<chain stem>.continuity.json` beside the chain.
++`initialize` adopts an existing valid chain; the genesis event commits to its
++current head.
++
++`prune_through` requires an approving policy: a `policy_fingerprint`, an
++`AuditRetentionPolicy`, or the `AuditRetentionReport` returned by
++`scrub_audit_artifacts`. Supplying approvals that disagree fails with
++`policy_mismatch`. Pruning is never skipped to keep the chain verifiable; the
++tombstone is what keeps it verifiable.
++
++### Concurrency and crash recovery
++
++Every store operation holds an exclusive lock for its whole read-modify-write
++cycle: a process-local lock plus an OS file lock on a permanent
++`.<manifest>.lock` file beside the manifest. Each document is written to a
++same-directory temporary file, flushed, fsynced, renamed into place, and the
++directory is fsynced. A rotation therefore commits to the exact chain head at
++the moment of rollover even when other threads or processes are appending, and
++concurrent requests to rotate to the same key produce one transition: rotating
++to the active key returns the event that opened its epoch.
++
++Pruning is write-ahead. The signed tombstone is made durable before the chain
++is rewritten. If the process stops in between, verification reports
++`incomplete_transition`, and the next store operation or `store.recover()`
++checks the still-present entries against the tombstone and completes the
++pruning deterministically. If those entries no longer match, recovery refuses
++with `tombstone_mismatch`. `recover()` also removes stale temporary files.
++
++### Restores
++
++After restoring the chain (and the manifest, when it was backed up) and before
++writers resume, call the restore hook:
++
++```python
++from openmed.core.audit_continuity import record_restore_transition
++
++record_restore_transition(
++    "audit/chain-0001.json",
++    key_provider=caller_owned_key_provider,
++    backup_digest=recovery_point_manifest_digest,
++)
++```
++
++Pruning recorded in the manifest is re-applied first, so a restore never brings
++pruned entries back. The restore event opens a new signer epoch and commits to
++the restored chain head. If only the chain was rolled back and the manifest is
++the live one, chain-head commitments from the lost timeline are reported as
++superseded rather than as failures; earlier commitments must still match, so a
++restored chain that forked from the recorded history is refused.
++
++`AuditContinuityRecoveryHook` adapts the same call to a recovery workflow that
++calls `open_recovery_epoch(context)` with a context exposing `manifest_digest`
++and `recovery_point_id`. Point it at the staged chain so the restore event is
++part of the state that becomes live. Back up the continuity manifest together
++with its chain.
++
++## Verify offline
++
++```python
++from openmed.core.audit_chain import AuditChain
++from openmed.core.audit_continuity import ContinuityManifest, verify_continuity
++
++report = verify_continuity(
++    AuditChain.load("audit/chain-0001.json"),
++    ContinuityManifest.load("audit/chain-0001.continuity.json"),
++    key_provider=verification_key_provider,
++    trusted_anchors=retained_head_refs,
++    allowed_policy_fingerprints=[policy.fingerprint],
++)
++```
++
++The report contains only versions, counts, digests, the opaque chain ID, key
++IDs, epoch windows, policy fingerprints, and a `code`. It is never partially
++valid: `report.valid` is true only when every check passed. Chain entries
++appended after the last signed event fail with `unanchored_tail` unless
++`allow_unanchored_tail=True` is passed; they are then counted in
++`unanchored_entry_count`.
++
++| Code | Meaning |
++| --- | --- |
++| `valid` | Every check passed. |
++| `malformed_manifest` | The manifest has unknown fields, wrong types, or invalid JSON. |
++| `unsupported_version` | Unknown manifest format, version, or algorithm. |
++| `chain_mismatch` | The manifest belongs to another chain or chain format. |
++| `chain_invalid` | The audit chain itself does not verify. |
++| `event_gap` | An event is missing, or the declared event count disagrees. |
++| `event_duplicate` | An event index appears twice. |
++| `event_reordered` | Events are out of order. |
++| `fork` | An event does not link to its predecessor, history moved backwards without a restore, or a trusted anchor diverged. |
++| `epoch_mismatch` | Epoch numbering, an epoch-opening event, or the epoch summary was altered. |
++| `unsigned_epoch_transition` | A rotation or restore lacks a required signature. |
++| `signature_invalid` | A signature does not verify. |
++| `unknown_signer_key` | An event is signed by a key that never opened an epoch. |
++| `retired_signer_key` | An event is signed by, or a new epoch reuses, a retired epoch key. |
++| `signer_key_unavailable` | The provider cannot resolve a key that must be verified. |
++| `anchor_mismatch` | A signed chain-head commitment no longer matches the chain, or an anchor was altered. |
++| `anchor_missing` | A trusted anchor is no longer in the manifest. |
++| `sequence_gap` | Chain records were deleted, or pruning is not explained by tombstones. |
++| `tombstone_mismatch` | A tombstone was altered or disagrees with the chain or earlier anchors. |
++| `incomplete_transition` | A recorded pruning has not been applied yet; run `recover()`. |
++| `policy_mismatch` | A tombstone names a retention policy that is not allowed. |
++| `unanchored_tail` | Chain entries were appended after the last signed event. |
++
++### Trusted anchors and retiring keys
++
++Export `manifest.head_ref()` (an event index and digest) into release or
++compliance evidence. Passing those references back as `trusted_anchors`
++detects a manifest that was truncated (`anchor_missing`) or rewritten (`fork`).
++It also lets a retired key be removed from the verification provider once a
++trusted reference covers its epochs: the event digests up to the newest matching
++reference are authenticated by the hash links, so signatures at or before it
++whose keys are no longer available are counted in `unverified_signature_count`
++instead of failing. Without such a reference, a missing key fails with
++`signer_key_unavailable`.
++
++## Security boundary
++
++Signatures are HMAC-SHA256 over domain-separated, per-purpose derived keys, so
++a continuity signature can never be replayed as an audit-report signature or
++the other way round. HMAC is symmetric: verification proves integrity to
++holders of the provider, not public non-repudiation. The manifest header is not
++signed on its own; retain head references outside the manifest when truncation
++of the newest events matters. Choosing retention periods, key custody, and
++backup storage remain caller responsibilities.
++
++This continuity layer covers the de-identification audit chain in
++`openmed.core.audit_chain`. The separate hash-chained log used by GDPR and Part
++11 workflows in `openmed.compliance.audit_chain` is not covered yet.
+diff --git a/docs/security/audit-key-rotation.md b/docs/security/audit-key-rotation.md
+index 88c5ff035..3e01db807 100644
+--- a/docs/security/audit-key-rotation.md
++++ b/docs/security/audit-key-rotation.md
+@@ -89,6 +89,12 @@ unverified data cannot be carried beside an otherwise valid signature.
+    permits retirement.
+ 4. Remove the former key from the provider only after that policy is met.
+ 
++To prove which key vouched for which part of an audit chain across rotations,
++record each rollover in the [audit continuity manifest](audit-continuity.md).
++Its signatures use `AuditKeyRotationSigner.sign_digest` and
++`AuditKeyRotationVerifier.verify_digest`, which sign value-free digests with a
++separate per-purpose key derivation.
++
+ Key IDs must be stable, non-secret metadata identifiers such as
+ `audit-2026`. Never use a raw key, token, patient identifier, or document text
+ as a key ID. HMAC is symmetric: verification proves integrity to callers that
+diff --git a/docs/security/tamper-evident-audit-log.md b/docs/security/tamper-evident-audit-log.md
+index 4e2c79489..c2152fd1d 100644
+--- a/docs/security/tamper-evident-audit-log.md
++++ b/docs/security/tamper-evident-audit-log.md
+@@ -83,6 +83,16 @@ detector evidence, mappings, free-form metadata, or residual-risk notes.
+ Unknown fields are rejected when a chain is loaded so uncommitted data cannot
+ be hidden alongside the verified payload.
+ 
++## Pruned chains
++
++`AuditChain.prune_through(sequence)` removes the oldest entries once a
++retention policy allows it. The pruned document uses chain version 2 and keeps
++`base_sequence` and `base_hash`, the hash of the last removed entry, so the
++remaining entries still link and verify. Unpruned chains keep the version 1
++layout. Use [audit continuity](audit-continuity.md) to record a signed,
++value-free tombstone for each pruned segment, so verification can prove that
++the missing prefix was removed by policy and not deleted silently.
++
+ ## Security boundary
+ 
+ A valid chain proves that its contents still match its retained count, head,
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 0e993a2fd..ec6096cc3 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -604,6 +604,7 @@ nav:
+       - Key Management and Rotation: security/key-management.md
+       - Key Custody Metadata: security/key-custody-metadata.md
+       - Audit-report Signing Key Rotation: security/audit-key-rotation.md
++      - Audit Continuity Across Rotation and Retention: security/audit-continuity.md
+       - Encrypted Surrogate Mappings: security/encrypted-surrogate-vault.md
+       - Structured Access Review: security/access-review.md
+       - Surrogate-key Providers: security/surrogate-key-providers.md
+diff --git a/openmed/core/__init__.py b/openmed/core/__init__.py
+index 450587264..783c99db9 100644
+--- a/openmed/core/__init__.py
++++ b/openmed/core/__init__.py
+@@ -9,6 +9,16 @@
+     append_to_chain_file,
+     verify_chain,
+ )
++from .audit_continuity import (
++    AuditContinuityError,
++    AuditContinuityRecoveryHook,
++    AuditContinuityStore,
++    ContinuityAnchorRef,
++    ContinuityManifest,
++    ContinuityVerificationReport,
++    record_restore_transition,
++    verify_continuity,
++)
+ from .audit_key_rotation import (
+     MAX_AUDIT_HMAC_KEY_BYTES,
+     MIN_AUDIT_HMAC_KEY_BYTES,
+@@ -267,6 +277,14 @@
+     "ChainVerificationResult",
+     "append_to_chain_file",
+     "verify_chain",
++    "AuditContinuityError",
++    "AuditContinuityRecoveryHook",
++    "AuditContinuityStore",
++    "ContinuityAnchorRef",
++    "ContinuityManifest",
++    "ContinuityVerificationReport",
++    "record_restore_transition",
++    "verify_continuity",
+     "AuditKeyProvider",
+     "AuditKeyRotationError",
+     "AuditKeyRotationSigner",
+diff --git a/openmed/core/audit_chain.py b/openmed/core/audit_chain.py
+index ab17e10e1..d6e66a0f4 100644
+--- a/openmed/core/audit_chain.py
++++ b/openmed/core/audit_chain.py
+@@ -3,10 +3,17 @@
+ The chain stores only canonical labels, offsets, and cryptographic hashes from
+ an :class:`~openmed.core.audit.AuditReport`. It deliberately excludes source
+ text, replacements, detector evidence, context, and reversible mappings.
++
++A chain may be pruned under a retention policy. A pruned chain keeps the
++sequence number and entry hash of its last removed entry as a retained base,
++so the remaining entries still link and verify. The removed prefix is
++described elsewhere by value-free tombstones in the continuity manifest
++(:mod:`openmed.core.audit_continuity`).
+ """
+ 
+ from __future__ import annotations
+ 
++import contextlib
+ import json
+ import os
+ import tempfile
+@@ -20,9 +27,24 @@
+ 
+ CHAIN_FORMAT = "openmed.audit-chain"
+ CHAIN_VERSION = 1
++PRUNED_CHAIN_VERSION = 2
++SUPPORTED_CHAIN_VERSIONS = frozenset({CHAIN_VERSION, PRUNED_CHAIN_VERSION})
+ GENESIS_HASH = stable_hash(
+     {"format": CHAIN_FORMAT, "version": CHAIN_VERSION, "sequence": -1}
+ )
++CHAIN_VERIFICATION_CODES = frozenset(
++    {
++        "valid",
++        "entry_count_excess",
++        "entry_count_deficit",
++        "sequence_reordered",
++        "sequence_gap",
++        "broken_link",
++        "entry_hash_mismatch",
++        "head_mismatch",
++        "chain_invalid",
++    }
++)
+ 
+ _CHAIN_FIELDS = {
+     "format",
+@@ -32,6 +54,7 @@
+     "head_hash",
+     "entries",
+ }
++_PRUNED_CHAIN_FIELDS = _CHAIN_FIELDS | {"base_sequence", "base_hash"}
+ _ENTRY_FIELDS = {
+     "sequence",
+     "previous_hash",
+@@ -76,6 +99,55 @@ def _reject_unknown_fields(
+         raise ValueError(f"{object_name} contains unsupported fields")
+ 
+ 
++def _fsync_directory(directory: Path) -> None:
++    """Best-effort flush of a directory entry after an atomic rename."""
++    if os.name == "nt":
++        return
++    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
++    try:
++        descriptor = os.open(directory, flags)
++    except OSError:  # pragma: no cover - platform/filesystem dependent
++        return
++    try:
++        os.fsync(descriptor)
++    except OSError:  # pragma: no cover - platform/filesystem dependent
++        pass
++    finally:
++        os.close(descriptor)
++
++
++def _atomic_write_text(path: Path, text: str) -> Path:
++    """Durably replace ``path`` with ``text`` via a same-directory rename.
++
++    The temporary file is flushed and fsynced before the rename and the parent
++    directory is fsynced afterwards, so a crash leaves either the previous or
++    the complete new document. A failed write removes its temporary file.
++    """
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temporary: Path | None = None
++    try:
++        with tempfile.NamedTemporaryFile(
++            "w",
++            delete=False,
++            dir=path.parent,
++            encoding="utf-8",
++            prefix=f".{path.name}.",
++            suffix=".tmp",
++        ) as handle:
++            temporary = Path(handle.name)
++            handle.write(text)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary, path)
++        temporary = None
++        _fsync_directory(path.parent)
++    finally:
++        if temporary is not None:
++            with contextlib.suppress(OSError):
++                temporary.unlink()
++    return path
++
++
+ @dataclass(frozen=True)
+ class AuditChainSpan:
+     """PHI-safe span material committed to an audit-chain entry."""
+@@ -208,12 +280,30 @@ def from_dict(cls, data: Mapping[str, Any]) -> "AuditChainEntry":
+ 
+ @dataclass(frozen=True)
+ class ChainVerificationResult:
+-    """Detailed result of an offline audit-chain verification."""
++    """Detailed result of an offline audit-chain verification.
++
++    Attributes:
++        valid: Whether the chain verified.
++        checked_entries: Number of entries checked before the result.
++        reason: Human-readable, value-free description.
++        entry_index: Position of the failing entry when one is identifiable.
++        code: Stable value-free reason code from
++            :data:`CHAIN_VERIFICATION_CODES`.
++    """
+ 
+     valid: bool
+     checked_entries: int
+     reason: str
+     entry_index: int | None = None
++    code: str | None = None
++
++    def __post_init__(self) -> None:
++        code = self.code
++        if code is None:
++            code = "valid" if self.valid else "chain_invalid"
++        if code not in CHAIN_VERIFICATION_CODES or (code == "valid") != self.valid:
++            raise ValueError("audit chain verification code is not supported")
++        object.__setattr__(self, "code", code)
+ 
+     def __bool__(self) -> bool:
+         return self.valid
+@@ -278,7 +368,19 @@ def _entry_from_report(
+ 
+ 
+ class AuditChain:
+-    """Append-only sequence of PHI-safe de-identification audit entries."""
++    """Append-only sequence of PHI-safe de-identification audit entries.
++
++    Args:
++        entries: Retained entries in sequence order.
++        declared_entry_count: Retained entry count recorded with the chain.
++        declared_head_hash: Retained head hash recorded with the chain.
++        base_sequence: Sequence number of the first retained entry. It is
++            ``0`` for an unpruned chain and the number of pruned entries after
++            policy-approved pruning.
++        base_hash: Entry hash of the last pruned entry, which the first
++            retained entry links to. It is :data:`GENESIS_HASH` when nothing
++            was pruned.
++    """
+ 
+     GENESIS_HASH = GENESIS_HASH
+ 
+@@ -288,14 +390,22 @@ def __init__(
+         *,
+         declared_entry_count: int | None = None,
+         declared_head_hash: str | None = None,
++        base_sequence: int = 0,
++        base_hash: str | None = None,
+     ) -> None:
++        if type(base_sequence) is not int or base_sequence < 0:
++            raise ValueError("audit chain base_sequence must be a non-negative integer")
++        resolved_base = self.GENESIS_HASH if base_hash is None else base_hash
++        _require_sha256_hash(resolved_base, "audit chain base_hash")
++        if (base_sequence == 0) != (resolved_base == self.GENESIS_HASH):
++            raise ValueError("audit chain base_hash does not match base_sequence")
++        self._base_sequence = base_sequence
++        self._base_hash = resolved_base
+         self._entries = list(entries or ())
+         self._declared_entry_count = (
+             len(self._entries) if declared_entry_count is None else declared_entry_count
+         )
+-        current_head = (
+-            self._entries[-1].entry_hash if self._entries else self.GENESIS_HASH
+-        )
++        current_head = self._entries[-1].entry_hash if self._entries else resolved_base
+         self._declared_head_hash = (
+             current_head if declared_head_hash is None else declared_head_hash
+         )
+@@ -310,6 +420,35 @@ def head_hash(self) -> str:
+         """Return the retained head hash that anchors the serialized chain."""
+         return self._declared_head_hash
+ 
++    @property
++    def base_sequence(self) -> int:
++        """Return the sequence number of the first retained entry."""
++        return self._base_sequence
++
++    @property
++    def base_hash(self) -> str:
++        """Return the hash the first retained entry links to."""
++        return self._base_hash
++
++    @property
++    def next_sequence(self) -> int:
++        """Return the sequence number the next appended entry will receive."""
++        return self._base_sequence + len(self._entries)
++
++    @property
++    def is_pruned(self) -> bool:
++        """Return whether a policy-approved prefix has been removed."""
++        return self._base_sequence > 0
++
++    def entry_at(self, sequence: int) -> AuditChainEntry | None:
++        """Return the retained entry at ``sequence``, or ``None`` if absent."""
++        if type(sequence) is not int:
++            return None
++        offset = sequence - self._base_sequence
++        if not 0 <= offset < len(self._entries):
++            return None
++        return self._entries[offset]
++
+     def append(self, report: AuditReport) -> AuditChainEntry:
+         """Verify and append one audit report without retaining raw PHI fields."""
+         current = self.verify()
+@@ -318,11 +457,11 @@ def append(self, report: AuditReport) -> AuditChainEntry:
+                 f"cannot append to an invalid audit chain: {current.reason}"
+             )
+         previous_hash = (
+-            self._entries[-1].entry_hash if self._entries else self.GENESIS_HASH
++            self._entries[-1].entry_hash if self._entries else self._base_hash
+         )
+         entry = _entry_from_report(
+             report,
+-            sequence=len(self._entries),
++            sequence=self.next_sequence,
+             previous_hash=previous_hash,
+         )
+         self._entries.append(entry)
+@@ -332,6 +471,40 @@ def append(self, report: AuditReport) -> AuditChainEntry:
+ 
+     append_report = append
+ 
++    def prune_through(self, last_sequence: int) -> tuple[AuditChainEntry, ...]:
++        """Remove retained entries up to and including ``last_sequence``.
++
++        The chain keeps the last removed entry hash as its new base so the
++        remaining entries still verify. Callers that need continuity evidence
++        should record a tombstone first, for example through
++        :meth:`openmed.core.audit_continuity.AuditContinuityStore.prune_through`.
++
++        Args:
++            last_sequence: Highest retained sequence number to remove.
++
++        Returns:
++            The removed entries, in sequence order.
++
++        Raises:
++            ValueError: If the chain is invalid or ``last_sequence`` is not a
++                retained sequence number.
++        """
++        current = self.verify()
++        if not current.valid:
++            raise ValueError(f"cannot prune an invalid audit chain: {current.reason}")
++        if (
++            type(last_sequence) is not int
++            or not self._base_sequence <= last_sequence < self.next_sequence
++        ):
++            raise ValueError("prune sequence must name a retained audit chain entry")
++        cut = last_sequence - self._base_sequence + 1
++        removed = tuple(self._entries[:cut])
++        self._entries = self._entries[cut:]
++        self._base_sequence = last_sequence + 1
++        self._base_hash = removed[-1].entry_hash
++        self._declared_entry_count = len(self._entries)
++        return removed
++
+     def verify(self) -> ChainVerificationResult:
+         """Verify count, order, links, entry hashes, and retained head offline."""
+         actual_count = len(self._entries)
+@@ -340,26 +513,32 @@ def verify(self) -> ChainVerificationResult:
+                 False,
+                 0,
+                 "insertion detected: chain contains more entries than declared",
++                code="entry_count_excess",
+             )
+         if actual_count < self._declared_entry_count:
+             return ChainVerificationResult(
+                 False,
+                 0,
+                 "deletion detected: chain contains fewer entries than declared",
++                code="entry_count_deficit",
+             )
+ 
+         sequences = [entry.sequence for entry in self._entries]
+-        expected_sequences = list(range(actual_count))
++        expected_sequences = list(
++            range(self._base_sequence, self._base_sequence + actual_count)
++        )
+         if sequences != expected_sequences:
+             if sorted(sequences) == expected_sequences:
+                 reason = "reordering detected: entry sequence is out of order"
++                code = "sequence_reordered"
+             else:
+                 reason = (
+                     "insertion or deletion detected: entry sequence is not contiguous"
+                 )
+-            return ChainVerificationResult(False, 0, reason)
++                code = "sequence_gap"
++            return ChainVerificationResult(False, 0, reason, code=code)
+ 
+-        previous_hash = self.GENESIS_HASH
++        previous_hash = self._base_hash
+         for index, entry in enumerate(self._entries):
+             if entry.previous_hash != previous_hash:
+                 return ChainVerificationResult(
+@@ -367,6 +546,7 @@ def verify(self) -> ChainVerificationResult:
+                     index,
+                     f"reordering or mutation detected: broken link at entry {index}",
+                     index,
++                    code="broken_link",
+                 )
+             if entry.entry_hash != entry.compute_hash():
+                 return ChainVerificationResult(
+@@ -374,6 +554,7 @@ def verify(self) -> ChainVerificationResult:
+                     index,
+                     f"mutation detected: hash mismatch at entry {index}",
+                     index,
++                    code="entry_hash_mismatch",
+                 )
+             previous_hash = entry.entry_hash
+ 
+@@ -382,6 +563,7 @@ def verify(self) -> ChainVerificationResult:
+                 False,
+                 actual_count,
+                 "deletion or mutation detected: retained head hash does not match",
++                code="head_mismatch",
+             )
+         return ChainVerificationResult(
+             True,
+@@ -396,8 +578,12 @@ def contains_report(self, report: AuditReport) -> bool:
+         )
+ 
+     def to_dict(self) -> dict[str, Any]:
+-        """Return the versioned chain envelope and retained head anchor."""
+-        return {
++        """Return the versioned chain envelope and retained head anchor.
++
++        Unpruned chains keep the version 1 layout. Pruned chains use version 2,
++        which adds ``base_sequence`` and ``base_hash``.
++        """
++        payload: dict[str, Any] = {
+             "format": CHAIN_FORMAT,
+             "version": CHAIN_VERSION,
+             "genesis_hash": self.GENESIS_HASH,
+@@ -405,6 +591,11 @@ def to_dict(self) -> dict[str, Any]:
+             "head_hash": self._declared_head_hash,
+             "entries": [entry.to_dict() for entry in self._entries],
+         }
++        if self.is_pruned:
++            payload["version"] = PRUNED_CHAIN_VERSION
++            payload["base_sequence"] = self._base_sequence
++            payload["base_hash"] = self._base_hash
++        return payload
+ 
+     def to_json(self) -> str:
+         """Serialize the chain deterministically."""
+@@ -413,11 +604,26 @@ def to_json(self) -> str:
+     @classmethod
+     def from_dict(cls, data: Mapping[str, Any]) -> "AuditChain":
+         """Load a versioned audit chain from a mapping."""
+-        _reject_unknown_fields(data, _CHAIN_FIELDS, "audit chain")
++        version = data.get("version")
++        pruned = type(version) is int and version == PRUNED_CHAIN_VERSION
++        _reject_unknown_fields(
++            data,
++            _PRUNED_CHAIN_FIELDS if pruned else _CHAIN_FIELDS,
++            "audit chain",
++        )
+         if data.get("format") != CHAIN_FORMAT:
+             raise ValueError(f"audit chain format must be {CHAIN_FORMAT!r}")
+-        if data.get("version") != CHAIN_VERSION:
++        if type(version) is not int or version not in SUPPORTED_CHAIN_VERSIONS:
+             raise ValueError("unsupported audit chain version")
++        base_sequence: Any = 0
++        base_hash = GENESIS_HASH
++        if pruned:
++            base_sequence = data.get("base_sequence")
++            if type(base_sequence) is not int or base_sequence < 1:
++                raise ValueError("audit chain base_sequence must be a positive integer")
++            base_hash = _require_sha256_hash(
++                data.get("base_hash"), "audit chain base_hash"
++            )
+         if data.get("genesis_hash") != GENESIS_HASH:
+             raise ValueError("audit chain genesis_hash does not match this format")
+         declared_count = data.get("entry_count")
+@@ -438,6 +644,8 @@ def from_dict(cls, data: Mapping[str, Any]) -> "AuditChain":
+             loaded_entries,
+             declared_entry_count=declared_count,
+             declared_head_hash=declared_head,
++            base_sequence=base_sequence,
++            base_hash=base_hash,
+         )
+ 
+     @classmethod
+@@ -457,21 +665,8 @@ def load(cls, path: str | Path) -> "AuditChain":
+         return cls.from_json(Path(path).read_text(encoding="utf-8"))
+ 
+     def write(self, path: str | Path) -> Path:
+-        """Atomically persist the complete chain document."""
+-        destination = Path(path)
+-        destination.parent.mkdir(parents=True, exist_ok=True)
+-        with tempfile.NamedTemporaryFile(
+-            "w",
+-            delete=False,
+-            dir=destination.parent,
+-            encoding="utf-8",
+-            prefix=f".{destination.name}.",
+-        ) as handle:
+-            handle.write(self.to_json())
+-            handle.write("\n")
+-            temporary = Path(handle.name)
+-        os.replace(temporary, destination)
+-        return destination
++        """Atomically and durably persist the complete chain document."""
++        return _atomic_write_text(Path(path), self.to_json() + "\n")
+ 
+ 
+ def verify_chain(chain: AuditChain | Mapping[str, Any]) -> ChainVerificationResult:
+@@ -495,9 +690,12 @@ def append_to_chain_file(path: str | Path, report: AuditReport) -> AuditChainEnt
+     "AuditChainEntry",
+     "AuditChainSpan",
+     "CHAIN_FORMAT",
++    "CHAIN_VERIFICATION_CODES",
+     "CHAIN_VERSION",
+     "ChainVerificationResult",
+     "GENESIS_HASH",
++    "PRUNED_CHAIN_VERSION",
++    "SUPPORTED_CHAIN_VERSIONS",
+     "append_to_chain_file",
+     "verify_chain",
+ ]
+diff --git a/openmed/core/audit_continuity.py b/openmed/core/audit_continuity.py
+new file mode 100644
+index 000000000..32f5a9378
+--- /dev/null
++++ b/openmed/core/audit_continuity.py
+@@ -0,0 +1,2456 @@
++"""Tamper-evident audit continuity across key rotation, retention, and restore.
++
++An :class:`~openmed.core.audit_chain.AuditChain` proves that its retained
++entries still link to each other. It cannot, on its own, prove that nothing was
++silently removed when entries aged out, that the chain restored from a backup
++is the chain that was backed up, or which signing key vouched for which part of
++the history. This module adds a versioned *continuity manifest* beside the
++chain that records those facts as a hash-linked, signed event log:
++
++* ``genesis`` opens signer epoch 0 for a chain identifier.
++* ``anchor`` is a periodic signed digest of the chain head.
++* ``rotation`` closes the current signer epoch and opens the next one. It is
++  signed by both the outgoing and the incoming key, so there is no unsigned gap
++  between epochs.
++* ``retention`` is a non-reversible pruning tombstone: first and last sequence,
++  record count, boundary entry hashes, a digest of the pruned segment, and the
++  approving retention-policy fingerprint. It never holds entry content.
++* ``restore`` records that the chain was restored from a backup and opens a
++  restore epoch.
++
++Every event commits to the chain state at the time it was written (the next
++sequence number and the head hash), to the previous event digest, and to the
++opaque chain identifier. :func:`verify_continuity` replays the log offline and
++returns a bounded, value-free :class:`ContinuityVerificationReport` with a
++stable reason code from :data:`CONTINUITY_REASON_CODES`.
++
++:class:`AuditContinuityStore` keeps the chain file and the manifest in step.
++Every mutation runs under an exclusive lock (a process-local lock plus an OS
++file lock) and writes each document with an fsynced atomic rename. Pruning is
++write-ahead: the tombstone is made durable before the chain is rewritten, and
++any interrupted pruning is completed deterministically on the next operation
++or by :meth:`AuditContinuityStore.recover`.
++
++Signatures reuse the caller-owned key providers from
++:mod:`openmed.core.audit_key_rotation`. OpenMed never stores, logs, or exports
++key material; manifests and reports carry only key identifiers. Nothing in
++this module makes network calls.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import os
++import re
++import secrets
++import stat
++import sys
++import threading
++from collections.abc import Iterable, Iterator, Mapping, Sequence
++from dataclasses import dataclass
++from pathlib import Path
++from types import MappingProxyType
++from typing import TYPE_CHECKING, Any, Final
++
++from .audit import AuditReport, stable_hash
++from .audit_chain import (
++    CHAIN_FORMAT,
++    GENESIS_HASH,
++    AuditChain,
++    AuditChainEntry,
++    _atomic_write_text,
++)
++from .audit_key_rotation import (
++    AUDIT_SIGNATURE_ALGORITHM,
++    AuditKeyRotationError,
++    KeyProvider,
++    _digest_signature_status,
++    _sign_digest,
++    _validate_provider,
++)
++
++if TYPE_CHECKING:
++    from openmed.risk.audit_retention import (
++        AuditRetentionPolicy,
++        AuditRetentionReport,
++    )
++
++CONTINUITY_FORMAT: Final = "openmed.audit-continuity"
++CONTINUITY_VERSION: Final = 1
++CONTINUITY_REPORT_FORMAT: Final = "openmed.audit-continuity.verification"
++CONTINUITY_REPORT_VERSION: Final = 1
++CONTINUITY_DIGEST_ALGORITHM: Final = "sha256"
++CONTINUITY_SIGNATURE_ALGORITHM: Final = AUDIT_SIGNATURE_ALGORITHM
++CONTINUITY_SIGNATURE_PURPOSE: Final = "audit-continuity"
++MAX_CONTINUITY_EVENTS: Final = 65_536
++MAX_CONTINUITY_JSON_BYTES: Final = 64 * 1024 * 1024
++CONTINUITY_EVENT_KINDS: Final = (
++    "genesis",
++    "anchor",
++    "rotation",
++    "retention",
++    "restore",
++)
++
++CONTINUITY_REASON_CODES: Final = frozenset(
++    {
++        "valid",
++        "malformed_manifest",
++        "unsupported_version",
++        "chain_mismatch",
++        "chain_invalid",
++        "event_gap",
++        "event_duplicate",
++        "event_reordered",
++        "fork",
++        "epoch_mismatch",
++        "unsigned_epoch_transition",
++        "signature_invalid",
++        "unknown_signer_key",
++        "retired_signer_key",
++        "signer_key_unavailable",
++        "anchor_mismatch",
++        "anchor_missing",
++        "sequence_gap",
++        "tombstone_mismatch",
++        "incomplete_transition",
++        "policy_mismatch",
++        "unanchored_tail",
++    }
++)
++"""Stable, value-free outcomes of :func:`verify_continuity`."""
++
++CONTINUITY_ERROR_CODES: Final = CONTINUITY_REASON_CODES | frozenset(
++    {
++        "already_initialized",
++        "not_initialized",
++        "invalid_argument",
++        "lock_failed",
++        "io_failed",
++    }
++)
++"""Codes carried by :class:`AuditContinuityError`."""
++
++_SAFE_ID_RE: Final = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
++_DIGEST_RE: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
++_SIGNATURE_RE: Final = re.compile(r"^[0-9a-f]{64}$")
++_EPOCH_OPENERS: Final = frozenset({"genesis", "rotation", "restore"})
++_TRANSITIONS: Final = frozenset({"rotation", "restore"})
++_SIGNATURE_ROLES: Final = frozenset({"signer", "outgoing", "incoming"})
++_BODY_FIELDS: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
++    {
++        "genesis": frozenset({"key_id"}),
++        "anchor": frozenset(),
++        "rotation": frozenset({"from_key_id", "to_key_id"}),
++        "retention": frozenset(
++            {
++                "first_sequence",
++                "last_sequence",
++                "record_count",
++                "start_hash",
++                "end_hash",
++                "segment_digest",
++                "policy_fingerprint",
++                "retention_report_digest",
++            }
++        ),
++        "restore": frozenset({"key_id", "restore_id", "backup_digest"}),
++    }
++)
++_MANIFEST_FIELDS: Final = frozenset(
++    {
++        "format",
++        "version",
++        "chain_id",
++        "chain_format",
++        "chain_genesis_hash",
++        "digest_algorithm",
++        "signature_algorithm",
++        "event_count",
++        "head_digest",
++        "epochs",
++        "events",
++    }
++)
++_EVENT_FIELDS: Final = frozenset(
++    {
++        "index",
++        "kind",
++        "epoch",
++        "previous_digest",
++        "next_sequence",
++        "head_hash",
++        "body",
++        "digest",
++        "signatures",
++    }
++)
++_SIGNATURE_FIELDS: Final = frozenset({"role", "key_id", "algorithm", "value"})
++_EPOCH_FIELDS: Final = frozenset(
++    {
++        "epoch",
++        "key_id",
++        "opened_by",
++        "opened_at_event",
++        "start_sequence",
++        "end_sequence",
++        "closed_at_event",
++        "state",
++    }
++)
++_ANCHOR_REF_FIELDS: Final = frozenset({"index", "digest"})
++_COUNT_FIELDS: Final = (
++    "event_count",
++    "epoch_count",
++    "anchor_count",
++    "rotation_count",
++    "retention_count",
++    "restore_count",
++    "next_sequence",
++    "retained_entry_count",
++    "pruned_entry_count",
++    "unanchored_entry_count",
++    "superseded_event_count",
++    "pruned_anchor_count",
++    "trusted_anchor_count",
++    "superseded_trusted_anchor_count",
++    "unverified_signature_count",
++)
++
++
++class AuditContinuityError(ValueError):
++    """Raised with a stable, value-free code when continuity cannot hold.
++
++    Attributes:
++        code: One of :data:`CONTINUITY_ERROR_CODES`.
++    """
++
++    def __init__(self, code: str) -> None:
++        self.code = code if code in CONTINUITY_ERROR_CODES else "malformed_manifest"
++        super().__init__(f"audit continuity failed: {self.code}")
++
++
++def _fail(code: str) -> AuditContinuityError:
++    return AuditContinuityError(code)
++
++
++def _require_int(value: Any, *, minimum: int = 0) -> int:
++    if type(value) is not int or value < minimum:
++        raise _fail("malformed_manifest")
++    return value
++
++
++def _require_digest(value: Any) -> str:
++    if type(value) is not str or not _DIGEST_RE.fullmatch(value):
++        raise _fail("malformed_manifest")
++    return value
++
++
++def _require_safe_id(value: Any) -> str:
++    if type(value) is not str or not _SAFE_ID_RE.fullmatch(value):
++        raise _fail("malformed_manifest")
++    return value
++
++
++def _require_fields(data: Any, fields: frozenset[str]) -> dict[str, Any]:
++    if not isinstance(data, Mapping):
++        raise _fail("malformed_manifest")
++    try:
++        snapshot = dict(data.items())
++    except Exception:  # noqa: BLE001 - mappings may execute caller code.
++        raise _fail("malformed_manifest") from None
++    if set(snapshot) != fields or not all(type(key) is str for key in snapshot):
++        raise _fail("malformed_manifest")
++    return snapshot
++
++
++def _require_list(value: Any, *, limit: int) -> list[Any]:
++    if type(value) is not list or len(value) > limit:
++        raise _fail("malformed_manifest")
++    return value
++
++
++def _new_opaque_id(prefix: str) -> str:
++    return f"{prefix}-{secrets.token_hex(16)}"
++
++
++def _canonical_json(data: Any) -> str:
++    return json.dumps(
++        data,
++        allow_nan=False,
++        ensure_ascii=True,
++        separators=(",", ":"),
++        sort_keys=True,
++    )
++
++
++def continuity_origin_digest(chain_id: str) -> str:
++    """Return the domain-separated digest the first event links to.
++
++    Args:
++        chain_id: Opaque chain identifier recorded in the manifest.
++    """
++
++    return stable_hash(
++        {
++            "format": f"{CONTINUITY_FORMAT}.origin",
++            "version": CONTINUITY_VERSION,
++            "chain_id": chain_id,
++            "chain_format": CHAIN_FORMAT,
++            "chain_genesis_hash": GENESIS_HASH,
++        }
++    )
++
++
++def tombstone_segment_digest(
++    chain_id: str,
++    entries: Sequence[AuditChainEntry],
++) -> str:
++    """Return the non-reversible digest of a pruned chain segment.
++
++    The digest commits to the chain identifier, the segment bounds, and the
++    entry hashes only. Entry hashes are themselves digests, so the result
++    reveals nothing about audit payloads.
++
++    Args:
++        chain_id: Opaque chain identifier recorded in the manifest.
++        entries: The contiguous entries being pruned, in sequence order.
++
++    Raises:
++        AuditContinuityError: If ``entries`` is empty.
++    """
++
++    if not entries:
++        raise _fail("invalid_argument")
++    return stable_hash(
++        {
++            "format": f"{CONTINUITY_FORMAT}.segment",
++            "version": CONTINUITY_VERSION,
++            "chain_id": chain_id,
++            "first_sequence": entries[0].sequence,
++            "last_sequence": entries[-1].sequence,
++            "entry_hashes": [entry.entry_hash for entry in entries],
++        }
++    )
++
++
++@dataclass(frozen=True)
++class ContinuitySignature:
++    """One HMAC signature over an event digest.
++
++    Attributes:
++        role: ``"signer"`` for ordinary events, or ``"outgoing"`` and
++            ``"incoming"`` for epoch transitions.
++        key_id: Non-secret identifier of the signing key.
++        algorithm: Signature algorithm, currently ``"HMAC-SHA256"``.
++        value: Hex signature value. It never contains key material.
++    """
++
++    role: str
++    key_id: str
++    algorithm: str
++    value: str
++
++    def __post_init__(self) -> None:
++        if type(self.role) is not str or self.role not in _SIGNATURE_ROLES:
++            raise _fail("malformed_manifest")
++        _require_safe_id(self.key_id)
++        _require_safe_id(self.algorithm)
++        if type(self.value) is not str or not _SIGNATURE_RE.fullmatch(self.value):
++            raise _fail("malformed_manifest")
++
++    def to_dict(self) -> dict[str, str]:
++        """Return the JSON-compatible signature."""
++
++        return {
++            "role": self.role,
++            "key_id": self.key_id,
++            "algorithm": self.algorithm,
++            "value": self.value,
++        }
++
++    @classmethod
++    def from_dict(cls, data: Mapping[str, Any]) -> ContinuitySignature:
++        """Load a signature, rejecting unknown fields."""
++
++        values = _require_fields(data, _SIGNATURE_FIELDS)
++        return cls(
++            role=values["role"],
++            key_id=values["key_id"],
++            algorithm=values["algorithm"],
++            value=values["value"],
++        )
++
++
++@dataclass(frozen=True)
++class RetentionTombstone:
++    """Value-free record of one policy-approved pruned chain segment.
++
++    Attributes:
++        first_sequence: First pruned sequence number.
++        last_sequence: Last pruned sequence number.
++        record_count: Number of pruned entries.
++        start_hash: ``previous_hash`` of the first pruned entry.
++        end_hash: ``entry_hash`` of the last pruned entry; the retained chain
++            links to it.
++        segment_digest: :func:`tombstone_segment_digest` of the segment.
++        policy_fingerprint: Fingerprint of the approving retention policy.
++        retention_report_digest: Integrity digest of the approving retention
++            report, when one was supplied.
++    """
++
++    first_sequence: int
++    last_sequence: int
++    record_count: int
++    start_hash: str
++    end_hash: str
++    segment_digest: str
++    policy_fingerprint: str
++    retention_report_digest: str | None = None
++
++    def __post_init__(self) -> None:
++        _require_int(self.first_sequence)
++        _require_int(self.last_sequence)
++        _require_int(self.record_count, minimum=1)
++        _require_digest(self.start_hash)
++        _require_digest(self.end_hash)
++        _require_digest(self.segment_digest)
++        _require_digest(self.policy_fingerprint)
++        if self.retention_report_digest is not None:
++            _require_digest(self.retention_report_digest)
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the JSON-compatible tombstone body."""
++
++        return {
++            "first_sequence": self.first_sequence,
++            "last_sequence": self.last_sequence,
++            "record_count": self.record_count,
++            "start_hash": self.start_hash,
++            "end_hash": self.end_hash,
++            "segment_digest": self.segment_digest,
++            "policy_fingerprint": self.policy_fingerprint,
++            "retention_report_digest": self.retention_report_digest,
++        }
++
++    @classmethod
++    def from_dict(cls, data: Mapping[str, Any]) -> RetentionTombstone:
++        """Load a tombstone body, rejecting unknown fields."""
++
++        values = _require_fields(data, _BODY_FIELDS["retention"])
++        return cls(**values)
++
++
++def verify_tombstone_segment(
++    tombstone: RetentionTombstone,
++    entries: Sequence[AuditChainEntry],
++    *,
++    chain_id: str,
++) -> bool:
++    """Return whether ``entries`` are exactly the segment a tombstone describes.
++
++    Use this to check a retained backup copy of a pruned segment before that
++    copy is itself disposed of.
++
++    Args:
++        tombstone: The tombstone recorded when the segment was pruned.
++        entries: Candidate entries, in sequence order.
++        chain_id: Opaque chain identifier recorded in the manifest.
++    """
++
++    try:
++        entries = tuple(entries)
++        if len(entries) != tombstone.record_count:
++            return False
++        sequences = [entry.sequence for entry in entries]
++        expected = list(range(tombstone.first_sequence, tombstone.last_sequence + 1))
++        if sequences != expected:
++            return False
++        previous = tombstone.start_hash
++        for entry in entries:
++            if entry.previous_hash != previous or entry.compute_hash() != (
++                entry.entry_hash
++            ):
++                return False
++            previous = entry.entry_hash
++        return (
++            previous == tombstone.end_hash
++            and tombstone_segment_digest(chain_id, entries) == tombstone.segment_digest
++        )
++    except Exception:  # noqa: BLE001 - verification must fail closed.
++        return False
++
++
++def _validate_body(kind: str, body: Any) -> MappingProxyType[str, Any]:
++    fields = _BODY_FIELDS.get(kind)
++    if fields is None:
++        raise _fail("malformed_manifest")
++    values = _require_fields(body, fields)
++    if kind == "genesis":
++        _require_safe_id(values["key_id"])
++    elif kind == "rotation":
++        _require_safe_id(values["from_key_id"])
++        _require_safe_id(values["to_key_id"])
++    elif kind == "retention":
++        values = RetentionTombstone.from_dict(values).to_dict()
++    elif kind == "restore":
++        _require_safe_id(values["key_id"])
++        _require_safe_id(values["restore_id"])
++        _require_digest(values["backup_digest"])
++    return MappingProxyType(dict(sorted(values.items())))
++
++
++def _event_digest(
++    *,
++    chain_id: str,
++    index: int,
++    kind: str,
++    epoch: int,
++    previous_digest: str,
++    next_sequence: int,
++    head_hash: str,
++    body: Mapping[str, Any],
++) -> str:
++    return stable_hash(
++        {
++            "format": f"{CONTINUITY_FORMAT}.event",
++            "version": CONTINUITY_VERSION,
++            "chain_id": chain_id,
++            "index": index,
++            "kind": kind,
++            "epoch": epoch,
++            "previous_digest": previous_digest,
++            "next_sequence": next_sequence,
++            "head_hash": head_hash,
++            "body": dict(body),
++        }
++    )
++
++
++@dataclass(frozen=True)
++class ContinuityEvent:
++    """One hash-linked, signed event in a continuity manifest.
++
++    Attributes:
++        index: Position of the event in the manifest, starting at 0.
++        kind: One of :data:`CONTINUITY_EVENT_KINDS`.
++        epoch: Signer epoch the event belongs to. Transitions carry the epoch
++            they open.
++        previous_digest: Digest of the preceding event, or the chain origin
++            digest for the first event.
++        next_sequence: The chain's next sequence number when the event was
++            written, i.e. the number of entries ever committed.
++        head_hash: The chain head hash when the event was written.
++        body: Kind-specific, value-free fields.
++        digest: Digest over every field above and the chain identifier.
++        signatures: Signatures over ``digest``.
++    """
++
++    index: int
++    kind: str
++    epoch: int
++    previous_digest: str
++    next_sequence: int
++    head_hash: str
++    body: Mapping[str, Any]
++    digest: str
++    signatures: tuple[ContinuitySignature, ...]
++
++    def __post_init__(self) -> None:
++        _require_int(self.index)
++        if type(self.kind) is not str or self.kind not in CONTINUITY_EVENT_KINDS:
++            raise _fail("malformed_manifest")
++        _require_int(self.epoch)
++        _require_digest(self.previous_digest)
++        _require_int(self.next_sequence)
++        _require_digest(self.head_hash)
++        _require_digest(self.digest)
++        object.__setattr__(self, "body", _validate_body(self.kind, self.body))
++        signatures = tuple(self.signatures)
++        if len(signatures) > len(_SIGNATURE_ROLES) or not all(
++            type(item) is ContinuitySignature for item in signatures
++        ):
++            raise _fail("malformed_manifest")
++        object.__setattr__(self, "signatures", signatures)
++
++    def compute_digest(self, chain_id: str) -> str:
++        """Return the digest this event should carry for ``chain_id``."""
++
++        return _event_digest(
++            chain_id=chain_id,
++            index=self.index,
++            kind=self.kind,
++            epoch=self.epoch,
++            previous_digest=self.previous_digest,
++            next_sequence=self.next_sequence,
++            head_hash=self.head_hash,
++            body=self.body,
++        )
++
++    @property
++    def tombstone(self) -> RetentionTombstone | None:
++        """Return the pruning tombstone of a ``retention`` event."""
++
++        if self.kind != "retention":
++            return None
++        return RetentionTombstone.from_dict(self.body)
++
++    @property
++    def opened_key_id(self) -> str | None:
++        """Return the key ID an epoch-opening event introduces."""
++
++        if self.kind in {"genesis", "restore"}:
++            return str(self.body["key_id"])
++        if self.kind == "rotation":
++            return str(self.body["to_key_id"])
++        return None
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the JSON-compatible event."""
++
++        return {
++            "index": self.index,
++            "kind": self.kind,
++            "epoch": self.epoch,
++            "previous_digest": self.previous_digest,
++            "next_sequence": self.next_sequence,
++            "head_hash": self.head_hash,
++            "body": dict(self.body),
++            "digest": self.digest,
++            "signatures": [item.to_dict() for item in self.signatures],
++        }
++
++    @classmethod
++    def from_dict(cls, data: Mapping[str, Any]) -> ContinuityEvent:
++        """Load an event, rejecting unknown fields and malformed values."""
++
++        values = _require_fields(data, _EVENT_FIELDS)
++        signatures = _require_list(values["signatures"], limit=len(_SIGNATURE_ROLES))
++        return cls(
++            index=values["index"],
++            kind=values["kind"],
++            epoch=values["epoch"],
++            previous_digest=values["previous_digest"],
++            next_sequence=values["next_sequence"],
++            head_hash=values["head_hash"],
++            body=values["body"],
++            digest=values["digest"],
++            signatures=tuple(
++                ContinuitySignature.from_dict(item) for item in signatures
++            ),
++        )
++
++
++@dataclass(frozen=True)
++class SignerEpoch:
++    """Summary of one signer epoch and its sequence validity window.
++
++    Attributes:
++        epoch: Epoch number, starting at 0.
++        key_id: Non-secret identifier of the epoch signing key.
++        opened_by: Event kind that opened the epoch.
++        opened_at_event: Index of the opening event.
++        start_sequence: First chain sequence the epoch vouches for.
++        end_sequence: Exclusive end of the window, or ``None`` while active.
++        closed_at_event: Index of the closing transition, or ``None``.
++    """
++
++    epoch: int
++    key_id: str
++    opened_by: str
++    opened_at_event: int
++    start_sequence: int
++    end_sequence: int | None = None
++    closed_at_event: int | None = None
++
++    def __post_init__(self) -> None:
++        _require_int(self.epoch)
++        _require_safe_id(self.key_id)
++        if self.opened_by not in _EPOCH_OPENERS:
++            raise _fail("malformed_manifest")
++        _require_int(self.opened_at_event)
++        _require_int(self.start_sequence)
++        if (self.end_sequence is None) != (self.closed_at_event is None):
++            raise _fail("malformed_manifest")
++        if self.end_sequence is not None:
++            _require_int(self.end_sequence)
++            _require_int(self.closed_at_event)
++
++    @property
++    def state(self) -> str:
++        """Return ``"active"`` for the open epoch and ``"retired"`` otherwise."""
++
++        return "active" if self.end_sequence is None else "retired"
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the JSON-compatible epoch summary."""
++
++        return {
++            "epoch": self.epoch,
++            "key_id": self.key_id,
++            "opened_by": self.opened_by,
++            "opened_at_event": self.opened_at_event,
++            "start_sequence": self.start_sequence,
++            "end_sequence": self.end_sequence,
++            "closed_at_event": self.closed_at_event,
++            "state": self.state,
++        }
++
++    @classmethod
++    def from_dict(cls, data: Mapping[str, Any]) -> SignerEpoch:
++        """Load an epoch summary, rejecting unknown fields."""
++
++        values = _require_fields(data, _EPOCH_FIELDS)
++        epoch = cls(
++            epoch=values["epoch"],
++            key_id=values["key_id"],
++            opened_by=values["opened_by"],
++            opened_at_event=values["opened_at_event"],
++            start_sequence=values["start_sequence"],
++            end_sequence=values["end_sequence"],
++            closed_at_event=values["closed_at_event"],
++        )
++        if values["state"] != epoch.state:
++            raise _fail("malformed_manifest")
++        return epoch
++
++
++def derive_epochs(events: Sequence[ContinuityEvent]) -> tuple[SignerEpoch, ...]:
++    """Derive the ordered signer epochs that a sequence of events describes.
++
++    The derivation is structural only; :func:`verify_continuity` checks the
++    signatures and ordering that make the epochs trustworthy.
++
++    Args:
++        events: Manifest events in index order.
++    """
++
++    epochs: list[SignerEpoch] = []
++    for event in events:
++        key_id = event.opened_key_id
++        if key_id is None:
++            continue
++        if epochs and event.kind in _TRANSITIONS:
++            current = epochs[-1]
++            epochs[-1] = SignerEpoch(
++                epoch=current.epoch,
++                key_id=current.key_id,
++                opened_by=current.opened_by,
++                opened_at_event=current.opened_at_event,
++                start_sequence=current.start_sequence,
++                end_sequence=event.next_sequence,
++                closed_at_event=event.index,
++            )
++        epochs.append(
++            SignerEpoch(
++                epoch=event.epoch,
++                key_id=key_id,
++                opened_by=event.kind,
++                opened_at_event=event.index,
++                start_sequence=0 if event.kind == "genesis" else event.next_sequence,
++            )
++        )
++    return tuple(epochs)
++
++
++@dataclass(frozen=True)
++class ContinuityAnchorRef:
++    """Externally retained reference to one manifest event.
++
++    Export :meth:`ContinuityManifest.head_ref` into release or compliance
++    evidence; passing it back to :func:`verify_continuity` later detects a
++    truncated or rewritten manifest and lets retired keys be dropped for the
++    history it covers.
++
++    Attributes:
++        index: Event index.
++        digest: Event digest.
++    """
++
++    index: int
++    digest: str
++
++    def __post_init__(self) -> None:
++        _require_int(self.index)
++        _require_digest(self.digest)
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the JSON-compatible reference."""
++
++        return {"index": self.index, "digest": self.digest}
++
++    @classmethod
++    def from_dict(cls, data: Mapping[str, Any]) -> ContinuityAnchorRef:
++        """Load a reference, rejecting unknown fields."""
++
++        values = _require_fields(data, _ANCHOR_REF_FIELDS)
++        return cls(index=values["index"], digest=values["digest"])
++
++
++@dataclass(frozen=True)
++class ContinuityManifest:
++    """Versioned, transport-neutral continuity manifest for one audit chain.
++
++    The header fields ``event_count``, ``head_digest``, and ``epochs`` are
++    derived from ``events`` when omitted and verified against them by
++    :func:`verify_continuity` when loaded from a document.
++
++    Attributes:
++        chain_id: Opaque chain identifier. It must not encode patient,
++            document, or deployment identifiers.
++        events: Events in index order.
++        declared_event_count: Event count recorded in the document header.
++        declared_head_digest: Last event digest recorded in the header.
++        declared_epochs: Epoch summary recorded in the header.
++    """
++
++    chain_id: str
++    events: tuple[ContinuityEvent, ...]
++    declared_event_count: int | None = None
++    declared_head_digest: str | None = None
++    declared_epochs: tuple[SignerEpoch, ...] | None = None
++
++    def __post_init__(self) -> None:
++        _require_safe_id(self.chain_id)
++        events = tuple(self.events)
++        if not events or len(events) > MAX_CONTINUITY_EVENTS:
++            raise _fail("malformed_manifest")
++        if not all(type(item) is ContinuityEvent for item in events):
++            raise _fail("malformed_manifest")
++        object.__setattr__(self, "events", events)
++        if self.declared_event_count is None:
++            object.__setattr__(self, "declared_event_count", len(events))
++        else:
++            _require_int(self.declared_event_count)
++        if self.declared_head_digest is None:
++            object.__setattr__(self, "declared_head_digest", events[-1].digest)
++        else:
++            _require_digest(self.declared_head_digest)
++        if self.declared_epochs is None:
++            object.__setattr__(self, "declared_epochs", derive_epochs(events))
++        else:
++            object.__setattr__(self, "declared_epochs", tuple(self.declared_epochs))
++
++    @property
++    def event_count(self) -> int:
++        """Return the number of events."""
++
++        return len(self.events)
++
++    @property
++    def head_event(self) -> ContinuityEvent:
++        """Return the most recent event."""
++
++        return self.events[-1]
++
++    @property
++    def head_digest(self) -> str:
++        """Return the most recent event digest."""
++
++        return self.events[-1].digest
++
++    @property
++    def epochs(self) -> tuple[SignerEpoch, ...]:
++        """Return the signer epochs derived from the events."""
++
++        return derive_epochs(self.events)
++
++    @property
++    def current_epoch(self) -> SignerEpoch:
++        """Return the active signer epoch."""
++
++        epochs = self.epochs
++        if not epochs:
++            raise _fail("epoch_mismatch")
++        return epochs[-1]
++
++    @property
++    def used_key_ids(self) -> frozenset[str]:
++        """Return every key ID that has opened an epoch."""
++
++        return frozenset(epoch.key_id for epoch in self.epochs)
++
++    @property
++    def tombstones(self) -> tuple[RetentionTombstone, ...]:
++        """Return the pruning tombstones in event order."""
++
++        return tuple(
++            tombstone
++            for event in self.events
++            if (tombstone := event.tombstone) is not None
++        )
++
++    @property
++    def pruned_through(self) -> int:
++        """Return the number of chain entries the tombstones cover."""
++
++        tombstones = self.tombstones
++        return tombstones[-1].last_sequence + 1 if tombstones else 0
++
++    def head_ref(self) -> ContinuityAnchorRef:
++        """Return a reference to the head event for external retention."""
++
++        head = self.head_event
++        return ContinuityAnchorRef(index=head.index, digest=head.digest)
++
++    def with_event(self, event: ContinuityEvent) -> ContinuityManifest:
++        """Return a new manifest with ``event`` appended."""
++
++        return ContinuityManifest(chain_id=self.chain_id, events=(*self.events, event))
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the versioned, value-free manifest document."""
++
++        epochs = self.declared_epochs or ()
++        return {
++            "format": CONTINUITY_FORMAT,
++            "version": CONTINUITY_VERSION,
++            "chain_id": self.chain_id,
++            "chain_format": CHAIN_FORMAT,
++            "chain_genesis_hash": GENESIS_HASH,
++            "digest_algorithm": CONTINUITY_DIGEST_ALGORITHM,
++            "signature_algorithm": CONTINUITY_SIGNATURE_ALGORITHM,
++            "event_count": self.declared_event_count,
++            "head_digest": self.declared_head_digest,
++            "epochs": [epoch.to_dict() for epoch in epochs],
++            "events": [event.to_dict() for event in self.events],
++        }
++
++    def to_json(self) -> str:
++        """Serialize the manifest deterministically."""
++
++        return _canonical_json(self.to_dict())
++
++    def write(self, path: str | Path) -> Path:
++        """Atomically and durably write the manifest document."""
++
++        return _atomic_write_text(Path(path), self.to_json() + "\n")
++
++    @classmethod
++    def from_dict(cls, data: Mapping[str, Any]) -> ContinuityManifest:
++        """Load a manifest document.
++
++        Raises:
++            AuditContinuityError: With ``unsupported_version`` for an unknown
++                format, version, or algorithm, ``chain_mismatch`` for a manifest
++                bound to another chain format, and ``malformed_manifest`` for
++                any structural problem.
++        """
++
++        if not isinstance(data, Mapping):
++            raise _fail("malformed_manifest")
++        if data.get("format") != CONTINUITY_FORMAT:
++            raise _fail("unsupported_version")
++        version = data.get("version")
++        if type(version) is not int or version != CONTINUITY_VERSION:
++            raise _fail("unsupported_version")
++        values = _require_fields(data, _MANIFEST_FIELDS)
++        if (
++            values["digest_algorithm"] != CONTINUITY_DIGEST_ALGORITHM
++            or values["signature_algorithm"] != CONTINUITY_SIGNATURE_ALGORITHM
++        ):
++            raise _fail("unsupported_version")
++        if (
++            values["chain_format"] != CHAIN_FORMAT
++            or values["chain_genesis_hash"] != GENESIS_HASH
++        ):
++            raise _fail("chain_mismatch")
++        events = _require_list(values["events"], limit=MAX_CONTINUITY_EVENTS)
++        epochs = _require_list(values["epochs"], limit=MAX_CONTINUITY_EVENTS)
++        return cls(
++            chain_id=_require_safe_id(values["chain_id"]),
++            events=tuple(ContinuityEvent.from_dict(item) for item in events),
++            declared_event_count=_require_int(values["event_count"]),
++            declared_head_digest=_require_digest(values["head_digest"]),
++            declared_epochs=tuple(SignerEpoch.from_dict(item) for item in epochs),
++        )
++
++    @classmethod
++    def from_json(cls, data: str | bytes) -> ContinuityManifest:
++        """Load a manifest from strict, size-bounded JSON."""
++
++        size = len(data) if isinstance(data, bytes) else len(data.encode("utf-8"))
++        if size > MAX_CONTINUITY_JSON_BYTES:
++            raise _fail("malformed_manifest")
++        try:
++            parsed = json.loads(
++                data,
++                object_pairs_hook=_unique_object,
++                parse_constant=_reject_constant,
++            )
++        except (RecursionError, TypeError, ValueError, UnicodeDecodeError):
++            raise _fail("malformed_manifest") from None
++        return cls.from_dict(parsed)
++
++    @classmethod
++    def load(cls, path: str | Path) -> ContinuityManifest:
++        """Load a manifest document from disk."""
++
++        source = Path(path)
++        try:
++            if source.stat().st_size > MAX_CONTINUITY_JSON_BYTES:
++                raise _fail("malformed_manifest")
++            payload = source.read_bytes()
++        except OSError:
++            raise _fail("io_failed") from None
++        return cls.from_json(payload)
++
++
++def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
++    result: dict[str, Any] = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError("duplicate key")
++        result[key] = value
++    return result
++
++
++def _reject_constant(_value: str) -> None:
++    raise ValueError("non-finite constant")
++
++
++@dataclass(frozen=True)
++class ContinuityVerificationReport:
++    """Bounded, value-free outcome of :func:`verify_continuity`.
++
++    The report holds only versions, counts, digests, opaque identifiers, key
++    identifiers, epoch windows, and a controlled reason code. It is suitable
++    for offline release or compliance evidence.
++
++    Attributes:
++        valid: Whether continuity verified.
++        code: One of :data:`CONTINUITY_REASON_CODES`.
++        event_index: Index of the event that failed, when one is identifiable.
++        chain_id: Opaque chain identifier, when the manifest could be read.
++        manifest_digest: Head event digest, when the manifest could be read.
++        chain_head_hash: Audit chain head hash, when the chain could be read.
++        counts: Fixed set of non-negative counters.
++        epochs: Derived signer epochs.
++        policy_fingerprints: Retention-policy fingerprints that approved
++            pruning, in first-use order.
++    """
++
++    valid: bool
++    code: str
++    event_index: int | None
++    chain_id: str | None
++    manifest_digest: str | None
++    chain_head_hash: str | None
++    counts: Mapping[str, int]
++    epochs: tuple[SignerEpoch, ...] = ()
++    policy_fingerprints: tuple[str, ...] = ()
++
++    def __post_init__(self) -> None:
++        if self.code not in CONTINUITY_REASON_CODES or self.valid != (
++            self.code == "valid"
++        ):
++            raise ValueError("continuity report code is not supported")
++        counts = {name: int(self.counts.get(name, 0)) for name in _COUNT_FIELDS}
++        if any(value < 0 for value in counts.values()):
++            raise ValueError("continuity report counts must be non-negative")
++        object.__setattr__(self, "counts", MappingProxyType(counts))
++        object.__setattr__(self, "epochs", tuple(self.epochs))
++        object.__setattr__(self, "policy_fingerprints", tuple(self.policy_fingerprints))
++
++    def __bool__(self) -> bool:
++        return self.valid
++
++    def _payload(self) -> dict[str, Any]:
++        return {
++            "format": CONTINUITY_REPORT_FORMAT,
++            "version": CONTINUITY_REPORT_VERSION,
++            "manifest_version": CONTINUITY_VERSION,
++            "valid": self.valid,
++            "code": self.code,
++            "event_index": self.event_index,
++            "chain_id": self.chain_id,
++            "manifest_digest": self.manifest_digest,
++            "chain_head_hash": self.chain_head_hash,
++            "counts": dict(self.counts),
++            "epochs": [epoch.to_dict() for epoch in self.epochs],
++            "policy_fingerprints": list(self.policy_fingerprints),
++        }
++
++    @property
++    def report_digest(self) -> str:
++        """Return the digest binding the complete report payload."""
++
++        return stable_hash(self._payload())
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the report with its integrity digest."""
++
++        return {**self._payload(), "report_digest": self.report_digest}
++
++    def to_json(self, *, indent: int | None = None) -> str:
++        """Serialize the report deterministically."""
++
++        return json.dumps(
++            self.to_dict(),
++            allow_nan=False,
++            ensure_ascii=True,
++            indent=indent,
++            separators=None if indent is not None else (",", ":"),
++            sort_keys=True,
++        )
++
++
++class _Failure(Exception):
++    def __init__(self, code: str, index: int | None = None) -> None:
++        super().__init__(code)
++        self.code = code
++        self.index = index
++
++
++def _coerce_chain(chain: AuditChain | Mapping[str, Any]) -> AuditChain:
++    if isinstance(chain, AuditChain):
++        return chain
++    if not isinstance(chain, Mapping):
++        raise _Failure("chain_invalid")
++    try:
++        return AuditChain.from_dict(chain)
++    except Exception:  # noqa: BLE001 - malformed input must fail closed.
++        raise _Failure("chain_invalid") from None
++
++
++def _coerce_manifest(
++    manifest: ContinuityManifest | Mapping[str, Any],
++) -> ContinuityManifest:
++    if isinstance(manifest, ContinuityManifest):
++        return manifest
++    try:
++        return ContinuityManifest.from_dict(manifest)
++    except AuditContinuityError as error:
++        raise _Failure(error.code) from None
++    except Exception:  # noqa: BLE001 - malformed input must fail closed.
++        raise _Failure("malformed_manifest") from None
++
++
++def _coerce_refs(
++    refs: Iterable[ContinuityAnchorRef | Mapping[str, Any]],
++) -> tuple[ContinuityAnchorRef, ...]:
++    try:
++        items = list(refs)
++        if len(items) > MAX_CONTINUITY_EVENTS:
++            raise _fail("invalid_argument")
++        return tuple(
++            item
++            if isinstance(item, ContinuityAnchorRef)
++            else ContinuityAnchorRef.from_dict(item)
++            for item in items
++        )
++    except Exception:  # noqa: BLE001 - malformed input must fail closed.
++        raise _Failure("malformed_manifest") from None
++
++
++def _coerce_fingerprints(values: Iterable[str] | None) -> frozenset[str] | None:
++    if values is None:
++        return None
++    try:
++        items = frozenset(values)
++    except TypeError:
++        raise _Failure("policy_mismatch") from None
++    if not all(type(item) is str and _DIGEST_RE.fullmatch(item) for item in items):
++        raise _Failure("policy_mismatch")
++    return items
++
++
++_DIGEST_MISMATCH_CODES: Final[Mapping[str, str]] = MappingProxyType(
++    {
++        "anchor": "anchor_mismatch",
++        "retention": "tombstone_mismatch",
++        "genesis": "epoch_mismatch",
++        "rotation": "epoch_mismatch",
++        "restore": "epoch_mismatch",
++    }
++)
++
++_CHAIN_CODE_MAP: Final[Mapping[str, str]] = MappingProxyType(
++    {
++        "entry_count_deficit": "sequence_gap",
++        "sequence_gap": "sequence_gap",
++        "head_mismatch": "sequence_gap",
++    }
++)
++
++
++class _Verification:
++    """One offline replay of a continuity manifest against an audit chain."""
++
++    def __init__(
++        self,
++        *,
++        key_provider: KeyProvider,
++        trusted_anchors: tuple[ContinuityAnchorRef, ...],
++        allowed_policy_fingerprints: frozenset[str] | None,
++        expected_chain_id: str | None,
++        allow_unanchored_tail: bool,
++        tolerate_unavailable_keys: bool,
++    ) -> None:
++        self.provider = key_provider
++        self.trusted = trusted_anchors
++        self.allowed = allowed_policy_fingerprints
++        self.expected_chain_id = expected_chain_id
++        self.allow_tail = allow_unanchored_tail
++        self.tolerate = tolerate_unavailable_keys
++        self.counts: dict[str, int] = dict.fromkeys(_COUNT_FIELDS, 0)
++        self.manifest: ContinuityManifest | None = None
++        self.chain: AuditChain | None = None
++        self.policies: list[str] = []
++        self.checkpoint = -1
++
++    def report(
++        self, code: str, index: int | None = None
++    ) -> ContinuityVerificationReport:
++        manifest = self.manifest
++        chain = self.chain
++        epochs: tuple[SignerEpoch, ...] = ()
++        if manifest is not None:
++            with contextlib.suppress(Exception):
++                epochs = derive_epochs(manifest.events)
++            self.counts["event_count"] = manifest.event_count
++            self.counts["epoch_count"] = len(epochs)
++            for kind in ("anchor", "rotation", "retention", "restore"):
++                self.counts[f"{kind}_count"] = sum(
++                    1 for event in manifest.events if event.kind == kind
++                )
++        if chain is not None:
++            self.counts["next_sequence"] = chain.next_sequence
++            self.counts["retained_entry_count"] = len(chain.entries)
++            self.counts["pruned_entry_count"] = chain.base_sequence
++        return ContinuityVerificationReport(
++            valid=code == "valid",
++            code=code,
++            event_index=index,
++            chain_id=manifest.chain_id if manifest is not None else None,
++            manifest_digest=manifest.head_digest if manifest is not None else None,
++            chain_head_hash=chain.head_hash if chain is not None else None,
++            counts=self.counts,
++            epochs=epochs,
++            policy_fingerprints=tuple(self.policies),
++        )
++
++    def run(
++        self,
++        chain: AuditChain | Mapping[str, Any],
++        manifest: ContinuityManifest | Mapping[str, Any],
++    ) -> ContinuityVerificationReport:
++        try:
++            self.manifest = _coerce_manifest(manifest)
++            self.chain = _coerce_chain(chain)
++            self._verify_header()
++            self._verify_indices()
++            self._verify_trusted_anchors()
++            self._replay_events()
++            self._verify_declared_summary()
++            self._verify_chain()
++            self._verify_coverage()
++            self._verify_chain_states()
++            self._verify_tail()
++        except _Failure as failure:
++            return self.report(failure.code, failure.index)
++        return self.report("valid")
++
++    # Manifest-level checks -------------------------------------------------
++
++    def _verify_header(self) -> None:
++        manifest = self._manifest()
++        if (
++            self.expected_chain_id is not None
++            and manifest.chain_id != self.expected_chain_id
++        ):
++            raise _Failure("chain_mismatch")
++
++    def _verify_indices(self) -> None:
++        manifest = self._manifest()
++        indices = [event.index for event in manifest.events]
++        seen: set[int] = set()
++        for index in indices:
++            if index in seen:
++                raise _Failure("event_duplicate", index)
++            seen.add(index)
++        expected = list(range(len(indices)))
++        if indices != sorted(indices):
++            position = next(
++                position
++                for position, (actual, wanted) in enumerate(
++                    zip(indices, sorted(indices), strict=True)
++                )
++                if actual != wanted
++            )
++            raise _Failure("event_reordered", position)
++        if indices != expected:
++            missing = next(
++                wanted
++                for actual, wanted in zip(indices, expected, strict=True)
++                if actual != wanted
++            )
++            raise _Failure("event_gap", missing)
++        if manifest.declared_event_count != len(indices):
++            raise _Failure("event_gap", len(indices))
++
++    def _verify_trusted_anchors(self) -> None:
++        manifest = self._manifest()
++        events = manifest.events
++        restore_indices = [event.index for event in events if event.kind == "restore"]
++        for ref in self.trusted:
++            if ref.index < len(events) and events[ref.index].digest == ref.digest:
++                self.counts["trusted_anchor_count"] += 1
++                self.checkpoint = max(self.checkpoint, ref.index)
++            elif any(index <= ref.index for index in restore_indices):
++                self.counts["superseded_trusted_anchor_count"] += 1
++            elif ref.index >= len(events):
++                raise _Failure("anchor_missing", ref.index)
++            else:
++                raise _Failure("fork", ref.index)
++
++    def _replay_events(self) -> None:
++        manifest = self._manifest()
++        chain_id = manifest.chain_id
++        previous = continuity_origin_digest(chain_id)
++        epoch_keys: list[str] = []
++        current_key: str | None = None
++        last_next = 0
++        coverage_next = 0
++        coverage_hash = GENESIS_HASH
++        for event in manifest.events:
++            index = event.index
++            if index == 0 and event.previous_digest != previous:
++                # The origin digest binds the chain identifier; a mismatch
++                # means the manifest was issued for another chain.
++                raise _Failure("chain_mismatch", index)
++            if event.compute_digest(chain_id) != event.digest:
++                raise _Failure(_DIGEST_MISMATCH_CODES[event.kind], index)
++            if event.previous_digest != previous:
++                raise _Failure("fork", index)
++            if (index == 0) != (event.kind == "genesis"):
++                raise _Failure("epoch_mismatch", index)
++            current_epoch = len(epoch_keys) - 1
++            expected_epoch = (
++                current_epoch + 1 if event.kind in _EPOCH_OPENERS else current_epoch
++            )
++            if event.epoch != expected_epoch:
++                raise _Failure("epoch_mismatch", index)
++
++            retired = frozenset(epoch_keys) - {current_key}
++            if event.kind == "genesis":
++                expected = {"signer": str(event.body["key_id"])}
++            elif event.kind in {"anchor", "retention"}:
++                expected = {"signer": str(current_key)}
++            elif event.kind == "rotation":
++                if event.body["from_key_id"] != current_key:
++                    raise _Failure("epoch_mismatch", index)
++                to_key = str(event.body["to_key_id"])
++                if to_key in epoch_keys:
++                    raise _Failure("retired_signer_key", index)
++                expected = {"outgoing": str(current_key), "incoming": to_key}
++            else:
++                restore_key = str(event.body["key_id"])
++                if restore_key in retired:
++                    raise _Failure("retired_signer_key", index)
++                expected = {"incoming": restore_key}
++            all_keys = frozenset(epoch_keys)
++            self._verify_signatures(event, expected, all_keys)
++
++            if event.kind != "restore" and event.next_sequence < last_next:
++                raise _Failure("fork", index)
++            tombstone = event.tombstone
++            if tombstone is not None:
++                if tombstone.last_sequence < tombstone.first_sequence or (
++                    tombstone.record_count
++                    != tombstone.last_sequence - tombstone.first_sequence + 1
++                ):
++                    raise _Failure("tombstone_mismatch", index)
++                if tombstone.first_sequence > coverage_next:
++                    raise _Failure("sequence_gap", index)
++                if (
++                    tombstone.first_sequence < coverage_next
++                    or tombstone.start_hash != coverage_hash
++                    or tombstone.last_sequence >= event.next_sequence
++                ):
++                    raise _Failure("tombstone_mismatch", index)
++                if (
++                    self.allowed is not None
++                    and tombstone.policy_fingerprint not in self.allowed
++                ):
++                    raise _Failure("policy_mismatch", index)
++                if tombstone.policy_fingerprint not in self.policies:
++                    self.policies.append(tombstone.policy_fingerprint)
++                coverage_next = tombstone.last_sequence + 1
++                coverage_hash = tombstone.end_hash
++            if event.kind == "restore" and event.next_sequence < coverage_next:
++                raise _Failure("tombstone_mismatch", index)
++
++            opened = event.opened_key_id
++            if opened is not None:
++                epoch_keys.append(opened)
++                current_key = opened
++            last_next = event.next_sequence
++            previous = event.digest
++
++    def _verify_signatures(
++        self,
++        event: ContinuityEvent,
++        expected: Mapping[str, str],
++        known_keys: frozenset[str],
++    ) -> None:
++        index = event.index
++        roles = [signature.role for signature in event.signatures]
++        if len(roles) != len(set(roles)):
++            raise _Failure("signature_invalid", index)
++        if set(roles) != set(expected):
++            if event.kind in _TRANSITIONS and set(expected) - set(roles):
++                raise _Failure("unsigned_epoch_transition", index)
++            raise _Failure("signature_invalid", index)
++        for signature in event.signatures:
++            wanted = expected[signature.role]
++            if signature.key_id != wanted:
++                if signature.key_id in known_keys:
++                    raise _Failure("retired_signer_key", index)
++                raise _Failure("unknown_signer_key", index)
++            if signature.algorithm != CONTINUITY_SIGNATURE_ALGORITHM:
++                raise _Failure("signature_invalid", index)
++            try:
++                status = _digest_signature_status(
++                    self.provider,
++                    event.digest,
++                    signature.value,
++                    key_id=signature.key_id,
++                    purpose=CONTINUITY_SIGNATURE_PURPOSE,
++                    role=signature.role,
++                )
++            except Exception:  # noqa: BLE001 - provider failures fail closed.
++                status = "unavailable"
++            if status == "unavailable":
++                if self.tolerate or index <= self.checkpoint:
++                    self.counts["unverified_signature_count"] += 1
++                    continue
++                raise _Failure("signer_key_unavailable", index)
++            if status != "valid":
++                raise _Failure("signature_invalid", index)
++
++    def _verify_declared_summary(self) -> None:
++        manifest = self._manifest()
++        if manifest.declared_head_digest != manifest.head_digest:
++            raise _Failure("fork", manifest.event_count - 1)
++        derived = [epoch.to_dict() for epoch in derive_epochs(manifest.events)]
++        declared = [epoch.to_dict() for epoch in manifest.declared_epochs or ()]
++        if derived != declared:
++            raise _Failure("epoch_mismatch")
++
++    # Chain-level checks ----------------------------------------------------
++
++    def _verify_chain(self) -> None:
++        result = self._chain().verify()
++        if not result.valid:
++            raise _Failure(_CHAIN_CODE_MAP.get(str(result.code), "chain_invalid"))
++
++    def _verify_coverage(self) -> None:
++        manifest = self._manifest()
++        chain = self._chain()
++        tombstones = manifest.tombstones
++        coverage_next = manifest.pruned_through
++        coverage_hash = tombstones[-1].end_hash if tombstones else GENESIS_HASH
++        if chain.base_sequence > coverage_next:
++            raise _Failure("sequence_gap")
++        if chain.base_sequence < coverage_next:
++            for tombstone in tombstones:
++                if tombstone.last_sequence < chain.base_sequence:
++                    continue
++                if tombstone.first_sequence < chain.base_sequence:
++                    raise _Failure("tombstone_mismatch")
++                entries = [
++                    chain.entry_at(sequence)
++                    for sequence in range(
++                        tombstone.first_sequence, tombstone.last_sequence + 1
++                    )
++                ]
++                present = [entry for entry in entries if entry is not None]
++                if len(present) != len(entries):
++                    raise _Failure("sequence_gap")
++                if not verify_tombstone_segment(
++                    tombstone, present, chain_id=manifest.chain_id
++                ):
++                    raise _Failure("tombstone_mismatch")
++            raise _Failure("incomplete_transition")
++        if chain.base_hash != coverage_hash:
++            raise _Failure("tombstone_mismatch")
++
++    def _verify_chain_states(self) -> None:
++        manifest = self._manifest()
++        chain = self._chain()
++        restores = [
++            (event.index, event.next_sequence)
++            for event in manifest.events
++            if event.kind == "restore"
++        ]
++        by_last = {item.last_sequence: item for item in manifest.tombstones}
++        by_first = {item.first_sequence: item for item in manifest.tombstones}
++        for event in manifest.events:
++            if any(
++                index > event.index and restored < event.next_sequence
++                for index, restored in restores
++            ):
++                self.counts["superseded_event_count"] += 1
++                continue
++            committed = event.next_sequence
++            if committed == 0:
++                if event.head_hash != GENESIS_HASH:
++                    raise _Failure("anchor_mismatch", event.index)
++                continue
++            sequence = committed - 1
++            if sequence >= chain.next_sequence:
++                raise _Failure("sequence_gap", event.index)
++            entry = chain.entry_at(sequence)
++            if entry is not None:
++                if entry.entry_hash != event.head_hash:
++                    raise _Failure("anchor_mismatch", event.index)
++                continue
++            boundary = by_last.get(sequence)
++            if boundary is not None:
++                if boundary.end_hash != event.head_hash:
++                    raise _Failure("tombstone_mismatch", event.index)
++                continue
++            following = by_first.get(committed)
++            if following is not None and following.start_hash != event.head_hash:
++                raise _Failure("tombstone_mismatch", event.index)
++            self.counts["pruned_anchor_count"] += 1
++
++    def _verify_tail(self) -> None:
++        manifest = self._manifest()
++        chain = self._chain()
++        unanchored = chain.next_sequence - manifest.head_event.next_sequence
++        self.counts["unanchored_entry_count"] = max(unanchored, 0)
++        if unanchored > 0 and not self.allow_tail:
++            raise _Failure("unanchored_tail")
++
++    def _manifest(self) -> ContinuityManifest:
++        if self.manifest is None:  # pragma: no cover - guarded by run().
++            raise _Failure("malformed_manifest")
++        return self.manifest
++
++    def _chain(self) -> AuditChain:
++        if self.chain is None:  # pragma: no cover - guarded by run().
++            raise _Failure("chain_invalid")
++        return self.chain
++
++
++def _run_verification(
++    chain: AuditChain | Mapping[str, Any],
++    manifest: ContinuityManifest | Mapping[str, Any],
++    *,
++    key_provider: KeyProvider,
++    trusted_anchors: Iterable[ContinuityAnchorRef | Mapping[str, Any]] = (),
++    allowed_policy_fingerprints: Iterable[str] | None = None,
++    expected_chain_id: str | None = None,
++    allow_unanchored_tail: bool = False,
++    tolerate_unavailable_keys: bool = False,
++) -> ContinuityVerificationReport:
++    _validate_provider(key_provider)
++    empty = _Verification(
++        key_provider=key_provider,
++        trusted_anchors=(),
++        allowed_policy_fingerprints=None,
++        expected_chain_id=None,
++        allow_unanchored_tail=False,
++        tolerate_unavailable_keys=False,
++    )
++    try:
++        refs = _coerce_refs(trusted_anchors)
++        allowed = _coerce_fingerprints(allowed_policy_fingerprints)
++        if expected_chain_id is not None and (
++            type(expected_chain_id) is not str
++            or not _SAFE_ID_RE.fullmatch(expected_chain_id)
++        ):
++            raise _Failure("chain_mismatch")
++    except _Failure as failure:
++        return empty.report(failure.code, failure.index)
++    return _Verification(
++        key_provider=key_provider,
++        trusted_anchors=refs,
++        allowed_policy_fingerprints=allowed,
++        expected_chain_id=expected_chain_id,
++        allow_unanchored_tail=bool(allow_unanchored_tail),
++        tolerate_unavailable_keys=tolerate_unavailable_keys,
++    ).run(chain, manifest)
++
++
++def verify_continuity(
++    chain: AuditChain | Mapping[str, Any],
++    manifest: ContinuityManifest | Mapping[str, Any],
++    *,
++    key_provider: KeyProvider,
++    trusted_anchors: Iterable[ContinuityAnchorRef | Mapping[str, Any]] = (),
++    allowed_policy_fingerprints: Iterable[str] | None = None,
++    expected_chain_id: str | None = None,
++    allow_unanchored_tail: bool = False,
++) -> ContinuityVerificationReport:
++    """Verify an audit chain's continuity offline and fail closed.
++
++    The verifier replays every manifest event: it recomputes digests and
++    links, checks epoch numbering and that every event is signed by the key of
++    the epoch it belongs to (both keys for a rotation), checks that pruning
++    tombstones are contiguous and agree with the retained chain and with
++    earlier signed anchors, and checks that every signed chain-head commitment
++    still matches the chain unless a later signed restore rolled it back.
++
++    Args:
++        chain: The audit chain as an object or decoded JSON document.
++        manifest: The continuity manifest as an object or decoded JSON.
++        key_provider: Caller-owned provider resolving every epoch key ID that
++            must still be verified. It is only called with key IDs.
++        trusted_anchors: Externally retained :class:`ContinuityAnchorRef`
++            values, for example from release evidence. Each must still be in
++            the manifest unless a later restore superseded it. Signatures at or
++            before the newest matching reference may use keys the provider no
++            longer holds; they are counted as ``unverified_signature_count``.
++        allowed_policy_fingerprints: When given, every tombstone must name one
++            of these retention-policy fingerprints.
++        expected_chain_id: When given, the manifest must belong to this chain.
++        allow_unanchored_tail: Accept chain entries appended after the last
++            signed event. They are reported in ``unanchored_entry_count``.
++
++    Returns:
++        A value-free report. ``report.valid`` is ``True`` only when every check
++        passed; otherwise ``report.code`` names the first failure.
++
++    Raises:
++        TypeError: If ``key_provider`` is neither callable nor a mapping.
++    """
++
++    return _run_verification(
++        chain,
++        manifest,
++        key_provider=key_provider,
++        trusted_anchors=trusted_anchors,
++        allowed_policy_fingerprints=allowed_policy_fingerprints,
++        expected_chain_id=expected_chain_id,
++        allow_unanchored_tail=allow_unanchored_tail,
++    )
++
++
++# Durable store ----------------------------------------------------------------
++
++_PROCESS_LOCKS: dict[str, threading.Lock] = {}
++_PROCESS_LOCKS_GUARD = threading.Lock()
++
++
++def _process_lock(path: Path) -> threading.Lock:
++    key = os.path.normcase(os.path.abspath(path))
++    with _PROCESS_LOCKS_GUARD:
++        lock = _PROCESS_LOCKS.get(key)
++        if lock is None:
++            lock = threading.Lock()
++            _PROCESS_LOCKS[key] = lock
++        return lock
++
++
++@contextlib.contextmanager
++def _exclusive_lock(path: Path) -> Iterator[None]:
++    """Serialize writers across threads and processes with a permanent lock."""
++
++    with _process_lock(path):
++        try:
++            path.parent.mkdir(parents=True, exist_ok=True)
++            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
++            descriptor = os.open(path, flags, 0o600)
++        except OSError:
++            raise _fail("lock_failed") from None
++        try:
++            try:
++                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
++                    raise _fail("lock_failed")
++                if sys.platform == "win32":
++                    import msvcrt
++
++                    if os.fstat(descriptor).st_size == 0:
++                        os.write(descriptor, b"0")
++                    os.lseek(descriptor, 0, os.SEEK_SET)
++                    msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
++                else:
++                    import fcntl
++
++                    fcntl.flock(descriptor, fcntl.LOCK_EX)
++            except OSError:
++                raise _fail("lock_failed") from None
++            yield
++        finally:
++            # Closing the descriptor releases the OS lock. The lock file is
++            # never unlinked, which would split writers into two lock domains.
++            os.close(descriptor)
++
++
++@dataclass(frozen=True)
++class ContinuityRecoveryResult:
++    """Value-free outcome of :meth:`AuditContinuityStore.recover`.
++
++    Attributes:
++        retention_completed: Whether an interrupted pruning was completed.
++        pruned_entry_count: Entries removed while completing it.
++        temporary_files_removed: Stale temporary files removed.
++    """
++
++    retention_completed: bool
++    pruned_entry_count: int
++    temporary_files_removed: int
++
++
++def _resolve_policy_fingerprint(
++    *,
++    policy_fingerprint: str | None,
++    policy: AuditRetentionPolicy | None,
++    retention_report: AuditRetentionReport | None,
++) -> tuple[str, str | None]:
++    candidates: list[Any] = []
++    report_digest: str | None = None
++    if policy_fingerprint is not None:
++        candidates.append(policy_fingerprint)
++    if policy is not None:
++        candidates.append(getattr(policy, "fingerprint", None))
++    if retention_report is not None:
++        candidates.append(getattr(retention_report, "policy_fingerprint", None))
++        report_digest = getattr(retention_report, "integrity_digest", None)
++        if type(report_digest) is not str or not _DIGEST_RE.fullmatch(report_digest):
++            raise _fail("invalid_argument")
++    if not candidates:
++        raise _fail("invalid_argument")
++    if not all(type(item) is str and _DIGEST_RE.fullmatch(item) for item in candidates):
++        raise _fail("invalid_argument")
++    if len(set(candidates)) != 1:
++        raise _fail("policy_mismatch")
++    return str(candidates[0]), report_digest
++
++
++class AuditContinuityStore:
++    """Keep an audit chain file and its continuity manifest in step.
++
++    All operations hold an exclusive lock for their whole read-modify-write
++    cycle, so appends, anchors, rotations, pruning, and restore transitions
++    from any number of threads or processes are applied one at a time and
++    each transition commits to the exact chain head at that moment.
++
++    Args:
++        chain_path: Audit chain JSON document.
++        key_provider: Caller-owned provider that resolves signing keys by
++            non-secret key ID. OpenMed never persists the material.
++        manifest_path: Continuity manifest path. Defaults to
++            ``<chain stem>.continuity.json`` beside the chain.
++        anchor_interval: When set, :meth:`append` writes a signed anchor
++            whenever this many entries have been appended since the last event.
++    """
++
++    def __init__(
++        self,
++        chain_path: str | Path,
++        *,
++        key_provider: KeyProvider,
++        manifest_path: str | Path | None = None,
++        anchor_interval: int | None = None,
++    ) -> None:
++        _validate_provider(key_provider)
++        if anchor_interval is not None and (
++            type(anchor_interval) is not int or anchor_interval < 1
++        ):
++            raise _fail("invalid_argument")
++        self._chain_path = Path(chain_path)
++        self._manifest_path = (
++            Path(manifest_path)
++            if manifest_path is not None
++            else self._chain_path.with_name(f"{self._chain_path.stem}.continuity.json")
++        )
++        if self._manifest_path == self._chain_path:
++            raise _fail("invalid_argument")
++        self._lock_path = self._manifest_path.with_name(
++            f".{self._manifest_path.name}.lock"
++        )
++        self._key_provider = key_provider
++        self._anchor_interval = anchor_interval
++
++    def __repr__(self) -> str:
++        return f"{type(self).__name__}(anchor_interval={self._anchor_interval!r})"
++
++    @property
++    def chain_path(self) -> Path:
++        """Return the audit chain document path."""
++
++        return self._chain_path
++
++    @property
++    def manifest_path(self) -> Path:
++        """Return the continuity manifest path."""
++
++        return self._manifest_path
++
++    def initialize(
++        self, *, key_id: str, chain_id: str | None = None
++    ) -> ContinuityEvent:
++        """Create the manifest and open signer epoch 0.
++
++        An existing, valid, unpruned chain is adopted: the genesis event
++        commits to its current head.
++
++        Args:
++            key_id: Key ID of the first signing epoch.
++            chain_id: Optional opaque chain identifier. A random one is
++                generated when omitted.
++
++        Raises:
++            AuditContinuityError: ``already_initialized`` if a manifest exists,
++                ``chain_invalid`` for an invalid or pruned chain, or
++                ``signer_key_unavailable`` if the key cannot be resolved.
++        """
++
++        resolved_chain_id = (
++            _new_opaque_id("chain") if chain_id is None else self._safe_id(chain_id)
++        )
++        resolved_key = self._safe_id(key_id)
++        with self._locked():
++            if self._manifest_path.exists():
++                raise _fail("already_initialized")
++            chain = self._read_chain(None)
++            if not chain.verify().valid or chain.is_pruned:
++                raise _fail("chain_invalid")
++            if not self._chain_path.exists():
++                self._write_chain(chain)
++            event = self._build_event(
++                None,
++                chain,
++                chain_id=resolved_chain_id,
++                kind="genesis",
++                epoch=0,
++                body={"key_id": resolved_key},
++                signers=(("signer", resolved_key),),
++            )
++            self._write_manifest(
++                ContinuityManifest(chain_id=resolved_chain_id, events=(event,))
++            )
++            return event
++
++    def append(self, report: AuditReport) -> AuditChainEntry:
++        """Append one audit report to the chain under the store lock.
++
++        Args:
++            report: The audit report to commit.
++
++        Returns:
++            The appended chain entry.
++
++        Raises:
++            AuditContinuityError: If the store is not initialized or the chain
++                cannot be recovered or written.
++            ValueError: If the chain or report is invalid.
++        """
++
++        with self._locked():
++            manifest = self._read_manifest()
++            chain = self._read_chain(manifest)
++            chain = self._recover_locked(chain, manifest)[0]
++            self._require_head_commitment(chain, manifest)
++            entry = chain.append(report)
++            self._write_chain(chain)
++            interval = self._anchor_interval
++            if (
++                interval is not None
++                and chain.next_sequence - manifest.head_event.next_sequence >= interval
++            ):
++                self._write_manifest(
++                    manifest.with_event(self._signed_event(manifest, chain, "anchor"))
++                )
++            return entry
++
++    def anchor(self) -> ContinuityEvent:
++        """Write a signed digest of the current chain head.
++
++        Raises:
++            AuditContinuityError: With a verification code if the existing
++                chain and manifest are inconsistent.
++        """
++
++        with self._locked():
++            chain, manifest = self._read_consistent()
++            event = self._signed_event(manifest, chain, "anchor")
++            self._write_manifest(manifest.with_event(event))
++            return event
++
++    def rotate(self, new_key_id: str) -> ContinuityEvent:
++        """Atomically close the active signer epoch and open a new one.
++
++        The rotation event commits to the exact chain head at the moment of
++        rollover and is signed by both the outgoing and the incoming key, so
++        every entry belongs to exactly one epoch and no window is unsigned.
++        Rotating to the key that is already active is idempotent and returns
++        the event that opened the active epoch.
++
++        Args:
++            new_key_id: Key ID of the incoming epoch. It must not have been
++                used by any earlier epoch.
++
++        Raises:
++            AuditContinuityError: ``retired_signer_key`` when the key ID was
++                used before, ``signer_key_unavailable`` when either key cannot
++                be resolved, or a verification code for inconsistent state.
++        """
++
++        incoming = self._safe_id(new_key_id)
++        with self._locked():
++            chain, manifest = self._read_consistent()
++            current = manifest.current_epoch
++            if incoming == current.key_id:
++                return manifest.events[current.opened_at_event]
++            if incoming in manifest.used_key_ids:
++                raise _fail("retired_signer_key")
++            event = self._build_event(
++                manifest,
++                chain,
++                chain_id=manifest.chain_id,
++                kind="rotation",
++                epoch=current.epoch + 1,
++                body={"from_key_id": current.key_id, "to_key_id": incoming},
++                signers=(("outgoing", current.key_id), ("incoming", incoming)),
++            )
++            self._write_manifest(manifest.with_event(event))
++            return event
++
++    def prune_through(
++        self,
++        last_sequence: int,
++        *,
++        policy_fingerprint: str | None = None,
++        policy: AuditRetentionPolicy | None = None,
++        retention_report: AuditRetentionReport | None = None,
++    ) -> ContinuityEvent:
++        """Prune chain entries through ``last_sequence`` behind a tombstone.
++
++        The signed tombstone is made durable before the chain is rewritten.
++        If the process stops in between, the next store operation (or
++        :meth:`recover`) checks the still-present entries against the
++        tombstone and completes the pruning, so retention is never skipped and
++        verification never breaks.
++
++        Args:
++            last_sequence: Highest retained sequence number to remove.
++            policy_fingerprint: Fingerprint of the approving retention policy.
++            policy: Approving :class:`~openmed.risk.audit_retention.
++                AuditRetentionPolicy`; its fingerprint is recorded.
++            retention_report: Approving
++                :class:`~openmed.risk.audit_retention.AuditRetentionReport`;
++                its policy fingerprint and integrity digest are recorded.
++
++        Raises:
++            AuditContinuityError: ``invalid_argument`` without an approving
++                policy or for an out-of-range sequence, ``policy_mismatch``
++                when the supplied approvals disagree, or a verification code
++                for inconsistent state.
++        """
++
++        fingerprint, report_digest = _resolve_policy_fingerprint(
++            policy_fingerprint=policy_fingerprint,
++            policy=policy,
++            retention_report=retention_report,
++        )
++        with self._locked():
++            chain, manifest = self._read_consistent()
++            if (
++                type(last_sequence) is not int
++                or not chain.base_sequence <= last_sequence < chain.next_sequence
++            ):
++                raise _fail("invalid_argument")
++            segment = tuple(
++                entry for entry in chain.entries if entry.sequence <= last_sequence
++            )
++            tombstone = RetentionTombstone(
++                first_sequence=segment[0].sequence,
++                last_sequence=segment[-1].sequence,
++                record_count=len(segment),
++                start_hash=segment[0].previous_hash,
++                end_hash=segment[-1].entry_hash,
++                segment_digest=tombstone_segment_digest(manifest.chain_id, segment),
++                policy_fingerprint=fingerprint,
++                retention_report_digest=report_digest,
++            )
++            event = self._signed_event(
++                manifest, chain, "retention", body=tombstone.to_dict()
++            )
++            self._write_manifest(manifest.with_event(event))
++            chain.prune_through(last_sequence)
++            self._write_chain(chain)
++            return event
++
++    def record_restore_transition(
++        self,
++        *,
++        backup_digest: str,
++        restore_id: str | None = None,
++        key_id: str | None = None,
++    ) -> ContinuityEvent:
++        """Record that the chain was restored from a backup.
++
++        Call this after the chain document (and, when it was backed up, the
++        manifest) has been restored, before new appends. Pruning recorded in
++        the manifest is re-applied first, so a restore never brings pruned
++        entries back. The restore event opens a new signer epoch, commits to
++        the restored chain head, and marks any later chain-head commitments
++        from the lost timeline as superseded.
++
++        Args:
++            backup_digest: ``sha256:<hex>`` digest identifying the backup, for
++                example the recovery-point manifest digest.
++            restore_id: Optional opaque restore identifier. A random one is
++                generated when omitted.
++            key_id: Key ID for the restore epoch. Defaults to the active key;
++                a key from an earlier, retired epoch is refused.
++
++        Raises:
++            AuditContinuityError: A verification code when the restored state
++                cannot be reconciled with the manifest.
++        """
++
++        if type(backup_digest) is not str or not _DIGEST_RE.fullmatch(backup_digest):
++            raise _fail("invalid_argument")
++        resolved_restore = (
++            _new_opaque_id("restore")
++            if restore_id is None
++            else self._safe_id(restore_id)
++        )
++        with self._locked():
++            manifest = self._read_manifest()
++            chain = self._read_chain(manifest)
++            chain = self._recover_locked(chain, manifest)[0]
++            current = manifest.current_epoch
++            restore_key = current.key_id if key_id is None else self._safe_id(key_id)
++            if restore_key != current.key_id and restore_key in manifest.used_key_ids:
++                raise _fail("retired_signer_key")
++            event = self._build_event(
++                manifest,
++                chain,
++                chain_id=manifest.chain_id,
++                kind="restore",
++                epoch=current.epoch + 1,
++                body={
++                    "key_id": restore_key,
++                    "restore_id": resolved_restore,
++                    "backup_digest": backup_digest,
++                },
++                signers=(("incoming", restore_key),),
++            )
++            candidate = manifest.with_event(event)
++            self._require_consistent(chain, candidate, allow_unanchored_tail=False)
++            self._write_manifest(candidate)
++            return event
++
++    def recover(self) -> ContinuityRecoveryResult:
++        """Complete any interrupted transition and remove stale temp files.
++
++        Recovery is deterministic: a pending tombstone is completed only when
++        the still-present entries match it exactly; otherwise the store
++        refuses with ``tombstone_mismatch``.
++        """
++
++        with self._locked():
++            manifest = self._read_manifest()
++            chain = self._read_chain(manifest)
++            _, pruned = self._recover_locked(chain, manifest)
++            removed = self._remove_stale_temporaries()
++            return ContinuityRecoveryResult(
++                retention_completed=pruned > 0,
++                pruned_entry_count=pruned,
++                temporary_files_removed=removed,
++            )
++
++    def load(self) -> tuple[AuditChain, ContinuityManifest]:
++        """Return the current chain and manifest under the store lock."""
++
++        with self._locked():
++            manifest = self._read_manifest()
++            return self._read_chain(manifest), manifest
++
++    def verify(
++        self,
++        *,
++        key_provider: KeyProvider | None = None,
++        trusted_anchors: Iterable[ContinuityAnchorRef | Mapping[str, Any]] = (),
++        allowed_policy_fingerprints: Iterable[str] | None = None,
++        allow_unanchored_tail: bool = False,
++    ) -> ContinuityVerificationReport:
++        """Verify the stored chain and manifest with :func:`verify_continuity`.
++
++        Args:
++            key_provider: Verification provider; defaults to the store's.
++            trusted_anchors: Externally retained event references.
++            allowed_policy_fingerprints: Retention policies allowed to prune.
++            allow_unanchored_tail: Accept entries after the last signed event.
++        """
++
++        with self._locked():
++            try:
++                manifest = self._read_manifest()
++                chain = self._read_chain(manifest)
++            except AuditContinuityError as error:
++                code = error.code if error.code in CONTINUITY_REASON_CODES else None
++                return _Verification(
++                    key_provider=self._key_provider,
++                    trusted_anchors=(),
++                    allowed_policy_fingerprints=None,
++                    expected_chain_id=None,
++                    allow_unanchored_tail=False,
++                    tolerate_unavailable_keys=False,
++                ).report(code or "malformed_manifest")
++        return verify_continuity(
++            chain,
++            manifest,
++            key_provider=self._key_provider if key_provider is None else key_provider,
++            trusted_anchors=trusted_anchors,
++            allowed_policy_fingerprints=allowed_policy_fingerprints,
++            expected_chain_id=manifest.chain_id,
++            allow_unanchored_tail=allow_unanchored_tail,
++        )
++
++    # Internals -------------------------------------------------------------
++
++    @staticmethod
++    def _safe_id(value: Any) -> str:
++        if type(value) is not str or not _SAFE_ID_RE.fullmatch(value):
++            raise _fail("invalid_argument")
++        return value
++
++    @contextlib.contextmanager
++    def _locked(self) -> Iterator[None]:
++        with _exclusive_lock(self._lock_path):
++            yield
++
++    def _read_manifest(self) -> ContinuityManifest:
++        if not self._manifest_path.exists():
++            raise _fail("not_initialized")
++        return ContinuityManifest.load(self._manifest_path)
++
++    def _read_chain(self, manifest: ContinuityManifest | None) -> AuditChain:
++        if not self._chain_path.exists():
++            if manifest is not None and (
++                manifest.head_event.next_sequence > 0 or manifest.tombstones
++            ):
++                raise _fail("sequence_gap")
++            return AuditChain()
++        try:
++            return AuditChain.load(self._chain_path)
++        except OSError:
++            raise _fail("io_failed") from None
++        except (TypeError, ValueError):
++            raise _fail("chain_invalid") from None
++
++    def _read_consistent(self) -> tuple[AuditChain, ContinuityManifest]:
++        manifest = self._read_manifest()
++        chain = self._read_chain(manifest)
++        chain = self._recover_locked(chain, manifest)[0]
++        self._require_consistent(chain, manifest, allow_unanchored_tail=True)
++        return chain, manifest
++
++    def _require_consistent(
++        self,
++        chain: AuditChain,
++        manifest: ContinuityManifest,
++        *,
++        allow_unanchored_tail: bool,
++    ) -> None:
++        # Retired keys may legitimately be gone from the signing provider, so
++        # unavailable keys do not block new transitions; every other check,
++        # including signatures whose keys are present, must pass.
++        report = _run_verification(
++            chain,
++            manifest,
++            key_provider=self._key_provider,
++            expected_chain_id=manifest.chain_id,
++            allow_unanchored_tail=allow_unanchored_tail,
++            tolerate_unavailable_keys=True,
++        )
++        if not report.valid:
++            raise _fail(report.code)
++
++    @staticmethod
++    def _require_head_commitment(
++        chain: AuditChain,
++        manifest: ContinuityManifest,
++    ) -> None:
++        # A constant-time guard for the hot append path: the newest signed
++        # event must still describe a prefix of the chain being extended.
++        head = manifest.head_event
++        if head.next_sequence > chain.next_sequence:
++            raise _fail("sequence_gap")
++        if head.next_sequence == 0:
++            committed = GENESIS_HASH
++        elif head.next_sequence == chain.base_sequence:
++            committed = chain.base_hash
++        else:
++            entry = chain.entry_at(head.next_sequence - 1)
++            committed = entry.entry_hash if entry is not None else ""
++        if committed != head.head_hash and head.next_sequence >= chain.base_sequence:
++            raise _fail("anchor_mismatch")
++
++    def _recover_locked(
++        self,
++        chain: AuditChain,
++        manifest: ContinuityManifest,
++    ) -> tuple[AuditChain, int]:
++        covered = manifest.pruned_through
++        if chain.base_sequence == covered:
++            return chain, 0
++        if chain.base_sequence > covered:
++            raise _fail("sequence_gap")
++        if chain.next_sequence < covered:
++            raise _fail("sequence_gap")
++        for tombstone in manifest.tombstones:
++            if tombstone.last_sequence < chain.base_sequence:
++                continue
++            if tombstone.first_sequence < chain.base_sequence:
++                raise _fail("tombstone_mismatch")
++            segment = [
++                entry
++                for entry in chain.entries
++                if tombstone.first_sequence <= entry.sequence <= tombstone.last_sequence
++            ]
++            if not verify_tombstone_segment(
++                tombstone, segment, chain_id=manifest.chain_id
++            ):
++                raise _fail("tombstone_mismatch")
++        pruned = covered - chain.base_sequence
++        try:
++            chain.prune_through(covered - 1)
++        except ValueError:
++            raise _fail("chain_invalid") from None
++        self._write_chain(chain)
++        return chain, pruned
++
++    def _remove_stale_temporaries(self) -> int:
++        removed = 0
++        for target in (self._chain_path, self._manifest_path):
++            parent = target.parent
++            if not parent.is_dir():
++                continue
++            for candidate in parent.glob(f".{target.name}.*.tmp"):
++                try:
++                    info = candidate.lstat()
++                    if stat.S_ISREG(info.st_mode):
++                        candidate.unlink()
++                        removed += 1
++                except OSError:
++                    continue
++        return removed
++
++    def _write_chain(self, chain: AuditChain) -> None:
++        try:
++            chain.write(self._chain_path)
++        except OSError:
++            raise _fail("io_failed") from None
++
++    def _write_manifest(self, manifest: ContinuityManifest) -> None:
++        try:
++            manifest.write(self._manifest_path)
++        except OSError:
++            raise _fail("io_failed") from None
++
++    def _signed_event(
++        self,
++        manifest: ContinuityManifest,
++        chain: AuditChain,
++        kind: str,
++        *,
++        body: Mapping[str, Any] | None = None,
++    ) -> ContinuityEvent:
++        current = manifest.current_epoch
++        return self._build_event(
++            manifest,
++            chain,
++            chain_id=manifest.chain_id,
++            kind=kind,
++            epoch=current.epoch,
++            body=body or {},
++            signers=(("signer", current.key_id),),
++        )
++
++    def _build_event(
++        self,
++        manifest: ContinuityManifest | None,
++        chain: AuditChain,
++        *,
++        chain_id: str,
++        kind: str,
++        epoch: int,
++        body: Mapping[str, Any],
++        signers: Sequence[tuple[str, str]],
++    ) -> ContinuityEvent:
++        index = 0 if manifest is None else manifest.event_count
++        if index >= MAX_CONTINUITY_EVENTS:
++            raise _fail("invalid_argument")
++        previous = (
++            continuity_origin_digest(chain_id)
++            if manifest is None
++            else manifest.head_digest
++        )
++        normalized = _validate_body(kind, body)
++        digest = _event_digest(
++            chain_id=chain_id,
++            index=index,
++            kind=kind,
++            epoch=epoch,
++            previous_digest=previous,
++            next_sequence=chain.next_sequence,
++            head_hash=chain.head_hash,
++            body=normalized,
++        )
++        signatures: list[ContinuitySignature] = []
++        for role, signer_key in signers:
++            try:
++                value = _sign_digest(
++                    self._key_provider,
++                    digest,
++                    key_id=signer_key,
++                    purpose=CONTINUITY_SIGNATURE_PURPOSE,
++                    role=role,
++                )
++            except AuditKeyRotationError:
++                raise _fail("signer_key_unavailable") from None
++            signatures.append(
++                ContinuitySignature(
++                    role=role,
++                    key_id=signer_key,
++                    algorithm=CONTINUITY_SIGNATURE_ALGORITHM,
++                    value=value,
++                )
++            )
++        return ContinuityEvent(
++            index=index,
++            kind=kind,
++            epoch=epoch,
++            previous_digest=previous,
++            next_sequence=chain.next_sequence,
++            head_hash=chain.head_hash,
++            body=normalized,
++            digest=digest,
++            signatures=tuple(signatures),
++        )
++
++
++def record_restore_transition(
++    chain_path: str | Path,
++    *,
++    key_provider: KeyProvider,
++    backup_digest: str,
++    manifest_path: str | Path | None = None,
++    restore_id: str | None = None,
++    key_id: str | None = None,
++) -> ContinuityEvent:
++    """Record a restore transition for a chain restored from a backup.
++
++    This is the hook a backup and restore workflow calls once the audit chain
++    (and its manifest, when backed up) has been restored and before writers
++    resume. See :meth:`AuditContinuityStore.record_restore_transition`.
++
++    Args:
++        chain_path: Restored audit chain document.
++        key_provider: Caller-owned signing-key provider.
++        backup_digest: ``sha256:<hex>`` digest identifying the backup.
++        manifest_path: Continuity manifest path, if not the default.
++        restore_id: Optional opaque restore identifier.
++        key_id: Optional key ID for the restore epoch.
++
++    Returns:
++        The signed restore event.
++    """
++
++    return AuditContinuityStore(
++        chain_path,
++        key_provider=key_provider,
++        manifest_path=manifest_path,
++    ).record_restore_transition(
++        backup_digest=backup_digest,
++        restore_id=restore_id,
++        key_id=key_id,
++    )
++
++
++class AuditContinuityRecoveryHook:
++    """Recovery-epoch hook that records a restore transition.
++
++    The hook duck-types a service recovery context exposing
++    ``manifest_digest`` and ``recovery_point_id``; it does not import the
++    service layer. Point it at the staged (not yet live) chain and manifest so
++    the restore event is part of the state that becomes live. Raising refuses
++    the activation.
++
++    Args:
++        chain_path: Restored audit chain document.
++        key_provider: Caller-owned signing-key provider.
++        manifest_path: Continuity manifest path, if not the default.
++        key_id: Optional key ID for the restore epoch.
++    """
++
++    def __init__(
++        self,
++        chain_path: str | Path,
++        *,
++        key_provider: KeyProvider,
++        manifest_path: str | Path | None = None,
++        key_id: str | None = None,
++    ) -> None:
++        self._store = AuditContinuityStore(
++            chain_path, key_provider=key_provider, manifest_path=manifest_path
++        )
++        self._key_id = key_id
++
++    def __repr__(self) -> str:
++        return f"{type(self).__name__}()"
++
++    def open_recovery_epoch(self, context: Any) -> None:
++        """Record the restore described by ``context``.
++
++        Args:
++            context: Object with a ``manifest_digest`` and an optional
++                ``recovery_point_id`` attribute.
++
++        Raises:
++            AuditContinuityError: If the restored state cannot be reconciled.
++        """
++
++        restore_id = getattr(context, "recovery_point_id", None)
++        if restore_id is not None and (
++            type(restore_id) is not str or not _SAFE_ID_RE.fullmatch(restore_id)
++        ):
++            restore_id = None
++        self._store.record_restore_transition(
++            backup_digest=getattr(context, "manifest_digest", None),  # type: ignore[arg-type]
++            restore_id=restore_id,
++            key_id=self._key_id,
++        )
++
++
++__all__ = [
++    "CONTINUITY_DIGEST_ALGORITHM",
++    "CONTINUITY_ERROR_CODES",
++    "CONTINUITY_EVENT_KINDS",
++    "CONTINUITY_FORMAT",
++    "CONTINUITY_REASON_CODES",
++    "CONTINUITY_REPORT_FORMAT",
++    "CONTINUITY_REPORT_VERSION",
++    "CONTINUITY_SIGNATURE_ALGORITHM",
++    "CONTINUITY_SIGNATURE_PURPOSE",
++    "CONTINUITY_VERSION",
++    "MAX_CONTINUITY_EVENTS",
++    "MAX_CONTINUITY_JSON_BYTES",
++    "AuditContinuityError",
++    "AuditContinuityRecoveryHook",
++    "AuditContinuityStore",
++    "ContinuityAnchorRef",
++    "ContinuityEvent",
++    "ContinuityManifest",
++    "ContinuityRecoveryResult",
++    "ContinuitySignature",
++    "ContinuityVerificationReport",
++    "RetentionTombstone",
++    "SignerEpoch",
++    "continuity_origin_digest",
++    "derive_epochs",
++    "record_restore_transition",
++    "tombstone_segment_digest",
++    "verify_continuity",
++    "verify_tombstone_segment",
++]
+diff --git a/openmed/core/audit_key_rotation.py b/openmed/core/audit_key_rotation.py
+index ee6ff659f..ad9aa6ab9 100644
+--- a/openmed/core/audit_key_rotation.py
++++ b/openmed/core/audit_key_rotation.py
+@@ -8,6 +8,11 @@
+ Key providers are deliberately callbacks or mappings supplied by the caller.
+ The provider and the resolved key material are never copied into an audit
+ report or included in an exception raised by this module.
++
++The same caller-owned keys can also sign value-free ``sha256:`` digests for a
++named purpose, such as the audit continuity manifest. Digest signatures use a
++separate per-purpose key derivation, so a report signature can never be
++replayed as a digest signature or the other way round.
+ """
+ 
+ from __future__ import annotations
+@@ -15,18 +20,26 @@
+ import hashlib
+ import hmac
+ import itertools
++import json
+ import re
+ from collections.abc import Mapping
+ from dataclasses import dataclass, field
+-from typing import Any, Final, Protocol, TypeAlias
++from typing import Any, Final, Literal, Protocol, TypeAlias
+ 
+ from .audit import AuditReport
+ 
+ AUDIT_SIGNATURE_ALGORITHM: Final = "HMAC-SHA256"
+ MIN_AUDIT_HMAC_KEY_BYTES: Final = 32
+ MAX_AUDIT_HMAC_KEY_BYTES: Final = 4_096
++AUDIT_DIGEST_PURPOSES: Final = frozenset({"audit-continuity"})
++AUDIT_DIGEST_ROLES: Final = frozenset({"signer", "outgoing", "incoming"})
+ _KEY_ID_RE: Final = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
++_DIGEST_RE: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
++_SIGNATURE_VALUE_RE: Final = re.compile(r"^[0-9a-f]{64}$")
+ _KEY_DERIVATION_CONTEXT: Final = b"openmed.audit-key-rotation.v1\x00"
++_DIGEST_DERIVATION_CONTEXT: Final = b"openmed.audit-digest-signature.v1\x00"
++
++DigestSignatureStatus: TypeAlias = Literal["valid", "invalid", "unavailable"]
+ _AUDIT_REPORT_FIELDS: Final = frozenset(
+     {
+         "policy",
+@@ -64,6 +77,10 @@ class AuditKeyRotationError(ValueError):
+     """Raised when a rotation provider or report cannot satisfy the contract."""
+ 
+ 
++class AuditKeyUnavailableError(AuditKeyRotationError):
++    """Raised when a provider cannot resolve key material for a key ID."""
++
++
+ def _require_key_id(value: Any) -> str:
+     if type(value) is not str or not _KEY_ID_RE.fullmatch(value):
+         raise AuditKeyRotationError(
+@@ -72,6 +89,24 @@ def _require_key_id(value: Any) -> str:
+     return value
+ 
+ 
++def _require_signed_digest(value: Any) -> str:
++    if type(value) is not str or not _DIGEST_RE.fullmatch(value):
++        raise AuditKeyRotationError("signed digest must be a sha256:<hex> digest")
++    return value
++
++
++def _require_purpose(value: Any) -> str:
++    if type(value) is not str or value not in AUDIT_DIGEST_PURPOSES:
++        raise AuditKeyRotationError("digest signature purpose is not supported")
++    return value
++
++
++def _require_role(value: Any) -> str:
++    if type(value) is not str or value not in AUDIT_DIGEST_ROLES:
++        raise AuditKeyRotationError("digest signature role is not supported")
++    return value
++
++
+ def _validate_provider(provider: Any) -> None:
+     if not callable(provider) and not isinstance(provider, Mapping):
+         raise TypeError("key_provider must be callable or a key-id mapping")
+@@ -81,13 +116,13 @@ def _resolve_key(provider: KeyProvider, key_id: str) -> bytes:
+     try:
+         value = provider[key_id] if isinstance(provider, Mapping) else provider(key_id)
+     except KeyError:
+-        raise AuditKeyRotationError(
++        raise AuditKeyUnavailableError(
+             "key provider has no key for the requested key_id"
+         ) from None
+     except Exception:
+         # Provider exceptions are caller-owned and may contain sensitive
+         # details.  Do not preserve or interpolate those messages.
+-        raise AuditKeyRotationError(
++        raise AuditKeyUnavailableError(
+             "key provider failed to resolve the requested key_id"
+         ) from None
+ 
+@@ -119,6 +154,86 @@ def _report_key(key: bytes, key_id: str) -> bytes:
+     ).digest()
+ 
+ 
++def _digest_signature_value(
++    key: bytes,
++    *,
++    digest: str,
++    key_id: str,
++    purpose: str,
++    role: str,
++) -> str:
++    """Return the hex HMAC binding a digest to its key ID, purpose, and role."""
++
++    derived = hmac.new(
++        key,
++        _DIGEST_DERIVATION_CONTEXT
++        + purpose.encode("ascii")
++        + b"\x00"
++        + key_id.encode("ascii"),
++        hashlib.sha256,
++    ).digest()
++    message = json.dumps(
++        {"digest": digest, "key_id": key_id, "purpose": purpose, "role": role},
++        ensure_ascii=True,
++        separators=(",", ":"),
++        sort_keys=True,
++    ).encode("ascii")
++    return hmac.new(derived, message, hashlib.sha256).hexdigest()
++
++
++def _sign_digest(
++    provider: KeyProvider,
++    digest: str,
++    *,
++    key_id: str,
++    purpose: str,
++    role: str,
++) -> str:
++    _require_signed_digest(digest)
++    _require_key_id(key_id)
++    _require_purpose(purpose)
++    _require_role(role)
++    key = _resolve_key(provider, key_id)
++    return _digest_signature_value(
++        key, digest=digest, key_id=key_id, purpose=purpose, role=role
++    )
++
++
++def _digest_signature_status(
++    provider: KeyProvider,
++    digest: Any,
++    value: Any,
++    *,
++    key_id: Any,
++    purpose: str,
++    role: Any,
++) -> DigestSignatureStatus:
++    """Classify a digest signature without exposing provider or key details.
++
++    Returns ``"unavailable"`` when the provider cannot resolve usable key
++    material for ``key_id``, ``"invalid"`` for malformed input or a
++    signature mismatch, and ``"valid"`` only for an exact match.
++    """
++
++    try:
++        _require_signed_digest(digest)
++        _require_key_id(key_id)
++        _require_purpose(purpose)
++        _require_role(role)
++    except AuditKeyRotationError:
++        return "invalid"
++    if type(value) is not str or not _SIGNATURE_VALUE_RE.fullmatch(value):
++        return "invalid"
++    try:
++        key = _resolve_key(provider, key_id)
++    except AuditKeyRotationError:
++        return "unavailable"
++    expected = _digest_signature_value(
++        key, digest=digest, key_id=key_id, purpose=purpose, role=role
++    )
++    return "valid" if hmac.compare_digest(expected, value) else "invalid"
++
++
+ def _snapshot_report_mapping(report: Mapping[str, Any]) -> dict[str, Any]:
+     try:
+         items = list(itertools.islice(report.items(), len(_AUDIT_REPORT_FIELDS) + 1))
+@@ -202,6 +317,41 @@ def sign(self, report: AuditReport, *, key_id: str | None = None) -> AuditReport
+         except Exception:
+             raise AuditKeyRotationError("audit report could not be signed") from None
+ 
++    def sign_digest(
++        self,
++        digest: str,
++        *,
++        purpose: str,
++        role: str = "signer",
++        key_id: str | None = None,
++    ) -> str:
++        """Return a hex HMAC-SHA256 signature over a value-free digest.
++
++        Args:
++            digest: A ``sha256:<hex>`` digest to sign.
++            purpose: Signature purpose from :data:`AUDIT_DIGEST_PURPOSES`.
++            role: Signer role from :data:`AUDIT_DIGEST_ROLES`, for example
++                ``"outgoing"`` or ``"incoming"`` during a key rollover.
++            key_id: Optional key-ID override for this signing operation.
++
++        Returns:
++            The 64-character hex signature value. It never contains key
++            material.
++
++        Raises:
++            AuditKeyRotationError: If an argument is malformed or the provider
++                cannot resolve valid key material.
++        """
++
++        effective_key_id = self.key_id if key_id is None else _require_key_id(key_id)
++        return _sign_digest(
++            self.key_provider,
++            digest,
++            key_id=effective_key_id,
++            purpose=purpose,
++            role=role,
++        )
++
+ 
+ @dataclass(frozen=True, slots=True)
+ class AuditKeyRotationVerifier:
+@@ -255,6 +405,41 @@ def verify(
+             # not surface caller-provider errors that could contain key data.
+             return False
+ 
++    def verify_digest(
++        self,
++        digest: str,
++        signature: str,
++        *,
++        key_id: str,
++        purpose: str,
++        role: str = "signer",
++    ) -> bool:
++        """Return whether ``signature`` signs ``digest`` for the given key ID.
++
++        Verification fails closed for malformed input, an unknown or
++        unavailable key ID, provider failures, and signature mismatches.
++
++        Args:
++            digest: The ``sha256:<hex>`` digest that was signed.
++            signature: The hex signature value to check.
++            key_id: Non-secret key identifier the signature claims.
++            purpose: Signature purpose from :data:`AUDIT_DIGEST_PURPOSES`.
++            role: Signer role from :data:`AUDIT_DIGEST_ROLES`.
++        """
++
++        try:
++            status = _digest_signature_status(
++                self.key_provider,
++                digest,
++                signature,
++                key_id=key_id,
++                purpose=purpose,
++                role=role,
++            )
++        except Exception:
++            return False
++        return status == "valid"
++
+ 
+ AuditReportSigner = AuditKeyRotationSigner
+ AuditReportVerifier = AuditKeyRotationVerifier
+@@ -288,11 +473,14 @@ def verify_audit_report(
+ 
+ 
+ __all__ = [
++    "AUDIT_DIGEST_PURPOSES",
++    "AUDIT_DIGEST_ROLES",
+     "AUDIT_SIGNATURE_ALGORITHM",
+     "MAX_AUDIT_HMAC_KEY_BYTES",
+     "MIN_AUDIT_HMAC_KEY_BYTES",
+     "AuditKeyProvider",
+     "AuditKeyRotationError",
++    "AuditKeyUnavailableError",
+     "AuditKeyRotationSigner",
+     "AuditKeyRotationVerifier",
+     "AuditReportSigner",
+diff --git a/tests/unit/core/test_audit_chain.py b/tests/unit/core/test_audit_chain.py
+index fc68d758f..49a49a0ce 100644
+--- a/tests/unit/core/test_audit_chain.py
++++ b/tests/unit/core/test_audit_chain.py
+@@ -11,6 +11,10 @@
+ 
+ from openmed.core.audit import AuditReport, AuditSpan, DetectorInfo, hash_text
+ from openmed.core.audit_chain import (
++    CHAIN_VERIFICATION_CODES,
++    CHAIN_VERSION,
++    GENESIS_HASH,
++    PRUNED_CHAIN_VERSION,
+     AuditChain,
+     append_to_chain_file,
+     verify_chain,
+@@ -265,3 +269,122 @@ def deny_network(*args: object, **kwargs: object) -> None:
+     monkeypatch.setattr(socket, "socket", deny_network)
+ 
+     assert chain.verify().valid
++
++
++def test_unpruned_chains_keep_the_version_one_document() -> None:
++    payload = _three_entry_chain().to_dict()
++
++    assert payload["version"] == CHAIN_VERSION
++    assert "base_sequence" not in payload
++    assert "base_hash" not in payload
++
++
++def test_pruned_chain_links_to_its_retained_base_and_round_trips(
++    tmp_path: Path,
++) -> None:
++    chain = _three_entry_chain()
++    first_hash = chain.entries[0].entry_hash
++
++    removed = chain.prune_through(0)
++
++    assert [entry.sequence for entry in removed] == [0]
++    assert chain.is_pruned
++    assert chain.base_sequence == 1
++    assert chain.base_hash == first_hash
++    assert chain.next_sequence == 3
++    assert chain.entry_at(0) is None
++    assert chain.entry_at(1) is not None
++    assert chain.verify().valid
++    payload = chain.to_dict()
++    assert payload["version"] == PRUNED_CHAIN_VERSION
++    assert payload["base_sequence"] == 1
++    serialized = chain.to_json()
++    assert "Alice Rivera" not in serialized
++    assert hash_text("Alice Rivera") not in serialized
++
++    path = tmp_path / "audit-chain.json"
++    chain.write(path)
++    restored = AuditChain.load(path)
++    assert restored.to_dict() == payload
++    assert restored.verify().valid
++    entry = restored.append(_report("Dmitri Okafor", "555-0104"))
++    assert entry.sequence == 3
++    assert restored.verify().valid
++
++
++def test_pruning_every_entry_keeps_the_head_and_continues_the_sequence() -> None:
++    chain = _three_entry_chain()
++    head = chain.head_hash
++
++    chain.prune_through(2)
++
++    assert chain.entries == ()
++    assert chain.head_hash == head == chain.base_hash
++    assert chain.verify().valid
++    assert chain.append(_report("Dmitri Okafor", "555-0104")).previous_hash == head
++
++
++def test_pruning_rejects_out_of_range_sequences_and_invalid_chains() -> None:
++    chain = _three_entry_chain()
++    chain.prune_through(0)
++    for sequence in (0, 3, -1):
++        with pytest.raises(ValueError, match="retained audit chain entry"):
++            chain.prune_through(sequence)
++
++    payload = json.loads(_three_entry_chain().to_json())
++    payload["entries"].pop(1)
++    with pytest.raises(ValueError, match="cannot prune an invalid audit chain"):
++        AuditChain.from_dict(payload).prune_through(0)
++
++
++def test_pruned_document_without_its_base_fails_closed() -> None:
++    chain = _three_entry_chain()
++    chain.prune_through(0)
++    payload = chain.to_dict()
++
++    stripped = dict(payload)
++    stripped.pop("base_sequence")
++    stripped.pop("base_hash")
++    stripped["version"] = CHAIN_VERSION
++    assert AuditChain.from_dict(stripped).verify().code == "sequence_gap"
++
++    for field, value in (("base_sequence", 0), ("base_hash", GENESIS_HASH)):
++        with pytest.raises(ValueError):
++            AuditChain.from_dict({**payload, field: value})
++
++
++def test_verification_results_carry_stable_value_free_codes() -> None:
++    def broken(mutate):
++        payload = json.loads(_three_entry_chain().to_json())
++        mutate(payload)
++        return AuditChain.from_dict(payload).verify().code
++
++    def swap(payload):
++        entries = payload["entries"]
++        entries[0], entries[1] = entries[1], entries[0]
++
++    def relabel(payload):
++        payload["entries"][1]["spans"][0]["label"] = "PHONE"
++
++    def duplicate(payload):
++        payload["entries"].insert(1, copy.deepcopy(payload["entries"][0]))
++
++    def drop(payload):
++        payload["entries"].pop(1)
++
++    def renumber(payload):
++        payload["entries"][2]["sequence"] = 7
++
++    assert _three_entry_chain().verify().code == "valid"
++    assert broken(swap) == "sequence_reordered"
++    assert broken(relabel) == "entry_hash_mismatch"
++    assert broken(duplicate) == "entry_count_excess"
++    assert broken(drop) == "entry_count_deficit"
++    assert broken(renumber) == "sequence_gap"
++    assert (
++        AuditChain(_three_entry_chain().entries, declared_head_hash=GENESIS_HASH)
++        .verify()
++        .code
++        == "head_mismatch"
++    )
++    assert all(code.replace("_", "").isalpha() for code in CHAIN_VERIFICATION_CODES)
+diff --git a/tests/unit/core/test_audit_continuity.py b/tests/unit/core/test_audit_continuity.py
+new file mode 100644
+index 000000000..4eaa9d320
+--- /dev/null
++++ b/tests/unit/core/test_audit_continuity.py
+@@ -0,0 +1,1195 @@
++"""Tests for audit continuity across key rotation, retention, and restore."""
++
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import socket
++import subprocess
++import sys
++import tempfile
++import textwrap
++import threading
++import time
++from collections.abc import Callable
++from pathlib import Path
++from typing import Any
++
++import pytest
++from hypothesis import HealthCheck, given, settings
++from hypothesis import strategies as st
++
++from openmed.core.audit import AuditReport, AuditSpan, hash_text
++from openmed.core.audit_chain import AuditChain
++from openmed.core.audit_continuity import (
++    CONTINUITY_REASON_CODES,
++    AuditContinuityError,
++    AuditContinuityRecoveryHook,
++    AuditContinuityStore,
++    ContinuityAnchorRef,
++    ContinuityEvent,
++    ContinuityManifest,
++    record_restore_transition,
++    tombstone_segment_digest,
++    verify_continuity,
++    verify_tombstone_segment,
++)
++from openmed.core.audit_key_rotation import AuditKeyRotationSigner
++from openmed.risk.audit_retention import (
++    AuditRetentionPolicy,
++    RetentionRule,
++    scrub_audit_artifacts,
++)
++
++ROOT = Path(__file__).resolve().parents[3]
++KEYS = {
++    f"audit-epoch-{index}": f"synthetic-continuity-key-{index:02d}-0123456789abcdef".encode(
++        "ascii"
++    )
++    for index in range(12)
++}
++POLICY = AuditRetentionPolicy(rules={"audit": RetentionRule.days(30)})
++BACKUP_DIGEST = "sha256:" + "b" * 64
++SENTINEL_PREFIX = "Quorvexa Sentinel"
++
++
++def _sentinel(index: int) -> str:
++    return f"{SENTINEL_PREFIX} {index:04d}"
++
++
++def _report(index: int) -> AuditReport:
++    name = _sentinel(index)
++    original = f"Patient {name} attended the synthetic clinic."
++    start = original.index(name)
++    return AuditReport(
++        policy="synthetic_policy",
++        resolved_profile={"method": "mask"},
++        detectors=[],
++        safety_sweep={},
++        spans=[
++            AuditSpan(
++                start=start,
++                end=start + len(name),
++                label="NAME",
++                canonical_label="PERSON",
++                sources=["regex"],
++                confidence=1.0,
++                threshold=0.5,
++                action="mask",
++                surrogate="[PERSON]",
++                text_hash=hash_text(name),
++            )
++        ],
++        thresholds={},
++        residual_risk={},
++        openmed_version="synthetic",
++        manifest_hash=hash_text("synthetic manifest"),
++        document_length=len(original),
++        input_hash=hash_text(original),
++        deidentified_text_hash=hash_text(
++            "Patient [PERSON] attended the synthetic clinic."
++        ),
++    )
++
++
++def _store(root: Path, **kwargs: Any) -> AuditContinuityStore:
++    return AuditContinuityStore(root / "audit-chain.json", key_provider=KEYS, **kwargs)
++
++
++def _initialized(root: Path, **kwargs: Any) -> AuditContinuityStore:
++    store = _store(root, **kwargs)
++    store.initialize(key_id="audit-epoch-0", chain_id="chain-synthetic")
++    return store
++
++
++def _append(store: AuditContinuityStore, start: int, count: int) -> int:
++    for index in range(start, start + count):
++        store.append(_report(index))
++    return start + count
++
++
++def _documents(store: AuditContinuityStore) -> tuple[dict[str, Any], dict[str, Any]]:
++    chain = json.loads(store.chain_path.read_text(encoding="utf-8"))
++    manifest = json.loads(store.manifest_path.read_text(encoding="utf-8"))
++    return chain, manifest
++
++
++def _verify(chain: Any, manifest: Any, **kwargs: Any):
++    return verify_continuity(chain, manifest, key_provider=KEYS, **kwargs)
++
++
++def _resign(
++    manifest: dict[str, Any],
++    index: int,
++    mutate: Callable[[dict[str, Any]], None] | None = None,
++    *,
++    keys: dict[str, str] | None = None,
++    provider: dict[str, bytes] = KEYS,
++) -> None:
++    """Mutate one event and recompute its digest and signatures in place."""
++
++    event = manifest["events"][index]
++    if mutate is not None:
++        mutate(event)
++    digest = ContinuityEvent.from_dict(event).compute_digest(manifest["chain_id"])
++    event["digest"] = digest
++    for signature in event["signatures"]:
++        key_id = (keys or {}).get(signature["role"], signature["key_id"])
++        signature["key_id"] = key_id
++        signature["value"] = AuditKeyRotationSigner(
++            key_id=key_id, key_provider=provider
++        ).sign_digest(digest, purpose="audit-continuity", role=signature["role"])
++    if index == len(manifest["events"]) - 1:
++        manifest["head_digest"] = digest
++
++
++def _lifecycle(root: Path) -> tuple[AuditContinuityStore, int]:
++    """Append, rotate three times, and prune twice; return the next report id."""
++
++    store = _initialized(root)
++    next_id = 0
++    for epoch in range(1, 4):
++        next_id = _append(store, next_id, 4)
++        store.anchor()
++        store.rotate(f"audit-epoch-{epoch}")
++    next_id = _append(store, next_id, 2)
++    store.prune_through(4, policy=POLICY)
++    store.prune_through(9, policy_fingerprint=POLICY.fingerprint)
++    store.anchor()
++    return store, next_id
++
++
++# Lifecycle -----------------------------------------------------------------
++
++
++def test_chain_stays_verifiable_across_rotation_pruning_backup_and_restore(
++    tmp_path: Path,
++) -> None:
++    live = tmp_path / "live"
++    store, next_id = _lifecycle(live)
++    assert store.verify().code == "valid"
++
++    backup = tmp_path / "backup"
++    shutil.copytree(live, backup)
++    next_id = _append(store, next_id, 3)
++    store.rotate("audit-epoch-4")
++    next_id = _append(store, next_id, 1)
++    store.anchor()
++    lost_head = store.load()[1].head_ref()
++
++    shutil.rmtree(live)
++    shutil.copytree(backup, live)
++    event = record_restore_transition(
++        live / "audit-chain.json",
++        key_provider=KEYS,
++        backup_digest=BACKUP_DIGEST,
++        restore_id="restore-synthetic",
++    )
++    assert event.kind == "restore"
++    next_id = _append(store, next_id, 2)
++    store.rotate("audit-epoch-5")
++    _append(store, next_id, 2)
++    store.anchor()
++
++    report = store.verify(
++        trusted_anchors=[lost_head], allowed_policy_fingerprints=[POLICY.fingerprint]
++    )
++    assert report.valid, report.code
++    assert report.code == "valid"
++    counts = report.counts
++    assert counts["rotation_count"] == 4
++    assert counts["retention_count"] == 2
++    assert counts["restore_count"] == 1
++    assert counts["pruned_entry_count"] == 10
++    assert counts["retained_entry_count"] == counts["next_sequence"] - 10
++    assert counts["unanchored_entry_count"] == 0
++    assert counts["superseded_trusted_anchor_count"] == 1
++    assert report.policy_fingerprints == (POLICY.fingerprint,)
++
++    epochs = report.epochs
++    assert [epoch.epoch for epoch in epochs] == list(range(len(epochs)))
++    assert [epoch.opened_by for epoch in epochs] == [
++        "genesis",
++        "rotation",
++        "rotation",
++        "rotation",
++        "restore",
++        "rotation",
++    ]
++    assert epochs[0].start_sequence == 0
++    for previous, current in zip(epochs, epochs[1:], strict=False):
++        assert previous.state == "retired"
++        assert previous.end_sequence == current.start_sequence
++    assert epochs[-1].state == "active"
++    assert epochs[-1].key_id == "audit-epoch-5"
++
++
++def test_restore_after_live_manifest_survives_reapplies_pruning(
++    tmp_path: Path,
++) -> None:
++    store = _initialized(tmp_path / "live")
++    next_id = _append(store, 0, 8)
++    store.anchor()
++    old_chain = store.chain_path.read_text(encoding="utf-8")
++
++    next_id = _append(store, next_id, 4)
++    store.prune_through(5, retention_report=_retention_report())
++    store.rotate("audit-epoch-1")
++    _append(store, next_id, 2)
++    store.anchor()
++
++    # Only the chain file is rolled back; the manifest is the live one.
++    store.chain_path.write_text(old_chain, encoding="utf-8")
++    assert store.verify().code == "incomplete_transition"
++    store.record_restore_transition(backup_digest=BACKUP_DIGEST)
++
++    chain, _ = store.load()
++    assert chain.base_sequence == 6
++    assert chain.next_sequence == 8
++    report = store.verify()
++    assert report.valid, report.code
++    assert report.counts["superseded_event_count"] >= 1
++    assert report.epochs[-1].opened_by == "restore"
++    retained = store.chain_path.read_text(encoding="utf-8")
++    for index in range(6):
++        assert _sentinel(index) not in retained
++        assert hash_text(_sentinel(index)) not in retained
++
++
++def test_restore_refuses_a_chain_that_forked_from_the_manifest(
++    tmp_path: Path,
++) -> None:
++    store = _initialized(tmp_path / "live")
++    _append(store, 0, 3)
++    store.anchor()
++    forked = AuditChain()
++    for index in range(100, 104):
++        forked.append(_report(index))
++    forked.write(store.chain_path)
++
++    with pytest.raises(AuditContinuityError) as error:
++        store.record_restore_transition(backup_digest=BACKUP_DIGEST)
++
++    assert error.value.code == "anchor_mismatch"
++
++
++def test_append_refuses_a_swapped_or_truncated_chain(tmp_path: Path) -> None:
++    store = _initialized(tmp_path)
++    _append(store, 0, 3)
++    store.anchor()
++    original = store.chain_path.read_text(encoding="utf-8")
++
++    forked = AuditChain()
++    for index in range(100, 104):
++        forked.append(_report(index))
++    forked.write(store.chain_path)
++    with pytest.raises(AuditContinuityError) as swapped:
++        store.append(_report(9))
++
++    shorter = AuditChain.from_json(original)
++    shorter = AuditChain(shorter.entries[:2])
++    shorter.write(store.chain_path)
++    with pytest.raises(AuditContinuityError) as truncated:
++        store.append(_report(9))
++
++    store.chain_path.unlink()
++    with pytest.raises(AuditContinuityError) as missing:
++        store.append(_report(9))
++
++    assert swapped.value.code == "anchor_mismatch"
++    assert truncated.value.code == "sequence_gap"
++    assert missing.value.code == "sequence_gap"
++
++
++def test_recovery_hook_records_the_restore_epoch_from_a_service_context(
++    tmp_path: Path,
++) -> None:
++    store = _initialized(tmp_path)
++    _append(store, 0, 2)
++    store.anchor()
++
++    class _Context:
++        recovery_point_id = "rp_" + "0" * 32
++        manifest_digest = "sha256:" + "c" * 64
++
++    hook = AuditContinuityRecoveryHook(
++        store.chain_path, key_provider=KEYS, key_id="audit-epoch-1"
++    )
++    hook.open_recovery_epoch(_Context())
++
++    _, manifest = store.load()
++    restore = manifest.head_event
++    assert restore.kind == "restore"
++    assert dict(restore.body) == {
++        "backup_digest": _Context.manifest_digest,
++        "key_id": "audit-epoch-1",
++        "restore_id": _Context.recovery_point_id,
++    }
++    assert manifest.current_epoch.key_id == "audit-epoch-1"
++    assert store.verify().valid
++    assert "AuditContinuityRecoveryHook()" == repr(hook)
++
++
++def _retention_report():
++    artifacts = [
++        {"artifact_id": "synthetic-a", "created_at": "2026-01-01", "counts": {"a": 1}},
++        {"artifact_id": "synthetic-b", "created_at": "2026-03-01", "counts": {"a": 2}},
++    ]
++    return scrub_audit_artifacts(
++        [{**item, "disposition": "audit"} for item in artifacts],
++        POLICY,
++        as_of="2026-03-10",
++    )
++
++
++def test_tombstone_records_the_approving_retention_report(tmp_path: Path) -> None:
++    store = _initialized(tmp_path)
++    _append(store, 0, 3)
++    retention = _retention_report()
++    event = store.prune_through(1, retention_report=retention, policy=POLICY)
++
++    tombstone = event.tombstone
++    assert tombstone is not None
++    assert tombstone.policy_fingerprint == POLICY.fingerprint
++    assert tombstone.retention_report_digest == retention.integrity_digest
++    assert tombstone.record_count == 2
++    assert (tombstone.first_sequence, tombstone.last_sequence) == (0, 1)
++    store.anchor()
++    assert store.verify().valid
++
++
++def test_pruning_requires_one_consistent_policy_approval(tmp_path: Path) -> None:
++    store = _initialized(tmp_path)
++    _append(store, 0, 3)
++    other = AuditRetentionPolicy(rules={"audit": RetentionRule.days(7)})
++
++    with pytest.raises(AuditContinuityError) as missing:
++        store.prune_through(1)
++    with pytest.raises(AuditContinuityError) as mismatch:
++        store.prune_through(1, policy=POLICY, policy_fingerprint=other.fingerprint)
++    with pytest.raises(AuditContinuityError) as out_of_range:
++        store.prune_through(9, policy=POLICY)
++
++    assert missing.value.code == "invalid_argument"
++    assert mismatch.value.code == "policy_mismatch"
++    assert out_of_range.value.code == "invalid_argument"
++    assert store.load()[0].base_sequence == 0
++
++
++def test_rotation_refuses_reused_keys_and_is_idempotent_for_the_active_key(
++    tmp_path: Path,
++) -> None:
++    store = _initialized(tmp_path)
++    first = store.rotate("audit-epoch-1")
++    again = store.rotate("audit-epoch-1")
++
++    with pytest.raises(AuditContinuityError) as reused:
++        store.rotate("audit-epoch-0")
++    with pytest.raises(AuditContinuityError) as unknown:
++        store.rotate("audit-missing-key")
++
++    assert again == first
++    assert reused.value.code == "retired_signer_key"
++    assert unknown.value.code == "signer_key_unavailable"
++    assert store.load()[1].event_count == 2
++
++
++def test_store_refuses_operations_before_initialization(tmp_path: Path) -> None:
++    store = _store(tmp_path)
++    with pytest.raises(AuditContinuityError) as error:
++        store.append(_report(0))
++    assert error.value.code == "not_initialized"
++    store.initialize(key_id="audit-epoch-0")
++    with pytest.raises(AuditContinuityError) as again:
++        store.initialize(key_id="audit-epoch-0")
++    assert again.value.code == "already_initialized"
++    assert store.load()[1].chain_id.startswith("chain-")
++
++
++def test_existing_chain_is_adopted_by_the_genesis_event(tmp_path: Path) -> None:
++    chain = AuditChain()
++    for index in range(3):
++        chain.append(_report(index))
++    chain.write(tmp_path / "audit-chain.json")
++
++    store = _initialized(tmp_path)
++    genesis = store.load()[1].head_event
++
++    assert genesis.next_sequence == 3
++    assert genesis.head_hash == chain.head_hash
++    assert store.verify().valid
++
++
++def test_anchor_interval_signs_the_head_without_explicit_anchors(
++    tmp_path: Path,
++) -> None:
++    store = _initialized(tmp_path, anchor_interval=3)
++    _append(store, 0, 7)
++
++    report = store.verify(allow_unanchored_tail=True)
++    assert report.valid
++    assert report.counts["anchor_count"] == 2
++    assert report.counts["unanchored_entry_count"] == 1
++    assert store.verify().code == "unanchored_tail"
++
++
++# Tamper detection -------------------------------------------------------------
++
++
++@pytest.fixture
++def anchored(tmp_path: Path) -> AuditContinuityStore:
++    store, _ = _lifecycle(tmp_path)
++    assert store.verify().valid
++    return store
++
++
++def _index_of(manifest: dict[str, Any], kind: str, *, last: bool = False) -> int:
++    indices = [
++        position
++        for position, event in enumerate(manifest["events"])
++        if event["kind"] == kind
++    ]
++    return indices[-1] if last else indices[0]
++
++
++def test_deleted_record_is_a_sequence_gap(anchored: AuditContinuityStore) -> None:
++    chain, manifest = _documents(anchored)
++    del chain["entries"][1]
++
++    assert _verify(chain, manifest).code == "sequence_gap"
++
++
++def test_truncated_chain_tail_is_a_sequence_gap(
++    anchored: AuditContinuityStore,
++) -> None:
++    chain, manifest = _documents(anchored)
++    del chain["entries"][-1]
++    chain["entry_count"] -= 1
++    chain["head_hash"] = chain["entries"][-1]["entry_hash"]
++
++    assert _verify(chain, manifest).code == "sequence_gap"
++
++
++def test_rebuilt_chain_without_a_record_is_an_anchor_mismatch(
++    tmp_path: Path,
++) -> None:
++    store = _initialized(tmp_path)
++    _append(store, 0, 4)
++    store.anchor()
++    _, manifest = _documents(store)
++    rebuilt = AuditChain()
++    for index in (0, 2, 3, 4):
++        rebuilt.append(_report(index))
++
++    report = _verify(rebuilt, manifest)
++
++    assert report.code == "anchor_mismatch"
++    assert report.event_index == 1
++
++
++def test_unexplained_pruning_is_a_sequence_gap(tmp_path: Path) -> None:
++    store = _initialized(tmp_path)
++    _append(store, 0, 4)
++    store.anchor()
++    chain, manifest = store.load()
++    chain.prune_through(1)
++
++    assert _verify(chain, manifest).code == "sequence_gap"
++
++
++def test_missing_duplicated_and_reordered_anchors_fail_with_stable_codes(
++    anchored: AuditContinuityStore,
++    subtests,
++) -> None:
++    def missing(manifest: dict[str, Any]) -> None:
++        del manifest["events"][_index_of(manifest, "anchor")]
++
++    def duplicated(manifest: dict[str, Any]) -> None:
++        position = _index_of(manifest, "anchor")
++        manifest["events"].insert(position, dict(manifest["events"][position]))
++
++    def reordered(manifest: dict[str, Any]) -> None:
++        position = _index_of(manifest, "anchor")
++        events = manifest["events"]
++        events[position], events[position + 1] = events[position + 1], events[position]
++
++    def modified(manifest: dict[str, Any]) -> None:
++        position = _index_of(manifest, "anchor")
++        manifest["events"][position]["head_hash"] = "sha256:" + "0" * 64
++
++    def truncated_header(manifest: dict[str, Any]) -> None:
++        manifest["events"].pop()
++
++    cases = {
++        "missing": (missing, "event_gap"),
++        "duplicated": (duplicated, "event_duplicate"),
++        "reordered": (reordered, "event_reordered"),
++        "modified": (modified, "anchor_mismatch"),
++        "truncated": (truncated_header, "event_gap"),
++    }
++    for name, (mutate, code) in cases.items():
++        with subtests.test(case=name):
++            chain, manifest = _documents(anchored)
++            mutate(manifest)
++            report = _verify(chain, manifest)
++            assert report.code == code
++            assert not report.valid
++
++
++def test_resigned_anchor_without_the_key_is_rejected(
++    anchored: AuditContinuityStore,
++) -> None:
++    chain, manifest = _documents(anchored)
++    position = _index_of(manifest, "anchor")
++    attacker = {"audit-attacker": b"synthetic-attacker-key-material-0123456789"}
++
++    def move_head(event: dict[str, Any]) -> None:
++        event["head_hash"] = "sha256:" + "1" * 64
++
++    _resign(manifest, position, move_head, provider={**KEYS, **attacker})
++    manifest["events"][position]["signatures"][0]["value"] = "0" * 64
++
++    assert _verify(chain, manifest).code == "signature_invalid"
++
++
++def test_unknown_and_retired_signer_material_fail_closed(
++    anchored: AuditContinuityStore,
++    subtests,
++) -> None:
++    attacker = {"audit-attacker": b"synthetic-attacker-key-material-0123456789"}
++    with subtests.test(case="unknown"):
++        chain, manifest = _documents(anchored)
++        position = _index_of(manifest, "anchor", last=True)
++        _resign(
++            manifest,
++            position,
++            keys={"signer": "audit-attacker"},
++            provider={**KEYS, **attacker},
++        )
++        assert _verify(chain, manifest).code == "unknown_signer_key"
++
++    with subtests.test(case="retired"):
++        chain, manifest = _documents(anchored)
++        position = _index_of(manifest, "anchor", last=True)
++        _resign(manifest, position, keys={"signer": "audit-epoch-0"})
++        assert _verify(chain, manifest).code == "retired_signer_key"
++
++    with subtests.test(case="unavailable"):
++        chain, manifest = _documents(anchored)
++        partial = {key: value for key, value in KEYS.items() if key != "audit-epoch-0"}
++        report = verify_continuity(chain, manifest, key_provider=partial)
++        assert report.code == "signer_key_unavailable"
++        assert report.event_index == 0
++
++
++def test_trusted_anchor_lets_retired_keys_be_dropped(
++    anchored: AuditContinuityStore,
++) -> None:
++    chain, manifest = anchored.load()
++    checkpoint = manifest.head_ref()
++    next_id = _append(anchored, 100, 2)
++    anchored.anchor()
++    assert next_id == 102
++    chain, manifest = anchored.load()
++    current_only = {"audit-epoch-3": KEYS["audit-epoch-3"]}
++
++    without = verify_continuity(chain, manifest, key_provider=current_only)
++    with_checkpoint = verify_continuity(
++        chain, manifest, key_provider=current_only, trusted_anchors=[checkpoint]
++    )
++
++    assert without.code == "signer_key_unavailable"
++    assert with_checkpoint.valid, with_checkpoint.code
++    assert with_checkpoint.counts["trusted_anchor_count"] == 1
++    assert with_checkpoint.counts["unverified_signature_count"] > 0
++
++
++def test_trusted_anchor_detects_truncation_and_forks(
++    anchored: AuditContinuityStore,
++    subtests,
++) -> None:
++    _, manifest_obj = anchored.load()
++    head = manifest_obj.head_ref()
++    earlier = ContinuityAnchorRef(index=2, digest=manifest_obj.events[2].digest)
++
++    with subtests.test(case="truncated"):
++        chain, manifest = _documents(anchored)
++        manifest["events"].pop()
++        manifest["event_count"] -= 1
++        manifest["head_digest"] = manifest["events"][-1]["digest"]
++        report = _verify(chain, manifest, trusted_anchors=[head])
++        assert report.code == "anchor_missing"
++
++    with subtests.test(case="fork"):
++        chain, manifest = _documents(anchored)
++        wrong = ContinuityAnchorRef(index=earlier.index, digest="sha256:" + "2" * 64)
++        report = _verify(chain, manifest, trusted_anchors=[wrong.to_dict()])
++        assert report.code == "fork"
++
++    with subtests.test(case="matching"):
++        chain, manifest = _documents(anchored)
++        report = _verify(chain, manifest, trusted_anchors=[earlier, head])
++        assert report.valid
++        assert report.counts["trusted_anchor_count"] == 2
++
++
++def test_reordered_and_missing_epochs_are_detected(
++    anchored: AuditContinuityStore,
++    subtests,
++) -> None:
++    with subtests.test(case="summary reordered"):
++        chain, manifest = _documents(anchored)
++        epochs = manifest["epochs"]
++        epochs[1], epochs[2] = epochs[2], epochs[1]
++        assert _verify(chain, manifest).code == "epoch_mismatch"
++
++    with subtests.test(case="rotation events reordered"):
++        chain, manifest = _documents(anchored)
++        rotations = [
++            position
++            for position, event in enumerate(manifest["events"])
++            if event["kind"] == "rotation"
++        ]
++        events = manifest["events"]
++        first, second = rotations[0], rotations[1]
++        events[first], events[second] = events[second], events[first]
++        assert _verify(chain, manifest).code == "event_reordered"
++
++    with subtests.test(case="rotation renumbered"):
++        chain, manifest = _documents(anchored)
++        position = _index_of(manifest, "rotation")
++        manifest["events"][position]["epoch"] = 7
++        assert _verify(chain, manifest).code == "epoch_mismatch"
++
++    with subtests.test(case="rotation removed"):
++        chain, manifest = _documents(anchored)
++        del manifest["events"][_index_of(manifest, "rotation")]
++        assert _verify(chain, manifest).code == "event_gap"
++
++
++def test_unsigned_epoch_transition_is_rejected(
++    anchored: AuditContinuityStore,
++    subtests,
++) -> None:
++    for role in ("outgoing", "incoming"):
++        with subtests.test(role=role):
++            chain, manifest = _documents(anchored)
++            event = manifest["events"][_index_of(manifest, "rotation")]
++            event["signatures"] = [
++                item for item in event["signatures"] if item["role"] != role
++            ]
++            assert _verify(chain, manifest).code == "unsigned_epoch_transition"
++
++
++def test_forged_tombstones_are_rejected(
++    anchored: AuditContinuityStore,
++    subtests,
++) -> None:
++    with subtests.test(case="edited record count"):
++        chain, manifest = _documents(anchored)
++        position = _index_of(manifest, "retention")
++        manifest["events"][position]["body"]["record_count"] = 1
++        assert _verify(chain, manifest).code == "tombstone_mismatch"
++
++    with subtests.test(case="edited segment digest"):
++        chain, manifest = _documents(anchored)
++        position = _index_of(manifest, "retention")
++        manifest["events"][position]["body"]["segment_digest"] = "sha256:" + "3" * 64
++        assert _verify(chain, manifest).code == "tombstone_mismatch"
++
++    with subtests.test(case="insider tombstone with the wrong boundary"):
++        store = _initialized(anchored.chain_path.parent / "insider")
++        _append(store, 0, 4)
++        store.prune_through(1, policy=POLICY)
++        chain, manifest = _documents(store)
++        position = _index_of(manifest, "retention", last=True)
++
++        def move_boundary(event: dict[str, Any]) -> None:
++            event["body"]["end_hash"] = "sha256:" + "4" * 64
++
++        _resign(manifest, position, move_boundary)
++        assert _verify(chain, manifest).code == "tombstone_mismatch"
++
++    with subtests.test(case="insider tombstone with a coverage gap"):
++        store = _initialized(anchored.chain_path.parent / "gap")
++        _append(store, 0, 4)
++        store.prune_through(1, policy=POLICY)
++        chain, manifest = _documents(store)
++        position = _index_of(manifest, "retention", last=True)
++
++        def skip_first(event: dict[str, Any]) -> None:
++            event["body"]["first_sequence"] = 1
++            event["body"]["record_count"] = 1
++
++        _resign(manifest, position, skip_first)
++        assert _verify(chain, manifest).code == "sequence_gap"
++
++
++def test_policy_versions_must_match_when_required(
++    anchored: AuditContinuityStore,
++) -> None:
++    other = AuditRetentionPolicy(rules={"audit": RetentionRule.days(7)})
++
++    assert (
++        anchored.verify(allowed_policy_fingerprints=[other.fingerprint]).code
++        == "policy_mismatch"
++    )
++    assert anchored.verify(allowed_policy_fingerprints=[POLICY.fingerprint]).valid
++
++
++def test_manifest_shape_version_and_chain_binding_fail_closed(
++    anchored: AuditContinuityStore,
++    subtests,
++) -> None:
++    def unknown_field(manifest: dict[str, Any]) -> None:
++        manifest["events"][0][_sentinel(9)] = "unsafe"
++
++    def future_version(manifest: dict[str, Any]) -> None:
++        manifest["version"] = 99
++
++    def other_chain(manifest: dict[str, Any]) -> None:
++        manifest["chain_genesis_hash"] = "sha256:" + "5" * 64
++
++    def changed_chain_id(manifest: dict[str, Any]) -> None:
++        manifest["chain_id"] = "chain-other"
++
++    cases = {
++        "unknown field": (unknown_field, "malformed_manifest"),
++        "future version": (future_version, "unsupported_version"),
++        "other chain format": (other_chain, "chain_mismatch"),
++        "changed chain id": (changed_chain_id, "chain_mismatch"),
++    }
++    for name, (mutate, code) in cases.items():
++        with subtests.test(case=name):
++            chain, manifest = _documents(anchored)
++            mutate(manifest)
++            report = _verify(chain, manifest)
++            assert report.code == code
++            assert _sentinel(9) not in report.to_json()
++
++    chain, manifest = _documents(anchored)
++    assert (
++        _verify(chain, manifest, expected_chain_id="chain-other").code
++        == "chain_mismatch"
++    )
++
++
++def test_every_reason_code_is_controlled() -> None:
++    assert "valid" in CONTINUITY_REASON_CODES
++    assert all(code.replace("_", "").isalpha() for code in CONTINUITY_REASON_CODES)
++    assert str(AuditContinuityError("not-a-code")) == (
++        "audit continuity failed: malformed_manifest"
++    )
++
++
++# Crash recovery and concurrency -------------------------------------------------
++
++
++def _interrupt_next_chain_write(monkeypatch: pytest.MonkeyPatch) -> None:
++    original = AuditChain.write
++
++    def interrupted(self: AuditChain, path: Any) -> Path:
++        monkeypatch.setattr(AuditChain, "write", original)
++        raise OSError("simulated crash before the chain rewrite")
++
++    monkeypatch.setattr(AuditChain, "write", interrupted)
++
++
++def test_interrupted_pruning_is_completed_deterministically_after_restart(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    store = _initialized(tmp_path / "primary")
++    _append(store, 0, 6)
++    store.anchor()
++    _interrupt_next_chain_write(monkeypatch)
++    with pytest.raises(AuditContinuityError) as crashed:
++        store.prune_through(3, policy=POLICY)
++    assert crashed.value.code == "io_failed"
++    assert store.verify().code == "incomplete_transition"
++
++    replica = tmp_path / "replica"
++    shutil.copytree(tmp_path / "primary", replica)
++    restarted = _store(tmp_path / "primary")
++    other = _store(replica)
++    first = restarted.recover()
++    second = other.recover()
++
++    assert first.retention_completed and first.pruned_entry_count == 4
++    assert second == first
++    assert restarted.recover().retention_completed is False
++    assert restarted.chain_path.read_bytes() == other.chain_path.read_bytes()
++    assert restarted.verify().valid
++    assert _sentinel(0) not in restarted.chain_path.read_text(encoding="utf-8")
++
++
++def test_interrupted_pruning_with_tampered_pending_entries_is_refused(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    store = _initialized(tmp_path)
++    _append(store, 0, 4)
++    _interrupt_next_chain_write(monkeypatch)
++    with pytest.raises(AuditContinuityError):
++        store.prune_through(1, policy=POLICY)
++    chain = AuditChain()
++    for index in (50, 51, 52, 53):
++        chain.append(_report(index))
++    chain.write(store.chain_path)
++
++    with pytest.raises(AuditContinuityError) as refused:
++        store.recover()
++
++    assert refused.value.code == "tombstone_mismatch"
++    assert store.verify().code == "tombstone_mismatch"
++
++
++def test_concurrent_writers_recover_an_interrupted_transition_once(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    store = _initialized(tmp_path)
++    _append(store, 0, 5)
++    _interrupt_next_chain_write(monkeypatch)
++    with pytest.raises(AuditContinuityError):
++        store.prune_through(2, policy=POLICY)
++
++    errors: list[BaseException] = []
++
++    def writer(offset: int) -> None:
++        try:
++            _append(_store(tmp_path), offset, 4)
++        except BaseException as error:  # pragma: no cover - surfaced below
++            errors.append(error)
++
++    threads = [threading.Thread(target=writer, args=(100 * n,)) for n in range(1, 4)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++
++    assert errors == []
++    store.anchor()
++    report = store.verify()
++    assert report.valid, report.code
++    assert report.counts["pruned_entry_count"] == 3
++    assert report.counts["next_sequence"] == 5 + 12
++
++
++def test_rotation_concurrent_with_appends_has_one_ordered_transition(
++    tmp_path: Path,
++) -> None:
++    store = _initialized(tmp_path)
++    _append(store, 0, 2)
++    started = threading.Barrier(5)
++    errors: list[BaseException] = []
++    transitions: list[ContinuityEvent] = []
++
++    def writer(offset: int) -> None:
++        try:
++            started.wait()
++            _append(_store(tmp_path), offset, 6)
++        except BaseException as error:  # pragma: no cover - surfaced below
++            errors.append(error)
++
++    def rotator() -> None:
++        try:
++            started.wait()
++            transitions.append(_store(tmp_path).rotate("audit-epoch-1"))
++        except BaseException as error:  # pragma: no cover - surfaced below
++            errors.append(error)
++
++    threads = [threading.Thread(target=writer, args=(100 * n,)) for n in range(1, 4)]
++    threads += [threading.Thread(target=rotator) for _ in range(2)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++
++    assert errors == []
++    assert len(transitions) == 2 and transitions[0] == transitions[1]
++    store.anchor()
++    chain, manifest = store.load()
++    rotations = [event for event in manifest.events if event.kind == "rotation"]
++    assert len(rotations) == 1
++    boundary = rotations[0].next_sequence
++    assert 2 <= boundary <= 20
++    assert rotations[0].head_hash == chain.entry_at(boundary - 1).entry_hash
++    epochs = manifest.epochs
++    assert [(epoch.start_sequence, epoch.end_sequence) for epoch in epochs] == [
++        (0, boundary),
++        (boundary, None),
++    ]
++    report = store.verify()
++    assert report.valid, report.code
++    assert report.counts["next_sequence"] == 20
++    assert report.counts["unanchored_entry_count"] == 0
++
++
++_CHILD_WRITER = textwrap.dedent(
++    """
++    import sys
++    from pathlib import Path
++
++    from openmed.core.audit import AuditReport, hash_text
++    from openmed.core.audit_continuity import AuditContinuityStore
++
++    keys = {
++        f"audit-epoch-{index}": (
++            f"synthetic-continuity-key-{index:02d}-0123456789abcdef"
++        ).encode("ascii")
++        for index in range(12)
++    }
++    store = AuditContinuityStore(Path(sys.argv[1]), key_provider=keys)
++    worker = sys.argv[2]
++    empty = hash_text("")
++    for index in range(int(sys.argv[3])):
++        store.append(
++            AuditReport(
++                policy="synthetic_policy",
++                resolved_profile={"method": "mask"},
++                detectors=[],
++                safety_sweep={},
++                spans=[],
++                thresholds={},
++                residual_risk={},
++                openmed_version="synthetic",
++                manifest_hash=empty,
++                document_length=0,
++                input_hash=hash_text(f"synthetic-{worker}-{index}"),
++                deidentified_text_hash=empty,
++            )
++        )
++    """
++)
++
++
++def test_rotation_is_serialized_with_appends_from_other_processes(
++    tmp_path: Path,
++) -> None:
++    store = _initialized(tmp_path)
++    env = {**os.environ, "PYTHONPATH": str(ROOT)}
++    children = [
++        subprocess.Popen(
++            [
++                sys.executable,
++                "-c",
++                _CHILD_WRITER,
++                str(store.chain_path),
++                f"worker{worker}",
++                "8",
++            ],
++            env=env,
++            stdout=subprocess.DEVNULL,
++            stderr=subprocess.PIPE,
++        )
++        for worker in range(2)
++    ]
++    # Rotate once the children are writing so the rollover interleaves with
++    # their appends; the outcome must not depend on that timing.
++    while all(child.poll() is None for child in children):
++        if store.load()[0].next_sequence >= 2:
++            break
++        time.sleep(0.005)
++    store.rotate("audit-epoch-1")
++    store.rotate("audit-epoch-2")
++    for child in children:
++        _, stderr = child.communicate(timeout=120)
++        assert child.returncode == 0, stderr.decode("utf-8", "replace")[-500:]
++
++    store.anchor()
++    report = store.verify()
++    assert report.valid, report.code
++    assert report.counts["next_sequence"] == 16
++    assert report.counts["rotation_count"] == 2
++    windows = [(epoch.start_sequence, epoch.end_sequence) for epoch in report.epochs]
++    assert windows[0][0] == 0 and windows[-1][1] is None
++    for previous, current in zip(windows, windows[1:], strict=False):
++        assert previous[1] == current[0]
++
++
++def test_failed_writes_leave_no_temporary_files(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    store = _initialized(tmp_path)
++    _append(store, 0, 2)
++
++    def failing_replace(source: Any, target: Any) -> None:
++        raise OSError("simulated rename failure")
++
++    monkeypatch.setattr(os, "replace", failing_replace)
++    with pytest.raises(AuditContinuityError) as error:
++        store.anchor()
++    monkeypatch.undo()
++
++    assert error.value.code == "io_failed"
++    assert (
++        sorted(path.name for path in tmp_path.iterdir() if path.name.endswith(".tmp"))
++        == []
++    )
++    stale = tmp_path / ".audit-chain.json.leftover.tmp"
++    stale.write_text("{}", encoding="utf-8")
++    assert store.recover().temporary_files_removed == 1
++    assert store.verify(allow_unanchored_tail=True).valid
++
++
++# Privacy and offline behavior ---------------------------------------------------
++
++
++def test_pruned_sentinels_are_absent_from_retained_state_and_evidence(
++    anchored: AuditContinuityStore,
++) -> None:
++    report = anchored.verify()
++    evidence = report.to_json(indent=2)
++    retained = "".join(
++        path.read_text(encoding="utf-8")
++        for path in anchored.chain_path.parent.iterdir()
++        if path.is_file()
++    )
++
++    for index in range(10):
++        for value in (_sentinel(index), hash_text(_sentinel(index))):
++            assert value not in retained
++            assert value not in evidence
++    # Retained entries keep their own value-free commitments.
++    assert hash_text(_sentinel(10)) in retained
++    for material in KEYS.values():
++        assert material.decode("ascii") not in retained
++        assert material.decode("ascii") not in evidence
++
++
++def test_report_is_bounded_deterministic_and_value_free(
++    anchored: AuditContinuityStore,
++) -> None:
++    first = anchored.verify()
++    second = anchored.verify()
++    payload = first.to_dict()
++
++    assert first.to_json() == second.to_json()
++    assert payload["format"] == "openmed.audit-continuity.verification"
++    assert payload["version"] == 1
++    assert payload["report_digest"] == first.report_digest
++    assert set(payload["counts"]) == set(first.counts)
++    assert all(type(value) is int and value >= 0 for value in first.counts.values())
++    assert set(payload) == {
++        "format",
++        "version",
++        "manifest_version",
++        "valid",
++        "code",
++        "event_index",
++        "chain_id",
++        "manifest_digest",
++        "chain_head_hash",
++        "counts",
++        "epochs",
++        "policy_fingerprints",
++        "report_digest",
++    }
++
++
++def test_errors_never_echo_identifiers_or_paths(tmp_path: Path) -> None:
++    store = _initialized(tmp_path / _sentinel(1).replace(" ", "-"))
++    with pytest.raises(AuditContinuityError) as error:
++        store.rotate(_sentinel(2))
++    message = str(error.value)
++    assert _sentinel(1).replace(" ", "-") not in message
++    assert _sentinel(2) not in message
++    assert error.value.code == "invalid_argument"
++
++
++def test_manifest_round_trips_and_rejects_duplicate_keys(
++    anchored: AuditContinuityStore,
++) -> None:
++    _, manifest = anchored.load()
++    text = manifest.to_json()
++    assert ContinuityManifest.from_json(text).to_json() == text
++    duplicated = text[:-1] + ',"chain_id":"chain-other"}'
++    with pytest.raises(AuditContinuityError) as error:
++        ContinuityManifest.from_json(duplicated)
++    assert error.value.code == "malformed_manifest"
++
++
++def test_verification_is_fully_offline(
++    anchored: AuditContinuityStore,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    chain, manifest = anchored.load()
++
++    def deny_network(*args: object, **kwargs: object) -> None:
++        raise AssertionError("network access is forbidden during verification")
++
++    monkeypatch.setattr(socket, "socket", deny_network)
++    monkeypatch.setattr(socket, "create_connection", deny_network)
++
++    assert verify_continuity(chain, manifest, key_provider=KEYS).valid
++
++
++def test_segment_digest_helpers_check_a_retained_backup_copy(tmp_path: Path) -> None:
++    store = _initialized(tmp_path)
++    _append(store, 0, 4)
++    chain_before, _ = store.load()
++    segment = chain_before.entries[:2]
++    event = store.prune_through(1, policy=POLICY)
++    tombstone = event.tombstone
++    assert tombstone is not None
++
++    assert tombstone.segment_digest == tombstone_segment_digest(
++        "chain-synthetic", segment
++    )
++    assert verify_tombstone_segment(tombstone, segment, chain_id="chain-synthetic")
++    assert not verify_tombstone_segment(
++        tombstone, chain_before.entries[1:3], chain_id="chain-synthetic"
++    )
++    assert not verify_tombstone_segment(tombstone, segment, chain_id="chain-other")
++
++
++# Property: random lifecycles verify and any event edit is detected -------------
++
++_OPERATIONS = st.lists(
++    st.sampled_from(["append", "append", "append", "anchor", "rotate", "prune"]),
++    min_size=1,
++    max_size=14,
++)
++
++
++@settings(
++    max_examples=20,
++    deadline=None,
++    derandomize=True,
++    suppress_health_check=[HealthCheck.too_slow],
++)
++@given(operations=_OPERATIONS, edit=st.integers(min_value=0, max_value=10_000))
++def test_random_lifecycles_verify_and_edits_are_detected(
++    operations: list[str],
++    edit: int,
++) -> None:
++    with tempfile.TemporaryDirectory() as directory:
++        store = _initialized(Path(directory))
++        next_id = 0
++        rotations = 0
++        for operation in operations:
++            if operation == "append":
++                store.append(_report(next_id))
++                next_id += 1
++            elif operation == "anchor":
++                store.anchor()
++            elif operation == "rotate" and rotations < 10:
++                rotations += 1
++                store.rotate(f"audit-epoch-{rotations}")
++            elif operation == "prune":
++                chain, _ = store.load()
++                if chain.entries:
++                    store.prune_through(chain.base_sequence, policy=POLICY)
++        store.anchor()
++        report = store.verify()
++        assert report.valid, report.code
++
++        chain_doc, manifest = _documents(store)
++        position = edit % len(manifest["events"])
++        manifest["events"][position]["head_hash"] = "sha256:" + "6" * 64
++        tampered = _verify(chain_doc, manifest)
++        assert not tampered.valid
++        assert tampered.code in CONTINUITY_REASON_CODES
+diff --git a/tests/unit/core/test_audit_key_rotation.py b/tests/unit/core/test_audit_key_rotation.py
+index 54de3b79f..14e7e8968 100644
+--- a/tests/unit/core/test_audit_key_rotation.py
++++ b/tests/unit/core/test_audit_key_rotation.py
+@@ -13,6 +13,7 @@
+     AuditKeyRotationError,
+     AuditKeyRotationSigner,
+     AuditKeyRotationVerifier,
++    AuditKeyUnavailableError,
+     sign_audit_report,
+     verify_audit_report,
+ )
+@@ -182,3 +183,85 @@ def test_verifier_returns_false_for_invalid_runtime_input():
+ 
+     assert not verifier.verify(None)  # type: ignore[arg-type]
+     assert not verifier.verify([])  # type: ignore[arg-type]
++
++
++_DIGEST = "sha256:" + "ab" * 32
++
++
++def test_digest_signatures_bind_key_id_purpose_and_role():
++    signer = AuditKeyRotationSigner(key_id="audit-2026", key_provider=_KEYS)
++    verifier = AuditKeyRotationVerifier(key_provider=_KEYS)
++    value = signer.sign_digest(_DIGEST, purpose="audit-continuity")
++
++    assert len(value) == 64
++    assert signer.sign_digest(_DIGEST, purpose="audit-continuity") == value
++    assert verifier.verify_digest(
++        _DIGEST, value, key_id="audit-2026", purpose="audit-continuity"
++    )
++    assert not verifier.verify_digest(
++        _DIGEST, value, key_id="audit-2025", purpose="audit-continuity"
++    )
++    assert not verifier.verify_digest(
++        _DIGEST,
++        value,
++        key_id="audit-2026",
++        purpose="audit-continuity",
++        role="incoming",
++    )
++    assert not verifier.verify_digest(
++        "sha256:" + "cd" * 32, value, key_id="audit-2026", purpose="audit-continuity"
++    )
++    rotated = signer.sign_digest(
++        _DIGEST, purpose="audit-continuity", role="outgoing", key_id="audit-2025"
++    )
++    assert verifier.verify_digest(
++        _DIGEST,
++        rotated,
++        key_id="audit-2025",
++        purpose="audit-continuity",
++        role="outgoing",
++    )
++
++
++def test_digest_signatures_are_domain_separated_from_report_signatures():
++    signer = AuditKeyRotationSigner(key_id="audit-2026", key_provider=_KEYS)
++    report = signer.sign(_report())
++    assert report.signature is not None
++
++    digest_value = signer.sign_digest(report.repro_hash, purpose="audit-continuity")
++
++    assert digest_value != report.signature.value
++    assert not AuditKeyRotationVerifier(key_provider=_KEYS).verify_digest(
++        report.repro_hash,
++        report.signature.value,
++        key_id="audit-2026",
++        purpose="audit-continuity",
++    )
++
++
++def test_digest_signing_rejects_unknown_purposes_roles_and_digests(subtests):
++    signer = AuditKeyRotationSigner(key_id="audit-2026", key_provider=_KEYS)
++    cases = {
++        "purpose": (_DIGEST, {"purpose": "release"}),
++        "role": (_DIGEST, {"purpose": "audit-continuity", "role": "admin"}),
++        "digest": ("not-a-digest", {"purpose": "audit-continuity"}),
++    }
++    for name, (digest, kwargs) in cases.items():
++        with subtests.test(case=name):
++            with pytest.raises(AuditKeyRotationError):
++                signer.sign_digest(digest, **kwargs)
++
++
++def test_unavailable_digest_keys_fail_closed_without_echoing_material():
++    def provider(key_id: str) -> bytes:
++        raise RuntimeError("vault refused " + _KEYS["audit-2026"].decode("ascii"))
++
++    signer = AuditKeyRotationSigner(key_id="audit-2026", key_provider=provider)
++    with pytest.raises(AuditKeyUnavailableError) as error:
++        signer.sign_digest(_DIGEST, purpose="audit-continuity")
++
++    assert "synthetic-new-signing-key" not in str(error.value)
++    assert isinstance(error.value, AuditKeyRotationError)
++    assert not AuditKeyRotationVerifier(key_provider=provider).verify_digest(
++        _DIGEST, "0" * 64, key_id="audit-2026", purpose="audit-continuity"
++    )

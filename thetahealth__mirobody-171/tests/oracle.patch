@@ -1,0 +1,470 @@
+diff --git a/.github/workflows/test-build.yml b/.github/workflows/test-build.yml
+index c053269b0..b833d67df 100644
+--- a/.github/workflows/test-build.yml
++++ b/.github/workflows/test-build.yml
+@@ -18,6 +18,9 @@ on:
+     branches: [ main ]
+   pull_request:
+ 
++permissions:
++  contents: read
++
+ jobs:
+   test-build:
+     runs-on: ubuntu-latest
+@@ -231,6 +234,7 @@ jobs:
+         python -c "import mirobody; print(f'Mirobody {mirobody.__version__} works on ${{ matrix.os }}')"
+ 
+   summary:
++    permissions: {}
+     needs: [test-build, test-import, windows-benchmark]
+     runs-on: ubuntu-latest
+     if: always()
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bf05432f8..028d1d373 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -75,6 +75,21 @@
+ 
+ ### Fixed
+ 
++- **Security diagnostics could retain credentials and report content.** HTTP
++  helpers now log only response status and error codes, configuration output
++  shows credential presence without fragments, and storage failures omit vendor
++  exception text. Credential/file correlation handles use a process-local keyed
++  digest, so a log reader cannot test guesses against an unkeyed fingerprint.
++  Extraction errors return a fixed public sentence. Local file checks retain
++  resolved-path containment with an explicit directory boundary. Synthetic
++  regression cases exercise traversal, symlinks and diagnostic redaction.
++- **Provider account addresses used only 32 bits of MD5.** Distinct provider
++  identities could share an internal email and therefore reuse one account.
++  New addresses use a 128-bit SHA-256 prefix; existing provider links are still
++  resolved before address generation. A regression pins two invented ids that
++  collided previously. Mandrill detection now matches its exact SMTP hostname,
++  and the test workflow explicitly limits its token to repository reads.
++
+ - **A cut medication log suggested an invalid retry.** The shared character-cut
+   notice recommended `view=stats`, which `query_medications` refuses. The leading
+   cut notice now asks callers to narrow the query using the producing tool's
+diff --git a/mirobody/server/routers/records_router.py b/mirobody/server/routers/records_router.py
+index 24316b4bb..c7570f693 100644
+--- a/mirobody/server/routers/records_router.py
++++ b/mirobody/server/routers/records_router.py
+@@ -148,11 +148,9 @@ async def standardize(body: StandardizeRequest, user_id: str = Depends(verify_to
+ 
+     try:
+         readings = await parse_text(body.text)
+-    except ExtractionError as e:
+-        # A fixed sentence (no provider key, or an answer that was not a JSON
+-        # array): the caller's to act on, not a server fault. Any other
+-        # RuntimeError may quote what it was sent, so it is not echoed.
+-        return _error(400, str(e), "extraction_failed", "text")
++    except ExtractionError:
++        # Exception text can grow to include model output or configuration.
++        return _error(400, "Check the configured text model and the document format.", "extraction_failed", "text")
+     except Exception as e:
+         logger.error("standardize failed: error_type=%s", type(e).__name__, exc_info=not is_driver_exception(e))
+         return _error(500, "This extraction could not complete.", "internal_error")
+diff --git a/mirobody/user/auth/email.py b/mirobody/user/auth/email.py
+index 2fc21054e..4393f6c77 100644
+--- a/mirobody/user/auth/email.py
++++ b/mirobody/user/auth/email.py
+@@ -536,14 +536,14 @@ def create_email_validator(
+     Factory function to create the appropriate email validator based on configuration.
+     
+     Priority:
+-    1. Mandrill via SMTP config (if smtp_host contains 'mandrillapp.com', use smtp_pass as API key)
++    1. Mandrill via its exact SMTP hostname, using smtp_pass as the API key
+     2. SMTP configuration (if smtp_host, smtp_user, smtp_pass are provided)
+     3. Mandrill configuration (if mandrill_api_key is provided)
+     4. DummyEmailCodeValidator (fallback)
+     """
+     
+-    # Priority 1: Auto-detect Mandrill from smtp_host
+-    if smtp_host and "mandrillapp.com" in smtp_host.lower() and smtp_pass and from_email and template:
++    # A substring also matched attacker-controlled lookalike hostnames.
++    if smtp_host.rstrip(".").lower() == "smtp.mandrillapp.com" and smtp_pass and from_email and template:
+         return MandrillEmailValidator(
+             apiKey          = smtp_pass,  # Use smtp_pass as Mandrill API key
+             template        = template,
+diff --git a/mirobody/user/platform.py b/mirobody/user/platform.py
+index fec438a05..b672a45bc 100644
+--- a/mirobody/user/platform.py
++++ b/mirobody/user/platform.py
+@@ -333,7 +333,8 @@ async def get_user_providers(self, user_id: str, provider_prefix: str | None = N
+             return []
+ 
+     def _generate_unique_email(self, provider_slug: str, provider_user_id: str) -> str:
+-        provider_hash = hashlib.md5(f"{provider_slug}_{provider_user_id}".encode()).hexdigest()[:8]
++        # A 32-bit prefix could map distinct provider accounts to one email.
++        provider_hash = hashlib.sha256(f"{provider_slug}_{provider_user_id}".encode()).hexdigest()[:32]
+         return f"{provider_slug}_{provider_hash}@theta.local"
+ 
+ 
+diff --git a/mirobody/utils/config/config.py b/mirobody/utils/config/config.py
+index 1b0be3def..b063f57ed 100644
+--- a/mirobody/utils/config/config.py
++++ b/mirobody/utils/config/config.py
+@@ -669,13 +669,8 @@ def print_predefined_codes(self):
+ 
+     @staticmethod
+     def to_masked_str(s: str) -> str:
+-        n = len(s)
+-        if n <= 0:
+-            return ""
+-        if n < 6:
+-            return "************"
+-
+-        return f"{s[:3]}******{s[n-3:]}"
++        """Report presence without exposing even a short credential fragment."""
++        return "[configured]" if s else ""
+ 
+     #-------------------------------------------------------------------------
+ 
+diff --git a/mirobody/utils/config/storage/abstract.py b/mirobody/utils/config/storage/abstract.py
+index 296e66bb0..0302a4bf3 100644
+--- a/mirobody/utils/config/storage/abstract.py
++++ b/mirobody/utils/config/storage/abstract.py
+@@ -2,7 +2,6 @@
+ import logging
+ from typing import BinaryIO
+ 
+-from mirobody.kernel.ops import is_driver_exception
+ from mirobody.utils.file_types import guess_mime
+ 
+ logger = logging.getLogger(__name__)
+@@ -18,8 +17,8 @@ def storage_failure(action: str, key: str, exc: Exception) -> str:
+     from mirobody.utils.log import secret_fingerprint
+ 
+     error_type = type(exc).__name__
+-    logger.error("%s failed: key=%s error_type=%s", action, secret_fingerprint(key), error_type,
+-                 exc_info=not is_driver_exception(exc))
++    # Vendor exceptions can quote signed URLs, object keys and credentials.
++    logger.error("%s failed: key=%s error_type=%s", action, secret_fingerprint(key), error_type)
+     return f"{action} failed ({error_type})"
+ 
+ 
+diff --git a/mirobody/utils/config/storage/local.py b/mirobody/utils/config/storage/local.py
+index 6c778e089..e2af1bcd9 100644
+--- a/mirobody/utils/config/storage/local.py
++++ b/mirobody/utils/config/storage/local.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import logging
++import os
+ 
+ from pathlib import Path
+ from typing import IO
+@@ -92,13 +93,10 @@ def _get_file_path(self, key: str) -> Path:
+         """
+         object_key = self._build_object_key(key)
+         candidate = (self.base_path / object_key).resolve()
+-        root = self.base_path.resolve()
+-        # `is_relative_to` compares resolved paths, so it also catches a key
+-        # that traverses through an existing symlink.
+-        if not candidate.is_relative_to(root):
+-            raise ValueError(
+-                f"file key {key!r} resolves outside the storage root"
+-            )
++        root = os.path.join(str(self.base_path.resolve()), "")
++        # Resolve symlinks first; the separator also excludes sibling prefixes.
++        if not str(candidate).startswith(root):
++            raise ValueError("File key resolves outside the storage root")
+         return candidate
+     
+     #-----------------------------------------------------
+diff --git a/mirobody/utils/ephemeral.py b/mirobody/utils/ephemeral.py
+index 1813bae8a..9fefe5fa6 100644
+--- a/mirobody/utils/ephemeral.py
++++ b/mirobody/utils/ephemeral.py
+@@ -109,6 +109,11 @@ def _connection(self):
+ 
+     @staticmethod
+     def _hash(key: str) -> bytes:
++        """Stable index for encrypted state, never a password verifier.
++
++        Garmin OAuth request tokens form these keys. Salting this index per
++        request would make server and worker lose the same persisted state.
++        """
+         return hashlib.sha256(key.encode("utf-8")).digest()
+ 
+     def _seal(self, value: str) -> str:
+diff --git a/mirobody/utils/http.py b/mirobody/utils/http.py
+index a4800c41c..c69f26a36 100644
+--- a/mirobody/utils/http.py
++++ b/mirobody/utils/http.py
+@@ -142,17 +142,11 @@ def json_response(content: Any, status_code: int = 200, request: Request | None
+     if not disable_log:
+         extra = _log_extra(request, status=status_code)
+ 
+-        message = ""
+-        if content and isinstance(content, dict):
+-            if "message" in content and isinstance(content["message"], str) and len(content["message"]) > 0:
+-                message = content["message"]
+-            elif "msg" in content and isinstance(content["msg"], str) and len(content["msg"]) > 0:
+-                message = content["msg"]
+-
++        # Response messages can quote credentials or uploaded report contents.
+         if status_code >= 400:
+-            logger.warning(message, stacklevel=2, extra=extra)
++            logger.warning("HTTP response", stacklevel=2, extra=extra)
+         else:
+-            logger.info(message, stacklevel=2, extra=extra)
++            logger.info("HTTP response", stacklevel=2, extra=extra)
+ 
+     return Response(
+         content     = json.dumps(
+@@ -185,9 +179,9 @@ def json_response_with_code(code: int = 0, msg: str = "ok", data: Any = None, re
+         extra = _log_extra(request, status=status)
+         if code != 0:
+             extra["error_code"] = code
+-            logger.warning(msg, stacklevel=2, extra=extra)
++            logger.warning("HTTP response", stacklevel=2, extra=extra)
+         else:
+-            logger.info(msg, stacklevel=2, extra=extra)
++            logger.info("HTTP response", stacklevel=2, extra=extra)
+ 
+     content = {
+         "code"      : code,
+@@ -345,7 +339,7 @@ def jsonrpc_error(id: Any, code: int, msg: str = "", data: Any = None, method: s
+                   request: Request | None = None, disable_log: bool = False) -> Response:
+     if not disable_log:
+         extra = _log_extra(request, mcp_method=method, request_id=id, error_code=code)
+-        logger.warning(msg, stacklevel=2, extra=extra)
++        logger.warning("HTTP response", stacklevel=2, extra=extra)
+ 
+     content = {
+         "jsonrpc"   : "2.0",
+diff --git a/mirobody/utils/log.py b/mirobody/utils/log.py
+index c01ca7514..e0bce3d64 100644
+--- a/mirobody/utils/log.py
++++ b/mirobody/utils/log.py
+@@ -12,23 +12,20 @@
+ 
+ #-----------------------------------------------------------------------------
+ 
++# A process-local key prevents offline guessing of names and short credentials.
++_fingerprint_key = secrets.token_bytes(32)
++
++
+ def secret_fingerprint(secret: str | None) -> str:
+-    """A stable, non-reversible handle for a credential, safe to log.
+-
+-    Bearer tokens, ID tokens and OAuth client secrets were being logged whole,
+-    and in one case returned to the caller in an HTTP 401 body. Truncation
+-    (`token[:50]`, used elsewhere in this repo) is not a fix for a JWT: the
+-    first 50 characters are the header plus the start of the *payload*, which
+-    is base64 of the claims: email, subject, issuer. It hides the signature,
+-    which is the one part that is not sensitive on its own.
+-
+-    A digest prefix keeps what logging a token is actually for (correlating
+-    "this same token failed here and here" across lines) while carrying none
+-    of the claims.
++    """A keyed log handle that correlates only within this process.
++
++    Plain SHA-256 prefixes let a log reader test guesses for file keys or
++    short credentials. The random key never leaves this process, so logs
++    expose neither a credential fragment nor a reusable unkeyed digest.
+     """
+     if not secret or not isinstance(secret, str):
+         return "<none>"
+-    return "sha256:" + hashlib.sha256(secret.encode("utf-8")).hexdigest()[:12]
++    return "hmac-sha256:" + hmac.digest(_fingerprint_key, secret.encode("utf-8"), "sha256").hex()[:12]
+ 
+ #-----------------------------------------------------------------------------
+ 
+diff --git a/tests/server/test_codeql_security.py b/tests/server/test_codeql_security.py
+new file mode 100644
+index 000000000..51414ebab
+--- /dev/null
++++ b/tests/server/test_codeql_security.py
+@@ -0,0 +1,189 @@
++"""Synthetic checks for the shared boundaries flagged by CodeQL."""
++
++import hashlib
++import importlib
++import json
++import logging
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from mirobody.utils import http
++from mirobody.utils.config.config import Config
++from mirobody.utils.config.storage.local import LocalStorage
++from mirobody.utils.log import secret_fingerprint
++
++
++@pytest.mark.parametrize("status,code", [(200, 0), (400, -1), (500, -3)])
++@pytest.mark.parametrize("helper", ["json_response", "json_response_with_code"])
++def test_response_body_is_preserved_but_never_logged(caplog, status, code, helper):
++    message = "synthetic-private-message@example.invalid"
++    with caplog.at_level(logging.INFO, logger=http.__name__):
++        if helper == "json_response":
++            response = http.json_response({"message": message}, status_code=status)
++        else:
++            response = http.json_response_with_code(code=code, msg=message, status=status)
++    assert message in json.loads(response.body).values()
++    assert message not in caplog.text
++    assert caplog.records[-1].status == status
++
++
++@pytest.mark.parametrize("value", ["a", "short", "synthetic-secret-prefix-and-suffix"])
++def test_config_mask_does_not_reveal_credential_fragments(value):
++    assert Config.to_masked_str(value) == "[configured]"
++    assert Config.to_masked_str("") == ""
++
++
++def test_log_fingerprint_is_keyed_and_correlates_within_a_process(monkeypatch):
++    value = "synthetic@example.invalid"
++    assert secret_fingerprint(value) == secret_fingerprint(value)
++    assert secret_fingerprint(value) != secret_fingerprint(value + "x")
++    assert secret_fingerprint(value) != "sha256:" + hashlib.sha256(value.encode()).hexdigest()[:12]
++    assert value not in secret_fingerprint(value)
++    assert secret_fingerprint(None) == secret_fingerprint("") == "<none>"
++    from mirobody.utils import log
++
++    previous = secret_fingerprint(value)
++    monkeypatch.setattr(log, "_fingerprint_key", b"synthetic-different-key")
++    assert secret_fingerprint(value) != previous
++
++
++@pytest.mark.parametrize("host", ["smtp.mandrillapp.com", "SMTP.MANDRILLAPP.COM", "smtp.mandrillapp.com."])
++def test_exact_mandrill_host_uses_mandrill_api(monkeypatch, host):
++    from mirobody.user.auth import email
++
++    monkeypatch.setattr(email, "MandrillEmailValidator", lambda **kwargs: "mandrill")
++    monkeypatch.setattr(email, "SMTPEmailValidator", lambda **kwargs: "smtp")
++    assert email.create_email_validator(
++        smtp_host=host, smtp_user="synthetic", smtp_pass="synthetic", from_email="from@example.invalid", template="test",
++    ) == "mandrill"
++
++
++@pytest.mark.parametrize("host", ["smtp.mandrillapp.com.evil.invalid", "evil-mandrillapp.com", "mandrillapp.com.evil.invalid"])
++def test_similar_smtp_host_uses_configured_smtp_transport(monkeypatch, host):
++    from mirobody.user.auth import email
++
++    monkeypatch.setattr(email, "MandrillEmailValidator", lambda **kwargs: "mandrill")
++    monkeypatch.setattr(email, "SMTPEmailValidator", lambda **kwargs: "smtp")
++    assert email.create_email_validator(
++        smtp_host=host, smtp_user="synthetic", smtp_pass="synthetic", from_email="from@example.invalid", template="test",
++    ) == "smtp"
++
++
++def test_synthetic_provider_addresses_do_not_collide_on_old_md5_prefix():
++    from mirobody.user.platform import PlatformUserService
++
++    service = PlatformUserService()
++    # These invented ids share the previous eight-character MD5 prefix.
++    first = service._generate_unique_email("theta_garmin", "102")
++    second = service._generate_unique_email("theta_garmin", "44553")
++    assert first != second
++    assert first == service._generate_unique_email("theta_garmin", "102")
++
++
++@pytest.mark.parametrize("key", ["../outside/private.txt", "../uploads-sibling/private.txt", "nested/../../outside/private.txt"])
++@pytest.mark.asyncio
++async def test_local_storage_refuses_escape_for_every_operation(tmp_path, key):
++    root = tmp_path / "uploads"
++    outside = tmp_path / "outside"
++    outside.mkdir()
++    (outside / "private.txt").write_bytes(b"synthetic-private-data")
++    storage = LocalStorage(base_path=str(root), proxy_url="/files")
++    assert (await storage.put(key, b"replace"))[1]
++    assert (await storage.get(key))[1]
++    assert await storage.delete(key)
++    assert (await storage.generate_signed_url(key))[1]
++    assert (outside / "private.txt").read_bytes() == b"synthetic-private-data"
++
++
++@pytest.mark.asyncio
++async def test_local_storage_rejects_symlink_escape_and_allows_nested_files(tmp_path):
++    root = tmp_path / "uploads"
++    outside = tmp_path / "outside"
++    outside.mkdir()
++    storage = LocalStorage(base_path=str(root), prefix="tenant", proxy_url="/files")
++    (root / "tenant").mkdir()
++    (root / "tenant" / "escape").symlink_to(outside, target_is_directory=True)
++    assert (await storage.put("escape/private.txt", b"blocked"))[1]
++    assert not (outside / "private.txt").exists()
++    url, error = await storage.put("nested/allowed.txt", b"synthetic")
++    assert url == "/files/tenant/nested/allowed.txt" and error is None
++    assert await storage.get("nested/allowed.txt") == (b"synthetic", None)
++    assert await storage.delete("nested/allowed.txt") is None
++
++
++def test_ephemeral_lookup_index_remains_byte_identical():
++    from mirobody.utils.ephemeral import EphemeralStore
++
++    value = "synthetic-oauth-state"
++    assert EphemeralStore._hash(value) == hashlib.sha256(value.encode()).digest()
++
++
++def test_storage_failure_log_never_includes_vendor_exception_text(caplog):
++    from mirobody.utils.config.storage.abstract import storage_failure
++
++    message = "synthetic-secret-from-vendor"
++    try:
++        raise ValueError(message)
++    except ValueError as exc:
++        with caplog.at_level(logging.ERROR):
++            answer = storage_failure("download", "synthetic-key", exc)
++    assert message not in caplog.text
++    assert answer == "download failed (ValueError)"
++    assert "synthetic-key" not in caplog.text
++
++
++def test_standardize_error_cannot_echo_an_arbitrary_extraction_exception(monkeypatch):
++    from mirobody import engine
++    from mirobody.engine.parse import ExtractionError
++    records_router = importlib.import_module("mirobody.server.routers.records_router")
++
++    async def fail(*args, **kwargs):
++        raise ExtractionError("synthetic-private-report-content")
++
++    monkeypatch.setattr(engine, "parse_text", fail)
++    app = FastAPI()
++    app.include_router(records_router.router)
++    app.dependency_overrides[records_router.verify_token] = lambda: "1"
++    response = TestClient(app).post("/api/standardize", json={"text": "synthetic"})
++    assert response.status_code == 400
++    assert "synthetic-private-report-content" not in response.text
++    assert response.json()["error"]["code"] == "extraction_failed"
++
++
++def test_failed_provider_decryption_logs_only_ciphertext_fingerprint(monkeypatch, caplog):
++    service_module = importlib.import_module("mirobody.collect.providers._platform.database_service")
++    monkeypatch.setattr(service_module, "decrypt_string_aes_gcm", lambda value: None)
++    with caplog.at_level(logging.ERROR):
++        assert service_module.ProviderDatabaseService()._decrypt("synthetic-ciphertext", "7") is None
++    assert "synthetic-ciphertext" not in caplog.text
++    assert secret_fingerprint("synthetic-ciphertext") in caplog.text
++
++
++def test_unavailable_model_diagnostic_contains_metadata_not_key_value(monkeypatch, caplog):
++    from mirobody.utils.config import llm
++    from mirobody.utils.llm import utils
++
++    spec = llm.RouteSpec(alias="synthetic", model="synthetic", api_key_env="SYNTHETIC_API_KEY", base_url="")
++    monkeypatch.setattr(llm, "route_candidates", lambda surface: [spec])
++    monkeypatch.setattr(llm, "read_api_key", lambda name: "synthetic-private-value")
++    monkeypatch.setattr(llm, "_fits", lambda surface, candidate: True)
++    monkeypatch.setattr(utils, "resolve_route", lambda surface: None)
++    with caplog.at_level(logging.ERROR):
++        assert utils._route(None, None, "text") is None
++    assert "SYNTHETIC_API_KEY" in caplog.text
++    assert "synthetic-private-value" not in caplog.text
++
++
++@pytest.mark.asyncio
++async def test_existing_provider_link_never_regenerates_internal_email(monkeypatch):
++    module = importlib.import_module("mirobody.user.platform")
++
++    async def existing(**kwargs):
++        return [{"user_id": "7", "is_del": False, "reconnect": 0}]
++
++    monkeypatch.setattr(module, "execute_query", existing)
++    service = module.PlatformUserService()
++    monkeypatch.setattr(service, "_generate_unique_email", lambda *args: pytest.fail("existing link must retain its account"))
++    assert await service.find_or_create_user_by_provider_id("theta_garmin", "102", "UTC") == "7"

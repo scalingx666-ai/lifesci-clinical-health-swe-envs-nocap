@@ -1,0 +1,185 @@
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+index 34f0bda03ee..cf4afabda9e 100644
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -51,6 +51,7 @@ export * from './search/search';
+ export * from './sftp';
+ export * from './smarthealthlinks';
+ export * from './sql-on-fhir/eval';
++export * from './static-client';
+ export * from './storage';
+ export * from './subscriptions';
+ export * from './types';
+diff --git a/packages/core/src/static-client.test.ts b/packages/core/src/static-client.test.ts
+new file mode 100644
+index 00000000000..aa4a65375d0
+--- /dev/null
++++ b/packages/core/src/static-client.test.ts
+@@ -0,0 +1,42 @@
++// SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
++// SPDX-License-Identifier: Apache-2.0
++import type { Patient } from '@medplum/fhirtypes';
++import { createStaticClient } from './static-client';
++
++const patient: Patient = { resourceType: 'Patient', id: '123', name: [{ given: ['Homer'] }] };
++
++describe('createStaticClient', () => {
++  test('Reads resources by type and id', async () => {
++    const medplum = createStaticClient([patient]);
++    await expect(medplum.readResource('Patient', '123')).resolves.toMatchObject(patient);
++    await expect(medplum.readReference({ reference: 'Patient/123' })).resolves.toMatchObject(patient);
++  });
++
++  test('Ignores autoBatchTime', async () => {
++    const other: Patient = { resourceType: 'Patient', id: '456' };
++    const medplum = createStaticClient([patient, other], { autoBatchTime: 100 });
++    await expect(
++      Promise.all([medplum.readResource('Patient', '123'), medplum.readResource('Patient', '456')])
++    ).resolves.toMatchObject([patient, other]);
++  });
++
++  test('Unknown resource is not found', async () => {
++    const medplum = createStaticClient([patient]);
++    await expect(medplum.readResource('Patient', 'missing')).rejects.toThrow('Not found');
++  });
++
++  test('Rejects requests other than reads', async () => {
++    const medplum = createStaticClient([patient]);
++    await expect(medplum.searchResources('Patient', 'name=Homer')).rejects.toThrow('Not supported by static client');
++    await expect(medplum.createResource({ resourceType: 'Patient' })).rejects.toThrow('Not supported by static client');
++  });
++
++  test('Ignores an active login in localStorage', () => {
++    localStorage.setItem('activeLogin', JSON.stringify({ accessToken: 'x', refreshToken: 'y' }));
++    try {
++      expect(createStaticClient([]).getActiveLogin()).toBeUndefined();
++    } finally {
++      localStorage.removeItem('activeLogin');
++    }
++  });
++});
+diff --git a/packages/core/src/static-client.ts b/packages/core/src/static-client.ts
+new file mode 100644
+index 00000000000..c9764bbc01a
+--- /dev/null
++++ b/packages/core/src/static-client.ts
+@@ -0,0 +1,73 @@
++// SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
++// SPDX-License-Identifier: Apache-2.0
++import type { OperationOutcome, Resource } from '@medplum/fhirtypes';
++import type { MedplumClientOptions } from './client';
++import { MedplumClient } from './client';
++import { ContentType } from './contenttype';
++import { badRequest, notFound } from './outcomes';
++import { ClientStorage, MemoryStorage } from './storage';
++
++/**
++ * A FHIR read path relative to the FHIR base URL: `Patient/123`.
++ * Does not match searches (`Patient?name=Homer`), sub-paths (`Patient/123/_history`), or operations (`$export`).
++ */
++const READ_PATH = /^(?<resourceType>[A-Za-z]+)\/(?<id>[^/?]+)$/;
++
++/**
++ * Creates a MedplumClient that serves reads from the given resources and never touches the network.
++ *
++ * Use it to render Medplum React components from data gathered up front:
++ *
++ * ```tsx
++ * const medplum = createStaticClient([report, patient, ...observations]);
++ * <MedplumProvider medplum={medplum}>
++ *   <DiagnosticReportDisplay value={report} />
++ * </MedplumProvider>
++ * ```
++ *
++ * Only reads by type and id (`GET [base]/Type/id`) are supported. A read of a resource not in the
++ * list fails with "Not found", the same as a real server. Any other request, such as a search or a
++ * write, fails with "Bad request".
++ * @param resources - The resources to serve.
++ * @param options - Optional client options. `fetch`, `storage`, and `autoBatchTime` are always replaced.
++ * @returns The client.
++ */
++export function createStaticClient(resources: Resource[], options?: MedplumClientOptions): MedplumClient {
++  const byKey = new Map<string, Resource>();
++  for (const resource of resources) {
++    if (resource.id) {
++      byKey.set(`${resource.resourceType}/${resource.id}`, resource);
++    }
++  }
++
++  // Assigned below; the fetch closure only runs after construction.
++  let fhirBaseUrl = '';
++
++  const client = new MedplumClient({
++    ...options,
++    autoBatchTime: 0,
++    storage: new ClientStorage(new MemoryStorage()),
++    fetch: async (url: string, init?: RequestInit) => {
++      const method = init?.method ?? 'GET';
++      const path = url.startsWith(fhirBaseUrl) ? url.slice(fhirBaseUrl.length).replace(/^\//, '') : undefined;
++      const read = method === 'GET' ? path?.match(READ_PATH)?.groups : undefined;
++      if (!read) {
++        return jsonResponse(400, badRequest(`Not supported by static client: ${method} ${url}`));
++      }
++      const resource = byKey.get(`${read.resourceType}/${read.id}`);
++      return resource ? jsonResponse(200, resource) : jsonResponse(404, notFound);
++    },
++  });
++
++  fhirBaseUrl = client.fhirUrl().toString();
++  return client;
++}
++
++function jsonResponse(status: number, body: Resource | OperationOutcome): Partial<Response> {
++  return {
++    ok: status < 400,
++    status,
++    headers: new Headers({ 'content-type': ContentType.FHIR_JSON }),
++    json: async () => body,
++  };
++}
+diff --git a/packages/react/src/DiagnosticReportDisplay/DiagnosticReportDisplay.test.tsx b/packages/react/src/DiagnosticReportDisplay/DiagnosticReportDisplay.test.tsx
+index 351f0d854a8..e6aeb975b4e 100644
+--- a/packages/react/src/DiagnosticReportDisplay/DiagnosticReportDisplay.test.tsx
++++ b/packages/react/src/DiagnosticReportDisplay/DiagnosticReportDisplay.test.tsx
+@@ -1,8 +1,8 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+-import { createReference } from '@medplum/core';
++import { createReference, createStaticClient } from '@medplum/core';
+ import type { DiagnosticReport, Observation, Reference } from '@medplum/fhirtypes';
+-import { HomerDiagnosticReport, HomerSimpson, MockClient, TestOrganization } from '@medplum/mock';
++import { DrAliceSmith, HomerDiagnosticReport, HomerSimpson, MockClient, TestOrganization } from '@medplum/mock';
+ import { MedplumProvider } from '@medplum/react-hooks';
+ import {
+   HealthGorillaCholesterolObservation,
+@@ -481,4 +481,30 @@ describe('DiagnosticReportDisplay', () => {
+     expect(screen.getByText('Diagnostic Report')).toBeDefined();
+     expect(screen.getByText('XYZ')).toBeDefined();
+   });
++
++  // Guards the contract that this component only reads by id, so it can render from resources
++  // gathered up front. The static client rejects searches and writes, which MockClient allows.
++  test('Renders with a static client', async () => {
++    const staticClient = createStaticClient([
++      HealthGorillaQuestDiagnosticReport,
++      HomerSimpson,
++      DrAliceSmith,
++      HealthGorillaQuestServiceRequest,
++      HealthGorillaQuestParentLab,
++      HealthGorillaQuestObservationGroup1,
++      HealthGorillaQuestObservationGroup2,
++      HealthGorillaQuestObservationGroup3,
++    ]);
++
++    await act(async () => {
++      render(
++        <MedplumProvider medplum={staticClient}>
++          <DiagnosticReportDisplay value={createReference(HealthGorillaQuestDiagnosticReport)} />
++        </MedplumProvider>
++      );
++    });
++
++    expect(await screen.findByText('Homer Simpson')).toBeInTheDocument();
++    expect(screen.getByText('Alice Smith')).toBeInTheDocument();
++  });
+ });

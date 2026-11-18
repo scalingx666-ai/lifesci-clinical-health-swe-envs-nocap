@@ -1,0 +1,281 @@
+diff --git a/erpnext/controllers/queries.py b/erpnext/controllers/queries.py
+index 27535a5e2fc8..b9d992a46475 100644
+--- a/erpnext/controllers/queries.py
++++ b/erpnext/controllers/queries.py
+@@ -24,6 +24,7 @@
+ 
+ import erpnext
+ from erpnext.selling.doctype.party_specific_item.party_specific_item import get_allowed_items_condition
++from erpnext.selling.doctype.quotation.mapper import get_existing_customer_name
+ from erpnext.stock.doctype.company_restriction.company_restriction import get_restriction_criterion
+ from erpnext.stock.doctype.item.item import get_allowed_uoms
+ from erpnext.stock.doctype.item.item_search import get_item_search_candidates
+@@ -942,10 +943,15 @@ def get_account_list(
+ @frappe.whitelist()
+ @frappe.validate_and_sanitize_search_inputs
+ def get_blanket_orders(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict):
++	party = filters.get("party")
++	if filters.get("quotation_to"):
++		party = get_existing_customer_name(filters.get("quotation_to"), party)
++
+ 	bo_filters = [
+ 		["docstatus", "=", 1],
+ 		["status", "!=", "Closed"],
+ 		["blanket_order_type", "=", filters.get("blanket_order_type")],
++		["customer" if filters.get("blanket_order_type") == "Selling" else "supplier", "=", party],
+ 		["company", "=", filters.get("company")],
+ 	]
+ 
+diff --git a/erpnext/manufacturing/doctype/blanket_order/blanket_order.py b/erpnext/manufacturing/doctype/blanket_order/blanket_order.py
+index 00f74e8bbb2b..5f6ec9e8a57a 100644
+--- a/erpnext/manufacturing/doctype/blanket_order/blanket_order.py
++++ b/erpnext/manufacturing/doctype/blanket_order/blanket_order.py
+@@ -14,6 +14,7 @@
+ from erpnext.controllers.item_close import clear_closed_rows_on_amend, validate_parent_reopen
+ from erpnext.controllers.status_updater import StatusUpdater
+ from erpnext.manufacturing.doctype.blanket_order import blanket_order_pricing
++from erpnext.selling.doctype.quotation.mapper import get_existing_customer_name
+ from erpnext.setup.doctype.terms_and_conditions.terms_and_conditions import validate_terms_and_conditions
+ from erpnext.stock.doctype.item.item import get_item_defaults
+ 
+@@ -26,6 +27,7 @@
+ 
+ ORDER_TYPE_BY_DOCTYPE = {
+ 	"Sales Order": ("Selling", "customer"),
++	"Quotation": ("Selling", "party_name"),
+ 	"Purchase Order": ("Purchasing", "supplier"),
+ }
+ 
+@@ -146,7 +148,7 @@ def validate_party(self):
+ 		self.set(f"{other_party_field}_name", None)
+ 
+ 	def validate_order_matches(self, order_doc) -> None:
+-		order_type, party_field = ORDER_TYPE_BY_DOCTYPE[order_doc.doctype]
++		order_type, order_party_field = ORDER_TYPE_BY_DOCTYPE[order_doc.doctype]
+ 		if self.blanket_order_type != order_type:
+ 			frappe.throw(
+ 				_("Blanket Order {0} is a {1} order and cannot be used on a {2}").format(
+@@ -154,12 +156,17 @@ def validate_order_matches(self, order_doc) -> None:
+ 				)
+ 			)
+ 
+-		if self.get(party_field) != order_doc.get(party_field):
++		party = self.get(blanket_order_pricing.get_order_type_config(order_type)["party_field"])
++		order_party = order_doc.get(order_party_field)
++		if order_doc.doctype == "Quotation":
++			order_party = get_existing_customer_name(order_doc.quotation_to, order_party)
++
++		if party != order_party:
+ 			frappe.throw(
+ 				_("Blanket Order {0} is for {1}, not {2}").format(
+ 					frappe.bold(self.name),
+-					frappe.bold(self.get(party_field)),
+-					frappe.bold(order_doc.get(party_field)),
++					frappe.bold(party),
++					frappe.bold(order_doc.get(order_party_field)),
+ 				)
+ 			)
+ 
+@@ -412,7 +419,7 @@ def update_item(source, target, source_parent):
+ 
+ 
+ def validate_against_blanket_order(order_doc):
+-	if order_doc.doctype in ("Sales Order", "Purchase Order"):
++	if order_doc.doctype in ORDER_TYPE_BY_DOCTYPE:
+ 		order_data = {}
+ 
+ 		for item in order_doc.get("items"):
+@@ -426,7 +433,8 @@ def validate_against_blanket_order(order_doc):
+ 			bo_doc.validate_can_be_ordered(order_doc.transaction_date)
+ 			bo_doc.validate_order_matches(order_doc)
+ 			bo_doc.validate_items_are_open(list(item_data))
+-			bo_doc.validate_qty_can_be_ordered(item_data, order_doc.doctype)
++			if order_doc.doctype != "Quotation":
++				bo_doc.validate_qty_can_be_ordered(item_data, order_doc.doctype)
+ 			bo_doc.set_order_rates(order_doc)
+ 
+ 
+diff --git a/erpnext/manufacturing/doctype/blanket_order/test_blanket_order.py b/erpnext/manufacturing/doctype/blanket_order/test_blanket_order.py
+index d9fbf68cbe72..746f3c724ea5 100644
+--- a/erpnext/manufacturing/doctype/blanket_order/test_blanket_order.py
++++ b/erpnext/manufacturing/doctype/blanket_order/test_blanket_order.py
+@@ -320,6 +320,64 @@ def test_blanket_order_lookup_keeps_order_within_allowance(self):
+ 		)
+ 		self.assertEqual(details.blanket_order, bo.name)
+ 
++	def test_quotation_uses_only_a_selling_blanket_order_of_its_customer(self):
++		from erpnext.crm.doctype.lead.test_lead import make_lead
++		from erpnext.selling.doctype.quotation.test_quotation import make_quotation
++
++		item = make_item("_Test Blanket Order Quotation Item", {"is_stock_item": 1}).name
++		purchasing = make_blanket_order(blanket_order_type="Purchasing", rate=40, item_code=item)
++		other_customer = make_blanket_order(
++			blanket_order_type="Selling", customer="_Test Customer 1", rate=60, item_code=item
++		)
++		selling = make_blanket_order(blanket_order_type="Selling", rate=90, item_code=item)
++		for bo, days in ((purchasing, 3), (other_customer, 5)):
++			bo.db_set("to_date", add_days(today(), days))
++
++		lookup = {
++			"company": "_Test Company",
++			"currency": selling.currency,
++			"customer": selling.customer,
++			"doctype": "Quotation",
++			"item_code": item,
++			"quotation_to": "Customer",
++			"transaction_date": today(),
++		}
++		self.assertEqual(get_blanket_order_details(lookup).blanket_order, selling.name)
++		self.assertFalse(get_blanket_order_details({**lookup, "customer": None}))
++
++		link_filters = {
++			"company": "_Test Company",
++			"blanket_order_type": "Selling",
++			"item": item,
++			"party": selling.customer,
++			"quotation_to": "Customer",
++		}
++		orders = get_blanket_orders("Blanket Order", "", "name", 0, 20, link_filters)
++		self.assertEqual([order[0] for order in orders], [selling.name])
++
++		def quotation_against(bo):
++			quotation = make_quotation(item_code=item, party_name=selling.customer, do_not_save=True)
++			quotation.items[0].against_blanket_order = 1
++			quotation.items[0].blanket_order = bo.name
++			return quotation
++
++		self.assertRaisesRegex(
++			frappe.ValidationError, "cannot be used on", quotation_against(purchasing).insert
++		)
++		self.assertRaisesRegex(frappe.ValidationError, "is for", quotation_against(other_customer).insert)
++		quotation_against(selling).insert()
++
++		lead = make_lead()
++		frappe.db.set_value("Customer", other_customer.customer, "lead_name", lead.name)
++		lead_lookup = {**lookup, "quotation_to": "Lead", "customer": lead.name}
++		self.assertEqual(get_blanket_order_details(lead_lookup).blanket_order, other_customer.name)
++		lead_filters = {**link_filters, "party": lead.name, "quotation_to": "Lead"}
++		orders = get_blanket_orders("Blanket Order", "", "name", 0, 20, lead_filters)
++		self.assertEqual([order[0] for order in orders], [other_customer.name])
++		lead_quotation = quotation_against(other_customer)
++		lead_quotation.update({"quotation_to": "Lead", "party_name": lead.name})
++		lead_quotation.insert()
++
+ 	def test_blanket_order_rate_is_set_by_the_server(self):
+ 		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=100, rate=100)
+ 		po = make_purchase_order_against(bo, qty=10)
+@@ -382,7 +440,12 @@ def test_closed_blanket_order_cannot_be_ordered_against(self):
+ 		self.assertRaises(frappe.InvalidStatusError, make_order, bo.name)
+ 		self.assertRaises(frappe.InvalidStatusError, po.save)
+ 
+-		filters = {"company": bo.company, "blanket_order_type": "Purchasing", "item": bo.items[0].item_code}
++		filters = {
++			"company": bo.company,
++			"blanket_order_type": "Purchasing",
++			"item": bo.items[0].item_code,
++			"party": bo.supplier,
++		}
+ 		orders = get_blanket_orders("Blanket Order", "", "name", 0, 20, filters)
+ 		self.assertNotIn(bo.name, [order[0] for order in orders])
+ 
+@@ -545,7 +608,12 @@ def test_closed_row_is_skipped_when_ordering(self):
+ 		self.assertRaises(frappe.InvalidStatusError, po.save)
+ 
+ 		for row, is_listed in ((bo.items[0], False), (bo.items[1], True)):
+-			filters = {"company": bo.company, "blanket_order_type": "Purchasing", "item": row.item_code}
++			filters = {
++				"company": bo.company,
++				"blanket_order_type": "Purchasing",
++				"item": row.item_code,
++				"party": bo.supplier,
++			}
+ 			orders = get_blanket_orders("Blanket Order", "", "name", 0, 20, filters)
+ 			self.assertEqual(bo.name in [order[0] for order in orders], is_listed)
+ 
+@@ -624,6 +692,7 @@ def test_expired_blanket_order_cannot_be_ordered_against(self):
+ 			"company": bo.company,
+ 			"blanket_order_type": "Purchasing",
+ 			"item": bo.items[0].item_code,
++			"party": bo.supplier,
+ 			"transaction_date": today(),
+ 		}
+ 		orders = get_blanket_orders("Blanket Order", "", "name", 0, 20, filters)
+@@ -914,6 +983,7 @@ def test_blanket_order_lookup_filters_currency(self):
+ 			"currency": transaction_currency,
+ 			"blanket_order_type": "Selling",
+ 			"item": blanket_order.items[0].item_code,
++			"party": blanket_order.customer,
+ 		}
+ 		matching_orders = get_blanket_orders("Blanket Order", "", "name", 0, 20, filters)
+ 		self.assertIn(blanket_order.name, [order[0] for order in matching_orders])
+diff --git a/erpnext/public/js/controllers/transaction.js b/erpnext/public/js/controllers/transaction.js
+index d2b2ffd13556..adf6f8ea8e7e 100644
+--- a/erpnext/public/js/controllers/transaction.js
++++ b/erpnext/public/js/controllers/transaction.js
+@@ -339,12 +339,15 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
+ 		if (this.frm.fields_dict["items"].grid.get_field("blanket_order")) {
+ 			this.frm.set_query("blanket_order", "items", function (doc, cdt, cdn) {
+ 				var item = locals[cdt][cdn];
++				const is_selling = ["Sales Order", "Quotation"].includes(doc.doctype);
+ 				return {
+ 					query: "erpnext.controllers.queries.get_blanket_orders",
+ 					filters: {
+ 						company: doc.company,
+ 						currency: doc.currency,
+-						blanket_order_type: doc.doctype === "Sales Order" ? "Selling" : "Purchasing",
++						blanket_order_type: is_selling ? "Selling" : "Purchasing",
++						party: is_selling ? doc.customer || doc.party_name : doc.supplier,
++						quotation_to: doc.quotation_to,
+ 						item: item.item_code,
+ 						transaction_date: doc.transaction_date,
+ 					},
+diff --git a/erpnext/selling/doctype/quotation/quotation.py b/erpnext/selling/doctype/quotation/quotation.py
+index dd92306508ea..19047cf41bc1 100644
+--- a/erpnext/selling/doctype/quotation/quotation.py
++++ b/erpnext/selling/doctype/quotation/quotation.py
+@@ -12,6 +12,7 @@
+ from erpnext.accounts.doctype.pricing_rule.utils import validate_coupon_code
+ from erpnext.controllers.selling_controller import SellingController
+ from erpnext.crm.doctype.lead.mapper import validate_lead_is_enabled
++from erpnext.manufacturing.doctype.blanket_order.blanket_order import validate_against_blanket_order
+ 
+ from .mapper import (
+ 	get_existing_customer_name,
+@@ -181,6 +182,7 @@ def validate(self):
+ 			validate_coupon_code(self.coupon_code, customer)
+ 
+ 		self.set_customer_name()
++		validate_against_blanket_order(self)
+ 		if self.items:
+ 			self.with_items = 1
+ 
+diff --git a/erpnext/stock/get_item_details.py b/erpnext/stock/get_item_details.py
+index b9e8e69ca2fd..c7551e800a7f 100644
+--- a/erpnext/stock/get_item_details.py
++++ b/erpnext/stock/get_item_details.py
+@@ -24,6 +24,7 @@
+ 	set_transaction_type,
+ 	validate_pricing_context,
+ )
++from erpnext.selling.doctype.quotation.mapper import get_existing_customer_name
+ from erpnext.setup.doctype.brand.brand import get_brand_defaults
+ from erpnext.setup.doctype.item_group.item_group import get_item_group_defaults
+ from erpnext.setup.utils import get_exchange_rate
+@@ -2186,10 +2187,13 @@ def _get_blanket_order_details(ctx: ItemDetailsCtx):
+ 			.limit(1)
+ 		)
+ 
+-		if ctx.customer and ctx.doctype == "Sales Order":
+-			query = query.where(bo.customer == ctx.customer)
+-		elif ctx.supplier and ctx.doctype == "Purchase Order":
+-			query = query.where(bo.supplier == ctx.supplier)
++		if ctx.doctype in ("Sales Order", "Quotation"):
++			customer = ctx.customer
++			if ctx.doctype == "Quotation":
++				customer = get_existing_customer_name(ctx.quotation_to, ctx.party_name or ctx.customer)
++			query = query.where((bo.blanket_order_type == "Selling") & (bo.customer == customer))
++		elif ctx.doctype == "Purchase Order":
++			query = query.where((bo.blanket_order_type == "Purchasing") & (bo.supplier == ctx.supplier))
+ 		if ctx.blanket_order:
+ 			query = query.where(bo.name == ctx.blanket_order)
+ 		if ctx.currency:

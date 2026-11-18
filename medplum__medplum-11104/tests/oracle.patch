@@ -1,0 +1,304 @@
+diff --git a/packages/server/src/auth/securityrequest.ts b/packages/server/src/auth/securityrequest.ts
+index 4657b2ab0c5..8343671fe54 100644
+--- a/packages/server/src/auth/securityrequest.ts
++++ b/packages/server/src/auth/securityrequest.ts
+@@ -115,3 +115,66 @@ export async function supersedePriorSecurityRequests(
+     }
+   }
+ }
++
++/**
++ * The longest time that a security request of any type stays valid, in milliseconds.
++ */
++const MAX_EXPIRATION_MS = Math.max(...Object.values(USER_SECURITY_REQUEST_EXPIRATION_MS));
++
++/**
++ * Marks all of the user's unused requests that match the predicate as used.
++ *
++ * Walks every request updated within the longest validity window, rather than a fixed number of
++ * the most recent ones, so that a burst of newer requests cannot leave an older one redeemable.
++ * @param systemRepo - The system repository to use.
++ * @param user - The user whose requests should be retired.
++ * @param predicate - Returns true for requests that should be retired.
++ */
++async function retireSecurityRequests(
++  systemRepo: SystemRepository,
++  user: WithId<User>,
++  predicate: (securityRequest: UserSecurityRequest) => boolean
++): Promise<void> {
++  const since = new Date(Date.now() - MAX_EXPIRATION_MS).toISOString();
++  await systemRepo.processAllResources<UserSecurityRequest>(
++    {
++      resourceType: 'UserSecurityRequest',
++      count: 1000,
++      sortRules: [{ code: '_lastUpdated' }],
++      filters: [
++        { code: 'user', operator: Operator.EQUALS, value: getReferenceString(user) },
++        { code: '_lastUpdated', operator: Operator.GREATER_THAN_OR_EQUALS, value: since },
++      ],
++    },
++    async (securityRequest) => {
++      if (!securityRequest.used && predicate(securityRequest)) {
++        // Patch rather than update, so that a request being consumed concurrently is not clobbered
++        await systemRepo.patchResource<UserSecurityRequest>('UserSecurityRequest', securityRequest.id, [
++          { op: 'add', path: '/used', value: true },
++        ]);
++      }
++    }
++  );
++}
++
++/**
++ * Marks all of the user's unused password requests (invite and reset) as used.
++ *
++ * Called when the user's password changes, so that links issued before the change cannot be used to
++ * replace the new password.
++ * @param systemRepo - The system repository to use.
++ * @param user - The user whose password requests should be retired.
++ */
++export async function retirePasswordSecurityRequests(systemRepo: SystemRepository, user: WithId<User>): Promise<void> {
++  // Matches what /auth/setpassword accepts: every type except verify-email, including requests without a type
++  await retireSecurityRequests(systemRepo, user, (securityRequest) => securityRequest.type !== 'verify-email');
++}
++
++/**
++ * Marks all of the user's unused security requests as used.
++ * @param systemRepo - The system repository to use.
++ * @param user - The user whose requests should be retired.
++ */
++export async function retireAllSecurityRequests(systemRepo: SystemRepository, user: WithId<User>): Promise<void> {
++  await retireSecurityRequests(systemRepo, user, () => true);
++}
+diff --git a/packages/server/src/auth/setpassword.test.ts b/packages/server/src/auth/setpassword.test.ts
+index f70c353e07d..dd249fb7e5c 100644
+--- a/packages/server/src/auth/setpassword.test.ts
++++ b/packages/server/src/auth/setpassword.test.ts
+@@ -20,6 +20,7 @@ import { generateSecret } from '../oauth/keys';
+ import { tryLogin } from '../oauth/utils';
+ import { setupPwnedPasswordMock, setupRecaptchaMock, withTestContext } from '../test.setup';
+ import { registerNew } from './register';
++import { setPassword } from './setpassword';
+ 
+ const fetchMock = vi.spyOn(globalThis, 'fetch');
+ const app = express();
+@@ -177,6 +178,89 @@ describe('Set Password', () => {
+     expect(res4).toHaveStatus(200);
+   });
+ 
++  test('Setting a password retires earlier links', async () => {
++    const email = `george${randomUUID()}@example.com`;
++    const { user, project } = await withTestContext(() =>
++      registerNew({
++        projectName: 'Set Password Project',
++        firstName: 'George',
++        lastName: 'Washington',
++        email,
++        password: 'password!@#',
++        scope: 'openid profile email',
++      })
++    );
++
++    const systemRepo = await getProjectSystemRepo(project);
++    const createRequest = (type: UserSecurityRequest['type']): Promise<UserSecurityRequest> =>
++      withTestContext(() =>
++        systemRepo.createResource<UserSecurityRequest>({
++          resourceType: 'UserSecurityRequest',
++          meta: { project: project.id },
++          type,
++          user: createReference(user),
++          secret: generateSecret(16),
++        })
++      );
++    const invite = await createRequest('invite');
++    const verifyEmail = await createRequest('verify-email');
++    const reset = await createRequest('reset');
++
++    const res1 = await request(app)
++      .post('/auth/setpassword')
++      .type('json')
++      .send({ id: reset.id, secret: reset.secret, password: 'my-new-password' });
++    expect(res1).toHaveStatus(200);
++
++    const res2 = await request(app)
++      .post('/auth/setpassword')
++      .type('json')
++      .send({ id: invite.id, secret: invite.secret, password: 'other-new-password' });
++    expect(res2).toHaveStatus(400);
++    expect(res2.body).toMatchObject(badRequest('Already used'));
++
++    const stillOpen = await getGlobalSystemRepo().readResource<UserSecurityRequest>(
++      'UserSecurityRequest',
++      verifyEmail.id as string
++    );
++    expect(stillOpen.used).toBeFalsy();
++  });
++
++  test('Setting a password without a link retires earlier links', async () => {
++    const email = `george${randomUUID()}@example.com`;
++    const { user, project } = await withTestContext(() =>
++      registerNew({
++        projectName: 'Set Password Project',
++        firstName: 'George',
++        lastName: 'Washington',
++        email,
++        password: 'password!@#',
++        scope: 'openid profile email',
++      })
++    );
++
++    const systemRepo = await getProjectSystemRepo(project);
++    const invite = await withTestContext(() =>
++      systemRepo.createResource<UserSecurityRequest>({
++        resourceType: 'UserSecurityRequest',
++        meta: { project: project.id },
++        type: 'invite',
++        user: createReference(user),
++        secret: generateSecret(16),
++      })
++    );
++
++    // As in /auth/changepassword and /admin/projects/setpassword
++    await withTestContext(() => setPassword(getGlobalSystemRepo(), user, 'my-new-password'));
++
++    const res = await request(app)
++      .post('/auth/setpassword')
++      .type('json')
++      .send({ id: invite.id, secret: invite.secret, password: 'other-new-password' });
++    expect(res).toHaveStatus(400);
++    expect(res.body).toMatchObject(badRequest('Already used'));
++  });
++
+   test('Expired UserSecurityRequest', async () => {
+     const email = `george${randomUUID()}@example.com`;
+ 
+diff --git a/packages/server/src/auth/setpassword.ts b/packages/server/src/auth/setpassword.ts
+index 48c2e8b63c7..605e4a6d37b 100644
+--- a/packages/server/src/auth/setpassword.ts
++++ b/packages/server/src/auth/setpassword.ts
+@@ -12,7 +12,7 @@ import type { SuperAdminRepository } from '../fhir/repo';
+ import { getGlobalSystemRepo } from '../fhir/repo';
+ import { timingSafeEqualStr } from '../oauth/utils';
+ import { makeValidationMiddleware } from '../util/validator';
+-import { consumeSecurityRequest, isSecurityRequestExpired } from './securityrequest';
++import { consumeSecurityRequest, isSecurityRequestExpired, retirePasswordSecurityRequests } from './securityrequest';
+ import { bcryptHashPassword } from './utils';
+ 
+ export const setPasswordValidator = makeValidationMiddleware([
+@@ -96,6 +96,8 @@ export async function setPassword(
+       if (securityRequest) {
+         await consumeSecurityRequest(txRepo.getSystemRepo(), securityRequest);
+       }
++      // Links issued before this change must not be able to replace the new password
++      await retirePasswordSecurityRequests(txRepo.getSystemRepo(), user);
+       // Patch so that only these fields are written, leaving the rest of the User as
+       // stored rather than reverting it to this snapshot.
+       await txRepo.patchResource<User>('User', user.id, patch);
+diff --git a/packages/server/src/fhir/operations/rescope.test.ts b/packages/server/src/fhir/operations/rescope.test.ts
+index b9102071266..4a1abcb9092 100644
+--- a/packages/server/src/fhir/operations/rescope.test.ts
++++ b/packages/server/src/fhir/operations/rescope.test.ts
+@@ -2,7 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ import type { WithId } from '@medplum/core';
+ import { ContentType, createReference, Operator } from '@medplum/core';
+-import type { Parameters, Project, ProjectMembership, User } from '@medplum/fhirtypes';
++import type { Parameters, Project, ProjectMembership, User, UserSecurityRequest } from '@medplum/fhirtypes';
+ import express from 'express';
+ import { randomUUID } from 'node:crypto';
+ import request from 'supertest';
+@@ -114,6 +114,33 @@ describe('User/$rescope', () => {
+     expect(reread.meta?.project).toBeUndefined();
+   });
+ 
++  test('Rescope to server retires open links', async () => {
++    const user = await invitedUser('project');
++    const systemRepo = getGlobalSystemRepo();
++    const searchRequests = (): Promise<UserSecurityRequest[]> =>
++      systemRepo.searchResources<UserSecurityRequest>({
++        resourceType: 'UserSecurityRequest',
++        filters: [{ code: 'user', operator: Operator.EQUALS, value: 'User/' + user.id }],
++      });
++    const before = await searchRequests();
++    expect(before.length).toBeGreaterThan(0);
++    expect(before.every((r) => !r.used)).toBe(true);
++
++    const res = await request(app)
++      .post(`/fhir/R4/User/${user.id}/$rescope`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .set('X-Medplum', 'extended')
++      .send({
++        resourceType: 'Parameters',
++        parameter: [{ name: 'scope', valueCode: 'server' }],
++      } satisfies Parameters);
++    expect(res).toHaveStatus(200);
++
++    const after = await searchRequests();
++    expect(after.every((r) => r.used)).toBe(true);
++  });
++
+   test('Project admin cannot promote User to project scope', async () => {
+     const user = await invitedUser('server');
+ 
+@@ -357,6 +384,14 @@ describe('User/$rescope', () => {
+     const updated = res.body as User;
+     expect(updated.project?.reference).toStrictEqual(`Project/${otherProject.id}`);
+     expect(updated.meta?.project).toStrictEqual(otherProject.id);
++
++    // Links issued under the previous project are retired
++    const securityRequests = await systemRepo.searchResources<UserSecurityRequest>({
++      resourceType: 'UserSecurityRequest',
++      filters: [{ code: 'user', operator: Operator.EQUALS, value: `User/${user.id}` }],
++    });
++    expect(securityRequests.length).toBeGreaterThan(0);
++    expect(securityRequests.every((r) => r.used)).toBe(true);
+   });
+ 
+   test('Project admin cannot rescope User in a linked project', async () => {
+diff --git a/packages/server/src/fhir/operations/rescope.ts b/packages/server/src/fhir/operations/rescope.ts
+index caff52b4743..e497a4bc5e2 100644
+--- a/packages/server/src/fhir/operations/rescope.ts
++++ b/packages/server/src/fhir/operations/rescope.ts
+@@ -15,6 +15,7 @@ import {
+ import type { FhirRequest, FhirResponse } from '@medplum/fhir-router';
+ import type { Project, ProjectMembership, Reference, User } from '@medplum/fhirtypes';
+ import assert from 'node:assert';
++import { retireAllSecurityRequests } from '../../auth/securityrequest';
+ import type { AuthenticatedRequestContext } from '../../context';
+ import { getAuthenticatedContext } from '../../context';
+ import { makeOperationDefinition } from './definitions';
+@@ -166,6 +167,9 @@ async function rescopeUserToProject(
+         );
+       }
+ 
++      // Open links were issued under the previous owner, and remain readable there
++      await retireAllSecurityRequests(txRepo, rereadUser);
++
+       return txRepo.updateResource({
+         ...rereadUser,
+         meta: { ...rereadUser.meta, project: targetProject.id },
+@@ -173,7 +177,7 @@ async function rescopeUserToProject(
+       });
+     },
+     {
+-      resourceTypes: ['Project', 'ProjectMembership', 'User'],
++      resourceTypes: ['Project', 'ProjectMembership', 'User', 'UserSecurityRequest'],
+       source: 'rescopeUserToProject',
+       serializable: true, // if a new project membership is added for this user, we want this tx to fail
+     }
+@@ -198,11 +202,14 @@ async function rescopeUserToServer(ctx: AuthenticatedRequestContext, user: WithI
+         throw new OperationOutcomeError(badRequest('User is already server-scoped'));
+       }
+ 
++      // Open links were issued while the User belonged to the Project, and remain readable there
++      await retireAllSecurityRequests(txRepo, rereadUser);
++
+       delete rereadUser.project;
+       delete rereadUser.meta?.project;
+ 
+       return txRepo.updateResource(rereadUser);
+     },
+-    { resourceTypes: ['User'], source: 'rescopeUserToServer' }
++    { resourceTypes: ['User', 'UserSecurityRequest'], source: 'rescopeUserToServer' }
+   );
+ }

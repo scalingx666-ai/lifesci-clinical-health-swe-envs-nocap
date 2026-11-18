@@ -1,0 +1,223 @@
+diff --git a/backend/app/services/providers/garmin/data_247.py b/backend/app/services/providers/garmin/data_247.py
+index c65ee26435..fd780c5524 100644
+--- a/backend/app/services/providers/garmin/data_247.py
++++ b/backend/app/services/providers/garmin/data_247.py
+@@ -1,13 +1,18 @@
+ """Garmin 247 Data implementation for sleep, dailies, epochs, and body composition."""
+ 
++import json
+ from datetime import datetime, timedelta, timezone
+ from decimal import Decimal
+ from typing import Any
+ from uuid import UUID, uuid4
+ 
++from redis.exceptions import RedisError
++from sqlalchemy import text
++
+ from app.config import settings
+ from app.constants.sleep import SleepStageType
+ from app.database import DbSession
++from app.integrations.redis_client import get_redis_client
+ from app.models import EventRecord, EventRecordDetail, SeriesSample
+ from app.repositories import (
+     DataSourceRepository,
+@@ -56,6 +61,15 @@
+     SeriesType.air_temperature
+ }
+ 
++# Garmin splits a large push into requests seconds apart, so a slot's types are joined within this window; a later
++# push of the slot replaces it, as the Health API requires (§7.2), and starts afresh.
++EPOCH_SLOT_TTL_SECONDS = 15 * 60
++EPOCH_SLOT_SECONDS = 900
++# Garmin sends one epoch per activity type in a slot: a per-type epoch field becomes a series only through this map,
++# so it is summed over the slot's types and merged across pushes.
++EPOCH_SUMMED_FIELDS = {"steps": "steps", "energy": "activeKilocalories"}
++EPOCH_STORED_FIELDS = (*EPOCH_SUMMED_FIELDS.values(), "activeTimeInSeconds")
++
+ 
+ class Garmin247Data(Base247DataTemplate):
+     """Garmin implementation for 247 data (sleep, dailies, epochs, body composition).
+@@ -668,12 +682,14 @@ def normalize_epochs(
+         self,
+         raw_epochs: list[dict[str, Any]],
+         user_id: UUID,
++        db: DbSession | None = None,
+     ) -> dict[str, list[dict[str, Any]]]:
+         """Normalize epoch data into categorized samples.
+ 
+         Args:
+             raw_epochs: List of raw epoch data from API
+             user_id: User ID
++            db: Given for a push, whose slots may be split across requests and are joined in its transaction
+ 
+         Returns:
+             Dict with keys like 'heart_rate', 'steps', etc.
+@@ -698,20 +714,59 @@ def normalize_epochs(
+                 summary_ids=[summary_id for summary_id, _ in skipped[:5]],
+             )
+ 
+-        step_samples: list[dict[str, Any]] = []
+-        energy_samples: list[dict[str, Any]] = []
++        if db is not None:
++            self._merge_pushed_epochs(db, user_id, slots)
++
++        summed: dict[str, list[dict[str, Any]]] = {key: [] for key in EPOCH_SUMMED_FIELDS}
+         for slot in slots.values():
+             slot_epochs = slot.pop("epochs").values()
+-            for samples, field in ((step_samples, "steps"), (energy_samples, "activeKilocalories")):
++            for key, field in EPOCH_SUMMED_FIELDS.items():
+                 values = [value for e in slot_epochs if (value := to_decimal(e.get(field))) is not None]
+                 if values:
+-                    samples.append({**slot, "value": sum(values)})
++                    summed[key].append({**slot, "value": sum(values)})
+ 
+-        return {
+-            "heart_rate": heart_rate_samples,
+-            "steps": step_samples,
+-            "energy": energy_samples,
+-        }
++        return {"heart_rate": heart_rate_samples, **summed}
++
++    def _merge_pushed_epochs(self, db: DbSession, user_id: UUID, slots: dict[int, dict[str, Any]]) -> None:
++        """Join each slot with the activity types the requests of the same push stored before it.
++
++        A transaction lock per slot, held to the commit, makes requests of one push write in turn, so the last one
++        stores the full sum and a plain upsert is enough. A slot whose active time fills it is dropped from Redis;
++        without Redis each request sums only its own epochs.
++        """
++        if not slots:
++            return
++        keys = {start: f"garmin:epochs:{user_id}:{start}" for start in slots}
++        # One order for every request, so two of them never wait on each other's locks.
++        for key in sorted(keys.values()):
++            db.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": key})
++        try:
++            redis_client = get_redis_client()
++            pipe = redis_client.pipeline()
++            for start, slot in slots.items():
++                pipe.hset(
++                    keys[start],
++                    mapping={
++                        str(activity_type): json.dumps({field: epoch.get(field) for field in EPOCH_STORED_FIELDS})
++                        for activity_type, epoch in slot["epochs"].items()
++                    },
++                )
++                pipe.expire(keys[start], EPOCH_SLOT_TTL_SECONDS)
++                pipe.hgetall(keys[start])
++            stored = pipe.execute()[2::3]
++
++            complete = []
++            for (start, slot), fields in zip(slots.items(), stored):
++                slot["epochs"] = {activity_type: json.loads(value) for activity_type, value in fields.items()}
++                active = sum(to_decimal(e.get("activeTimeInSeconds")) or 0 for e in slot["epochs"].values())
++                if active >= EPOCH_SLOT_SECONDS:
++                    complete.append(keys[start])
++            if complete:
++                redis_client.delete(*complete)
++        except (RedisError, ValueError) as e:
++            logger.warning(
++                "Could not merge Garmin epochs with earlier pushes", provider="garmin", user_id=str(user_id), exc_info=e
++            )
+ 
+     def _collect_epoch(
+         self,
+@@ -803,16 +858,13 @@ def save_epochs_data(
+         db: DbSession,
+         user_id: UUID,
+         normalized_epochs: dict[str, list[dict[str, Any]]],
+-    ) -> int:
++    ) -> WriteCounts:
+         """Save epoch samples to SeriesSample.
+ 
+         Uses bulk_create with ON CONFLICT DO UPDATE for efficient upserts.
+         """
+         samples = self._build_epochs_samples(user_id, normalized_epochs)
+-        counts: int = 0
+-        if samples:
+-            counts = self.data_point_repo.bulk_create(db, samples)
+-        return counts
++        return self.data_point_repo.bulk_create(db, samples) if samples else WriteCounts(0, 0)
+ 
+     # -------------------------------------------------------------------------
+     # Body Composition - /wellness-api/rest/bodyComps
+@@ -2111,7 +2163,7 @@ def process_items_batch(
+                 )
+ 
+         if epoch_items:
+-            all_samples.extend(self._build_epochs_samples(user_id, self.normalize_epochs(epoch_items, user_id)))
++            all_samples.extend(self._build_epochs_samples(user_id, self.normalize_epochs(epoch_items, user_id, db)))
+ 
+         count = WriteCounts(0, 0)
+ 
+diff --git a/backend/tests/providers/garmin/test_garmin_247.py b/backend/tests/providers/garmin/test_garmin_247.py
+index 020ed71869..f6f92fa1fd 100644
+--- a/backend/tests/providers/garmin/test_garmin_247.py
++++ b/backend/tests/providers/garmin/test_garmin_247.py
+@@ -7,6 +7,7 @@
+ from uuid import UUID, uuid4
+ 
+ import pytest
++from sqlalchemy import event as sa_event
+ from sqlalchemy.orm import Session
+ 
+ from app.models import DataSource, HealthScore, SeriesAggregate, SeriesSample, SleepDetails
+@@ -21,6 +22,7 @@
+ from app.services.providers.garmin.handlers.wellness import process_wellness_items
+ from app.services.providers.garmin.oauth import GarminOAuth
+ from app.utils.context import sync_run_var
++from app.utils.conversion import to_decimal
+ from tests.factories import UserConnectionFactory, UserFactory
+ 
+ # One day's stressDetails as Garmin sends it after midnight, and again in the morning with more data
+@@ -468,6 +470,51 @@ def test_normalize_epochs_counts_a_repeated_epoch_once(
+         assert [sample["value"] for sample in normalized["steps"]] == [450]
+         assert [sample["value"] for sample in normalized["energy"]] == [19]
+ 
++    def test_normalize_epochs_sums_a_slot_split_across_requests_of_a_push(
++        self, db: Session, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]]
++    ) -> None:
++        """Garmin splits a push into requests: the second one adds the slot's other activity type to the first."""
++        user_id = uuid4()
++        walking, sedentary = mixed_slot_epochs
++
++        garmin_247.normalize_epochs([walking], user_id, db)
++        normalized = garmin_247.normalize_epochs([sedentary], user_id, db)
++
++        assert [sample["value"] for sample in normalized["steps"]] == [420]
++        assert [sample["value"] for sample in normalized["energy"]] == [18]
++
++    def test_requests_of_a_push_lock_their_slots_in_one_order(
++        self, db: Session, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]]
++    ) -> None:
++        """Held to the commit, so a request writes its sum only after the earlier one committed its own."""
++        later = {**mixed_slot_epochs[0], "startTimeInSeconds": mixed_slot_epochs[0]["startTimeInSeconds"] + 900}
++        locked: list[str] = []
++
++        def capture(*args: Any) -> None:
++            if "pg_advisory_xact_lock" in args[2]:
++                locked.append(args[3]["key"])
++
++        sa_event.listen(db.get_bind(), "before_cursor_execute", capture)
++        try:
++            garmin_247.normalize_epochs([later, *mixed_slot_epochs], uuid4(), db)
++        finally:
++            sa_event.remove(db.get_bind(), "before_cursor_execute", capture)
++
++        assert len(locked) == 2
++        assert locked == sorted(locked)
++
++    def test_pulled_epochs_are_not_joined_with_pushed_ones(
++        self, db: Session, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]]
++    ) -> None:
++        """A pull returns every type of its range at once, so it replaces the slot like a later push does."""
++        user_id = uuid4()
++        walking, sedentary = mixed_slot_epochs
++        garmin_247.normalize_epochs([walking], user_id, db)
++
++        normalized = garmin_247.normalize_epochs([sedentary], user_id)
++
++        assert [sample["value"] for sample in normalized["steps"]] == [to_decimal(sedentary["steps"])]
++
+     def test_normalize_epochs_takes_the_slot_window_from_the_latest_epoch(
+         self, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]]
+     ) -> None:

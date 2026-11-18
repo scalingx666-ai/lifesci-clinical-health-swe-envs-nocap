@@ -1,0 +1,116 @@
+diff --git a/packages/core/src/command/hl7-notification/hl7-notification-webhook-sender-direct.ts b/packages/core/src/command/hl7-notification/hl7-notification-webhook-sender-direct.ts
+index 4281d3367d..1af52611e0 100644
+--- a/packages/core/src/command/hl7-notification/hl7-notification-webhook-sender-direct.ts
++++ b/packages/core/src/command/hl7-notification/hl7-notification-webhook-sender-direct.ts
+@@ -1,7 +1,7 @@
+ import { Hl7Message } from "@medplum/core";
+ import { Bundle, CodeableConcept, Resource } from "@medplum/fhirtypes";
+-import { executeWithNetworkRetries, MetriportError } from "@metriport/shared";
+ import { basicToExtendedIso8601 } from "@metriport/shared/common/date";
++import { executeWithNetworkRetries, MetriportError } from "@metriport/shared";
+ import { CreateDischargeRequeryParams } from "@metriport/shared/domain/patient/patient-monitoring/discharge-requery";
+ import { TcmEncounterUpsertInput } from "@metriport/shared/domain/tcm-encounter";
+ import axios from "axios";
+diff --git a/packages/infra/lib/api-stack.ts b/packages/infra/lib/api-stack.ts
+index 252e4304b0..15ac0d557e 100644
+--- a/packages/infra/lib/api-stack.ts
++++ b/packages/infra/lib/api-stack.ts
+@@ -733,6 +733,7 @@ export class APIStack extends Stack {
+         iheResponsesBucketName: props.config.iheResponsesBucketName,
+         iheParsedResponsesBucketName: props.config.iheParsedResponsesBucketName,
+         alarmAction: slackNotification?.alarmAction,
++        featureFlagsTable,
+       });
+     }
+ 
+diff --git a/packages/infra/lib/ihe-gateway-v2-stack.ts b/packages/infra/lib/ihe-gateway-v2-stack.ts
+index f1bdd47a77..8927a7e6ba 100644
+--- a/packages/infra/lib/ihe-gateway-v2-stack.ts
++++ b/packages/infra/lib/ihe-gateway-v2-stack.ts
+@@ -1,20 +1,20 @@
+ import { Duration, NestedStack, NestedStackProps } from "aws-cdk-lib";
++import { SnsAction } from "aws-cdk-lib/aws-cloudwatch-actions";
++import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
+ import * as ec2 from "aws-cdk-lib/aws-ec2";
+-import * as iam from "aws-cdk-lib/aws-iam";
+ import * as glue from "aws-cdk-lib/aws-glue";
++import * as iam from "aws-cdk-lib/aws-iam";
+ import { Function as Lambda } from "aws-cdk-lib/aws-lambda";
++import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
+ import * as s3 from "aws-cdk-lib/aws-s3";
++import { Queue } from "aws-cdk-lib/aws-sqs";
+ import { Construct } from "constructs";
+ import { EnvType } from "./env-type";
+ import { createLambda } from "./shared/lambda";
+ import { LambdaLayers } from "./shared/lambda-layers";
+ import { Secrets } from "./shared/secrets";
+-import { provideAccessToQueue } from "./shared/sqs";
+-import { Queue } from "aws-cdk-lib/aws-sqs";
+-import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
+-import { SnsAction } from "aws-cdk-lib/aws-cloudwatch-actions";
+-import { createQueue } from "./shared/sqs";
+ import { QueueAndLambdaSettings } from "./shared/settings";
++import { createQueue, provideAccessToQueue } from "./shared/sqs";
+ 
+ interface IHEGatewayV2LambdasNestedStackProps extends NestedStackProps {
+   lambdaLayers: LambdaLayers;
+@@ -33,6 +33,7 @@ interface IHEGatewayV2LambdasNestedStackProps extends NestedStackProps {
+   iheResponsesBucketName: string;
+   iheParsedResponsesBucketName: string;
+   alarmAction?: SnsAction;
++  featureFlagsTable?: dynamodb.Table;
+ }
+ 
+ function settings() {
+@@ -234,6 +235,7 @@ export class IHEGatewayV2LambdasNestedStack extends NestedStack {
+       apiURL: string;
+       envType: EnvType;
+       sentryDsn: string | undefined;
++      featureFlagsTable?: dynamodb.Table;
+     },
+     iheResponsesBucket: s3.Bucket,
+     iheParsedResponsesBucket: s3.Bucket,
+@@ -252,6 +254,7 @@ export class IHEGatewayV2LambdasNestedStack extends NestedStack {
+       apiURL,
+       envType,
+       sentryDsn,
++      featureFlagsTable,
+     } = ownProps;
+ 
+     const patientDiscoveryLambda = createLambda({
+@@ -277,6 +280,7 @@ export class IHEGatewayV2LambdasNestedStack extends NestedStack {
+         IHE_RESPONSES_BUCKET_NAME: iheResponsesBucket.bucketName,
+         IHE_PARSED_RESPONSES_BUCKET_NAME: iheParsedResponsesBucket.bucketName,
+         WRITE_TO_S3_QUEUE_URL: writeToS3Queue.queueUrl,
++        ...(featureFlagsTable && { FEATURE_FLAGS_TABLE_NAME: featureFlagsTable.tableName }),
+       },
+       layers: [lambdaLayers.shared],
+       memory: 4096,
+diff --git a/packages/lambdas/src/ihe-gateway-v2-outbound-patient-discovery.ts b/packages/lambdas/src/ihe-gateway-v2-outbound-patient-discovery.ts
+index 62068c6027..01b734d002 100644
+--- a/packages/lambdas/src/ihe-gateway-v2-outbound-patient-discovery.ts
++++ b/packages/lambdas/src/ihe-gateway-v2-outbound-patient-discovery.ts
+@@ -5,12 +5,23 @@ import { out } from "@metriport/core/util/log";
+ import { getEnvVarOrFail, getEnvType } from "@metriport/core/util/env-var";
+ import { getSamlCertsAndKeys } from "./shared/secrets";
+ import { capture } from "./shared/capture";
++import { getEnvOrFail } from "./shared/env";
++import { FeatureFlags } from "@metriport/core/command/feature-flags/ffs-on-dynamodb";
+ 
+ capture.init();
+ const { log } = out("ihe-gateway-v2-outbound-patient-discovery");
+ const apiUrl = getEnvVarOrFail("API_URL");
+ const pdResponseUrl = `http://${apiUrl}/internal/carequality/patient-discovery/response`;
+ 
++// Automatically set by AWS
++const region = getEnvOrFail("AWS_REGION");
++
++// Set by us
++const featureFlagsTableName = getEnvOrFail("FEATURE_FLAGS_TABLE_NAME");
++
++// Call this before reading FFs
++FeatureFlags.init(region, featureFlagsTableName);
++
+ // TODO move to capture.wrapHandler()
+ export const handler = Sentry.AWSLambda.wrapHandler(
+   async ({ cxId, patientId, pdRequestGatewayV2 }: PDRequestGatewayV2Params) => {

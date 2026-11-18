@@ -1,0 +1,293 @@
+diff --git a/packages/core/src/command/consolidated/consolidated-create.ts b/packages/core/src/command/consolidated/consolidated-create.ts
+index 6cb3fe604f..16840c422c 100644
+--- a/packages/core/src/command/consolidated/consolidated-create.ts
++++ b/packages/core/src/command/consolidated/consolidated-create.ts
+@@ -3,7 +3,10 @@ import { errorToString } from "@metriport/shared";
+ import { parseFhirBundle } from "@metriport/shared/medical";
+ import dayjs from "dayjs";
+ import duration from "dayjs/plugin/duration";
+-import { generateAiBriefBundleEntry, getAiBriefFromS3 } from "../../domain/ai-brief/generate";
++import {
++  generateAiBriefBundleEntry,
++  getCachedAiBriefOrGenerateNewOne,
++} from "../../domain/ai-brief/generate";
+ import { createConsolidatedDataFilePath } from "../../domain/consolidated/filename";
+ import { createFolderName } from "../../domain/filename";
+ import { Patient } from "../../domain/patient";
+@@ -149,12 +152,20 @@ export async function createConsolidatedFromConversions({
+     }
+   }
+ 
+-  const shouldGetAiBriefFromS3 =
++  const shouldUseCachedAiBrief =
+     isAiBriefFeatureFlagEnabled && useCachedAiBrief && bundle.entry && bundle.entry.length > 0;
+ 
+-  if (shouldGetAiBriefFromS3) {
++  //Generates AI brief if it doesn't exist in S3
++  if (shouldUseCachedAiBrief) {
+     const aiBriefEntry = await generateAiBriefWithTimeout(
+-      controls => getAiBriefFromS3({ cxId, patientId, bundle, log, aiBriefControls: controls }),
++      controls =>
++        getCachedAiBriefOrGenerateNewOne({
++          cxId,
++          patientId,
++          bundle,
++          log,
++          aiBriefControls: controls,
++        }),
+       cxId,
+       patientId,
+       log
+diff --git a/packages/core/src/command/consolidated/consolidated-get.ts b/packages/core/src/command/consolidated/consolidated-get.ts
+index f56b267731..35ae51c300 100644
+--- a/packages/core/src/command/consolidated/consolidated-get.ts
++++ b/packages/core/src/command/consolidated/consolidated-get.ts
+@@ -121,6 +121,7 @@ export async function getConsolidatedPatientDataAsync({
+   requestId,
+   conversionType,
+   fromDashboard,
++  useCachedAiBrief,
+ }: GetConsolidatedPatientData & {
+   requestId: string;
+   conversionType: ConsolidationConversionType;
+@@ -134,6 +135,7 @@ export async function getConsolidatedPatientDataAsync({
+     dateTo,
+     isAsync: true,
+     fromDashboard,
++    useCachedAiBrief,
+   };
+   const connector = buildConsolidatedSnapshotConnector();
+   connector
+diff --git a/packages/core/src/command/hl7-notification/hl7-notification-webhook-sender-direct.ts b/packages/core/src/command/hl7-notification/hl7-notification-webhook-sender-direct.ts
+index e60de57271..dbb48aae7c 100644
+--- a/packages/core/src/command/hl7-notification/hl7-notification-webhook-sender-direct.ts
++++ b/packages/core/src/command/hl7-notification/hl7-notification-webhook-sender-direct.ts
+@@ -35,6 +35,7 @@ import {
+ } from "./hl7-notification-webhook-sender";
+ import {
+   asString,
++  isConsolidatedRefreshTriggerEvent,
+   isSupportedTriggerEvent,
+   ParsedHl7Data,
+   parseHl7Message,
+@@ -74,6 +75,7 @@ export const dischargeEventCode = "A03";
+ const INTERNAL_HL7_ENDPOINT = `notification`;
+ const INTERNAL_PATIENT_ENDPOINT = "internal/patient";
+ const DISCHARGE_REQUERY_ENDPOINT = "monitoring/discharge-requery";
++const USE_CACHED_AI_BRIEF = true;
+ const SIGNED_URL_DURATION_SECONDS = dayjs.duration({ minutes: 10 }).asSeconds();
+ 
+ type ClinicalInformation = {
+@@ -134,6 +136,14 @@ export class Hl7NotificationWebhookSenderDirect implements Hl7NotificationWebhoo
+       triggerEvent,
+     });
+ 
++    await this.notifyAnalytics({
++      cxId,
++      patientId,
++      messageCode,
++      triggerEvent,
++      hieName: params.hieName,
++    });
++
+     log(`Init S3 upload to bucket ${bucketName} with key ${rawDataFileKey}`);
+     await s3Utils.uploadFile({
+       bucket: bucketName,
+@@ -261,25 +271,8 @@ export class Hl7NotificationWebhookSenderDirect implements Hl7NotificationWebhoo
+         })
+     );
+ 
+-    const posthogApiKeyArn = Config.getPostHogApiKey();
+-    if (!posthogApiKeyArn) {
+-      throw new Error("Posthog API key not found");
+-    }
+-
+-    const posthogApiKey = await getSecretValueOrFail(posthogApiKeyArn, Config.getAWSRegion());
+-    analytics(
+-      {
+-        distinctId: cxId,
+-        event: EventTypes.hl7NotificationReceived,
+-        properties: {
+-          cxId,
+-          patientId,
+-          messageCode,
+-          triggerEvent,
+-        },
+-      },
+-      posthogApiKey
+-    );
++    log(`Calling refresh consolidated callback endpoint in API...`);
++    await this.refreshConsolidated(triggerEvent, cxId, patientId);
+ 
+     log(`Done. API notified...`);
+   }
+@@ -345,4 +338,68 @@ export class Hl7NotificationWebhookSenderDirect implements Hl7NotificationWebhoo
+ 
+     return clinicalInformation;
+   }
++
++  private async refreshConsolidated(
++    triggerEvent: SupportedTriggerEvent,
++    cxId: string,
++    patientId: string
++  ) {
++    const { log } = out(
++      `refreshConsolidated, cx: ${cxId}, pt: ${patientId}, triggerEvent: ${triggerEvent}`
++    );
++    if (!isConsolidatedRefreshTriggerEvent(triggerEvent)) {
++      return;
++    }
++    log(`POST ${this.getConsolidatedRefreshEndpoint(patientId, cxId)}`);
++    await executeWithNetworkRetries(
++      async () => axios.post(this.getConsolidatedRefreshEndpoint(patientId, cxId)),
++      { log }
++    );
++  }
++
++  private getConsolidatedRefreshEndpoint(patientId: string, cxId: string): string {
++    const baseUrl = `${this.apiUrl}/internal/patient/${patientId}/consolidated/refresh`;
++    return `${baseUrl}?cxId=${cxId}&useCachedAiBrief=${USE_CACHED_AI_BRIEF}`;
++  }
++
++  private async notifyAnalytics({
++    cxId,
++    patientId,
++    messageCode,
++    triggerEvent,
++    hieName,
++  }: {
++    cxId: string;
++    patientId: string;
++    messageCode: string;
++    triggerEvent: string;
++    hieName: string;
++  }) {
++    try {
++      const posthogApiKeyArn = Config.getPostHogApiKey();
++      if (!posthogApiKeyArn) {
++        throw new MetriportError("No posthog API key provided in webhook sender");
++      }
++
++      const posthogApiKey = await getSecretValueOrFail(posthogApiKeyArn, Config.getAWSRegion());
++      analytics(
++        {
++          distinctId: cxId,
++          event: EventTypes.hl7NotificationReceived,
++          properties: {
++            cxId,
++            patientId,
++            messageCode,
++            triggerEvent,
++            hieName,
++          },
++        },
++        posthogApiKey
++      );
++    } catch (error) {
++      capture.error("Failed to notify analytics", {
++        extra: { cxId, patientId, messageCode, triggerEvent, hieName, error },
++      });
++    }
++  }
+ }
+diff --git a/packages/core/src/command/hl7-notification/utils.ts b/packages/core/src/command/hl7-notification/utils.ts
+index c7ff6f7732..ba87face7c 100644
+--- a/packages/core/src/command/hl7-notification/utils.ts
++++ b/packages/core/src/command/hl7-notification/utils.ts
+@@ -18,6 +18,7 @@ export interface ParsedHl7Data {
+ }
+ 
+ const supportedTypes = ["A01", "A03"] as const;
++const CONSOLIDATED_REFRESH_TRIGGER_EVENTS = ["A01", "A03"] as const;
+ 
+ export type SupportedTriggerEvent = (typeof supportedTypes)[number];
+ export function isSupportedTriggerEvent(
+@@ -26,6 +27,10 @@ export function isSupportedTriggerEvent(
+   return supportedTypes.includes(triggerEvent as SupportedTriggerEvent);
+ }
+ 
++export function isConsolidatedRefreshTriggerEvent(triggerEvent: string): boolean {
++  return CONSOLIDATED_REFRESH_TRIGGER_EVENTS.includes(triggerEvent as SupportedTriggerEvent);
++}
++
+ export async function parseHl7Message(
+   rawMessage: Hl7Message,
+   hieConfig: string
+diff --git a/packages/core/src/domain/ai-brief/generate.ts b/packages/core/src/domain/ai-brief/generate.ts
+index 7495f60dcd..527ff79fe9 100644
+--- a/packages/core/src/domain/ai-brief/generate.ts
++++ b/packages/core/src/domain/ai-brief/generate.ts
+@@ -1,5 +1,5 @@
+ import { Binary, Bundle, BundleEntry, Resource } from "@medplum/fhirtypes";
+-import { errorToString, executeWithNetworkRetries } from "@metriport/shared";
++import { errorToString, executeWithNetworkRetries, MetriportError } from "@metriport/shared";
+ import { parseFhirBundle } from "@metriport/shared/medical/fhir/bundle";
+ import dayjs from "dayjs";
+ import duration from "dayjs/plugin/duration";
+@@ -56,7 +56,7 @@ export async function generateAiBriefBundleEntry({
+ 
+     if (aiBriefContent) {
+       const aiBriefFhirResource = generateAiBriefFhirResource(aiBriefContent);
+-      await uploadAiBriefToS3(aiBriefFhirResource, cxId, patientId, log);
++      await uploadAiBriefToS3({ aiBriefFhirResource, cxId, patientId, log });
+       return buildBundleEntry(aiBriefFhirResource);
+     }
+     return undefined;
+@@ -77,12 +77,17 @@ export async function generateAiBriefBundleEntry({
+   return undefined;
+ }
+ 
+-async function uploadAiBriefToS3(
+-  aiBriefFhirResource: Binary,
+-  cxId: string,
+-  patientId: string,
+-  log: typeof console.log
+-) {
++async function uploadAiBriefToS3({
++  aiBriefFhirResource,
++  cxId,
++  patientId,
++  log,
++}: {
++  aiBriefFhirResource: Binary;
++  cxId: string;
++  patientId: string;
++  log: typeof console.log;
++}): Promise<void> {
+   try {
+     const aiBriefWrappedInBundle = buildBundleFromResources({
+       resources: [aiBriefFhirResource],
+@@ -116,7 +121,7 @@ async function uploadAiBriefToS3(
+  * @param log - The log function.
+  * @returns The AI Brief bundle entry.
+  */
+-export async function getAiBriefFromS3({
++export async function getCachedAiBriefOrGenerateNewOne({
+   cxId,
+   patientId,
+   bundle,
+@@ -144,21 +149,18 @@ export async function getAiBriefFromS3({
+     const aiBrief = await s3Utils.getFileContentsAsString(Config.getAiBriefBucketName(), filePath);
+ 
+     if (!aiBrief) {
+-      log(`No AI Brief found in S3, generating new one`);
+-      return await generateAiBriefBundleEntry(params);
++      throw new MetriportError("No AI Brief found in S3");
+     }
+ 
+     log(`Got AI Brief from S3`);
+     const aiBriefBundle = parseFhirBundle(aiBrief) as Bundle<Binary>;
+     if (!aiBriefBundle) {
+-      log(`Failed to parse AI Brief bundle, generating new one`);
+-      return await generateAiBriefBundleEntry(params);
++      throw new MetriportError("Failed to parse AI Brief bundle");
+     }
+ 
+     const aiBriefResource = getAiBriefResourceFromBundle(aiBriefBundle);
+     if (!aiBriefResource) {
+-      log(`No AI Brief resource found in bundle, generating new one`);
+-      return await generateAiBriefBundleEntry(params);
++      throw new MetriportError("No AI Brief resource found in bundle");
+     }
+ 
+     return buildBundleEntry(aiBriefResource);

@@ -1,0 +1,925 @@
+diff --git a/api/src/main/java/org/openmrs/aop/RequiredDataAdvice.java b/api/src/main/java/org/openmrs/aop/RequiredDataAdvice.java
+index 284d0a6c0e8f..899e9697d446 100644
+--- a/api/src/main/java/org/openmrs/aop/RequiredDataAdvice.java
++++ b/api/src/main/java/org/openmrs/aop/RequiredDataAdvice.java
+@@ -34,6 +34,7 @@
+ import org.openmrs.api.handler.UnretireHandler;
+ import org.openmrs.api.handler.UnvoidHandler;
+ import org.openmrs.api.handler.VoidHandler;
++import org.openmrs.security.MaskedObject;
+ import org.openmrs.util.HandlerUtil;
+ import org.openmrs.util.Reflect;
+ import org.openmrs.validator.ValidateUtil;
+@@ -83,6 +84,10 @@ public class RequiredDataAdvice implements MethodBeforeAdvice {
+ 
+ 	private static final String UNABLE_GETTER_METHOD = "unable.getter.method";
+ 
++	/** Method name prefixes that write, so {@link #rejectMaskedArguments} knows when to look. */
++	private static final List<String> WRITE_METHOD_PREFIXES = List.of("save", "create", "update", "void", "unvoid", "retire",
++	    "unretire", "purge", "delete", "merge");
++
+ 	/**
+ 	 * <p>
+ 	 * <strong>Should</strong> not fail on update method with no arguments
+@@ -100,6 +105,8 @@ public void before(Method method, Object[] args, Object target) throws Throwable
+ 			return;
+ 		}
+ 
++		rejectMaskedArguments(methodName, args);
++
+ 		Object mainArgument = args[0];
+ 
+ 		// fail early on a null parameter
+@@ -190,6 +197,39 @@ else if (Reflect.isCollection(mainArgument) && isOpenmrsObjectCollection(mainArg
+ 		}
+ 	}
+ 
++	/**
++	 * Refuses a {@link MaskedObject} on its way into a write, rather than letting it reach Hibernate.
++	 * <p>
++	 * A mask carries no data: it stands in, during serialization, for an object a
++	 * {@code DomainObjectAuthorizationRule} refused (see {@code org.openmrs.security.Authorize}).
++	 * Saving one would blank the record it stands for, and being a proxy it would be read as an
++	 * unmanaged entity and inserted as new - the failure that ruled out enforcing those rules inside
++	 * the domain objects. This advice is the one place every write passes through, so it is where that
++	 * is caught.
++	 * <p>
++	 * Gated on the method name so a read handed a large collection does not pay for the scan.
++	 */
++	private static void rejectMaskedArguments(String methodName, Object[] args) {
++		if (WRITE_METHOD_PREFIXES.stream().noneMatch(methodName::startsWith)) {
++			return;
++		}
++
++		for (Object argument : args) {
++			rejectIfMasked(argument);
++			if (argument instanceof Collection<?> elements) {
++				elements.forEach(RequiredDataAdvice::rejectIfMasked);
++			}
++		}
++	}
++
++	private static void rejectIfMasked(Object argument) {
++		if (argument instanceof MaskedObject masked) {
++			throw new APIException("A masked " + masked.getMaskedType().getName() + " cannot be written: it stands in "
++			        + "for an object the current user may not read, so persisting it would blank that record. What "
++			        + "Authorize returns is for serialization only.");
++		}
++	}
++
+ 	/**
+ 	 * Convenience method to change the given method to make sure it ends with the given class name.
+ 	 * <br>
+diff --git a/api/src/main/java/org/openmrs/security/Authorize.java b/api/src/main/java/org/openmrs/security/Authorize.java
+new file mode 100644
+index 000000000000..10bdf5daa813
+--- /dev/null
++++ b/api/src/main/java/org/openmrs/security/Authorize.java
+@@ -0,0 +1,341 @@
++/**
++ * This Source Code Form is subject to the terms of the Mozilla Public License,
++ * v. 2.0. If a copy of the MPL was not distributed with this file, You can
++ * obtain one at http://mozilla.org/MPL/2.0/. OpenMRS is also distributed under
++ * the terms of the Healthcare Disclaimer located at http://openmrs.org/license.
++ *
++ * Copyright (C) OpenMRS Inc. OpenMRS is a registered trademark and the OpenMRS
++ * graphic logo is a trademark of OpenMRS Inc.
++ */
++package org.openmrs.security;
++
++import java.lang.reflect.Array;
++import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.UUID;
++
++import org.aopalliance.intercept.MethodInterceptor;
++import org.aopalliance.intercept.MethodInvocation;
++import org.hibernate.proxy.HibernateProxy;
++import org.openmrs.OpenmrsObject;
++import org.openmrs.api.context.Context;
++import org.springframework.aop.framework.AopProxyUtils;
++import org.springframework.aop.framework.ProxyFactory;
++import org.springframework.aop.target.EmptyTargetSource;
++import org.springframework.util.ClassUtils;
++
++/**
++ * Applies registered {@link DomainObjectAuthorizationRule}s to what a presentation layer is about
++ * to serialize, replacing what a rule refuses with a {@link MaskedObject} rather than dropping it.
++ * <p>
++ * Service methods decide <em>whether</em> a call is allowed, and {@code @PostFilter} already drops
++ * elements a rule refuses. This is for the layer after that: webservices.rest and the FHIR module
++ * hold an object graph and have to decide how much of it to write out, and a reader needs to be
++ * able to tell data that is hidden from data that does not exist. Masking says so; a shorter list
++ * does not.
++ * <p>
++ * <strong>A caller that bypassed the services is the only check there is.</strong> The paragraph
++ * above assumes a service method already applied the rules through {@code @PostFilter} or a
++ * {@code hasPermission} guard, which is true of anything read through {@code ObsService} and its
++ * siblings. A module that queries with its own DAO has had no rule applied to what it holds: fhir2
++ * reads observations that way, and its DAO checks only the privilege, so an obs a rule refuses is
++ * served exactly as an allowed one is. Where that is how the data arrived, this is not a second
++ * opinion on top of a guard, it is the guard, and it has to be placed and tested as one. Nothing
++ * here makes such a reader covered by having called it.
++ * <p>
++ * <strong>What comes back must never be written.</strong> A masked object is a serialization-time
++ * artifact: it carries no data, and persisting one would blank the record it stands for. Handing
++ * one to a {@code save*} method is rejected rather than attempted (see {@code RequiredDataAdvice}).
++ * <p>
++ * Every rule is asked about {@link #GET} rather than about a privilege the caller names. What is
++ * being decided here is not whether the call was allowed - the service method settled that - but
++ * how much of what it returned may be written out, and that is one question however the object was
++ * reached.
++ * <p>
++ * A refused object becomes a mask, which holds nothing. One no rule refuses comes back exactly as
++ * it was, so only the objects handed to these methods are judged and nothing reachable through them
++ * is: a rule covering {@code PersonAttribute} does nothing for {@code maskIfDenied(patient)}, and
++ * those attributes go on to serialize in full. Reaching one means naming it,
++ * {@code maskIfDenied(patient.getAttributes())} as well as the patient.
++ * <p>
++ * Masking the fields of an allowed object was tried here and removed. A proxy that intercepted its
++ * getters has to hold the real object to delegate to, and in webservices.rest that both missed
++ * paths and changed what it rendered for data nobody had denied: a getter taking an argument
++ * ({@code Encounter.getObsAtTopLevel(boolean)}) is never intercepted, a proxy over a lazily loaded
++ * association masks nothing because the association's own class redeclares the getters, and
++ * {@code BaseDelegatingResource.getSubclassHandler} matches a delegate by exact class, so every
++ * {@code DrugOrder} reached through such a proxy lost its subclass representation as soon as any
++ * rule was registered. A presentation layer sees every nested object already unwrapped, and that is
++ * where the check belongs.
++ *
++ * @see MaskedObject
++ * @see DomainObjectAuthorizationRule
++ * @since 3.0.0
++ */
++public final class Authorize {
++
++	/**
++	 * First group of the uuid a mask reports, for a reader that has only the serialized value to go on
++	 * and no {@link MaskedObject} to test. The remaining groups are random: see
++	 * {@link #standInFor(OpenmrsObject)}.
++	 * <p>
++	 * Hex, because the whole value has to parse as a uuid and a readable word cannot: {@code m},
++	 * {@code s} and {@code k} are not hex digits, so {@code masked-} and uuid syntax are mutually
++	 * exclusive. This spells what the alphabet allows and is improbable as the opening group of a real
++	 * one.
++	 */
++	public static final String MASKED_UUID_PREFIX = "effaced0-";
++
++	/**
++	 * The permission every rule is asked about here, standing for "this is being read at the
++	 * presentation layer" rather than for any one service method's privilege.
++	 * <p>
++	 * Not a privilege a role holds, and never checked against one: {@code rulesAuthorize} puts it
++	 * straight to the rules without consulting {@code Context.hasPrivilege}, because whether the call
++	 * was allowed is a question the service method already answered. A rule that wants to distinguish
++	 * reading from writing can branch on it; one that does not can ignore it.
++	 */
++	public static final String GET = "Get";
++
++	/**
++	 * What a mask prints. Deliberately says nothing about what it stands for, since anything that
++	 * renders an object by its {@code toString()} - a JSP among them - would otherwise show the masked
++	 * type and the substitute uuid to whoever is reading the page.
++	 */
++	private static final String MASKED_TO_STRING = "[hidden]";
++
++	private Authorize() {
++	}
++
++	/**
++	 * The object, or a {@link MaskedObject} standing in for it when a registered rule refuses it. An
++	 * object that is already a mask comes back untouched rather than being judged again. A mask holds
++	 * nothing, so asking a rule about one asks it about a null id, and a rule phrased as an allow-list
++	 * reads that as "not allowed" at best and throws at worst.
++	 *
++	 * @param object the object about to be serialized, may be null
++	 * @param <T> the object's type
++	 * @return {@code object} itself when no rule refuses it, otherwise a {@link MaskedObject} stand-in
++	 *         of the same type; null stays null
++	 */
++	public static <T extends OpenmrsObject> T maskIfDenied(T object) {
++		if (object == null || isMasked(object)) {
++			return object;
++		}
++
++		OpenmrsPermissionEvaluator evaluator = evaluator();
++		if (!evaluator.hasRules()) {
++			return object;
++		}
++
++		return evaluator.rulesAuthorize(initialized(object), GET) ? object : standInFor(object);
++	}
++
++	/**
++	 * The collection with every object a registered rule refuses replaced by a {@link MaskedObject}.
++	 * <p>
++	 * Replaced rather than removed, so the size a caller sees is the size the query found: a reader can
++	 * tell six observations with two hidden from four observations, and a page of twenty stays a page
++	 * of twenty. The argument is never modified - unlike {@code @PostFilter}, which filters in place
++	 * and is why a {@code @PostFilter}ed {@code @Cacheable} method has to key its cache by the caller.
++	 * <p>
++	 * What comes back is unmodifiable, and when no rule is registered it is a view of the argument
++	 * rather than a copy. That is deliberate: copying calls {@code toArray()} on the argument, which
++	 * initializes a lazy Hibernate association, and several of them arrive uninitialized
++	 * ({@code patient.getIdentifiers()}, {@code visit.getEncounters()},
++	 * {@code concept.getConceptSets()}). A read helper should not turn a collection nobody asked for
++	 * into a select, nor raise {@code LazyInitializationException} on a closed session where returning
++	 * the collection untouched would not have. Being unmodifiable is what makes sharing it safe: a
++	 * caller that tries to sort or trim the result fails at its own call site instead of silently
++	 * scheduling deletes on the service's collection at flush.
++	 * <p>
++	 * Judging elements does have to iterate, so the laziness above only survives while no rule is
++	 * registered. The elements themselves stay mutable either way; only the collection is protected.
++	 *
++	 * @param collection the objects about to be serialized, may be null
++	 * @param <T> the element type
++	 * @return an unmodifiable collection of the same size, in the same order, possibly a view of
++	 *         {@code collection}; null stays null
++	 */
++	public static <T extends OpenmrsObject> Collection<T> maskIfDenied(Collection<T> collection) {
++		if (collection == null) {
++			return null;
++		}
++
++		OpenmrsPermissionEvaluator evaluator = evaluator();
++		if (!evaluator.hasRules()) {
++			// wrapped, not copied: copying would initialize a lazy association. See the javadoc
++			return Collections.unmodifiableCollection(collection);
++		}
++
++		List<T> masked = new ArrayList<>(collection.size());
++		for (T element : collection) {
++			masked.add(element == null || isMasked(element) ? element
++			        : evaluator.rulesAuthorize(initialized(element), GET) ? element : standInFor(element));
++		}
++		return Collections.unmodifiableList(masked);
++	}
++
++	/**
++	 * @param object the object to test, may be null
++	 * @return true if {@code object} stands in for one a rule refused
++	 */
++	public static boolean isMasked(Object object) {
++		return object instanceof MaskedObject;
++	}
++
++	/**
++	 * The object itself, or what a lazily loaded association stands for, so the rules are asked about
++	 * the real thing. A proxy is typed by the association's declared class, so a {@code Patient} rule
++	 * is never matched to an {@code obs.getPerson()} proxy whose persistent class is {@code Person},
++	 * and a refused patient reached that way would go out unmasked.
++	 * <p>
++	 * This initializes the proxy, which is why it sits here rather than in the evaluator: the rules are
++	 * also consulted once per element of a {@code @PostFilter}, by way of {@code hasPermission(...)},
++	 * and that path must not load anything, while a caller here is about to serialize the object
++	 * regardless. Whether a proxy arrives at all depends on what the session had already loaded, so
++	 * leaving it wrapped would make masking depend on that too.
++	 */
++	private static Object initialized(Object object) {
++		return object instanceof HibernateProxy hibernateProxy
++		        ? hibernateProxy.getHibernateLazyInitializer().getImplementation()
++		        : object;
++	}
++
++	/** The entity class behind a Hibernate or AOP proxy, so methods are read off the real type. */
++	private static Class<?> targetTypeOf(Object object) {
++		if (object instanceof HibernateProxy hibernateProxy) {
++			return hibernateProxy.getHibernateLazyInitializer().getPersistentClass();
++		}
++
++		return ClassUtils.getUserClass(AopProxyUtils.ultimateTargetClass(object));
++	}
++
++	/**
++	 * A stand-in of {@code object}'s own type, built with no target so that a method this mask does not
++	 * recognize cannot reach the real object: the proxy has nothing to delegate to, and every call is
++	 * answered by {@link MaskInterceptor}.
++	 * <p>
++	 * It discloses nothing of what it masks, its identity included. The uuid it reports is
++	 * {@link #MASKED_UUID_PREFIX} followed by the remaining groups of a fresh random one, and its id is
++	 * null, because the real identifiers are themselves disclosure: returning them from a search result
++	 * would tell a caller that a record exists and hand over a key to try elsewhere. A substitute is
++	 * reported rather than nothing only so the shape downstream stays valid: fhir2 sets a resource's
++	 * {@code id} from the uuid and a REST representation is keyed by it, and neither tolerates the
++	 * absence well. It buys nothing beyond that, and should not be mistaken for a usable reference -
++	 * what each layer renders from it points at no record, so fhir2 emits a
++	 * {@code "subject":{"reference":"Patient/effaced0-..."}} and REST a self link that resolves to
++	 * nothing. Showing a reader that something is hidden is each layer's own job, which it has to do
++	 * from {@link #isMasked(Object)} rather than from this value.
++	 * <p>
++	 * Generated once per mask, so it is stable while one object is being written out, and deliberately
++	 * not derived from the real uuid, so it is stable for nothing else: two masks of the same record do
++	 * not match. Correlating hidden entries across requests is not a capability this is meant to give.
++	 * <p>
++	 * Well-formed rather than a decorated string, so anything parsing it as a uuid - a client, a column
++	 * of that type, {@link UUID#fromString(String)} - is not handed something it rejects. The random
++	 * groups come from a version 4 uuid, so the version and variant bits are those of a real one.
++	 */
++	@SuppressWarnings("unchecked")
++	private static <T extends OpenmrsObject> T standInFor(T object) {
++		// the entity class, not object.getClass(): a lazily loaded association arrives as a Hibernate
++		// proxy, and masking that class would report a generated name from getMaskedType() and subclass
++		// the proxy rather than the entity
++		Class<?> maskedType = targetTypeOf(object);
++		ProxyFactory factory = new ProxyFactory();
++		factory.setTargetSource(EmptyTargetSource.forClass(maskedType));
++		factory.setProxyTargetClass(true);
++		factory.addInterface(MaskedObject.class);
++		// substring(9) drops the random uuid's own first group and separator, so the result is still 36
++		// characters in 8-4-4-4-12
++		factory.addAdvice(new MaskInterceptor(maskedType, MASKED_UUID_PREFIX + UUID.randomUUID().toString().substring(9)));
++		return (T) factory.getProxy(maskedType.getClassLoader());
++	}
++
++	private static OpenmrsPermissionEvaluator evaluator() {
++		return Context.getRegisteredComponents(OpenmrsPermissionEvaluator.class).get(0);
++	}
++
++	/**
++	 * Answers every call on a masked object without a target to fall back on, so a getter nobody
++	 * thought about returns emptiness rather than data. Collection, map and array returns come back
++	 * empty rather than null, because a serializer handed a null where it expected a collection fails
++	 * on the response it was halfway through writing.
++	 * <p>
++	 * A setter throws. Masking is for a read on its way out, and writing to one is a programmer error
++	 * worth hearing about at the call site rather than when the blanked record reaches the database.
++	 */
++	private static final class MaskInterceptor implements MethodInterceptor {
++
++		private final Class<?> maskedType;
++
++		private final String uuid;
++
++		private MaskInterceptor(Class<?> maskedType, String uuid) {
++			this.maskedType = maskedType;
++			this.uuid = uuid;
++		}
++
++		@Override
++		public Object invoke(MethodInvocation invocation) {
++			Method method = invocation.getMethod();
++			String name = method.getName();
++
++			switch (name) {
++				case "getMaskedType":
++					return maskedType;
++				case "getUuid":
++					return uuid;
++				case "toString":
++					// nothing identifying: a JSP that prints an object prints this, and legacyui was
++					// putting the masked type and the substitute uuid straight onto the page
++					return MASKED_TO_STRING;
++				case "hashCode":
++					return System.identityHashCode(invocation.getThis());
++				case "equals":
++					return invocation.getThis() == invocation.getArguments()[0];
++				default:
++					break;
++			}
++
++			if (name.startsWith("set") && method.getParameterCount() == 1) {
++				throw new UnsupportedOperationException(
++				        "Cannot write to a masked " + maskedType.getName() + ": it stands in for an object the "
++				                + "current user may not read, and persisting it would blank that record");
++			}
++
++			return emptyValueFor(method.getReturnType());
++		}
++
++		private static Object emptyValueFor(Class<?> returnType) {
++			if (Set.class.isAssignableFrom(returnType)) {
++				return Collections.emptySet();
++			}
++			if (Map.class.isAssignableFrom(returnType)) {
++				return Collections.emptyMap();
++			}
++			if (Collection.class.isAssignableFrom(returnType)) {
++				return Collections.emptyList();
++			}
++			if (returnType.isArray()) {
++				return Array.newInstance(returnType.getComponentType(), 0);
++			}
++			if (Boolean.class.equals(returnType)) {
++				// boxed, but treated as a flag everywhere in the domain model: `if (x.getVoided())` is the
++				// common idiom, so a null here would NPE the very serialization this is for
++				return Boolean.FALSE;
++			}
++			if (returnType.isPrimitive() && !void.class.equals(returnType)) {
++				// the zero value of any primitive, boxed: a one-element array of it is zero-filled, so this
++				// covers false and '\0' as well as the numeric zeroes without a branch each
++				return Array.get(Array.newInstance(returnType, 1), 0);
++			}
++			return null;
++		}
++	}
++}
+diff --git a/api/src/main/java/org/openmrs/security/DomainObjectAuthorizationRule.java b/api/src/main/java/org/openmrs/security/DomainObjectAuthorizationRule.java
+index 0eb2a6433bd8..a56f683198b5 100644
+--- a/api/src/main/java/org/openmrs/security/DomainObjectAuthorizationRule.java
++++ b/api/src/main/java/org/openmrs/security/DomainObjectAuthorizationRule.java
+@@ -49,6 +49,15 @@
+  * expression. Read it through a DAO or the Hibernate session instead, or guard the re-entrant call
+  * with a thread-local.
+  * <p>
++ * A rule is asked under one of two vocabularies, and both reach the same {@code isAuthorized}
++ * methods. An annotation names the privilege its method requires, so a rule sees
++ * {@code Get Patients} or {@code Edit Patients} and can tell a read from a write.
++ * {@link Authorize}, which a presentation layer calls on its way to serializing what a service
++ * already returned, names {@link Authorize#GET} instead: what it decides is not whether the call
++ * was allowed but how much of the result may be written out, and that is one question however the
++ * object was reached. A rule that branches on the permission should treat anything it does not
++ * recognize as a read rather than assuming a privilege name.
++ * <p>
+  * A rule is only ever asked about the object. {@link OpenmrsPermissionEvaluator} has already
+  * confirmed the current user holds the named privilege by the time any rule runs - a rule reached
+  * at all means the privilege check passed - so an implementation must not re-check it, and
+@@ -79,7 +88,9 @@ public interface DomainObjectAuthorizationRule {
+ 	 *            {@code hasPermission(targetDomainObject, permission)} expression
+ 	 * @param permission the privilege named by the expression, supplied so this rule can distinguish
+ 	 *            which operation is being attempted; already confirmed to be held, so it is not to be
+-	 *            re-checked (see this interface's javadoc)
++	 *            re-checked (see this interface's javadoc). {@link Authorize#GET} rather than a
++	 *            privilege name when the question comes from {@link Authorize} - see this interface's
++	 *            javadoc
+ 	 * @return true if this rule authorizes access to {@code targetDomainObject}
+ 	 */
+ 	boolean isAuthorized(Authentication authentication, Object targetDomainObject, Object permission);
+diff --git a/api/src/main/java/org/openmrs/security/LegacyContextAuthentication.java b/api/src/main/java/org/openmrs/security/LegacyContextAuthentication.java
+index 821801c18eef..40842caf25a9 100644
+--- a/api/src/main/java/org/openmrs/security/LegacyContextAuthentication.java
++++ b/api/src/main/java/org/openmrs/security/LegacyContextAuthentication.java
+@@ -76,7 +76,24 @@ static Supplier<Authentication> orCurrentUserContext(Supplier<? extends Authenti
+ 				// nothing published on this thread; the UserContext below is the store of record
+ 			}
+ 
+-			return resolved != null ? resolved : new OpenmrsAuthenticationToken(Context.getUserContext());
++			return resolved != null ? resolved : fromUserContext();
+ 		};
+ 	}
++
++	/**
++	 * The same {@link Authentication} an expression would be evaluated against, for a caller that has
++	 * no interceptor supplier to start from - {@link Authorize} consulting rules outside an expression.
++	 * Resolved the same way so a rule cannot be handed one identity through an annotation and another
++	 * through the helper.
++	 *
++	 * @return the published authentication, or one built from the current {@link UserContext}
++	 */
++	static Authentication current() {
++		Authentication published = SecurityContextHolder.getContext().getAuthentication();
++		return published != null ? published : fromUserContext();
++	}
++
++	private static Authentication fromUserContext() {
++		return new OpenmrsAuthenticationToken(Context.getUserContext());
++	}
+ }
+diff --git a/api/src/main/java/org/openmrs/security/MaskedObject.java b/api/src/main/java/org/openmrs/security/MaskedObject.java
+new file mode 100644
+index 000000000000..c217b8024793
+--- /dev/null
++++ b/api/src/main/java/org/openmrs/security/MaskedObject.java
+@@ -0,0 +1,45 @@
++/**
++ * This Source Code Form is subject to the terms of the Mozilla Public License,
++ * v. 2.0. If a copy of the MPL was not distributed with this file, You can
++ * obtain one at http://mozilla.org/MPL/2.0/. OpenMRS is also distributed under
++ * the terms of the Healthcare Disclaimer located at http://openmrs.org/license.
++ *
++ * Copyright (C) OpenMRS Inc. OpenMRS is a registered trademark and the OpenMRS
++ * graphic logo is a trademark of OpenMRS Inc.
++ */
++package org.openmrs.security;
++
++import org.openmrs.OpenmrsObject;
++
++/**
++ * Marks what {@link Authorize} returns in place of an object a registered
++ * {@link DomainObjectAuthorizationRule} refused: still the declared type, so it serializes where
++ * the real object would have, but answering every getter as if it held nothing - its identity
++ * included, since the uuid it reports is a well-formed but random one opening with
++ * {@link Authorize#MASKED_UUID_PREFIX}, and its id is null.
++ * <p>
++ * It exists so a presentation layer can tell <em>hidden</em> from <em>absent</em>. A reader handed
++ * a shorter list cannot; one handed a masked entry can say so, which is the difference between a
++ * chart that looks complete and one that admits it is not.
++ * <p>
++ * Every getter but its identity answers as if it held nothing, which means a consumer that treats a
++ * field as always present will fail on one: fhir2's observation status translator calls
++ * {@code obs.getStatus().toString()}, and a masked {@code Obs} returns null there. A reader has to
++ * null-check what it reads off a mask, or test {@link Authorize#isMasked(Object)} first and render
++ * the placeholder instead.
++ * <p>
++ * A masked object is a serialization-time artifact and must never be written back. Passing one to a
++ * {@code save*} method is rejected rather than persisted (see {@code RequiredDataAdvice}), because
++ * an authorization proxy reaching Hibernate is read as an unmanaged entity and inserted as new -
++ * the failure that ruled out enforcing these rules inside the domain objects themselves.
++ *
++ * @see Authorize
++ * @since 3.0.0
++ */
++public interface MaskedObject extends OpenmrsObject {
++
++	/**
++	 * @return the type of the object that was masked, for a reader deciding what to show in its place
++	 */
++	Class<?> getMaskedType();
++}
+diff --git a/api/src/main/java/org/openmrs/security/OpenmrsPermissionEvaluator.java b/api/src/main/java/org/openmrs/security/OpenmrsPermissionEvaluator.java
+index 879d540235ed..b14d5de9652e 100644
+--- a/api/src/main/java/org/openmrs/security/OpenmrsPermissionEvaluator.java
++++ b/api/src/main/java/org/openmrs/security/OpenmrsPermissionEvaluator.java
+@@ -153,6 +153,38 @@ public boolean hasPermission(Authentication authentication, Object targetDomainO
+ 		return authorizedByRules(authentication, targetDomainObject, permission);
+ 	}
+ 
++	/**
++	 * Whether any rule is registered at all, so a caller can skip work that would only ever be answered
++	 * by "nothing covers this" - {@link Authorize} returns early when no module has contributed a rule,
++	 * which is every installation that does not use them.
++	 *
++	 * @return true if at least one {@link DomainObjectAuthorizationRule} is registered
++	 * @since 3.0.0
++	 */
++	boolean hasRules() {
++		return !rules.isEmpty();
++	}
++
++	/**
++	 * Whether every registered rule covering {@code target}'s type authorizes it for
++	 * {@code permission}, with no privilege check of its own - the question {@link Authorize} asks on
++	 * behalf of a presentation layer that has already passed the service's own guard and is now
++	 * deciding how much of what it was given to disclose. Re-checking the privilege there would ask
++	 * what the service method already answered.
++	 * <p>
++	 * A null target, a type no rule covers, and a {@code Daemon} thread all authorize, exactly as they
++	 * do for {@code hasPermission(...)}.
++	 *
++	 * @param target the object to judge
++	 * @param permission the privilege the read is being made under, passed to the rules so they can
++	 *            tell operations apart
++	 * @return true if no registered rule refuses {@code target}
++	 * @since 3.0.0
++	 */
++	boolean rulesAuthorize(Object target, Object permission) {
++		return target == null || authorizedByRules(LegacyContextAuthentication.current(), target, permission);
++	}
++
+ 	/**
+ 	 * Every rule whose target type {@code target} is an instance of must authorize it -
+ 	 * most-restrictive-wins. A type no rule covers is authorized, which is what keeps this extension
+diff --git a/api/src/test/java/org/openmrs/security/AuthorizeTest.java b/api/src/test/java/org/openmrs/security/AuthorizeTest.java
+new file mode 100644
+index 000000000000..94355f15b1e0
+--- /dev/null
++++ b/api/src/test/java/org/openmrs/security/AuthorizeTest.java
+@@ -0,0 +1,345 @@
++/**
++ * This Source Code Form is subject to the terms of the Mozilla Public License,
++ * v. 2.0. If a copy of the MPL was not distributed with this file, You can
++ * obtain one at http://mozilla.org/MPL/2.0/. OpenMRS is also distributed under
++ * the terms of the Healthcare Disclaimer located at http://openmrs.org/license.
++ *
++ * Copyright (C) OpenMRS Inc. OpenMRS is a registered trademark and the OpenMRS
++ * graphic logo is a trademark of OpenMRS Inc.
++ */
++package org.openmrs.security;
++
++import java.io.Serializable;
++import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.List;
++import java.util.UUID;
++
++import org.hibernate.proxy.HibernateProxy;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.Test;
++import org.openmrs.Obs;
++import org.openmrs.Patient;
++import org.openmrs.api.APIException;
++import org.openmrs.api.context.Context;
++import org.openmrs.test.jupiter.BaseContextSensitiveTest;
++import org.springframework.security.core.Authentication;
++import org.springframework.stereotype.Component;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.SerializationFeature;
++
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertInstanceOf;
++import static org.junit.jupiter.api.Assertions.assertNotEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertSame;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * Covers {@link Authorize}, the presentation-layer side of {@link DomainObjectAuthorizationRule}: a
++ * rule's verdict applied to what is about to be serialized, with what it refuses replaced rather
++ * than dropped so a reader can tell hidden from absent.
++ * <p>
++ * The properties worth pinning are the ones a serializer depends on and the one that keeps the
++ * whole approach safe: a mask is still the declared type, it discloses only its identifiers, a
++ * collection keeps its size, and a mask is refused by the write path instead of reaching Hibernate.
++ * <p>
++ * {@link MaskingPatientRule} is registered for the whole suite, like the other rules in these
++ * tests, and refuses nothing until a test names a patient.
++ */
++public class AuthorizeTest extends BaseContextSensitiveTest {
++
++	@AfterEach
++	public void disarmRule() {
++		MaskingPatientRule.deniedPatientId = null;
++		MaskingPatientRule.timesAsked = 0;
++	}
++
++	private Patient patient(int id) {
++		return Context.getPatientService().getPatient(id);
++	}
++
++	@Test
++	public void maskIfDenied_shouldMaskTheObjectWhenARuleRefusesIt() {
++		Patient patient = patient(2);
++		MaskingPatientRule.deniedPatientId = 2;
++
++		Patient masked = Authorize.maskIfDenied(patient);
++
++		assertTrue(Authorize.isMasked(masked));
++		// still the declared type, so it serializes where the real object would have
++		assertNotNull(masked);
++		assertEquals(Patient.class, ((MaskedObject) masked).getMaskedType());
++	}
++
++	@Test
++	public void maskIfDenied_shouldDiscloseNothingAboutTheObjectItMasks() {
++		Patient patient = patient(2);
++		String uuid = patient.getUuid();
++		assertNotNull(patient.getPersonName(), "the premise: this patient has a name to hide");
++		MaskingPatientRule.deniedPatientId = 2;
++
++		Patient masked = Authorize.maskIfDenied(patient);
++
++		// a substitute identity rather than the real one: returning the uuid of a record the caller was
++		// refused would confirm it exists and hand over a key to try elsewhere
++		assertTrue(masked.getUuid().startsWith(Authorize.MASKED_UUID_PREFIX));
++		assertNotEquals(uuid, masked.getUuid());
++		assertNull(masked.getId());
++		assertNull(masked.getPersonName(), "a getter the mask does not recognize must not reach the real object");
++		assertNull(masked.getGender());
++		// a collection getter comes back empty rather than null: a serializer handed null where it
++		// expected a collection fails on the response it is halfway through writing
++		assertTrue(masked.getNames().isEmpty());
++		assertFalse(masked.getVoided());
++	}
++
++	@Test
++	public void maskIfDenied_shouldReportOneStableIdentityPerMaskAndNoneAcrossMasks() {
++		Patient patient = patient(2);
++		MaskingPatientRule.deniedPatientId = 2;
++
++		Patient masked = Authorize.maskIfDenied(patient);
++		Patient maskedAgain = Authorize.maskIfDenied(patient);
++
++		// stable while one object is written out, since a representation reads the uuid more than once
++		assertEquals(masked.getUuid(), masked.getUuid());
++		// and stable for nothing else: two masks of one record must not be correlatable
++		assertNotEquals(masked.getUuid(), maskedAgain.getUuid());
++	}
++
++	@Test
++	public void maskIfDenied_shouldReportAUuidAFhirIdAccepts() {
++		Patient patient = patient(2);
++		MaskingPatientRule.deniedPatientId = 2;
++
++		String uuid = Authorize.maskIfDenied(patient).getUuid();
++
++		// the reason a substitute is reported at all rather than nothing: fhir2's translators set
++		// Resource.id from the uuid, and a resource with no id cannot sit in a searchset bundle, whose
++		// entry.fullUrl is built from it. FHIR constrains an id to [A-Za-z0-9-.]{1,64}
++		assertTrue(uuid.matches("[A-Za-z0-9\\-.]{1,64}"), uuid);
++
++		// and a well-formed uuid besides, so anything that parses one is not handed something it rejects
++		assertEquals(uuid, UUID.fromString(uuid).toString());
++		assertEquals(4, UUID.fromString(uuid).version(), "the random groups keep a version 4 uuid's bits");
++	}
++
++	@Test
++	public void maskIfDenied_shouldSerializeAMaskedObject() {
++		// fetched before the rule is armed: getPatient is itself guarded by it
++		Patient patient = patient(2);
++		MaskingPatientRule.deniedPatientId = 2;
++		Patient masked = Authorize.maskIfDenied(patient);
++
++		// the whole object through a serializer, not just a string off it: the point of masking rather
++		// than nulling is that whatever is about to write the response still can, and a mask has to
++		// survive being walked getter by getter the way a serializer walks it
++		ObjectMapper mapper = new ObjectMapper();
++		mapper.configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
++		String json = assertDoesNotThrow(() -> mapper.writeValueAsString(masked));
++
++		assertTrue(json.contains(masked.getUuid()), json);
++		assertFalse(json.contains("Horatio"), "nothing of the real patient may appear: " + json);
++	}
++
++	@Test
++	public void maskIfDenied_shouldPrintNothingIdentifyingAboutAMask() {
++		Patient patient = patient(2);
++		MaskingPatientRule.deniedPatientId = 2;
++
++		String printed = Authorize.maskIfDenied(patient).toString();
++
++		// a JSP that prints an object prints this, so it must not carry the type or the substitute uuid
++		assertEquals("[hidden]", printed);
++	}
++
++	@Test
++	public void maskIfDenied_shouldAnswerEveryGetterOfAMaskWithoutThrowing() {
++		Patient patient = patient(2);
++		MaskingPatientRule.deniedPatientId = 2;
++		Patient masked = Authorize.maskIfDenied(patient);
++
++		// a consumer walks whatever getters it likes; none of them may blow up on the stand-in
++		for (Method method : Patient.class.getMethods()) {
++			if (method.getParameterCount() > 0 || void.class.equals(method.getReturnType())
++			        || method.getName().startsWith("set")) {
++				continue;
++			}
++			assertDoesNotThrow(() -> method.invoke(masked), method.getName());
++		}
++	}
++
++	@Test
++	public void maskIfDenied_shouldReturnAnUnmodifiableCollection() {
++		List<Patient> given = new ArrayList<>(List.of(patient(2)));
++
++		Collection<Patient> returned = Authorize.maskIfDenied(given);
++
++		// the result may be a view of the argument when no rule is registered, so it has to refuse
++		// mutation: a caller that trims it would otherwise be trimming the service's own collection,
++		// which on a Hibernate association becomes deletes at flush
++		assertThrows(UnsupportedOperationException.class, returned::clear);
++		assertEquals(1, given.size());
++	}
++
++	@Test
++	public void maskIfDenied_shouldRefuseAWriteToAMaskedObject() {
++		Patient patient = patient(2);
++		MaskingPatientRule.deniedPatientId = 2;
++		Patient masked = Authorize.maskIfDenied(patient);
++
++		assertThrows(UnsupportedOperationException.class, () -> masked.setGender("F"));
++	}
++
++	@Test
++	public void maskIfDenied_shouldLeaveANullObjectAlone() {
++		assertNull(Authorize.maskIfDenied((Patient) null));
++	}
++
++	@Test
++	public void maskIfDenied_shouldKeepTheSizeAndReplaceOnlyWhatARuleRefuses() {
++		List<Patient> patients = new ArrayList<>(List.of(patient(2), patient(6)));
++		MaskingPatientRule.deniedPatientId = 2;
++
++		Collection<Patient> filtered = Authorize.maskIfDenied(patients);
++
++		assertEquals(2, filtered.size(), "a replaced entry still counts, so six with two hidden is not four");
++		List<Patient> asList = new ArrayList<>(filtered);
++		assertTrue(Authorize.isMasked(asList.get(0)));
++		assertFalse(Authorize.isMasked(asList.get(1)));
++		assertEquals(6, asList.get(1).getId(), "order is preserved");
++	}
++
++	@Test
++	public void maskIfDenied_shouldNotMutateTheCollectionItWasGiven() {
++		List<Patient> patients = new ArrayList<>(List.of(patient(2)));
++		MaskingPatientRule.deniedPatientId = 2;
++
++		Authorize.maskIfDenied(patients);
++
++		// unlike @PostFilter, which filters in place - the reason a @PostFilter'ed @Cacheable method
++		// has to key its cache by the caller
++		assertEquals(1, patients.size());
++		assertFalse(Authorize.isMasked(patients.get(0)));
++	}
++
++	@Test
++	public void maskIfDenied_shouldLeaveANullCollectionAlone() {
++		assertNull(Authorize.maskIfDenied((Collection<Patient>) null));
++	}
++
++	@Test
++	public void save_shouldRejectAMaskedObjectRatherThanPersistIt() {
++		Patient patient = patient(2);
++		MaskingPatientRule.deniedPatientId = 2;
++		Patient masked = Authorize.maskIfDenied(patient);
++		MaskingPatientRule.deniedPatientId = null;
++
++		// the constraint the whole approach rests on: a mask carries no data, so saving one would blank
++		// the record it stands for, and as a proxy it would be inserted as new
++		APIException thrown = assertThrows(APIException.class, () -> Context.getPatientService().savePatient(masked));
++		assertTrue(thrown.getMessage().contains("cannot be written"), thrown.getMessage());
++	}
++
++	@Test
++	public void save_shouldRejectAMaskedObjectInsideACollectionArgument() {
++		Patient patient = patient(2);
++		MaskingPatientRule.deniedPatientId = 2;
++		Patient masked = Authorize.maskIfDenied(patient);
++		MaskingPatientRule.deniedPatientId = null;
++
++		assertThrows(APIException.class, () -> Context.getPatientService().mergePatients(patient(6), List.of(masked)));
++	}
++
++	@Test
++	public void maskIfDenied_shouldConsultNoRuleForATypeNoneCovers() {
++		Obs obs = new Obs();
++		obs.setUuid("an-obs-no-rule-covers");
++
++		// no Obs rule is registered, so this is the additive case: nothing refuses it
++		assertSame(obs, Authorize.maskIfDenied(obs));
++	}
++
++	@Test
++	public void maskIfDenied_shouldNotWrapAMaskAgain() {
++		Patient patient = patient(2);
++		MaskingPatientRule.deniedPatientId = 2;
++
++		Patient masked = Authorize.maskIfDenied(patient);
++		int askedToProduceTheMask = MaskingPatientRule.timesAsked;
++
++		assertSame(masked, Authorize.maskIfDenied(masked), "a mask is not wrapped again");
++		// not merely "came back unchanged": a rule asked about a mask is asked about a null id, which an
++		// allow-list rule reads as refused or throws on
++		assertEquals(askedToProduceTheMask, MaskingPatientRule.timesAsked, "a mask is not judged again");
++	}
++
++	@Test
++	public void maskIfDenied_shouldNotJudgeACollectionElementThatIsAlreadyAMask() {
++		Patient patient = patient(2);
++		MaskingPatientRule.deniedPatientId = 2;
++		Patient mask = Authorize.maskIfDenied(patient);
++		int askedToProduceTheMask = MaskingPatientRule.timesAsked;
++
++		Collection<Patient> judged = Authorize.maskIfDenied(List.of(mask));
++
++		assertSame(mask, judged.iterator().next(), "the mask is passed through");
++		assertEquals(askedToProduceTheMask, MaskingPatientRule.timesAsked, "and not judged again");
++	}
++
++	@Test
++	public void maskIfDenied_shouldAskAPatientRuleAboutALazyPersonProxy() {
++		Context.flushSession();
++		Context.clearSession();
++		Obs obs = Context.getObsService().getObs(7);
++		assertInstanceOf(HibernateProxy.class, obs.getPerson(), "the premise: a lazy proxy typed Person");
++		MaskingPatientRule.deniedPatientId = obs.getPersonId();
++
++		assertTrue(Authorize.isMasked(Authorize.maskIfDenied(obs.getPerson())),
++		    "a Patient rule has to reach a Person-typed proxy of a patient it refuses");
++	}
++
++	/**
++	 * Refuses exactly one, test-selected patient, authorizing every other target. Off by default so
++	 * registering it does not change behavior for tests that do not use it.
++	 */
++	@Component
++	public static class MaskingPatientRule implements DomainObjectAuthorizationRule {
++
++		static volatile Integer deniedPatientId;
++
++		/** How many times the rule has been consulted, so a test can pin that it was not. */
++		static volatile int timesAsked;
++
++		@Override
++		public Class<?> getTargetType() {
++			return Patient.class;
++		}
++
++		@Override
++		public boolean isAuthorized(Authentication authentication, Object targetDomainObject, Object permission) {
++			timesAsked++;
++			if (deniedPatientId == null || !(targetDomainObject instanceof Patient patient)) {
++				return true;
++			}
++			return !deniedPatientId.equals(patient.getPatientId());
++		}
++
++		@Override
++		public boolean isAuthorized(Authentication authentication, Serializable targetId, Class<?> targetType,
++		        Object permission) {
++			if (deniedPatientId == null) {
++				return true;
++			}
++			// an id form this rule cannot interpret denies, as DomainObjectAuthorizationRule requires
++			return targetId instanceof Integer id && !deniedPatientId.equals(id);
++		}
++	}
++}

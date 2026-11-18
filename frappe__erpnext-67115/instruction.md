@@ -1,0 +1,24 @@
+# Issue
+
+**Title:** fix(stock): check Inventory Dimension read permission in get_parent_fields (backport #65944)
+
+## Description
+
+Backport of #65944 to `version-15-hotfix`. The version-16 backport is #67114.
+
+`get_parent_fields` lists the parent document fields for the **Fetch Value From** field of the Inventory Dimension form. It did not check any permission, so any desk user could call it. It now needs read permission on Inventory Dimension.
+
+**Fix:** `get_parent_fields` checks read permission on Inventory Dimension before it reads the fields. ()
+
+**Changes compared with develop:** The cherry-pick conflicts on the function signature, because develop has type annotations on `get_parent_fields` that this branch does not have. The signature of this branch is kept and only the permission check is added. The test changes apply without changes. Other PRs to `version-15-hotfix` that change `inventory_dimension.py` and `test_inventory_dimension.py`: #67117. It touches different lines, and each PR merges on its own.
+
+ for the example and the steps to test.
+
+### Tests
+
+- `test_parent_fields_need_inventory_dimension_access`: passes on this branch, fails on `version-15-hotfix` without the fix.
+- `test_inventory_dimension.py` (complete file): 25 tests pass.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `a1ad8592b41f`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

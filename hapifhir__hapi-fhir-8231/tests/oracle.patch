@@ -1,0 +1,345 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8200-same-partition-merge-compartment-enforcement.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8200-same-partition-merge-compartment-enforcement.yaml
+new file mode 100644
+index 000000000000..bb5506a11194
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/8_12_0/8200-same-partition-merge-compartment-enforcement.yaml
+@@ -0,0 +1,4 @@
++---
++type: fix
++issue: 8200
++title: "Previously, when the Patient ID Partitioning Interceptor was used together with the Patient Compartment Enforcing Interceptor, a Patient $merge could fail with an HTTP 412 error, because the merge tried to update patient compartment resources in place. This is now fixed by creating copies of those resources in the target Patient's compartment during the merge operation, similar to a cross-partition merge."
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/provider/PartitionAwareReplaceReferencesSvc.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/provider/PartitionAwareReplaceReferencesSvc.java
+index 32ad2da1ebbf..60e6484766ff 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/provider/PartitionAwareReplaceReferencesSvc.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/provider/PartitionAwareReplaceReferencesSvc.java
+@@ -302,18 +302,15 @@ private void replaceSourceReferencesAndClassifyResources(
+ 			List<IBaseResource> theUpdateList) {
+ 
+ 		for (IBaseResource resource : theResources) {
+-			Integer currentPartitionId = RequestPartitionId.getPartitionFromUserDataIfPresent(resource)
+-					.map(RequestPartitionId::getFirstPartitionIdOrNull)
+-					.orElse(null);
++			RequestPartitionId currentPartition = determinePartition(resource, theRequestDetails);
+ 
+ 			// Rewrite source→target references so determineCreatePartitionForRequest
+ 			// routes based on the post-merge state.
+ 			replaceVersionlessReferences(resource, Map.of(theSourceRef, theTargetRef));
+ 
+ 			RequestPartitionId newPartition = determinePartition(resource, theRequestDetails);
+-			Integer newPartitionId = newPartition.getFirstPartitionIdOrNull();
+ 
+-			if (Objects.equals(currentPartitionId, newPartitionId)) {
++			if (Objects.equals(currentPartition, newPartition)) {
+ 				theUpdateList.add(resource);
+ 			} else {
+ 				theCopiesByDestPartition
+@@ -323,21 +320,9 @@ private void replaceSourceReferencesAndClassifyResources(
+ 		}
+ 	}
+ 
+-	/**
+-	 * Determines the partition for a resource by temporarily clearing its existing
+-	 * RESOURCE_PARTITION_ID and asking the partition helper to compute a fresh partition
+-	 * based on the resource's current references. The original partition is restored afterward.
+-	 */
+ 	private RequestPartitionId determinePartition(IBaseResource theResource, RequestDetails theRequestDetails) {
+-		Object savedPartitionUserData = theResource.getUserData(Constants.RESOURCE_PARTITION_ID);
+-		try {
+-			theResource.setUserData(Constants.RESOURCE_PARTITION_ID, null);
+-			String resourceType = myFhirContext.getResourceType(theResource);
+-			return myRequestPartitionHelperSvc.determineCreatePartitionForRequest(
+-					theRequestDetails, theResource, resourceType);
+-		} finally {
+-			theResource.setUserData(Constants.RESOURCE_PARTITION_ID, savedPartitionUserData);
+-		}
++		return myRequestPartitionHelperSvc.determineCreatePartitionForRequestIgnoringCachedPartition(
++				theRequestDetails, theResource, myFhirContext.getResourceType(theResource));
+ 	}
+ 
+ 	private enum ChangeType {
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/provider/merge/ResourceMergeService.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/provider/merge/ResourceMergeService.java
+index fef30cee0cab..155c96682109 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/provider/merge/ResourceMergeService.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/provider/merge/ResourceMergeService.java
+@@ -66,7 +66,7 @@
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.Optional;
++import java.util.Objects;
+ 
+ import static ca.uhn.fhir.batch2.jobs.merge.MergeAppCtx.JOB_MERGE;
+ import static ca.uhn.fhir.merge.MergeResourceHelper.addErrorToOperationOutcome;
+@@ -174,7 +174,8 @@ private void validateAndMerge(
+ 			IBaseResource sourceResource = mergeValidationResult.sourceResource;
+ 			IBaseResource targetResource = mergeValidationResult.targetResource;
+ 
+-			boolean isPartitionAwareMerge = requiresPartitionAwareMerge(sourceResource, targetResource);
++			boolean isPartitionAwareMerge =
++					requiresPartitionAwareMerge(sourceResource, targetResource, theRequestDetails);
+ 			validatePartitionAwareMergeAsyncNotSupported(isPartitionAwareMerge, theRequestDetails);
+ 
+ 			if (theMergeOperationParameters.getPreview()) {
+@@ -269,7 +270,8 @@ private void doMergeSync(
+ 
+ 		Date startTime = new Date();
+ 
+-		boolean partitionAwareMerge = requiresPartitionAwareMerge(theSourceResource, theTargetResource);
++		boolean partitionAwareMerge =
++				requiresPartitionAwareMerge(theSourceResource, theTargetResource, theRequestDetails);
+ 
+ 		validateResourceLimit(theMergeOperationParameters, theSourceResource, theRequestDetails, partitionAwareMerge);
+ 
+@@ -740,7 +742,8 @@ private void validateResourceLimit(
+ 		}
+ 	}
+ 
+-	private boolean requiresPartitionAwareMerge(IBaseResource theSourceResource, IBaseResource theTargetResource) {
++	private boolean requiresPartitionAwareMerge(
++			IBaseResource theSourceResource, IBaseResource theTargetResource, RequestDetails theRequestDetails) {
+ 		if (!myPartitionSettings.isPartitioningEnabled()) {
+ 			return false;
+ 		}
+@@ -750,16 +753,20 @@ private boolean requiresPartitionAwareMerge(IBaseResource theSourceResource, IBa
+ 		// every merge through it, not just cross-partition ones.
+ 		// TODO: either add all-partition support to the regular replace-references path, or merge the
+ 		// two paths so that the partition-aware path handles all cases.
+-		return isCrossPartitionMerge(theSourceResource, theTargetResource)
+-				|| !myPartitionSettings.isAllPartitionSearchSupported();
+-	}
+-
+-	private boolean isCrossPartitionMerge(IBaseResource theSourceResource, IBaseResource theTargetResource) {
+-		if (!myPartitionSettings.isPartitioningEnabled()) {
+-			return false;
++		if (!myPartitionSettings.isAllPartitionSearchSupported()) {
++			return true;
+ 		}
+-		Optional<RequestPartitionId> srcPart = RequestPartitionId.getPartitionFromUserDataIfPresent(theSourceResource);
+-		Optional<RequestPartitionId> tgtPart = RequestPartitionId.getPartitionFromUserDataIfPresent(theTargetResource);
+-		return srcPart.isPresent() && tgtPart.isPresent() && !srcPart.get().equals(tgtPart.get());
++		// This is the same computation PatientCompartmentEnforcingInterceptor performs, so in Patient ID mode it
++		// detects not only a change of partition but also a change of patient compartment within the same
++		// partition. Such a compartment change requires copying the referring resources too, since otherwise the
++		// enforcer rejects the in-place update.
++		String resourceType = myFhirContext.getResourceType(theSourceResource);
++		RequestPartitionId sourcePartition =
++				myRequestPartitionHelperSvc.determineCreatePartitionForRequestIgnoringCachedPartition(
++						theRequestDetails, theSourceResource, resourceType);
++		RequestPartitionId targetPartition =
++				myRequestPartitionHelperSvc.determineCreatePartitionForRequestIgnoringCachedPartition(
++						theRequestDetails, theTargetResource, resourceType);
++		return !Objects.equals(sourcePartition, targetPartition);
+ 	}
+ }
+diff --git a/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/provider/merge/ResourceMergeServiceTest.java b/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/provider/merge/ResourceMergeServiceTest.java
+index 5a9046d7acf6..114a47597329 100644
+--- a/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/provider/merge/ResourceMergeServiceTest.java
++++ b/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/provider/merge/ResourceMergeServiceTest.java
+@@ -67,7 +67,6 @@
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.stream.Stream;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.mockito.ArgumentMatchers.any;
+@@ -703,6 +702,12 @@ private void setupCrossPartitionPatients() {
+ 			myTargetPatient.setUserData(Constants.RESOURCE_PARTITION_ID, RequestPartitionId.fromPartitionId(TARGET_PARTITION_ID));
+ 			setupValidationMockForSuccess(mySourcePatient, myTargetPatient);
+ 			when(myPartitionSettingsMock.isPartitioningEnabled()).thenReturn(true);
++			when(myRequestPartitionHelperSvcMock.determineCreatePartitionForRequestIgnoringCachedPartition(
++							any(), eq(mySourcePatient), any()))
++					.thenReturn(RequestPartitionId.fromPartitionId(SOURCE_PARTITION_ID));
++			when(myRequestPartitionHelperSvcMock.determineCreatePartitionForRequestIgnoringCachedPartition(
++							any(), eq(myTargetPatient), any()))
++					.thenReturn(RequestPartitionId.fromPartitionId(TARGET_PARTITION_ID));
+ 		}
+ 
+ 		@ParameterizedTest
+diff --git a/hapi-fhir-jpaserver-searchparam/src/main/java/ca/uhn/fhir/jpa/partition/IRequestPartitionHelperSvc.java b/hapi-fhir-jpaserver-searchparam/src/main/java/ca/uhn/fhir/jpa/partition/IRequestPartitionHelperSvc.java
+index eba800586306..d4a0f43d6e9e 100644
+--- a/hapi-fhir-jpaserver-searchparam/src/main/java/ca/uhn/fhir/jpa/partition/IRequestPartitionHelperSvc.java
++++ b/hapi-fhir-jpaserver-searchparam/src/main/java/ca/uhn/fhir/jpa/partition/IRequestPartitionHelperSvc.java
+@@ -23,6 +23,7 @@
+ import ca.uhn.fhir.interceptor.model.RequestPartitionId;
+ import ca.uhn.fhir.jpa.model.dao.JpaPid;
+ import ca.uhn.fhir.jpa.searchparam.SearchParameterMap;
++import ca.uhn.fhir.rest.api.Constants;
+ import ca.uhn.fhir.rest.api.server.RequestDetails;
+ import ca.uhn.fhir.rest.api.server.storage.IResourcePersistentId;
+ import jakarta.annotation.Nonnull;
+@@ -155,6 +156,28 @@ default void validateHasPartitionPermissions(
+ 	RequestPartitionId determineCreatePartitionForRequest(
+ 			@Nullable RequestDetails theRequest, @Nonnull IBaseResource theResource, @Nonnull String theResourceType);
+ 
++	/**
++	 * Same as {@link #determineCreatePartitionForRequest(RequestDetails, IBaseResource, String)}, except that the
++	 * partition cached in the resource's {@link Constants#RESOURCE_PARTITION_ID} user data is ignored, so the
++	 * partition is always recomputed from the resource's current content. The cached value is restored afterward.
++	 *
++	 * @param theRequest the request details from the context of the call
++	 * @param theResource the resource whose partition should be recomputed
++	 * @param theResourceType the resource type
++	 * @return the partition computed from the resource's current content
++	 */
++	@Nonnull
++	default RequestPartitionId determineCreatePartitionForRequestIgnoringCachedPartition(
++			@Nullable RequestDetails theRequest, @Nonnull IBaseResource theResource, @Nonnull String theResourceType) {
++		Object cachedPartition = theResource.getUserData(Constants.RESOURCE_PARTITION_ID);
++		try {
++			theResource.setUserData(Constants.RESOURCE_PARTITION_ID, null);
++			return determineCreatePartitionForRequest(theRequest, theResource, theResourceType);
++		} finally {
++			theResource.setUserData(Constants.RESOURCE_PARTITION_ID, cachedPartition);
++		}
++	}
++
+ 	@Nonnull
+ 	Set<Integer> toReadPartitions(@Nonnull RequestPartitionId theRequestPartitionId);
+ 
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/merge/PatientIdModePatientMergeR4Test.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/merge/PatientIdModePatientMergeR4Test.java
+index d1b5681c26d3..2e5477e5617f 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/merge/PatientIdModePatientMergeR4Test.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/provider/merge/PatientIdModePatientMergeR4Test.java
+@@ -5,6 +5,7 @@
+ import ca.uhn.fhir.interceptor.api.Pointcut;
+ import ca.uhn.fhir.jpa.dao.TransactionPrePartitionResponse;
+ import ca.uhn.fhir.jpa.dao.tx.HapiTransactionService;
++import ca.uhn.fhir.jpa.interceptor.PatientCompartmentEnforcingInterceptor;
+ import ca.uhn.fhir.jpa.interceptor.PatientIdPartitionInterceptor;
+ import ca.uhn.fhir.jpa.merge.MergeOperationTestHelper;
+ import ca.uhn.fhir.jpa.merge.MergeTestParameters;
+@@ -86,6 +87,8 @@ public class PatientIdModePatientMergeR4Test extends BaseResourceProviderR4Test
+ 	private ResourceLinkServiceFactory myResourceLinkServiceFactory;
+ 	@Autowired
+ 	private HapiTransactionService myHapiTransactionService;
++	@Autowired
++	private PatientCompartmentEnforcingInterceptor myPatientCompartmentEnforcingInterceptor;
+ 	private PatientIdPartitionInterceptor myPartitionInterceptor;
+ 	private MergeOperationTestHelper myMergeHelper;
+ 	private IIdType myPatientIdSrc;
+@@ -101,6 +104,7 @@ public void before() throws Exception {
+ 		myPartitionInterceptor = new PatientIdPartitionInterceptor(
+ 			getFhirContext(), mySearchParamExtractor, myPartitionSettings, myDaoRegistry);
+ 		registerInterceptor(myPartitionInterceptor);
++		registerInterceptor(myPatientCompartmentEnforcingInterceptor);
+ 
+ 		myPartitionSettings.setPartitioningEnabled(true);
+ 		myPartitionSettings.setUnnamedPartitionMode(true);
+@@ -672,6 +676,79 @@ void testMerge_indirectReferrerPushesCountOverResourceLimit_mergeRejected() {
+ 		}
+ 	}
+ 
++	@Nested
++	class SamePartitionMergeWithCompartmentEnforcement {
++
++		// "src-4963" and "tgt-1" both hash to partition 14829 under
++		// PatientIdPartitionInterceptor.defaultPartitionAlgorithm
++		private static final String SAME_PARTITION_SOURCE_ID_PART = "src-4963";
++		private static final String SAME_PARTITION_TARGET_ID_PART = "tgt-1";
++
++		private IIdType mySamePartitionSrc;
++		private IIdType mySamePartitionTgt;
++
++		@BeforeEach
++		void beforeEach() {
++			mySamePartitionSrc = createPatient("Patient/" + SAME_PARTITION_SOURCE_ID_PART, List.of())
++				.getIdElement().toUnqualifiedVersionless();
++			mySamePartitionTgt = createPatient("Patient/" + SAME_PARTITION_TARGET_ID_PART, List.of())
++				.getIdElement().toUnqualifiedVersionless();
++			assertInSamePartition(mySamePartitionSrc, mySamePartitionTgt);
++		}
++
++		// Observation(subject=PatientSrc) where PatientSrc and PatientTgt are in the SAME partition, with
++		// PatientCompartmentEnforcingInterceptor registered. The merge causes the Observation to change to the
++		// target Patient's compartment, so it needs to be moved rather than updated in place. The undo must
++		// then move it back under its original ID.
++		@Test
++		void testMergeThenUndo_compartmentResourceReferencingSource_whenPatientsInSamePartition_resourceIsMovedAndRestored() {
++			// Setup
++			IIdType obsId = createObservation(mySamePartitionSrc, null, null, "obs-same-partition");
++
++			IBaseResource patientSrcBefore = readResource(Patient.class, mySamePartitionSrc);
++			IBaseResource patientTgtBefore = readResource(Patient.class, mySamePartitionTgt);
++			IBaseResource obsBefore = readResource(Observation.class, obsId);
++
++			// Execute
++			MergeTestParameters mergeParams = new MergeTestParameters()
++				.sourceResource(new Reference(mySamePartitionSrc))
++				.targetResource(new Reference(mySamePartitionTgt));
++			Parameters result = callMerge(mergeParams);
++			myMergeHelper.validateSyncMergeOutcome(result, mergeParams.asParametersResource(), mySamePartitionTgt);
++
++			// Verify: Obs moved to the target patient's compartment, old ID deleted
++			Observation movedObs = assertSingleResourceMovedToTarget(
++				Observation.class, Map.of("obs-same-partition", obsId), mySamePartitionTgt, Observation::getIdentifier);
++			IIdType movedObsId = movedObs.getIdElement().toUnqualifiedVersionless();
++
++			// Undo merge
++			Parameters undoParams = new Parameters();
++			undoParams.addParameter().setName("source-resource").setValue(new Reference(mySamePartitionSrc));
++			undoParams.addParameter().setName("target-resource").setValue(new Reference(mySamePartitionTgt));
++			myMergeHelper.callUndoMergeOperation("Patient", undoParams);
++
++			// Verify: Obs restored under its original ID in the source patient's compartment
++			List<Observation> restoredObs = searchBySubject(Observation.class, mySamePartitionSrc.getValue());
++			assertThat(restoredObs).hasSize(1);
++			assertThat(restoredObs.get(0).getIdElement().toUnqualifiedVersionless())
++				.as("undo must restore the Observation under its original ID")
++				.isEqualTo(obsId);
++
++			myMergeHelper.assertResourcesAreEqualIgnoringVersionAndLastUpdated(
++				patientSrcBefore, readResource(Patient.class, mySamePartitionSrc));
++			myMergeHelper.assertResourcesAreEqualIgnoringVersionAndLastUpdated(
++				patientTgtBefore, readResource(Patient.class, mySamePartitionTgt));
++			myMergeHelper.assertResourcesAreEqualIgnoringVersionAndLastUpdated(
++				obsBefore, readResource(Observation.class, obsId));
++
++			assertResourceDeleted(movedObsId);
++
++			assertThat(searchBySubject(Observation.class, mySamePartitionTgt.getValue()))
++				.as("no Observation should reference the target after undo")
++				.isEmpty();
++		}
++	}
++
+ 	@Nested
+ 	class VersionedReferences {
+ 
+diff --git a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/jpa/interceptor/PatientCompartmentEnforcingInterceptor.java b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/jpa/interceptor/PatientCompartmentEnforcingInterceptor.java
+index 5f4bae2a055b..480f7aba3dcd 100644
+--- a/hapi-fhir-storage/src/main/java/ca/uhn/fhir/jpa/interceptor/PatientCompartmentEnforcingInterceptor.java
++++ b/hapi-fhir-storage/src/main/java/ca/uhn/fhir/jpa/interceptor/PatientCompartmentEnforcingInterceptor.java
+@@ -28,7 +28,6 @@
+ import ca.uhn.fhir.jpa.partition.IRequestPartitionHelperSvc;
+ import ca.uhn.fhir.jpa.searchparam.extractor.ISearchParamExtractor;
+ import ca.uhn.fhir.jpa.util.ResourceCompartmentUtil;
+-import ca.uhn.fhir.rest.api.Constants;
+ import ca.uhn.fhir.rest.api.server.RequestDetails;
+ import ca.uhn.fhir.rest.server.exceptions.PreconditionFailedException;
+ import org.hl7.fhir.instance.model.api.IBaseResource;
+@@ -132,19 +131,10 @@ public void storagePreStorageResourceUpdated(
+ 	 */
+ 	private String determinePartition(
+ 			RequestDetails theRequestDetails, IBaseResource theResource, String resourceType) {
+-		Object stashedPartition = theResource.getUserData(Constants.RESOURCE_PARTITION_ID);
+-		if (stashedPartition != null) {
+-			theResource.setUserData(Constants.RESOURCE_PARTITION_ID, null);
+-		}
+-		try {
+-			assert myRequestPartitionHelperSvc != null;
+-			RequestPartitionId requestPartition = myRequestPartitionHelperSvc.determineCreatePartitionForRequest(
+-					theRequestDetails, theResource, resourceType);
+-			return requestPartition.toJson();
+-		} finally {
+-			if (stashedPartition != null) {
+-				theResource.setUserData(Constants.RESOURCE_PARTITION_ID, stashedPartition);
+-			}
+-		}
++		assert myRequestPartitionHelperSvc != null;
++		RequestPartitionId requestPartition =
++				myRequestPartitionHelperSvc.determineCreatePartitionForRequestIgnoringCachedPartition(
++						theRequestDetails, theResource, resourceType);
++		return requestPartition.toJson();
+ 	}
+ }

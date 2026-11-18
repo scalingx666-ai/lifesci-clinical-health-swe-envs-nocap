@@ -1,0 +1,223 @@
+diff --git a/backend/app/schemas/model_crud/data_priority/provider_setting.py b/backend/app/schemas/model_crud/data_priority/provider_setting.py
+index 331f48241e..b0976adf06 100644
+--- a/backend/app/schemas/model_crud/data_priority/provider_setting.py
++++ b/backend/app/schemas/model_crud/data_priority/provider_setting.py
+@@ -11,6 +11,10 @@ class ProviderSettingRead(BaseModel):
+     name: str = Field(..., description="Display name (e.g., 'Apple Health', 'Garmin')")
+     has_cloud_api: bool = Field(..., description="Whether provider uses cloud OAuth API")
+     is_enabled: bool = Field(..., description="Whether provider is enabled by admin")
++    credentials_configured: bool = Field(
++        True,
++        description="Whether the OAuth client ID and secret are set. Always true for SDK-only providers.",
++    )
+     icon_url: str = Field(
+         ...,
+         description=(
+diff --git a/backend/app/services/provider_settings_service.py b/backend/app/services/provider_settings_service.py
+index a65f5e4a46..6ddc04bc5b 100644
+--- a/backend/app/services/provider_settings_service.py
++++ b/backend/app/services/provider_settings_service.py
+@@ -57,6 +57,7 @@ def _to_read(self, provider_key: str, setting_map: dict) -> ProviderSettingRead:
+             name=strategy.display_name,
+             has_cloud_api=strategy.has_cloud_api,
+             is_enabled=setting.is_enabled if setting else True,
++            credentials_configured=strategy.credentials_configured,
+             icon_url=strategy.icon_url,
+             live_sync_mode=(
+                 setting.live_sync_mode
+@@ -109,6 +110,7 @@ def update_provider_setting(
+             name=strategy.display_name,
+             has_cloud_api=strategy.has_cloud_api,
+             is_enabled=setting.is_enabled,
++            credentials_configured=strategy.credentials_configured,
+             icon_url=strategy.icon_url,
+             live_sync_mode=(
+                 setting.live_sync_mode if setting.live_sync_mode is not None else strategy.default_live_sync_mode
+diff --git a/backend/app/services/providers/base_strategy.py b/backend/app/services/providers/base_strategy.py
+index b43bf9164e..e31243539f 100644
+--- a/backend/app/services/providers/base_strategy.py
++++ b/backend/app/services/providers/base_strategy.py
+@@ -256,6 +256,17 @@ def has_cloud_api(self) -> bool:
+         """Returns True if provider uses cloud OAuth API."""
+         return self.oauth is not None
+ 
++    @property
++    def credentials_configured(self) -> bool:
++        """False when a cloud provider is missing its OAuth client ID or secret.
++
++        SDK-only providers need no credentials, so they always count as configured.
++        """
++        if self.oauth is None:
++            return True
++        credentials = self.oauth.credentials
++        return bool(credentials.client_id and credentials.client_secret)
++
+     @property
+     def live_sync_configurable(self) -> bool:
+         """True when the admin can choose between pull and webhook live sync.
+diff --git a/backend/scripts/init_provider_settings.py b/backend/scripts/init_provider_settings.py
+index b591041646..022186fae1 100644
+--- a/backend/scripts/init_provider_settings.py
++++ b/backend/scripts/init_provider_settings.py
+@@ -30,9 +30,11 @@ def init_provider_settings() -> None:
+                 strategy = factory.get_provider(provider_name)
+             except ValueError:
+                 continue
++            setting = all_settings.get(provider_name)
++            if setting and setting.is_enabled and not strategy.credentials_configured:
++                print(f"  ⚠ {provider_name}: enabled but OAuth client ID or secret is not set")
+             if not strategy.capabilities.webhook_inbound_secret:
+                 continue
+-            setting = all_settings.get(provider_name)
+             if setting and setting.live_sync_mode == LiveSyncMode.WEBHOOK and not setting.webhook_secret:
+                 print(f"  ⚠ {provider_name}: webhook mode active but no inbound secret stored — re-register to fix")
+ 
+diff --git a/backend/tests/services/test_provider_settings_service.py b/backend/tests/services/test_provider_settings_service.py
+index b8ddcfff2a..7eb77b1157 100644
+--- a/backend/tests/services/test_provider_settings_service.py
++++ b/backend/tests/services/test_provider_settings_service.py
+@@ -11,8 +11,10 @@
+ from unittest.mock import patch
+ 
+ import pytest
++from pydantic import SecretStr
+ from sqlalchemy.orm import Session
+ 
++from app.config import settings
+ from app.constants.celery_tasks import CeleryTask
+ from app.schemas.auth import LiveSyncMode
+ from app.schemas.enums import ProviderName
+@@ -109,6 +111,57 @@ def test_get_all_providers_merges_database_settings(self, db: Session) -> None:
+         for provider in other_providers:
+             assert provider.is_enabled is True
+ 
++    def test_get_all_providers_credentials_configured_when_set(self, db: Session) -> None:
++        """Should report credentials as configured when client ID and secret are set."""
++        service = ProviderSettingsService()
++
++        with (
++            patch.object(settings, "oura_client_id", "client-id"),
++            patch.object(settings, "oura_client_secret", SecretStr("client-secret")),
++        ):
++            providers = service.get_all_providers(db)
++
++        oura = next(p for p in providers if p.provider == "oura")
++        assert oura.credentials_configured is True
++
++    @pytest.mark.parametrize(
++        ("client_id", "client_secret"),
++        [(None, None), ("client-id", None), (None, SecretStr("client-secret"))],
++    )
++    def test_get_all_providers_credentials_missing(
++        self, db: Session, client_id: str | None, client_secret: SecretStr | None
++    ) -> None:
++        """Should report credentials as missing when client ID or secret is unset."""
++        service = ProviderSettingsService()
++
++        with (
++            patch.object(settings, "oura_client_id", client_id),
++            patch.object(settings, "oura_client_secret", client_secret),
++        ):
++            providers = service.get_all_providers(db)
++
++        oura = next(p for p in providers if p.provider == "oura")
++        assert oura.credentials_configured is False
++
++    def test_get_all_providers_sdk_providers_need_no_credentials(self, db: Session) -> None:
++        """Should treat SDK-only providers as configured."""
++        service = ProviderSettingsService()
++
++        providers = service.get_all_providers(db)
++
++        for provider in providers:
++            if not provider.has_cloud_api:
++                assert provider.credentials_configured is True
++
++    def test_update_provider_setting_includes_credentials_configured(self, db: Session) -> None:
++        """Should return credentials_configured from the update endpoint too."""
++        service = ProviderSettingsService()
++
++        with patch.object(settings, "oura_client_id", None):
++            result = service.update_provider_setting(db, "oura", ProviderSettingUpdate(is_enabled=True))
++
++        assert result.credentials_configured is False
++
+ 
+ class TestProviderSettingsServiceUpdateProviderStatus:
+     """Test updating individual provider status."""
+diff --git a/docs/openapi.json b/docs/openapi.json
+index 7115862c8a..fd19559b16 100644
+--- a/docs/openapi.json
++++ b/docs/openapi.json
+@@ -15420,6 +15420,12 @@
+             "title": "Is Enabled",
+             "description": "Whether provider is enabled by admin"
+           },
++          "credentials_configured": {
++            "type": "boolean",
++            "title": "Credentials Configured",
++            "description": "Whether the OAuth client ID and secret are set. Always true for SDK-only providers.",
++            "default": true
++          },
+           "icon_url": {
+             "type": "string",
+             "title": "Icon Url",
+diff --git a/frontend/src/lib/components/settings/providers/ProviderCard.svelte b/frontend/src/lib/components/settings/providers/ProviderCard.svelte
+index 298169f9de..f80cb73545 100644
+--- a/frontend/src/lib/components/settings/providers/ProviderCard.svelte
++++ b/frontend/src/lib/components/settings/providers/ProviderCard.svelte
+@@ -1,5 +1,6 @@
+ <script lang="ts">
+ 	import ProviderLogo from '$lib/components/providers/ProviderLogo.svelte';
++	import Alert from '$lib/components/ui/Alert.svelte';
+ 	import Badge from '$lib/components/ui/Badge.svelte';
+ 	import Switch from '$lib/components/ui/Switch.svelte';
+ 	import { TINY } from '$lib/components/ui/typography';
+@@ -18,6 +19,8 @@
+ 	} = $props();
+ 
+ 	const changed = $derived(enabled !== provider.is_enabled);
++	// Only worth a warning while users can see it on the pairing page.
++	const missingCredentials = $derived(enabled && provider.credentials_configured === false);
+ </script>
+ 
+ <li class="flex flex-col gap-3 rounded-lg border border-border p-4">
+@@ -43,6 +46,13 @@
+ 		<Switch checked={enabled} label="Enable {provider.name}" onchange={ontoggle} />
+ 	</div>
+ 
++	{#if missingCredentials}
++		<Alert tone="warning">
++			OAuth client ID or secret is not set, so users can't connect {provider.name}. Set them in the
++			backend environment or disable the provider.
++		</Alert>
++	{/if}
++
+ 	<!-- Full width under the header: beside the logo, a third of a desktop row
+ 	     is too narrow for both pills. -->
+ 	<div class="border-t border-border/60 pt-3">
+diff --git a/frontend/src/lib/settings/settings.spec.ts b/frontend/src/lib/settings/settings.spec.ts
+index 56674a1c55..029512a366 100644
+--- a/frontend/src/lib/settings/settings.spec.ts
++++ b/frontend/src/lib/settings/settings.spec.ts
+@@ -21,6 +21,7 @@ const setting = (over: Partial<ProviderSetting>): ProviderSetting => ({
+ 	name: 'Oura',
+ 	has_cloud_api: true,
+ 	is_enabled: true,
++	credentials_configured: true,
+ 	icon_url: '/static/oura.svg',
+ 	live_sync_mode: 'pull',
+ 	live_sync_configurable: true,
+diff --git a/frontend/src/lib/settings/types.ts b/frontend/src/lib/settings/types.ts
+index fe2d96635b..84c1582dcf 100644
+--- a/frontend/src/lib/settings/types.ts
++++ b/frontend/src/lib/settings/types.ts
+@@ -25,6 +25,8 @@ export type ProviderSetting = {
+ 	name: string;
+ 	has_cloud_api: boolean;
+ 	is_enabled: boolean;
++	/** False when a cloud provider's OAuth client ID or secret is not set. */
++	credentials_configured: boolean;
+ 	icon_url: string;
+ 	live_sync_mode: 'pull' | 'webhook' | null;
+ 	live_sync_configurable: boolean;

@@ -1,0 +1,19 @@
+# Issue
+
+**Title:** Load Swift tokenizer assets offline by default and fail closed when absent
+
+## Description
+
+.
+
+OpenMedKit now loads tokenizer assets from local files only and fails closed with a typed, value-free `OpenMedTokenizerError` (for example `missingLocalAssets`) before model weights load, without making any request. The implicit Core ML tokenizer identity, the unpinned `resolve/main` download and the `AutoTokenizer.from(pretrained:)` fallback that wrote under Documents are removed. Network acquisition is now an explicit opt-in: `allowNetworkAccess: true` plus an `OpenMedTokenizerPin` with a repository ID, a full 40-character commit SHA and a SHA-256 digest (and optional size) for every file. The new `OpenMedTokenizerAssets.swift` downloads only `resolve/<pinned commit>/<file>`, verifies each file before writing, installs the snapshot atomically under `Caches/OpenMed/TokenizerAssets`, re-verifies it before every use, and rejects a pin whose repository differs from the declared tokenizer name. A new `OpenMed.load(backend:...) async` path loads tokenizers without a semaphore. The Maple loader now uses it, the three old semaphore bridges are reduced to one documented, deprecated bridge behind the synchronous initializers, and ZeroShot, the React Native iOS bridge, the OpenMedDemo text and `docs/swift-openmedkit.md` (offline assets, pinned opt-in, async loading and a 3.x migration note) are updated.
+
+Breaking: `allowNetworkAccess` now defaults to `false` and `OpenMedBackend.coreML` / `OpenMed(modelURL:id2labelURL:)` have no default `tokenizerName`. To migrate, ship `tokenizer.json` and `tokenizer_config.json` and pass `tokenizerFolderURL`, or pass `allowNetworkAccess: true` with an `OpenMedTokenizerPin`.
+
+Not covered: the zero-request proof for a fully initialized `OpenMed` runtime stops at the tokenizer stage. The tests show the tokenizer resolves offline and that the error which follows comes from the absent synthetic Core ML model. No test builds a working Core ML or MLX model, because SwiftPM CLI tests cannot load the MLX Metal library and no Core ML fixture is committed. The real Hub download (redirects to the CDN) is exercised only through `URLProtocol` stubs, and the React Native and scan-demo call sites were not run on a device. The scan demo is unchanged: its MLX artifacts already ship tokenizer files, so it keeps working with the new default. The v3.x deprecation warning for the default flip (inventory decision 1) is not part of this PR.
+
+Validation: `cd swift/OpenMedKit && swift test --filter "TokenizerAcquisitionTests|ShareRedactionTests"` (30 passed), `cd swift/OpenMedKit && swift test` (278 tests, 18 skipped, 0 failures), `swift build --only-use-versions-from-resolved-file --target OpenMedKit` at the repo root (ok), `scripts/format_swift.sh` and `scripts/lint_swift.sh` (clean), `npm run typecheck` in `js/openmedkit-react-native` (ok; its `tsx` node test could not start because the shared `node_modules` carries an x86_64 esbuild binary), `pytest tests/unit -k "docs or publication or mkdocs or swift or openmedkit or publish_workflow"` (207 passed, 14 skipped), `pytest tests/ -q -m "not slow and not fuzz" --ignore=tests/unit/training/synthetic/test_dicom_overlays.py` (26165 passed, 222 skipped, 298 deselected), `ruff check .` and `ruff format --check .` (clean), `scripts/security/check_effect_paths.py --check` (ok), `mypy` (clean). The full suite ran with `--ignore=tests/unit/training/synthetic/test_dicom_overlays.py` because `pydicom` is not installed in the shared venv. The strict MkDocs build is left to CI.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `b7c0322f1b17`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

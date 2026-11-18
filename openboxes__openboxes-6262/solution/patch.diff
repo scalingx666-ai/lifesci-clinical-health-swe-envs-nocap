@@ -1,0 +1,367 @@
+diff --git a/src/integration-test/groovy/org/pih/warehouse/api/spec/web/DeferResponseCloseFilterSpec.groovy b/src/integration-test/groovy/org/pih/warehouse/api/spec/web/DeferResponseCloseFilterSpec.groovy
+new file mode 100644
+index 00000000000..d13fa055d9a
+--- /dev/null
++++ b/src/integration-test/groovy/org/pih/warehouse/api/spec/web/DeferResponseCloseFilterSpec.groovy
+@@ -0,0 +1,163 @@
++package org.pih.warehouse.api.spec.web
++
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.ExecutorService
++import java.util.concurrent.Executors
++import java.util.concurrent.Future
++import java.util.concurrent.ThreadFactory
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.TimeoutException
++import org.hibernate.SessionFactory
++import org.hibernate.engine.spi.SessionFactoryImplementor
++import org.hibernate.event.service.spi.EventListenerRegistry
++import org.hibernate.event.spi.EventType
++import org.hibernate.event.spi.PostInsertEvent
++import org.hibernate.event.spi.PostInsertEventListener
++import org.hibernate.persister.entity.EntityPersister
++import org.springframework.beans.factory.annotation.Autowired
++
++import org.pih.warehouse.api.spec.base.ApiSpec
++import org.pih.warehouse.common.domain.builder.product.CategoryTestBuilder
++import org.pih.warehouse.product.Category
++
++/**
++ * Verifies that a response rendered inside a transactional controller action is not completed for the client
++ * before the transaction has committed.
++ *
++ * Step by step:
++ *  1. Register a Hibernate post-insert listener on the session factory. It ignores everything except a Category
++ *     with the name the test armed it with.
++ *  2. Post that category through the API from a second thread, so that this thread stays free to observe.
++ *  3. When the INSERT is flushed - which happens inside the commit, after the controller has already rendered its
++ *     response - the listener fires, counts down the "inserted" latch and then waits on the "released" latch.
++ *     That holds the transaction open with the response already rendered: the exact window the flakiness lives in.
++ *  4. While it is held, assert that the HTTP client is still waiting (its Future times out). Without
++ *     DeferResponseCloseFilter this assertion fails, because the client receives the complete response as soon as
++ *     the JSON converter closes the response writer, which is before the INSERT is even flushed.
++ *  5. Release the listener, then assert that the client completes and can read the category back.
++ */
++class DeferResponseCloseFilterSpec extends ApiSpec {
++
++    static final String CATEGORY_NAME_PREFIX = 'Test Category (defer response close)'
++
++    // Hibernate 5.2 has no removeListener, and clearing the listener group would also drop its duplication
++    // strategies, so the listener is registered once per session factory and left in place. It is inert unless
++    // armed, so it does not affect other specs.
++    static BlockingCategoryInsertListener listener
++    static SessionFactory listenerSessionFactory
++
++    @Autowired
++    SessionFactory sessionFactory
++
++    ExecutorService executor
++
++    @Override
++    void setupData() {
++        if (listener == null || listenerSessionFactory != sessionFactory) {
++            listener = new BlockingCategoryInsertListener()
++            ((SessionFactoryImplementor) sessionFactory)
++                    .getServiceRegistry()
++                    .getService(EventListenerRegistry)
++                    .getEventListenerGroup(EventType.POST_INSERT)
++                    .appendListener(listener)
++            listenerSessionFactory = sessionFactory
++        }
++
++        // A daemon thread so that a request that never returns cannot keep the test JVM alive.
++        executor = Executors.newSingleThreadExecutor({ Runnable runnable ->
++            Thread thread = new Thread(runnable, 'defer-response-close-client')
++            thread.daemon = true
++            return thread
++        } as ThreadFactory)
++    }
++
++    @Override
++    void cleanupData() {
++        try {
++            listener?.disarm()
++        } finally {
++            executor?.shutdownNow()
++            executor?.awaitTermination(10, TimeUnit.SECONDS)
++        }
++    }
++
++    void 'response for a transactional save is not completed until the transaction commits'() {
++        given: 'a category name that the listener will recognize'
++        String categoryName = "${CATEGORY_NAME_PREFIX} ${randomUtil.randomStringFieldValue('name')}"
++        listener.arm(categoryName)
++
++        when: 'the category is saved through the API on another thread'
++        Future<Category> savedCategory = executor.submit({
++            categoryApiWrapper.createOK(new CategoryTestBuilder().name(categoryName).rootCategory().build())
++        } as java.util.concurrent.Callable<Category>)
++
++        then: 'the INSERT is flushed and the commit is now blocked by the listener'
++        assert listener.inserted.await(10, TimeUnit.SECONDS)
++
++        and: 'the client is still waiting for the response (a generous bound, so that a slow client thread cannot mask a completed response)'
++        assert !completesWithin(savedCategory, 1000)
++
++        when: 'the commit is allowed to proceed'
++        listener.release()
++        Category category = savedCategory.get(10, TimeUnit.SECONDS)
++
++        then: 'the client gets the response and the category is visible to a follow-up request'
++        assert category.id
++        assert categoryApiWrapper.api.get(category.id, responseSpecUtil.OK_RESPONSE_SPEC).jsonPath().getString('name') == categoryName
++    }
++
++    /**
++     * True if the future completes within the given time. An ExecutionException (the API call itself failed) is
++     * deliberately left to propagate and fail the test.
++     */
++    private static boolean completesWithin(Future<?> future, long millis) {
++        try {
++            future.get(millis, TimeUnit.MILLISECONDS)
++            return true
++        } catch (TimeoutException ignored) {
++            return false
++        }
++    }
++
++    /**
++     * Blocks the thread that inserted a category with the armed name until released. Because the post-insert
++     * event fires during the flush at commit time, blocking here holds the transaction open after the controller
++     * has rendered its response.
++     */
++    static class BlockingCategoryInsertListener implements PostInsertEventListener {
++
++        private volatile String armedCategoryName
++        CountDownLatch inserted
++        CountDownLatch released
++
++        void arm(String categoryName) {
++            inserted = new CountDownLatch(1)
++            released = new CountDownLatch(1)
++            armedCategoryName = categoryName
++        }
++
++        void release() {
++            released?.countDown()
++        }
++
++        void disarm() {
++            armedCategoryName = null
++            release()
++        }
++
++        @Override
++        void onPostInsert(PostInsertEvent event) {
++            String name = armedCategoryName
++            if (name != null && event.entity instanceof Category && ((Category) event.entity).name == name) {
++                inserted.countDown()
++                // Bounded so that a failing test cannot hang the suite.
++                released.await(10, TimeUnit.SECONDS)
++            }
++        }
++
++        @Override
++        boolean requiresPostCommitHanding(EntityPersister persister) {
++            return false
++        }
++    }
++}
+diff --git a/src/integration-test/groovy/org/pih/warehouse/common/base/IntegrationSpecConfig.groovy b/src/integration-test/groovy/org/pih/warehouse/common/base/IntegrationSpecConfig.groovy
+index 8aab69fc071..4169ea361e0 100644
+--- a/src/integration-test/groovy/org/pih/warehouse/common/base/IntegrationSpecConfig.groovy
++++ b/src/integration-test/groovy/org/pih/warehouse/common/base/IntegrationSpecConfig.groovy
+@@ -1,7 +1,12 @@
+ package org.pih.warehouse.common.base
+ 
+ import org.springframework.boot.test.context.TestConfiguration
++import org.springframework.boot.web.servlet.FilterRegistrationBean
++import org.springframework.context.annotation.Bean
+ import org.springframework.context.annotation.ComponentScan
++import org.springframework.core.Ordered
++
++import org.pih.warehouse.common.web.DeferResponseCloseFilter
+ 
+ /**
+  * Manages any integration test specific application configuration such as wiring up test components.
+@@ -25,4 +30,18 @@ import org.springframework.context.annotation.ComponentScan
+ @ComponentScan(["org.pih.warehouse.api.*", "org.pih.warehouse.slice.*", "org.pih.warehouse.smoke.*"])
+ class IntegrationSpecConfig {
+ 
++    /**
++     * Keeps a response that the controller finished by closing the writer or stream from completing before the
++     * request has unwound, so that a spec's next request cannot overtake the previous request's transaction.
++     * See DeferResponseCloseFilter.
++     */
++    @Bean
++    FilterRegistrationBean deferResponseCloseFilterRegistration() {
++        FilterRegistrationBean registration = new FilterRegistrationBean(new DeferResponseCloseFilter())
++        // Must run before Grails' grailsWebRequestFilter (HIGHEST_PRECEDENCE + 30): that filter builds the
++        // GrailsWebRequest from the response it receives and render() writes to that response, so it has to receive
++        // the wrapped one. Registered at the highest precedence so that filters added later cannot end up in front.
++        registration.order = Ordered.HIGHEST_PRECEDENCE
++        return registration
++    }
+ }
+diff --git a/src/integration-test/groovy/org/pih/warehouse/common/web/DeferResponseCloseFilter.groovy b/src/integration-test/groovy/org/pih/warehouse/common/web/DeferResponseCloseFilter.groovy
+new file mode 100644
+index 00000000000..1ed2525ff5d
+--- /dev/null
++++ b/src/integration-test/groovy/org/pih/warehouse/common/web/DeferResponseCloseFilter.groovy
+@@ -0,0 +1,156 @@
++package org.pih.warehouse.common.web
++
++import javax.servlet.FilterChain
++import javax.servlet.ServletOutputStream
++import javax.servlet.WriteListener
++import javax.servlet.http.HttpServletRequest
++import javax.servlet.http.HttpServletResponse
++import javax.servlet.http.HttpServletResponseWrapper
++
++import org.springframework.web.filter.OncePerRequestFilter
++
++/**
++ * Test-only servlet filter that keeps a response from completing on the wire before the request has fully unwound.
++ *
++ * Why: the Grails JSON/XML converters end render() by calling close() on the response writer, and closing the
++ * writer makes the servlet container finish the response immediately (for a chunked response it writes the
++ * terminal chunk). In a controller action that runs inside a transaction (for example a controller annotated with
++ * @Transactional at the class level), the client therefore sees a complete response before the transaction has
++ * committed. Our API specs fire their next request the moment the previous response completes, so that request can
++ * reach the database before the commit - which shows up as intermittent "foreign key constraint fails" and
++ * "unsaved transient instance" errors on entities created by the immediately preceding request.
++ *
++ * What it does: the response is wrapped so that close() on the response writer (called by the converters) or on
++ * the output stream (called by download actions) flushes what has been written and then discards any further
++ * output, which is what the container does after a real close - but the container's own writer/stream is never
++ * closed by application code. The container closes it itself when the request finishes, which is after the
++ * controller action has returned and its transaction has completed. Status, headers and body bytes are still sent
++ * when the action flushes them; only the end of the response moves.
++ *
++ * This class is not component-scanned (no stereotype annotation, and IntegrationSpecConfig only scans the api,
++ * slice and smoke packages); IntegrationSpecConfig constructs it in a @Bean method. It lives in the integration
++ * test source set on purpose: that source set compiles to its own output directory and is not packaged into the
++ * application.
++ */
++class DeferResponseCloseFilter extends OncePerRequestFilter {
++
++    @Override
++    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain) {
++        chain.doFilter(request, new DeferredCloseResponse(response))
++    }
++
++    static class DeferredCloseResponse extends HttpServletResponseWrapper {
++
++        private DeferredClosePrintWriter writer
++        private DeferredCloseServletOutputStream outputStream
++
++        DeferredCloseResponse(HttpServletResponse response) {
++            super(response)
++        }
++
++        @Override
++        PrintWriter getWriter() throws IOException {
++            if (writer == null) {
++                writer = new DeferredClosePrintWriter(super.getWriter())
++            }
++            return writer
++        }
++
++        @Override
++        ServletOutputStream getOutputStream() throws IOException {
++            if (outputStream == null) {
++                outputStream = new DeferredCloseServletOutputStream(super.getOutputStream())
++            }
++            return outputStream
++        }
++
++        /**
++         * reset() clears the container's record of whether getWriter() or getOutputStream() was used, so the cached
++         * wrappers must be dropped as well and re-created from the container on the next call.
++         */
++        @Override
++        void reset() {
++            super.reset()
++            writer = null
++            outputStream = null
++        }
++    }
++
++    /**
++     * PrintWriter.close() closes the underlying writer and then sets its protected "out" field to null, after which
++     * every inherited print/write/flush method becomes a silent no-op via ensureOpen(). This subclass keeps the
++     * second half of that behaviour and drops the first: flush, then detach, never close the delegate.
++     */
++    static class DeferredClosePrintWriter extends PrintWriter {
++
++        DeferredClosePrintWriter(PrintWriter delegate) {
++            super(delegate, false)
++        }
++
++        @Override
++        void close() {
++            synchronized (lock) {
++                if (out == null) {
++                    return
++                }
++                // checkError() flushes the delegate and reports any error it has recorded so far.
++                if (((PrintWriter) out).checkError()) {
++                    setError()
++                }
++                out = null
++            }
++        }
++    }
++
++    static class DeferredCloseServletOutputStream extends ServletOutputStream {
++
++        private final ServletOutputStream delegate
++        private boolean closed = false
++
++        DeferredCloseServletOutputStream(ServletOutputStream delegate) {
++            this.delegate = delegate
++        }
++
++        @Override
++        void write(int b) throws IOException {
++            if (!closed) {
++                delegate.write(b)
++            }
++        }
++
++        @Override
++        void write(byte[] b, int off, int len) throws IOException {
++            if (!closed) {
++                delegate.write(b, off, len)
++            }
++        }
++
++        @Override
++        void flush() throws IOException {
++            if (!closed) {
++                delegate.flush()
++            }
++        }
++
++        @Override
++        void close() throws IOException {
++            if (!closed) {
++                try {
++                    delegate.flush()
++                } finally {
++                    closed = true
++                }
++            }
++        }
++
++        @Override
++        boolean isReady() {
++            return delegate.isReady()
++        }
++
++        @Override
++        void setWriteListener(WriteListener writeListener) {
++            delegate.setWriteListener(writeListener)
++        }
++    }
++}

@@ -1,0 +1,566 @@
+diff --git a/api/src/main/java/org/openmrs/api/db/ContextDAO.java b/api/src/main/java/org/openmrs/api/db/ContextDAO.java
+index 897de3aa53c7..86b7b6efbe61 100644
+--- a/api/src/main/java/org/openmrs/api/db/ContextDAO.java
++++ b/api/src/main/java/org/openmrs/api/db/ContextDAO.java
+@@ -26,7 +26,8 @@
+ public interface ContextDAO {
+ 
+ 	/**
+-	 * Authenticate user with the given username and password.
++	 * Authenticate user with the given username and password. Concurrent attempts for the same user are
++	 * serialized so that failed-attempt counting and lockout are atomic.
+ 	 * <p>
+ 	 * <strong>Should</strong> authenticate given username and password<br/>
+ 	 * <strong>Should</strong> authenticate given systemId and password<br/>
+@@ -50,7 +51,13 @@ public interface ContextDAO {
+ 	 * <strong>Should</strong> pass regression test for 1580<br/>
+ 	 * <strong>Should</strong> throw a ContextAuthenticationException if username is an empty
+ 	 * string<br/>
+-	 * <strong>Should</strong> throw a ContextAuthenticationException if username is white space
++	 * <strong>Should</strong> throw a ContextAuthenticationException if username is white space<br/>
++	 * <strong>Should</strong> authenticate with correct password after the lockout window expires<br/>
++	 * <strong>Should</strong> count failed attempts from one again after the lockout window
++	 * expires<br/>
++	 * <strong>Should</strong> lock out user when concurrent failed attempts exceed the limit<br/>
++	 * <strong>Should</strong> not block other users while one users row is locked<br/>
++	 * <strong>Should</strong> count every attempt when concurrent attempts stay within the limit
+ 	 *
+ 	 * @param username user's username or systemId
+ 	 * @param password user's password
+diff --git a/api/src/main/java/org/openmrs/api/db/hibernate/HibernateContextDAO.java b/api/src/main/java/org/openmrs/api/db/hibernate/HibernateContextDAO.java
+index 78a6af6ea2f6..3e9578153008 100644
+--- a/api/src/main/java/org/openmrs/api/db/hibernate/HibernateContextDAO.java
++++ b/api/src/main/java/org/openmrs/api/db/hibernate/HibernateContextDAO.java
+@@ -19,6 +19,9 @@
+ import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+ 
++import jakarta.persistence.LockTimeoutException;
++import jakarta.persistence.PessimisticLockException;
++
+ import org.apache.commons.lang3.StringUtils;
+ import org.hibernate.CacheMode;
+ import org.hibernate.FlushMode;
+@@ -31,7 +34,6 @@
+ import org.hibernate.search.mapper.orm.work.SearchIndexingPlan;
+ import org.hibernate.stat.QueryStatistics;
+ import org.hibernate.stat.Statistics;
+-import org.hibernate.type.StandardBasicTypes;
+ import org.openmrs.GlobalProperty;
+ import org.openmrs.OpenmrsObject;
+ import org.openmrs.User;
+@@ -50,6 +52,7 @@
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.orm.jpa.hibernate.SessionHolder;
+ import org.springframework.stereotype.Repository;
++import org.springframework.transaction.annotation.Isolation;
+ import org.springframework.transaction.annotation.Transactional;
+ import org.springframework.transaction.support.TransactionSynchronizationManager;
+ 
+@@ -93,7 +96,7 @@ public HibernateContextDAO(SessionFactory sessionFactory, SearchSessionFactory s
+ 	 * @see org.openmrs.api.db.ContextDAO#authenticate(java.lang.String, java.lang.String)
+ 	 */
+ 	@Override
+-	@Transactional(noRollbackFor = ContextAuthenticationException.class)
++	@Transactional(noRollbackFor = ContextAuthenticationException.class, isolation = Isolation.READ_COMMITTED)
+ 	public User authenticate(String login, String password) throws ContextAuthenticationException {
+ 		String errorMsg = "Invalid username and/or password: " + login;
+ 
+@@ -123,6 +126,26 @@ public User authenticate(String login, String password) throws ContextAuthentica
+ 		if (candidateUser != null && password != null) {
+ 			log.debug("Candidate user id: {}", candidateUser.getUserId());
+ 
++			session.flush();
++			Integer lockedUserId;
++			try {
++				lockedUserId = session
++				        .createNativeQuery("select user_id from users where user_id = ?1 for update", Integer.class)
++				        .setParameter(1, candidateUser.getUserId()).uniqueResult();
++			} catch (LockTimeoutException | PessimisticLockException | org.hibernate.PessimisticLockException e) {
++				log.warn("Could not lock the user row for login (login={}, userId={})", login, candidateUser.getUserId(), e);
++				throw new ContextAuthenticationException(errorMsg);
++			} catch (RuntimeException e) {
++				log.error("Could not lock the user row for login (login={}, userId={})", login, candidateUser.getUserId(),
++				    e);
++				throw new ContextAuthenticationException(errorMsg);
++			}
++			if (lockedUserId == null) {
++				log.info("Failed login attempt (login={}) - {}", login, errorMsg);
++				throw new ContextAuthenticationException(errorMsg);
++			}
++			session.refresh(candidateUser);
++
+ 			String lockoutTimeString = candidateUser.getUserProperty(OpenmrsConstants.USER_PROPERTY_LOCKOUT_TIMESTAMP, null);
+ 			long lockoutTime = -1;
+ 			if (StringUtils.isNotBlank(lockoutTimeString) && !"0".equals(lockoutTimeString)) {
+@@ -153,9 +176,8 @@ public User authenticate(String login, String password) throws ContextAuthentica
+ 				}
+ 			}
+ 
+-			Object[] passwordAndSalt = (Object[]) session
+-			        .createNativeQuery("select password, salt from users where user_id = ?1")
+-			        .addScalar("password", StandardBasicTypes.STRING).addScalar("salt", StandardBasicTypes.STRING)
++			Object[] passwordAndSalt = session
++			        .createNativeQuery("select password, salt from users where user_id = ?1", Object[].class)
+ 			        .setParameter(1, candidateUser.getUserId()).uniqueResult();
+ 
+ 			String passwordOnRecord = (String) passwordAndSalt[0];
+diff --git a/api/src/main/resources/org/openmrs/liquibase/updates/liquibase-update-to-latest-3.0.x.xml b/api/src/main/resources/org/openmrs/liquibase/updates/liquibase-update-to-latest-3.0.x.xml
+index ff26e20cc4e2..4f50a4c86cd7 100644
+--- a/api/src/main/resources/org/openmrs/liquibase/updates/liquibase-update-to-latest-3.0.x.xml
++++ b/api/src/main/resources/org/openmrs/liquibase/updates/liquibase-update-to-latest-3.0.x.xml
+@@ -163,4 +163,28 @@
+ 		<customChange class="org.openmrs.util.databasechange.CheckConceptReferenceRangeCriteriaChangeSet"/>
+ 	</changeSet>
+ 
++	<changeSet id="20261021-add-index-users-username" author="Wikum Weerakutti">
++		<preConditions onFail="MARK_RAN">
++			<not>
++				<indexExists tableName="users" indexName="users_username"/>
++			</not>
++		</preConditions>
++		<comment>Adding index on users.username, which is looked up on every login</comment>
++		<createIndex tableName="users" indexName="users_username">
++			<column name="username"/>
++		</createIndex>
++	</changeSet>
++
++	<changeSet id="20261021-add-index-users-system-id" author="Wikum Weerakutti">
++		<preConditions onFail="MARK_RAN">
++			<not>
++				<indexExists tableName="users" indexName="users_system_id"/>
++			</not>
++		</preConditions>
++		<comment>Adding index on users.system_id, which is looked up on every login</comment>
++		<createIndex tableName="users" indexName="users_system_id">
++			<column name="system_id"/>
++		</createIndex>
++	</changeSet>
++
+ </databaseChangeLog>
+diff --git a/api/src/test/java/org/openmrs/api/db/ContextDAOConcurrentLockoutIT.java b/api/src/test/java/org/openmrs/api/db/ContextDAOConcurrentLockoutIT.java
+new file mode 100644
+index 000000000000..1333c6e27bd0
+--- /dev/null
++++ b/api/src/test/java/org/openmrs/api/db/ContextDAOConcurrentLockoutIT.java
+@@ -0,0 +1,316 @@
++/**
++ * This Source Code Form is subject to the terms of the Mozilla Public License,
++ * v. 2.0. If a copy of the MPL was not distributed with this file, You can
++ * obtain one at http://mozilla.org/MPL/2.0/. OpenMRS is also distributed under
++ * the terms of the Healthcare Disclaimer located at http://openmrs.org/license.
++ *
++ * Copyright (C) OpenMRS Inc. OpenMRS is a registered trademark and the OpenMRS
++ * graphic logo is a trademark of OpenMRS Inc.
++ */
++package org.openmrs.api.db;
++
++import java.sql.DatabaseMetaData;
++import java.sql.ResultSet;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++
++import org.hibernate.SessionFactory;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.openmrs.User;
++import org.openmrs.api.context.Context;
++import org.openmrs.api.context.ContextAuthenticationException;
++import org.openmrs.test.SkipBaseSetup;
++import org.openmrs.test.jupiter.BaseContextSensitiveNonTransactionalTest;
++import org.openmrs.util.OpenmrsConstants;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.test.annotation.DirtiesContext;
++import org.springframework.test.context.TestContext;
++import org.springframework.test.context.TestExecutionListeners;
++import org.springframework.test.context.support.AbstractTestExecutionListener;
++import org.springframework.transaction.PlatformTransactionManager;
++import org.springframework.transaction.support.TransactionTemplate;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.junit.jupiter.api.Assertions.fail;
++import static org.springframework.test.context.TestExecutionListeners.MergeMode.MERGE_WITH_DEFAULTS;
++
++/**
++ * Runs {@link ContextDAO#authenticate(String, String)} against a real database (Testcontainers,
++ * never the in-memory H2) with genuinely concurrent sessions, to prove that failed login attempts
++ * for one user are serialized on that user's row and that the lock does not spill over to other
++ * users. The schema is created by Liquibase, so this also covers the fresh-install path of the
++ * users.username / users.system_id index changesets.
++ */
++@SkipBaseSetup
++@TestExecutionListeners(listeners = ContextDAOConcurrentLockoutIT.DiscardApplicationContextAroundClass.class, mergeMode = MERGE_WITH_DEFAULTS)
++public class ContextDAOConcurrentLockoutIT extends BaseContextSensitiveNonTransactionalTest {
++
++	/**
++	 * The session factory reads its connection settings when the application context is built, so a
++	 * context cached by an in-memory test class must be discarded before this class and the one built
++	 * against the container discarded after it. {@code @DirtiesContext} cannot express both, hence this
++	 * listener.
++	 */
++	public static class DiscardApplicationContextAroundClass extends AbstractTestExecutionListener {
++
++		@Override
++		public void beforeTestClass(TestContext testContext) {
++			testContext.markApplicationContextDirty(DirtiesContext.HierarchyMode.EXHAUSTIVE);
++		}
++
++		@Override
++		public void afterTestClass(TestContext testContext) {
++			testContext.markApplicationContextDirty(DirtiesContext.HierarchyMode.EXHAUSTIVE);
++		}
++	}
++
++	private static final String LOCKED_USERNAME = "correct";
++
++	private static final String LOCKED_USER_SYSTEM_ID = "7-5";
++
++	private static final String LOCKED_USER_SYSTEM_ID_WITHOUT_HYPHEN = "75";
++
++	private static final String LOCKED_USER_PASSWORD = "test";
++
++	private static final String WRONG_PASSWORD = "not the right password";
++
++	private static final String LOCKOUT_MESSAGE = "Invalid number of connection attempts";
++
++	private static final int ALLOWED_FAILED_LOGINS = 3;
++
++	private static final int CONCURRENT_ATTEMPTS = 20;
++
++	private static final int OTHER_USER_LOGIN_TIMEOUT_SECONDS = 10;
++
++	private static final int LOCK_HOLD_TIMEOUT_SECONDS = 30;
++
++	@Autowired
++	private SessionFactory sessionFactory;
++
++	@Autowired
++	private PlatformTransactionManager transactionManager;
++
++	@Override
++	public Boolean useInMemoryDatabase() {
++		return false;
++	}
++
++	/**
++	 * The MySQL image pinned in {@link org.openmrs.test.Containers#newMySQLContainer()} is too old for
++	 * JobRunr's schema migrations (they use common table expressions), so start MariaDB instead when no
++	 * database was chosen.
++	 */
++	@Override
++	protected void ensureDatabaseRunning() {
++		if (System.getProperty("database") == null) {
++			System.setProperty("database", "mariadb");
++		}
++		super.ensureDatabaseRunning();
++	}
++
++	@BeforeEach
++	void loadDataIntoRealDatabase() throws Exception {
++		deleteAllData();
++		executeDataSet(INITIAL_XML_DATASET_PACKAGE_PATH);
++		executeDataSet("org/openmrs/api/db/include/contextDAOTest.xml");
++		getConnection().commit();
++		authenticate();
++		Context.getAdministrationService().setGlobalProperty(OpenmrsConstants.GP_ALLOWED_FAILED_LOGINS_BEFORE_LOCKOUT,
++		    String.valueOf(ALLOWED_FAILED_LOGINS));
++		Context.clearSession();
++	}
++
++	/**
++	 * @see ContextDAO#authenticate(String,String)
++	 */
++	@Test
++	void authenticate_shouldLockOutUserWhenConcurrentFailedAttemptsExceedTheLimit() throws Exception {
++		List<String> logins = new ArrayList<>();
++		for (int i = 0; i < CONCURRENT_ATTEMPTS; i++) {
++			logins.add(List.of(LOCKED_USERNAME, LOCKED_USER_SYSTEM_ID, LOCKED_USER_SYSTEM_ID_WITHOUT_HYPHEN).get(i % 3));
++		}
++		List<String> outcomes = authenticateConcurrently(logins, WRONG_PASSWORD, 60);
++
++		long lockedOut = outcomes.stream().filter(m -> m.contains(LOCKOUT_MESSAGE)).count();
++		assertEquals(CONCURRENT_ATTEMPTS - (ALLOWED_FAILED_LOGINS + 1), lockedOut,
++		    "only the attempts up to and including the one that locks the account may check the password; outcomes: "
++		            + outcomes);
++
++		User user = Context.getUserService().getUserByUsername(LOCKED_USERNAME);
++		assertEquals(String.valueOf(ALLOWED_FAILED_LOGINS),
++		    user.getUserProperty(OpenmrsConstants.USER_PROPERTY_LOGIN_ATTEMPTS));
++		assertNotNull(user.getUserProperty(OpenmrsConstants.USER_PROPERTY_LOCKOUT_TIMESTAMP, null));
++
++		String stillLocked = authenticateInSeparateSession(LOCKED_USERNAME, LOCKED_USER_PASSWORD);
++		assertTrue(stillLocked.contains(LOCKOUT_MESSAGE),
++		    "the correct password must not be checked while the account is locked; outcome: " + stillLocked);
++	}
++
++	/**
++	 * @see ContextDAO#authenticate(String,String)
++	 */
++	@Test
++	void authenticate_shouldNotBlockOtherUsersWhileOneUsersRowIsLocked() throws Exception {
++		Integer lockedUserId = Context.getUserService().getUserByUsername(LOCKED_USERNAME).getUserId();
++		Context.clearSession();
++
++		CountDownLatch rowLocked = new CountDownLatch(1);
++		CountDownLatch release = new CountDownLatch(1);
++		List<Throwable> lockHolderErrors = new ArrayList<>();
++		Thread lockHolder = new Thread(() -> {
++			Context.openSession();
++			try {
++				new TransactionTemplate(transactionManager).executeWithoutResult(status -> {
++					sessionFactory.getCurrentSession()
++					        .createNativeQuery("select user_id from users where user_id = ?1 for update", Integer.class)
++					        .setParameter(1, lockedUserId).getResultList();
++					rowLocked.countDown();
++					try {
++						release.await(LOCK_HOLD_TIMEOUT_SECONDS, TimeUnit.SECONDS);
++					} catch (InterruptedException e) {
++						Thread.currentThread().interrupt();
++					}
++				});
++			} catch (Throwable t) {
++				lockHolderErrors.add(t);
++				rowLocked.countDown();
++			} finally {
++				Context.closeSession();
++			}
++		});
++		lockHolder.start();
++		assertTrue(rowLocked.await(30, TimeUnit.SECONDS), "the lock holder never acquired the row lock");
++		assertTrue(lockHolderErrors.isEmpty(), "the lock holder failed: " + lockHolderErrors);
++
++		try {
++			List<String> outcomes = authenticateConcurrently("admin", "test", 1, OTHER_USER_LOGIN_TIMEOUT_SECONDS);
++			assertEquals("authenticated", outcomes.get(0),
++			    "a login for a different user must complete while another user's row is locked");
++		} finally {
++			release.countDown();
++			lockHolder.join(TimeUnit.SECONDS.toMillis(LOCK_HOLD_TIMEOUT_SECONDS));
++		}
++		assertFalse(lockHolder.isAlive(), "the lock holder did not finish");
++		assertTrue(lockHolderErrors.isEmpty(), "the lock holder failed: " + lockHolderErrors);
++	}
++
++	/**
++	 * @see ContextDAO#authenticate(String,String)
++	 */
++	@Test
++	void authenticate_shouldCountEveryAttemptWhenConcurrentAttemptsStayWithinTheLimit() throws Exception {
++		List<String> outcomes = authenticateConcurrently(LOCKED_USERNAME, WRONG_PASSWORD, ALLOWED_FAILED_LOGINS);
++
++		assertTrue(outcomes.stream().noneMatch(m -> m.contains(LOCKOUT_MESSAGE)), outcomes.toString());
++
++		User user = Context.getUserService().getUserByUsername(LOCKED_USERNAME);
++		assertEquals(String.valueOf(ALLOWED_FAILED_LOGINS),
++		    user.getUserProperty(OpenmrsConstants.USER_PROPERTY_LOGIN_ATTEMPTS));
++		assertNull(user.getUserProperty(OpenmrsConstants.USER_PROPERTY_LOCKOUT_TIMESTAMP, null));
++
++		assertEquals("authenticated", authenticateInSeparateSession(LOCKED_USERNAME, LOCKED_USER_PASSWORD));
++	}
++
++	@Test
++	void liquibase_shouldCreateIndexesOnUsersUsernameAndSystemId() throws Exception {
++		Set<String> indexedColumns = new HashSet<>();
++		DatabaseMetaData metaData = getConnection().getMetaData();
++		try (ResultSet indexes = metaData.getIndexInfo(getConnection().getCatalog(), null, "users", false, false)) {
++			while (indexes.next()) {
++				String indexName = indexes.getString("INDEX_NAME");
++				if ("users_username".equalsIgnoreCase(indexName) || "users_system_id".equalsIgnoreCase(indexName)) {
++					indexedColumns.add(indexes.getString("COLUMN_NAME").toLowerCase());
++				}
++			}
++		}
++
++		assertEquals(new HashSet<>(List.of("username", "system_id")), indexedColumns);
++	}
++
++	private List<String> authenticateConcurrently(String username, String password, int attempts) throws Exception {
++		return authenticateConcurrently(username, password, attempts, 60);
++	}
++
++	private List<String> authenticateConcurrently(String username, String password, int attempts, int timeoutSeconds)
++	        throws Exception {
++		return authenticateConcurrently(Collections.nCopies(attempts, username), password, timeoutSeconds);
++	}
++
++	/**
++	 * Starts one session per login, releases them against {@link Context#authenticate(String, String)}
++	 * at the same instant and returns one outcome per attempt: "authenticated", or the message of the
++	 * {@link ContextAuthenticationException}.
++	 */
++	private List<String> authenticateConcurrently(List<String> logins, String password, int timeoutSeconds)
++	        throws Exception {
++		CountDownLatch ready = new CountDownLatch(logins.size());
++		CountDownLatch start = new CountDownLatch(1);
++		ExecutorService pool = Executors.newFixedThreadPool(logins.size());
++		try {
++			List<Future<String>> futures = new ArrayList<>();
++			for (String login : logins) {
++				futures.add(pool.submit(() -> {
++					ready.countDown();
++					start.await();
++					return authenticateInThisThread(login, password);
++				}));
++			}
++			assertTrue(ready.await(30, TimeUnit.SECONDS), "not all attempts were ready to start");
++			start.countDown();
++
++			List<String> outcomes = new ArrayList<>();
++			for (int i = 0; i < futures.size(); i++) {
++				try {
++					outcomes.add(futures.get(i).get(timeoutSeconds, TimeUnit.SECONDS));
++				} catch (TimeoutException e) {
++					fail("login for " + logins.get(i) + " did not complete within " + timeoutSeconds + "s; outcomes so far: "
++					        + outcomes);
++				}
++			}
++			return outcomes;
++		} finally {
++			pool.shutdownNow();
++		}
++	}
++
++	private String authenticateInSeparateSession(String username, String password) throws Exception {
++		ExecutorService executor = Executors.newSingleThreadExecutor();
++		try {
++			return executor.submit(() -> authenticateInThisThread(username, password)).get(60, TimeUnit.SECONDS);
++		} catch (ExecutionException e) {
++			if (e.getCause() instanceof Exception) {
++				throw (Exception) e.getCause();
++			}
++			throw e;
++		} finally {
++			executor.shutdownNow();
++		}
++	}
++
++	private static String authenticateInThisThread(String login, String password) {
++		try {
++			Context.openSession();
++			Context.authenticate(login, password);
++			return "authenticated";
++		} catch (ContextAuthenticationException e) {
++			return e.getMessage();
++		} finally {
++			Context.closeSession();
++		}
++	}
++}
+diff --git a/api/src/test/java/org/openmrs/api/db/ContextDAOTest.java b/api/src/test/java/org/openmrs/api/db/ContextDAOTest.java
+index d50974bec64b..24ae34b2938c 100644
+--- a/api/src/test/java/org/openmrs/api/db/ContextDAOTest.java
++++ b/api/src/test/java/org/openmrs/api/db/ContextDAOTest.java
+@@ -12,6 +12,7 @@
+ import java.util.LinkedHashSet;
+ import java.util.Properties;
+ import java.util.Set;
++import java.util.concurrent.TimeUnit;
+ 
+ import jakarta.annotation.Resource;
+ 
+@@ -26,6 +27,7 @@
+ import org.openmrs.api.context.ContextAuthenticationException;
+ import org.openmrs.api.db.hibernate.HibernateContextDAO;
+ import org.openmrs.test.jupiter.BaseContextSensitiveTest;
++import org.openmrs.util.OpenmrsConstants;
+ import org.openmrs.util.PrivilegeConstants;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.stereotype.Component;
+@@ -36,6 +38,7 @@
+ import static org.hamcrest.Matchers.empty;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.junit.jupiter.api.Assertions.assertSame;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+ import static org.junit.jupiter.api.Assertions.fail;
+@@ -256,6 +259,39 @@ public void authenticate_shouldLockoutUserAfterEightFailedAttempts() {
+ 		dao.authenticate("admin", "test");
+ 	}
+ 
++	/**
++	 * @see ContextDAO#authenticate(String,String)
++	 */
++	@Test
++	public void authenticate_shouldAuthenticateWithCorrectPasswordAfterTheLockoutWindowExpires() {
++		lockOutAdminSixMinutesAgo();
++
++		User user = dao.authenticate("admin", "test");
++
++		assertNull(user.getUserProperty(OpenmrsConstants.USER_PROPERTY_LOCKOUT_TIMESTAMP, null));
++	}
++
++	/**
++	 * @see ContextDAO#authenticate(String,String)
++	 */
++	@Test
++	public void authenticate_shouldCountFailedAttemptsFromOneAgainAfterTheLockoutWindowExpires() {
++		lockOutAdminSixMinutesAgo();
++
++		assertThrows(ContextAuthenticationException.class, () -> dao.authenticate("admin", "wrong"));
++
++		assertEquals("1",
++		    Context.getUserService().getUser(1).getUserProperty(OpenmrsConstants.USER_PROPERTY_LOGIN_ATTEMPTS));
++	}
++
++	private void lockOutAdminSixMinutesAgo() {
++		User admin = Context.getUserService().getUser(1);
++		admin.setUserProperty(OpenmrsConstants.USER_PROPERTY_LOGIN_ATTEMPTS, "7");
++		admin.setUserProperty(OpenmrsConstants.USER_PROPERTY_LOCKOUT_TIMESTAMP,
++		    String.valueOf(System.currentTimeMillis() - TimeUnit.MINUTES.toMillis(6)));
++		Context.flushSession();
++	}
++
+ 	/**
+ 	 * @see ContextDAO#authenticate(String,String)
+ 	 */
+diff --git a/api/src/test/java/org/openmrs/test/jupiter/BaseContextSensitiveNonTransactionalTest.java b/api/src/test/java/org/openmrs/test/jupiter/BaseContextSensitiveNonTransactionalTest.java
+index 54710b5128d2..7765b7d70858 100644
+--- a/api/src/test/java/org/openmrs/test/jupiter/BaseContextSensitiveNonTransactionalTest.java
++++ b/api/src/test/java/org/openmrs/test/jupiter/BaseContextSensitiveNonTransactionalTest.java
+@@ -888,6 +888,9 @@ public synchronized void deleteAllData() {
+ 			DefaultDataSet dataset = new DefaultDataSet();
+ 			while (resultSet.next()) {
+ 				String tableName = resultSet.getString(3);
++				if ("jobrunr_migrations".equalsIgnoreCase(tableName)) {
++					continue;
++				}
+ 				dataset.addTable(new DefaultTable(tableName));
+ 			}
+ 
+@@ -910,7 +913,7 @@ protected String getSchemaPattern() {
+ 		if (useInMemoryDatabase()) {
+ 			return "PUBLIC";
+ 		} else {
+-			return "public";
++			return isPostgreSQL() ? "public" : null;
+ 		}
+ 	}
+ 
+diff --git a/api/src/test/java/org/openmrs/util/DatabaseUpdaterDatabaseIT.java b/api/src/test/java/org/openmrs/util/DatabaseUpdaterDatabaseIT.java
+index 68f118d158ba..958e774648cd 100644
+--- a/api/src/test/java/org/openmrs/util/DatabaseUpdaterDatabaseIT.java
++++ b/api/src/test/java/org/openmrs/util/DatabaseUpdaterDatabaseIT.java
+@@ -32,7 +32,7 @@ public class DatabaseUpdaterDatabaseIT extends DatabaseIT {
+ 	 * This constant needs to be updated when adding new Liquibase update files to openmrs-core.
+ 	 */
+ 
+-	private static final int CHANGE_SET_COUNT_FOR_GREATER_THAN_2_1_X = 918;
++	private static final int CHANGE_SET_COUNT_FOR_GREATER_THAN_2_1_X = 920;
+ 
+ 	private static final int CHANGE_SET_COUNT_FOR_2_1_X = 870;
+ 

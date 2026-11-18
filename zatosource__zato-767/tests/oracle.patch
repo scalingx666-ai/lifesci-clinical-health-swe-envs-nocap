@@ -1,0 +1,296 @@
+diff --git a/code/zato-common/src/zato/common/odb/model.py b/code/zato-common/src/zato/common/odb/model.py
+index 05f094045d..28b0353f2f 100644
+--- a/code/zato-common/src/zato/common/odb/model.py
++++ b/code/zato-common/src/zato/common/odb/model.py
+@@ -911,12 +911,13 @@ class OutgoingFTP(Base):
+     timeout = Column(Integer, nullable=True)
+     port = Column(Integer, server_default=str(FTP_PORT), nullable=False)
+     dircache = Column(Boolean(), nullable=False)
++    use_ftps = Column(Boolean(), nullable=False)
+ 
+     cluster_id = Column(Integer, ForeignKey('cluster.id', ondelete='CASCADE'), nullable=False)
+     cluster = relationship(Cluster, backref=backref('out_conns_ftp', order_by=name, cascade='all, delete, delete-orphan'))
+ 
+     def __init__(self, id=None, name=None, is_active=None, host=None, user=None,
+-                 password=None, acct=None, timeout=None, port=None, dircache=None,
++                 password=None, acct=None, timeout=None, port=None, dircache=None, use_ftps=None,
+                  cluster_id=None):
+         self.id = id
+         self.name = name
+@@ -929,6 +930,7 @@ def __init__(self, id=None, name=None, is_active=None, host=None, user=None,
+         self.port = port
+         self.dircache = dircache
+         self.cluster_id = cluster_id
++        self.use_ftps = use_ftps
+ 
+ class OutgoingOdoo(Base):
+     """ An outgoing Odoo connection.
+diff --git a/code/zato-common/src/zato/common/odb/query.py b/code/zato-common/src/zato/common/odb/query.py
+index 4808acc9bb..76f3c8a338 100644
+--- a/code/zato-common/src/zato/common/odb/query.py
++++ b/code/zato-common/src/zato/common/odb/query.py
+@@ -572,7 +572,7 @@ def _out_ftp(session, cluster_id):
+     return session.query(
+         OutgoingFTP.id, OutgoingFTP.name, OutgoingFTP.is_active,
+         OutgoingFTP.host, OutgoingFTP.port, OutgoingFTP.user, OutgoingFTP.password,
+-        OutgoingFTP.acct, OutgoingFTP.timeout, OutgoingFTP.dircache).\
++        OutgoingFTP.acct, OutgoingFTP.timeout, OutgoingFTP.dircache, OutgoingFTP.use_ftps).\
+         filter(Cluster.id==OutgoingFTP.cluster_id).\
+         filter(Cluster.id==cluster_id).\
+         order_by(OutgoingFTP.name)
+diff --git a/code/zato-server/src/zato/server/connection/ftp.py b/code/zato-server/src/zato/server/connection/ftp.py
+index 12894f6461..f13825fdb1 100644
+--- a/code/zato-server/src/zato/server/connection/ftp.py
++++ b/code/zato-server/src/zato/server/connection/ftp.py
+@@ -16,18 +16,65 @@
+ 
+ # pyfilesystem
+ from fs.ftpfs import FTPFS, _GLOBAL_DEFAULT_TIMEOUT
++from fs.errors import RemoteConnectionError
++
++from socket import error as socket_error
++from ftplib import FTP_TLS
+ 
+ # Zato
+ from zato.common import Inactive, SECRET_SHADOW, TRACE1
+ 
+ logger = logging.getLogger(__name__)
+ 
++class FTP_TLS_IgnoreHost(FTP_TLS, object):
++    def makepasv(self):
++        _, port = super(FTP_TLS_IgnoreHost, self).makepasv()
++        return self.host, port
++
++    def storbinary(self, cmd, fp, blocksize=8192, callback=None, rest=None):
++        self.voidcmd('TYPE I')
++        conn = self.transfercmd(cmd, rest)
++        try:
++            while 1:
++                buf = fp.read(blocksize)
++                if not buf:
++                    break
++                conn.sendall(buf)
++                if callback:
++                    callback(buf)
++        finally:
++            conn.close()
++        return self.voidresp()
++
++class FTPSFS(FTPFS):
++
++    def __repr__(self):
++        return "FTPSFS({!r}, port={!r})".format(self.host, self.port)
++
++    def _open_ftp(self):
++        _ftp = FTP_TLS_IgnoreHost()
++        try:
++            _ftp.connect(self.host, self.port, self.timeout)
++            _ftp.auth()
++            _ftp.prot_p()
++            _ftp.login(self.user, self.passwd, self.acct)
++            _ftp.set_debuglevel(2)
++        except socket_error:
++            raise RemoteConnectionError()
++        return _ftp
++
+ class FTPFacade(FTPFS):
+     """ A thin wrapper around fs's FTPFS so it looks like the other Zato connection objects.
+     """
+     def conn(self):
+         return self
+ 
++class FTPSFacade(FTPSFS):
++    """ A thin wrapper around fs's FTPFS so it looks like the other Zato connection objects.
++    """
++    def conn(self):
++        return self
++
+ class FTPStore(object):
+     """ An object through which services access FTP connections.
+     """
+@@ -68,7 +115,11 @@ def get(self, name):
+             params = self.conn_params[name]
+             if params.is_active:
+                 timeout = float(params.timeout) if params.timeout else _GLOBAL_DEFAULT_TIMEOUT
+-                return FTPFacade(params.host, params.user, params.get('password'), params.acct, timeout, int(params.port), params.dircache)
++
++                if params.use_ftps:
++                    return FTPSFacade(params.host, params.user, params.get('password'), params.acct, timeout, int(params.port), params.dircache)
++                else:
++                    return FTPFacade(params.host, params.user, params.get('password'), params.acct, timeout, int(params.port), params.dircache)
+             else:
+                 raise Inactive(params.name)
+ 
+diff --git a/code/zato-server/src/zato/server/service/internal/outgoing/ftp.py b/code/zato-server/src/zato/server/service/internal/outgoing/ftp.py
+index fa4bbeb067..84c285b65c 100644
+--- a/code/zato-server/src/zato/server/service/internal/outgoing/ftp.py
++++ b/code/zato-server/src/zato/server/service/internal/outgoing/ftp.py
+@@ -36,7 +36,7 @@ class SimpleIO(AdminSIO):
+         response_elem = 'zato_outgoing_ftp_get_list_response'
+         input_required = ('cluster_id',)
+         output_required = ('id', 'name', 'is_active', 'host', 'port')
+-        output_optional = ('user', 'acct', 'timeout', Boolean('dircache'))
++        output_optional = ('user', 'acct', 'timeout', Boolean('dircache'), Boolean('use_ftps'))
+ 
+     def get_data(self, session):
+         return out_ftp_list(session, self.request.input.cluster_id, False)
+@@ -51,7 +51,7 @@ class Create(_FTPService):
+     class SimpleIO(AdminSIO):
+         request_elem = 'zato_outgoing_ftp_create_request'
+         response_elem = 'zato_outgoing_ftp_create_response'
+-        input_required = ('cluster_id', 'name', 'is_active', 'host', 'port', Boolean('dircache'))
++        input_required = ('cluster_id', 'name', 'is_active', 'host', 'port', Boolean('dircache'), Boolean('use_ftps'))
+         input_optional = ('user', 'acct', 'timeout')
+         output_required = ('id', 'name')
+ 
+@@ -78,6 +78,7 @@ def handle(self):
+                 item.user = input.user
+                 item.acct = input.acct
+                 item.timeout = input.timeout or None
++                item.use_ftps = input.use_ftps
+ 
+                 session.add(item)
+                 session.commit()
+@@ -100,7 +101,7 @@ class Edit(_FTPService):
+     class SimpleIO(AdminSIO):
+         request_elem = 'zato_outgoing_ftp_edit_request'
+         response_elem = 'zato_outgoing_ftp_edit_response'
+-        input_required = ('id', 'cluster_id', 'name', 'is_active', 'host', 'port', Boolean('dircache'))
++        input_required = ('id', 'cluster_id', 'name', 'is_active', 'host', 'port', Boolean('dircache'), Boolean('use_ftps'))
+         input_optional = ('user', 'acct', 'timeout')
+         output_required = ('id', 'name')
+ 
+@@ -128,6 +129,7 @@ def handle(self):
+                 item.user = input.user
+                 item.acct = input.acct
+                 item.timeout = input.timeout or None
++                item.use_ftps = input.use_ftps
+ 
+                 input.password = item.password
+                 input.old_name = old_name
+diff --git a/code/zato-web-admin/src/zato/admin/static/js/outgoing/ftp.js b/code/zato-web-admin/src/zato/admin/static/js/outgoing/ftp.js
+index 1d7aab009f..ae6bbaae85 100644
+--- a/code/zato-web-admin/src/zato/admin/static/js/outgoing/ftp.js
++++ b/code/zato-web-admin/src/zato/admin/static/js/outgoing/ftp.js
+@@ -38,6 +38,7 @@ $.fn.zato.outgoing.ftp.data_table.new_row = function(item, data, include_tr) {
+ 
+     var is_active = item.is_active == true;
+     var dircache = item.dircache == true;
++    var use_ftps = item.use_ftps == true;
+     
+     row += "<td class='numbering'>&nbsp;</td>";
+     row += "<td class='impexp'><input type='checkbox' /></td>";
+@@ -49,6 +50,7 @@ $.fn.zato.outgoing.ftp.data_table.new_row = function(item, data, include_tr) {
+     row += String.format('<td>{0}</td>', item.timeout ? item.timeout : '');
+     row += String.format('<td>{0}</td>', item.port);
+     row += String.format('<td>{0}</td>', dircache ? 'Yes' : 'No');
++    row += String.format('<td>{0}</td>', use_ftps ? 'Yes' : 'No');
+     row += String.format('<td>{0}</td>', String.format("<a href='javascript:$.fn.zato.data_table.change_password({0})'>Change password</a>", item.id));
+     row += String.format('<td>{0}</td>', String.format("<a href=\"javascript:$.fn.zato.outgoing.ftp.edit('{0}')\">Edit</a>", item.id));
+     row += String.format('<td>{0}</td>', String.format("<a href='javascript:$.fn.zato.outgoing.ftp.delete_({0});'>Delete</a>", item.id));
+diff --git a/code/zato-web-admin/src/zato/admin/templates/zato/outgoing/ftp.html b/code/zato-web-admin/src/zato/admin/templates/zato/outgoing/ftp.html
+index 5f7a6c7dd1..ca2765fb2b 100644
+--- a/code/zato-web-admin/src/zato/admin/templates/zato/outgoing/ftp.html
++++ b/code/zato-web-admin/src/zato/admin/templates/zato/outgoing/ftp.html
+@@ -32,12 +32,14 @@
+             'timeout',
+             'port',
+             '_dircache',
++            '_use_ftps',
+             '_change_password',
+             '_edit',
+             '_delete',
+             'id',
+             'is_active',
+-            'dircache'
++            'dircache',
++            'use_ftps'
+         ]
+     }
+     </script>
+@@ -76,6 +78,7 @@ <h2 class="zato">Outgoing FTP connections</h2>
+                         <th><a href="#">Timeout</a></th>
+                         <th><a href="#">Port</a></th>
+                         <th><a href="#">Cache directories</a></th>
++                        <th><a href="#">Use TLS</a></th>
+                         <th>&nbsp;</th>
+                         <th>&nbsp;</th>
+                         <th>&nbsp;</th>
+@@ -98,12 +101,14 @@ <h2 class="zato">Outgoing FTP connections</h2>
+                         <td>{{ item.timeout|default:'' }}</td>
+                         <td>{{ item.port }}</td>
+                         <td>{{ item.dircache|yesno:'Yes,No' }}</td>
++                        <td>{{ item.use_ftps|yesno:'Yes,No' }}</td>                        
+                         <td><a href="javascript:$.fn.zato.data_table.change_password('{{ item.id }}')">Change password</a></td>
+                         <td><a href="javascript:$.fn.zato.outgoing.ftp.edit('{{ item.id }}')">Edit</a></td>
+                         <td><a href="javascript:$.fn.zato.outgoing.ftp.delete_('{{ item.id }}')">Delete</a></td>
+                         <td class='ignore item_id_{{ item.id }}'>{{ item.id }}</td>
+                         <td class='ignore'>{{ item.is_active }}</td>
+                         <td class='ignore'>{{ item.dircache }}</td>
++                        <td class='ignore'>{{ item.use_ftps }}</td>
+                     </tr>
+                 {% endfor %}
+                 {% else %}
+@@ -160,6 +165,11 @@ <h2 class="zato">Outgoing FTP connections</h2>
+                             <td style="vertical-align:middle">Cache directories</td>
+                             <td>{{ create_form.dircache }}</td>
+                         </tr>
++                        
++                        <tr>
++                            <td style="vertical-align:middle">Use TLS</td>
++                            <td>{{ create_form.use_ftps }}</td>
++                        </tr>
+ 
+                         <tr>
+                             <td colspan="2" style="text-align:right">
+@@ -217,6 +227,11 @@ <h2 class="zato">Outgoing FTP connections</h2>
+                             <td>{{ edit_form.dircache }}</td>
+                         </tr>
+                         
++                        <tr>
++                            <td style="vertical-align:middle">Use TLS</td>
++                            <td>{{ edit_form.use_ftps }}</td>
++                        </tr>
++
+                         <tr>
+                             <td colspan="2" style="text-align:right">
+                                 <input type="submit" value="OK" />
+diff --git a/code/zato-web-admin/src/zato/admin/web/forms/outgoing/ftp.py b/code/zato-web-admin/src/zato/admin/web/forms/outgoing/ftp.py
+index 1502a9218d..c43601bd14 100644
+--- a/code/zato-web-admin/src/zato/admin/web/forms/outgoing/ftp.py
++++ b/code/zato-web-admin/src/zato/admin/web/forms/outgoing/ftp.py
+@@ -23,6 +23,7 @@ class CreateForm(forms.Form):
+     acct = forms.CharField(widget=forms.TextInput(attrs={'style':'width:100%'}))
+     timeout = forms.CharField(widget=forms.TextInput(attrs={'style':'width:10%'}))
+     dircache = forms.BooleanField(required=False, widget=forms.CheckboxInput(attrs={'checked':'checked'}))
++    use_ftps = forms.BooleanField(required=False, widget=forms.CheckboxInput())
+ 
+     def __init__(self, prefix=None, post_data=None):
+         super(CreateForm, self).__init__(post_data, prefix=prefix)
+@@ -30,3 +31,4 @@ def __init__(self, prefix=None, post_data=None):
+ class EditForm(CreateForm):
+     is_active = forms.BooleanField(required=False, widget=forms.CheckboxInput())
+     dircache = forms.BooleanField(required=False, widget=forms.CheckboxInput())
++    use_ftps = forms.BooleanField(required=False, widget=forms.CheckboxInput())
+diff --git a/code/zato-web-admin/src/zato/admin/web/views/outgoing/ftp.py b/code/zato-web-admin/src/zato/admin/web/views/outgoing/ftp.py
+index 792807a304..6d3743f20f 100644
+--- a/code/zato-web-admin/src/zato/admin/web/views/outgoing/ftp.py
++++ b/code/zato-web-admin/src/zato/admin/web/views/outgoing/ftp.py
+@@ -28,7 +28,7 @@ class Index(_Index):
+ 
+     class SimpleIO(_Index.SimpleIO):
+         input_required = ('cluster_id',)
+-        output_required = ('id', 'name', 'is_active', 'host', 'user', 'acct', 'timeout', 'port', 'dircache')
++        output_required = ('id', 'name', 'is_active', 'host', 'user', 'acct', 'timeout', 'port', 'dircache', 'use_ftps')
+         output_repeated = True
+ 
+     def handle(self):
+@@ -42,7 +42,7 @@ class _CreateEdit(CreateEdit):
+     method_allowed = 'POST'
+ 
+     class SimpleIO(CreateEdit.SimpleIO):
+-        input_required = ('name', 'is_active', 'host', 'user', 'timeout', 'acct', 'port', 'dircache')
++        input_required = ('name', 'is_active', 'host', 'user', 'timeout', 'acct', 'port', 'dircache', 'use_ftps')
+         output_required = ('id', 'name')
+ 
+     def success_message(self, item):

@@ -1,0 +1,1200 @@
+diff --git a/backend/app/api/routes/v1/sdk_logs.py b/backend/app/api/routes/v1/sdk_logs.py
+index f270865f9e..808539027d 100644
+--- a/backend/app/api/routes/v1/sdk_logs.py
++++ b/backend/app/api/routes/v1/sdk_logs.py
+@@ -5,6 +5,7 @@
+ 
+ from fastapi import APIRouter, HTTPException, Request, status
+ 
++from app.constants.sdk_providers import normalize_sdk_provider
+ from app.constants.series_types.sdk import get_series_type_from_metric_type
+ from app.schemas.providers.mobile_sdk import SDKLogEventType, SDKLogRequest
+ from app.schemas.responses.upload import UploadDataResponse
+@@ -130,7 +131,9 @@ def submit_sdk_logs(
+         )
+ 
+     batch_id = str(uuid.uuid4())
+-    provider = (body.provider or "unknown").lower()
++    raw_provider = (body.provider or "").lower()
++    # Canonical like the upload's, or the run would not be found under it ("google" vs "health_connect").
++    provider = normalize_sdk_provider(raw_provider) or raw_provider or "unknown"
+     event_types = [e.eventType for e in body.events]
+ 
+     log_structured(
+diff --git a/backend/app/api/routes/v1/sdk_sync.py b/backend/app/api/routes/v1/sdk_sync.py
+index 2b9b044036..63bc6cfdd5 100644
+--- a/backend/app/api/routes/v1/sdk_sync.py
++++ b/backend/app/api/routes/v1/sdk_sync.py
+@@ -1,15 +1,20 @@
+ import json
+ import uuid
+ from logging import getLogger
++from typing import Annotated
++from uuid import UUID
+ 
+-from fastapi import APIRouter, HTTPException, Request, status
++from fastapi import APIRouter, HTTPException, Query, Request, status
+ 
+ from app.config import settings
+ from app.constants.sdk_providers import SDK_PROVIDERS, normalize_sdk_provider
++from app.database import DbSession
+ from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_upload
+-from app.schemas.providers.mobile_sdk import SyncRequest
++from app.schemas.providers.mobile_sdk import SDKSyncState, SyncRequest
+ from app.schemas.responses.upload import UploadDataResponse
++from app.services import user_service
+ from app.services.raw_payload_storage import put_payload_to_s3, store_raw_payload
++from app.services.sync_status_service import get_sdk_sync_state
+ from app.utils.api_utils import inline_schema_defs
+ from app.utils.auth import SDKAuthDep
+ from app.utils.sdk_request_metadata import sdk_request_metadata
+@@ -164,3 +169,44 @@ def sync_sdk_data(
+     )
+ 
+     return UploadDataResponse(status_code=202, response="Import task queued successfully", user_id=user_id)
++
++
++@router.get("/sdk/users/{user_id}/sync/status")
++def get_sdk_sync_status(
++    user_id: UUID,
++    provider: Annotated[str, Query(description="SDK provider slug, e.g. `apple`, `samsung`, `health_connect`.")],
++    db: DbSession,
++    auth: SDKAuthDep,
++) -> SDKSyncState:
++    """Where the user's SDK sync for one provider stands, as the server sees it.
++
++    The server is the source of truth for sync progress; the device's own state is only a
++    cache. Call this after login, before starting a sync, to restore that state:
++
++    - `historicalSyncCompleted: true` - the historical export finished; only live sync is
++      left, continuing from `syncedUntil`.
++    - `historicalSyncCompleted: false` - the export has not finished. It runs newest first, so
++      each type in `dataTypes` with `historicalSyncCompleted: false` resumes backwards from its
++      `exportedRange.startDate`. Types not listed have no data on the server yet.
++    - `historicalSyncCompleted: null` - no historical export on record: nothing synced yet, or
++      an SDK version that does not send `syncSessionId`, so the server cannot tell. The same
++      applies per type in `dataTypes`.
++    - `syncedUntil: null` and empty `dataTypes` - nothing synced yet; start a full export.
++
++    A user who has never synced gets that empty state with 200, not 404.
++    """
++    if auth.auth_type == "sdk_token" and (not auth.user_id or str(auth.user_id) != str(user_id)):
++        raise HTTPException(
++            status_code=status.HTTP_403_FORBIDDEN,
++            detail="Token does not match user_id",
++        )
++
++    canonical = normalize_sdk_provider(provider)
++    if canonical is None:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail=f"Unsupported provider: {provider}. Supported: {', '.join(sorted(SDK_PROVIDERS))}",
++        )
++
++    user_service.get(db, user_id, raise_404=True)
++    return get_sdk_sync_state(db, user_id, canonical)
+diff --git a/backend/app/integrations/celery/tasks/process_sdk_upload_task.py b/backend/app/integrations/celery/tasks/process_sdk_upload_task.py
+index c87a08f197..e59696a0dc 100644
+--- a/backend/app/integrations/celery/tasks/process_sdk_upload_task.py
++++ b/backend/app/integrations/celery/tasks/process_sdk_upload_task.py
+@@ -1,4 +1,5 @@
+ import uuid
++from datetime import datetime
+ from logging import getLogger
+ from typing import Any
+ from uuid import UUID
+@@ -46,7 +47,13 @@ def _get_import_service(provider: str) -> SDKImportService:
+     raise ValueError(f"Unsupported provider: {provider}")
+ 
+ 
+-def _batch_outcomes(types: list[str], workouts_saved: int, sleep_saved: int, scope: SyncScope) -> list[DataTypeOutcome]:
++def _batch_outcomes(
++    types: list[str],
++    spans: dict[str, tuple[datetime, datetime]],
++    workouts_saved: int,
++    sleep_saved: int,
++    scope: SyncScope,
++) -> list[DataTypeOutcome]:
+     """What this batch wrote, per data type.
+ 
+     types holds series type slugs only, since the importer collects it from the samples it
+@@ -57,19 +64,30 @@ def _batch_outcomes(types: list[str], workouts_saved: int, sleep_saved: int, sco
+     reports IN_PROGRESS and leaves the outcome to it — the two arrive in either order, and
+     a batch claiming success would otherwise bury a reported failure. A live batch is the
+     only report there will be, so it is its own verdict.
++
++    A historical batch skips series filled from workouts: no end event would ever close them.
+     """
+-    status = SyncStatus.IN_PROGRESS if scope == SyncScope.HISTORICAL else SyncStatus.SUCCESS
+-    outcomes = [DataTypeOutcome(data_type=data_type, kind=DataTypeKind.SERIES, status=status) for data_type in types]
+-    for name, saved in (("workouts", workouts_saved), ("sleep", sleep_saved)):
+-        if saved:
+-            outcomes.append(
+-                DataTypeOutcome(
+-                    data_type=name,
+-                    kind=DataTypeKind.EVENT,
+-                    status=status,
+-                    items_inserted=saved,
+-                )
++    historical = scope == SyncScope.HISTORICAL
++    status = SyncStatus.IN_PROGRESS if historical else SyncStatus.SUCCESS
++    reported = [(data_type, DataTypeKind.SERIES, 0) for data_type in types if not historical or data_type in spans]
++    reported += [
++        (name, DataTypeKind.EVENT, saved)
++        for name, saved in (("workouts", workouts_saved), ("sleep", sleep_saved))
++        if saved
++    ]
++    outcomes = []
++    for data_type, kind, saved in reported:
++        start, end = spans.get(data_type, (None, None))
++        outcomes.append(
++            DataTypeOutcome(
++                data_type=data_type,
++                kind=kind,
++                status=status,
++                items_inserted=saved,
++                covered_start=start,
++                covered_end=end,
+             )
++        )
+     return outcomes
+ 
+ 
+@@ -206,9 +224,8 @@ def process_sdk_upload(
+         # Select the appropriate import service based on source
+         import_service = _get_import_service(provider)
+ 
+-        result = import_service.import_data_from_request(
+-            db, content, content_type, user_id, batch_id=batch_id
+-        ).model_dump()
++        response = import_service.import_data_from_request(db, content, content_type, user_id, batch_id=batch_id)
++        result = response.model_dump()
+ 
+         # Log processing completion with results
+         log_structured(
+@@ -266,7 +283,9 @@ def process_sdk_upload(
+                 },
+             )
+             try_record_data_types(
+-                run.run_id, _batch_outcomes(types, workouts_saved, sleep_saved, run.scope), scope=run.scope
++                run.run_id,
++                _batch_outcomes(types, response.spans, workouts_saved, sleep_saved, run.scope),
++                scope=run.scope,
+             )
+             if payload_ref and settings.raw_payload_storage == "disabled":
+                 # Transport-only copy and the data is committed, so drop it. A failed batch
+diff --git a/backend/app/repositories/sync_run_repository.py b/backend/app/repositories/sync_run_repository.py
+index 82fa023c6e..5bea9f5d55 100644
+--- a/backend/app/repositories/sync_run_repository.py
++++ b/backend/app/repositories/sync_run_repository.py
+@@ -1,4 +1,5 @@
+ from datetime import datetime
++from typing import NamedTuple
+ from uuid import UUID, uuid4
+ 
+ from sqlalchemy import ColumnElement, and_, case, func, literal, or_, select, update
+@@ -29,6 +30,15 @@ def _overlaps(
+     return conditions
+ 
+ 
++class HistoricalTypeRow(NamedTuple):
++    run_id: UUID
++    run_started_at: datetime
++    data_type: str | None
++    status: SyncStatus | None
++    covered_start: datetime | None
++    covered_end: datetime | None
++
++
+ class SyncRunRepository:
+     """Durable storage for sync runs and their per-data-type outcomes.
+ 
+@@ -199,6 +209,29 @@ def last_window_end(
+         )
+         return db_session.execute(stmt).scalar()
+ 
++    def historical_data_type_statuses(
++        self, db_session: DbSession, user_id: UUID, provider: str, source: SyncSource
++    ) -> list[HistoricalTypeRow]:
++        """Every type row of this provider's historical runs, raw; a run with no rows yet comes back once with Nones."""
++        stmt = (
++            select(
++                SyncRun.id,
++                SyncRun.started_at,
++                SyncRunDataType.data_type,
++                SyncRunDataType.status,
++                SyncRunDataType.covered_start,
++                SyncRunDataType.covered_end,
++            )
++            .outerjoin(SyncRunDataType, SyncRunDataType.run_id == SyncRun.id)
++            .where(
++                SyncRun.user_id == user_id,
++                SyncRun.provider == provider,
++                SyncRun.source == source,
++                SyncRun.scope == SyncScope.HISTORICAL,
++            )
++        )
++        return [HistoricalTypeRow(*row) for row in db_session.execute(stmt).all()]
++
+     def list_for_user(
+         self,
+         db_session: DbSession,
+diff --git a/backend/app/schemas/providers/mobile_sdk/__init__.py b/backend/app/schemas/providers/mobile_sdk/__init__.py
+index 1d0d7ad8a9..224217dfbb 100644
+--- a/backend/app/schemas/providers/mobile_sdk/__init__.py
++++ b/backend/app/schemas/providers/mobile_sdk/__init__.py
+@@ -18,6 +18,7 @@
+     SyncRequestData,
+     WorkoutStatistic,
+ )
++from .sync_state import CoveredRange, SDKDataTypeSyncState, SDKSyncState
+ 
+ __all__ = [
+     # SDKLogEvents
+@@ -37,4 +38,8 @@
+     "WorkoutStatistic",
+     "SourceInfo",
+     "OSVersion",
++    # SyncState
++    "CoveredRange",
++    "SDKDataTypeSyncState",
++    "SDKSyncState",
+ ]
+diff --git a/backend/app/schemas/providers/mobile_sdk/sync_state.py b/backend/app/schemas/providers/mobile_sdk/sync_state.py
+new file mode 100644
+index 0000000000..2d92a4cfd4
+--- /dev/null
++++ b/backend/app/schemas/providers/mobile_sdk/sync_state.py
+@@ -0,0 +1,67 @@
++# ruff: noqa: N815
++
++from datetime import datetime
++
++from pydantic import BaseModel, Field
++
++from app.schemas.sync_status import DataTypeKind
++
++
++class CoveredRange(BaseModel):
++    startDate: datetime = Field(description="Earliest timestamp in the span.")
++    endDate: datetime = Field(description="Latest timestamp in the span.")
++
++
++class SDKDataTypeSyncState(BaseModel):
++    """What the server holds for one data type from this provider."""
++
++    type: str = Field(
++        description="Canonical data type: a series type slug (e.g. `heart_rate`) or an event category "
++        "(`sleep`, `workout`).",
++        examples=["heart_rate"],
++    )
++    kind: DataTypeKind = Field(description="`series` for time series samples, `event` for sleep and workouts.")
++    historicalSyncCompleted: bool | None = Field(
++        description="Whether a historical export finished this type. When false, resume it backwards "
++        "from `exportedRange.startDate`. Null when no historical export reported this type, e.g. on SDK "
++        "versions that do not send `syncSessionId`.",
++    )
++    lastSyncedAt: datetime = Field(
++        description="When data of this type was last written on the server. For data held before this was "
++        "tracked, the time of its newest sample instead."
++    )
++    coveredRange: CoveredRange = Field(
++        description="Oldest and newest data held for this type from any sync. Gaps inside it are not shown, "
++        "and retention moves its start forward, so it is no resume point."
++    )
++    exportedRange: CoveredRange | None = Field(
++        description="What the latest historical export has sent of this type so far. The export runs newest "
++        "first, so an unfinished type resumes backwards from `exportedRange.startDate`. Null when no "
++        "export recorded a span, e.g. data synced before the server tracked it."
++    )
++
++
++class SDKSyncState(BaseModel):
++    """Where the server says a user's SDK sync for one provider stands.
++
++    The server is the source of truth: a device that lost its local state (e.g. after a
++    logout) reads this to know where to resume from.
++    """
++
++    provider: str = Field(description="Canonical SDK provider slug.", examples=["apple"])
++    historicalSyncCompleted: bool | None = Field(
++        description="Whether a historical export for this provider has finished every data type it covered. "
++        "False when one exists but has not finished. Null when there is no historical export on record: "
++        "nothing synced yet, or an SDK version that does not send `syncSessionId`.",
++    )
++    syncedUntil: datetime | None = Field(
++        description=(
++            "Newest data held from this provider, across all types: where live sync continues from. "
++            "Null when nothing has been synced yet."
++        ),
++        examples=["2026-11-01T22:15:00Z"],
++    )
++    dataTypes: list[SDKDataTypeSyncState] = Field(
++        default_factory=list,
++        description="Data held per type from this provider. Empty when nothing has been synced yet.",
++    )
+diff --git a/backend/app/schemas/responses/upload/upload_response.py b/backend/app/schemas/responses/upload/upload_response.py
+index 32f6c4e151..cff748f246 100644
+--- a/backend/app/schemas/responses/upload/upload_response.py
++++ b/backend/app/schemas/responses/upload/upload_response.py
+@@ -1,3 +1,5 @@
++from datetime import datetime
++
+ from pydantic import BaseModel, Field
+ 
+ 
+@@ -22,6 +24,8 @@ class UploadDataResponse(BaseModel):
+             "sorted. Empty when the batch saved no time-series samples."
+         ),
+     )
++    # Worker-side only: what the batch covered per type, for the run's progress. Never serialized.
++    spans: dict[str, tuple[datetime, datetime]] = Field(default_factory=dict, exclude=True)
+     workouts_saved: int = Field(0, description="Workouts saved")
+     meals_saved: int = Field(0, description="Meal correlations saved")
+     sleep_saved: int = Field(0, description="Sleep records saved")
+diff --git a/backend/app/services/sdk/import_service.py b/backend/app/services/sdk/import_service.py
+index e91601ef91..7a6b172622 100644
+--- a/backend/app/services/sdk/import_service.py
++++ b/backend/app/services/sdk/import_service.py
+@@ -123,6 +123,7 @@ class LoadDataResult(TypedDict):
+     records_inserted: int  # rows that did not exist
+     records_updated: int  # rows refreshed in place
+     types: list[str]  # series types written
++    spans: dict[str, tuple[datetime, datetime]]  # per type the device exports itself: record series, workouts, sleep
+     sleep_saved: int
+     dropped: list[InvalidRecord]
+     unsupported_types: dict[str, int]  # record types with no series mapping, skipped
+@@ -594,6 +595,11 @@ def load_data(
+         records_updated = 0
+         sleep_saved = 0
+         types: set[str] = set()
++        spans: dict[str, tuple[datetime, datetime]] = {}
++
++        def widen(data_type: str, start: datetime, end: datetime) -> None:
++            held = spans.get(data_type)
++            spans[data_type] = (min(held[0], start), max(held[1], end)) if held else (start, end)
+ 
+         # A nutrient record whose correlation isn't in this batch stays a loose sample.
+         correlation_records = [r for r in request.data.records if (r.type or "") in MEAL_CORRELATION_TYPES]
+@@ -651,6 +657,8 @@ def load_data(
+                     db_session, details_to_insert, detail_type=EventCategory.WORKOUT
+                 )
+             workouts_saved = len(inserted_ids)
++            for record in workout_records:
++                widen("workouts", record.start_datetime, record.end_datetime)
+ 
+             # Bulk create time series samples
+             if time_series_samples:
+@@ -668,6 +676,8 @@ def load_data(
+             records_inserted += counts.inserted
+             records_updated += counts.updated
+             types.update(sample.series_type.value for sample in samples)
++            for sample in samples:
++                widen(sample.series_type.value, sample.recorded_at, sample.recorded_at)
+ 
+         # Commit all workout and timeseries changes in one transaction
+         db_session.commit()
+@@ -676,6 +686,8 @@ def load_data(
+         if request.data.sleep:
+             handle_sleep_data(db_session, request, user_id)
+             sleep_saved = len(request.data.sleep)
++            for segment in request.data.sleep:
++                widen("sleep", segment.startDate, segment.endDate)
+ 
+         return {
+             "workouts_saved": workouts_saved,
+@@ -684,6 +696,7 @@ def load_data(
+             "records_inserted": records_inserted,
+             "records_updated": records_updated,
+             "types": sorted(types),
++            "spans": spans,
+             "sleep_saved": sleep_saved,
+             "dropped": dropped,
+             "unsupported_types": dict(unsupported_types),
+@@ -805,6 +818,7 @@ def import_data_from_request(
+                 records_inserted=saved_counts["records_inserted"],
+                 records_updated=saved_counts["records_updated"],
+                 types=saved_counts["types"],
++                spans=saved_counts["spans"],
+                 workouts_saved=saved_counts["workouts_saved"],
+                 meals_saved=saved_counts["meals_saved"],
+                 sleep_saved=saved_counts["sleep_saved"],
+diff --git a/backend/app/services/sync_status_service.py b/backend/app/services/sync_status_service.py
+index aedb9c7fa9..82b1984493 100644
+--- a/backend/app/services/sync_status_service.py
++++ b/backend/app/services/sync_status_service.py
+@@ -40,8 +40,11 @@
+ from app.integrations.redis_client import get_redis_client
+ from app.models import SyncRun
+ from app.repositories.data_type_coverage_repository import data_type_coverage_repository
+-from app.repositories.sync_run_repository import sync_run_repository
++from app.repositories.sync_run_repository import HistoricalTypeRow, sync_run_repository
++from app.schemas.enums import EventCategory
++from app.schemas.providers.mobile_sdk import CoveredRange, SDKDataTypeSyncState, SDKSyncState
+ from app.schemas.sync_status import (
++    DataTypeKind,
+     DataTypeOutcome,
+     SyncRunDetail,
+     SyncRunRecord,
+@@ -368,6 +371,88 @@ def last_backfill_requested_until(db: DbSession, user_id: UUID, provider: str) -
+     return sync_run_repository.last_window_end(db, user_id, provider, SyncSource.BACKFILL)
+ 
+ 
++# One SDK export names sleep and workouts differently per writer (batch vs the device's end event).
++_SDK_EVENT_TYPE_NAMES: dict[str, str] = {
++    "sleep": EventCategory.SLEEP,
++    "SLEEP": EventCategory.SLEEP,
++    "HKCategoryTypeIdentifierSleepAnalysis": EventCategory.SLEEP,
++    "workout": EventCategory.WORKOUT,
++    "workouts": EventCategory.WORKOUT,
++    "WORKOUT": EventCategory.WORKOUT,
++    "HKWorkoutTypeIdentifier": EventCategory.WORKOUT,
++}
++
++_FINISHED_STATUSES = frozenset({SyncStatus.SUCCESS, SyncStatus.SKIPPED})
++# IN_PROGRESS is no verdict: a batch writes it while the end event is still to come.
++_UNFINISHED_STATUSES = frozenset({SyncStatus.FAILED, SyncStatus.UNFINISHED, SyncStatus.STALE, SyncStatus.CANCELLED})
++
++
++def _finished_types_by_run(rows: list[HistoricalTypeRow]) -> dict[UUID, dict[str, bool]]:
++    """Per historical run, whether each type it reported finished; a run with no types yet maps to {}."""
++    statuses: dict[UUID, dict[str, set[SyncStatus]]] = {}
++    for row in rows:
++        by_type = statuses.setdefault(row.run_id, {})
++        if row.data_type is None or row.status is None:
++            continue
++        name = _SDK_EVENT_TYPE_NAMES.get(row.data_type, row.data_type)
++        by_type.setdefault(name, set()).add(SyncStatus(row.status))
++    return {
++        run_id: {
++            name: bool(seen & _FINISHED_STATUSES) and not seen & _UNFINISHED_STATUSES for name, seen in by_type.items()
++        }
++        for run_id, by_type in statuses.items()
++    }
++
++
++def _exported_ranges(rows: list[HistoricalTypeRow]) -> dict[str, CoveredRange]:
++    """Per type, the span the latest historical export that reported one has sent so far."""
++    latest: dict[str, tuple[datetime, CoveredRange]] = {}
++    for row in rows:
++        if row.data_type is None or row.covered_start is None or row.covered_end is None:
++            continue
++        name = _SDK_EVENT_TYPE_NAMES.get(row.data_type, row.data_type)
++        if name not in latest or row.run_started_at > latest[name][0]:
++            latest[name] = (row.run_started_at, CoveredRange(startDate=row.covered_start, endDate=row.covered_end))
++    return {name: span for name, (_, span) in latest.items()}
++
++
++def get_sdk_sync_state(db: DbSession, user_id: UUID, provider: str) -> SDKSyncState:
++    """Where a user's SDK sync for this provider stands, from the runs and data we hold."""
++    rows = sync_run_repository.historical_data_type_statuses(db, user_id, provider, SyncSource.SDK)
++    finished_by_run = _finished_types_by_run(rows)
++    exported = _exported_ranges(rows)
++    # None, not False, without an export to judge by: SDKs without syncSessionId never record one.
++    export_completed: bool | None = (
++        any(types and all(types.values()) for types in finished_by_run.values()) if finished_by_run else None
++    )
++    type_finished: dict[str, bool] = {}
++    for types in finished_by_run.values():
++        for name, done in types.items():
++            type_finished[name] = type_finished.get(name, False) or done
++
++    def type_completed(data_type: str) -> bool | None:
++        # A finished export covers types the device skipped for having no records.
++        return True if export_completed else type_finished.get(data_type)
++
++    held = data_type_coverage_repository.list_for_user(db, user_id, provider=provider)
++    return SDKSyncState(
++        provider=provider,
++        historicalSyncCompleted=export_completed,
++        syncedUntil=max((row.coverage_end for row in held), default=None),
++        dataTypes=[
++            SDKDataTypeSyncState(
++                type=row.data_type,
++                kind=DataTypeKind(row.kind),
++                historicalSyncCompleted=type_completed(row.data_type),
++                lastSyncedAt=row.last_written_at,
++                coveredRange=CoveredRange(startDate=row.coverage_start, endDate=row.coverage_end),
++                exportedRange=exported.get(row.data_type),
++            )
++            for row in held
++        ],
++    )
++
++
+ def get_stored_run(db: DbSession, run_key: str) -> SyncRunDetail | None:
+     """One stored run with its per-data-type breakdown, or None when unknown."""
+     run = sync_run_repository.get_with_data_types(db, run_key)
+diff --git a/backend/tests/api/v1/test_sdk_logs.py b/backend/tests/api/v1/test_sdk_logs.py
+index a996a64faa..18e70d1b66 100644
+--- a/backend/tests/api/v1/test_sdk_logs.py
++++ b/backend/tests/api/v1/test_sdk_logs.py
+@@ -118,6 +118,21 @@ def test_provider_omitted_defaults_to_unknown(self, mock_store: MagicMock, clien
+         mock_store.assert_called_once()
+         assert mock_store.call_args.kwargs["provider"] == "unknown"
+ 
++    @patch("app.api.routes.v1.sdk_logs.emit_sync_started")
++    @patch("app.api.routes.v1.sdk_logs.store_raw_payload")
++    def test_provider_alias_opens_the_run_under_the_canonical_slug(
++        self, mock_store: MagicMock, mock_started: MagicMock, client: TestClient, db: Session
++    ) -> None:
++        api_key = ApiKeyFactory()
++        response = client.post(
++            _url(),
++            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
++            json={**_payload(SYNC_START_EVENT), "provider": "google", "syncSessionId": "s1"},
++        )
++        assert response.status_code == 202
++        assert mock_started.call_args.args[1] == "health_connect"
++        assert mock_store.call_args.kwargs["provider"] == "health_connect"
++
+     @patch("app.api.routes.v1.sdk_logs.store_raw_payload")
+     def test_time_range_without_start_date_accepted(
+         self, mock_store: MagicMock, client: TestClient, db: Session
+diff --git a/backend/tests/api/v1/test_sdk_sync_status.py b/backend/tests/api/v1/test_sdk_sync_status.py
+new file mode 100644
+index 0000000000..3083ec5a87
+--- /dev/null
++++ b/backend/tests/api/v1/test_sdk_sync_status.py
+@@ -0,0 +1,310 @@
++"""Tests for the SDK sync status endpoint."""
++
++from collections.abc import Iterator
++from datetime import datetime, timezone
++from unittest.mock import patch
++from uuid import UUID, uuid4
++
++import pytest
++from sqlalchemy.orm import Session
++from starlette.testclient import TestClient
++
++from app.repositories.data_type_coverage_repository import data_type_coverage_repository
++from app.schemas.data_type_coverage import CoverageSpan
++from app.schemas.sync_status import (
++    DataTypeKind,
++    DataTypeOutcome,
++    SyncScope,
++    SyncSource,
++    SyncStage,
++    SyncStatus,
++    SyncStatusEvent,
++)
++from app.services.sdk_token_service import create_sdk_user_token
++from app.services.sync_status_service import try_persist_run, try_record_data_types
++from tests.factories import ApiKeyFactory, UserFactory
++
++ENDPOINT = "/api/v1/sdk/users/{user_id}/sync/status"
++
++
++def _at(day: int, hour: int = 0) -> datetime:
++    return datetime(2026, 10, day, hour, tzinfo=timezone.utc)
++
++
++@pytest.fixture
++def stored_runs(db: Session) -> Iterator[None]:
++    """Route the best-effort run writers onto the test session."""
++    with patch("app.services.sync_status_service.SessionLocal") as session_local:
++        session_local.return_value.__enter__.return_value = db
++        with patch("app.services.sync_status_service._dispatch_data_type_webhooks"):
++            yield
++
++
++def _open_export(user_id: UUID, session_id: str, started_at: datetime, provider: str = "apple") -> str:
++    run_key = f"sdk_{session_id}"
++    try_persist_run(
++        SyncStatusEvent(
++            run_id=run_key,
++            user_id=user_id,
++            provider=provider,
++            source=SyncSource.SDK,
++            scope=SyncScope.HISTORICAL,
++            stage=SyncStage.STARTED,
++            status=SyncStatus.IN_PROGRESS,
++            started_at=started_at,
++            timestamp=started_at,
++        )
++    )
++    return run_key
++
++
++def _report(
++    run_key: str,
++    data_type: str,
++    status: SyncStatus,
++    kind: DataTypeKind = DataTypeKind.SERIES,
++    covered: tuple[datetime, datetime] | None = None,
++) -> None:
++    span = {"covered_start": covered[0], "covered_end": covered[1]} if covered else {}
++    try_record_data_types(
++        run_key,
++        [DataTypeOutcome(data_type=data_type, kind=kind, status=status, **span)],
++        scope=SyncScope.HISTORICAL,
++    )
++
++
++def _hold(
++    db: Session,
++    user_id: UUID,
++    start: datetime,
++    end: datetime,
++    data_type: str = "heart_rate",
++    kind: DataTypeKind = DataTypeKind.SERIES,
++    provider: str = "apple",
++) -> None:
++    data_type_coverage_repository.record(db, [CoverageSpan(user_id, provider, data_type, kind, start, end)])
++    db.commit()
++
++
++def _get(client: TestClient, user_id: UUID, provider: str = "apple", token: str | None = None) -> dict:
++    headers = {"Authorization": f"Bearer {token}"} if token else {"X-Open-Wearables-API-Key": ApiKeyFactory().plain_key}
++    response = client.get(ENDPOINT.format(user_id=user_id), params={"provider": provider}, headers=headers)
++    assert response.status_code == 200, response.text
++    return response.json()
++
++
++def _types(body: dict) -> dict[str, dict]:
++    return {item["type"]: item for item in body["dataTypes"]}
++
++
++class TestSDKSyncState:
++    def test_new_user_gets_empty_state(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++
++        assert _get(client, user.id) == {
++            "provider": "apple",
++            "historicalSyncCompleted": None,
++            "syncedUntil": None,
++            "dataTypes": [],
++        }
++
++    @pytest.mark.usefixtures("stored_runs")
++    def test_interrupted_export_reports_where_each_type_resumes(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++        run_key = _open_export(user.id, "s1", _at(30))
++        _report(run_key, "heart_rate", SyncStatus.IN_PROGRESS, covered=(_at(25), _at(30, 18)))
++        _report(run_key, "steps", SyncStatus.SUCCESS)
++        _hold(db, user.id, _at(20), _at(30, 18), data_type="heart_rate")
++        _hold(db, user.id, _at(1), _at(30, 17), data_type="steps")
++
++        body = _get(client, user.id)
++
++        assert body["historicalSyncCompleted"] is False
++        assert body["syncedUntil"] == "2026-10-30T18:00:00Z"
++        heart_rate, steps = _types(body)["heart_rate"], _types(body)["steps"]
++        assert heart_rate["historicalSyncCompleted"] is False
++        assert heart_rate["coveredRange"] == {"startDate": "2026-10-20T00:00:00Z", "endDate": "2026-10-30T18:00:00Z"}
++        assert heart_rate["exportedRange"] == {"startDate": "2026-10-25T00:00:00Z", "endDate": "2026-10-30T18:00:00Z"}
++        assert steps["historicalSyncCompleted"] is True
++
++    @pytest.mark.usefixtures("stored_runs")
++    def test_resume_point_comes_from_the_latest_export_not_the_data_held(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++        old = _open_export(user.id, "s1", _at(5))
++        _report(old, "heart_rate", SyncStatus.UNFINISHED, covered=(_at(1), _at(5)))
++        new = _open_export(user.id, "s2", _at(30))
++        _report(new, "heart_rate", SyncStatus.IN_PROGRESS, covered=(_at(20), _at(30)))
++        _hold(db, user.id, _at(1), _at(30))
++
++        heart_rate = _types(_get(client, user.id))["heart_rate"]
++
++        assert heart_rate["coveredRange"]["startDate"] == "2026-10-01T00:00:00Z"
++        assert heart_rate["exportedRange"] == {"startDate": "2026-10-20T00:00:00Z", "endDate": "2026-10-30T00:00:00Z"}
++
++    @pytest.mark.usefixtures("stored_runs")
++    def test_sleep_and_workouts_reported_under_native_names_still_complete(
++        self, client: TestClient, db: Session
++    ) -> None:
++        """A batch writes `sleep`/`workouts`, the end event the device's own identifier."""
++        user = UserFactory()
++        run_key = _open_export(user.id, "s1", _at(28))
++        _report(run_key, "heart_rate", SyncStatus.SUCCESS)
++        _report(run_key, "sleep", SyncStatus.IN_PROGRESS, DataTypeKind.EVENT)
++        _report(run_key, "HKCategoryTypeIdentifierSleepAnalysis", SyncStatus.SUCCESS, DataTypeKind.EVENT)
++        _report(run_key, "workouts", SyncStatus.IN_PROGRESS, DataTypeKind.EVENT)
++        _report(run_key, "WORKOUT", SyncStatus.SUCCESS, DataTypeKind.EVENT)
++        _hold(db, user.id, _at(1), _at(27, 7), data_type="sleep", kind=DataTypeKind.EVENT)
++        _hold(db, user.id, _at(2), _at(26), data_type="workout", kind=DataTypeKind.EVENT)
++
++        body = _get(client, user.id)
++
++        assert body["historicalSyncCompleted"] is True
++        assert _types(body)["sleep"]["historicalSyncCompleted"] is True
++        assert _types(body)["workout"]["historicalSyncCompleted"] is True
++
++    @pytest.mark.usefixtures("stored_runs")
++    def test_completed_export_marks_every_held_type_done(self, client: TestClient, db: Session) -> None:
++        """The device sends no end event for a type it had nothing to send, so the run decides."""
++        user = UserFactory()
++        run_key = _open_export(user.id, "s1", _at(28))
++        _report(run_key, "heart_rate", SyncStatus.SUCCESS)
++        _hold(db, user.id, _at(1), datetime(2026, 11, 1, 22, 15, tzinfo=timezone.utc), data_type="heart_rate")
++        _hold(db, user.id, _at(3), _at(4), data_type="weight")
++
++        body = _get(client, user.id)
++
++        assert body["historicalSyncCompleted"] is True
++        assert body["syncedUntil"] == "2026-11-01T22:15:00Z"
++        assert all(item["historicalSyncCompleted"] for item in body["dataTypes"])
++
++    @pytest.mark.usefixtures("stored_runs")
++    def test_failed_type_leaves_the_export_incomplete(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++        run_key = _open_export(user.id, "s1", _at(28))
++        _report(run_key, "heart_rate", SyncStatus.SUCCESS)
++        _report(run_key, "steps", SyncStatus.IN_PROGRESS)
++        _report(run_key, "steps", SyncStatus.FAILED)
++        _hold(db, user.id, _at(10), _at(28), data_type="steps")
++
++        body = _get(client, user.id)
++
++        assert body["historicalSyncCompleted"] is False
++        assert _types(body)["steps"]["historicalSyncCompleted"] is False
++
++    @pytest.mark.usefixtures("stored_runs")
++    def test_completion_survives_a_later_interrupted_export(self, client: TestClient, db: Session) -> None:
++        """A device that lost its state may start a new export; the finished one still counts."""
++        user = UserFactory()
++        done = _open_export(user.id, "s1", _at(10))
++        _report(done, "heart_rate", SyncStatus.SUCCESS)
++        later = _open_export(user.id, "s2", _at(20))
++        _report(later, "heart_rate", SyncStatus.IN_PROGRESS)
++
++        assert _get(client, user.id)["historicalSyncCompleted"] is True
++
++    @pytest.mark.usefixtures("stored_runs")
++    def test_other_providers_do_not_leak_in(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++        run_key = _open_export(user.id, "s1", _at(10), provider="samsung")
++        _report(run_key, "heart_rate", SyncStatus.SUCCESS)
++        _hold(db, user.id, _at(1), _at(31), data_type="steps", provider="samsung")
++
++        assert _get(client, user.id) == {
++            "provider": "apple",
++            "historicalSyncCompleted": None,
++            "syncedUntil": None,
++            "dataTypes": [],
++        }
++
++    @pytest.mark.usefixtures("stored_runs")
++    def test_state_is_returned_after_logging_in_again(self, client: TestClient, db: Session) -> None:
++        """The device lost its local state on logout; a fresh token reads it back from the server."""
++        user = UserFactory()
++        run_key = _open_export(user.id, "s1", _at(30))
++        _report(run_key, "heart_rate", SyncStatus.IN_PROGRESS)
++        _hold(db, user.id, _at(20), _at(30, 18))
++
++        first = _get(client, user.id, token=create_sdk_user_token("app_1", str(user.id)))
++        relogged = _get(client, user.id, token=create_sdk_user_token("app_1", str(user.id)))
++
++        assert relogged == first
++        assert relogged["historicalSyncCompleted"] is False
++        assert relogged["syncedUntil"] == "2026-10-30T18:00:00Z"
++        assert [{k: v for k, v in item.items() if k != "lastSyncedAt"} for item in relogged["dataTypes"]] == [
++            {
++                "type": "heart_rate",
++                "kind": "series",
++                "historicalSyncCompleted": False,
++                "coveredRange": {"startDate": "2026-10-20T00:00:00Z", "endDate": "2026-10-30T18:00:00Z"},
++                "exportedRange": None,
++            }
++        ]
++
++    def test_data_without_any_export_on_record_is_unknown_not_unfinished(self, client: TestClient, db: Session) -> None:
++        """SDKs that send no syncSessionId upload as live, so no export is ever recorded."""
++        user = UserFactory()
++        _hold(db, user.id, _at(1), _at(30))
++
++        body = _get(client, user.id)
++
++        assert body["historicalSyncCompleted"] is None
++        assert body["syncedUntil"] == "2026-10-30T00:00:00Z"
++        assert _types(body)["heart_rate"]["historicalSyncCompleted"] is None
++
++    @pytest.mark.usefixtures("stored_runs")
++    def test_started_export_with_nothing_reported_yet_is_unfinished(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++        _open_export(user.id, "s1", _at(30))
++
++        assert _get(client, user.id)["historicalSyncCompleted"] is False
++
++    @pytest.mark.usefixtures("stored_runs")
++    def test_type_no_export_reported_is_unknown(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++        run_key = _open_export(user.id, "s1", _at(30))
++        _report(run_key, "heart_rate", SyncStatus.IN_PROGRESS)
++        _hold(db, user.id, _at(20), _at(30), data_type="heart_rate")
++        _hold(db, user.id, _at(1), _at(2), data_type="weight")
++
++        types = _types(_get(client, user.id))
++
++        assert types["heart_rate"]["historicalSyncCompleted"] is False
++        assert types["weight"]["historicalSyncCompleted"] is None
++
++    def test_provider_alias_is_normalized(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++
++        assert _get(client, user.id, provider="google")["provider"] == "health_connect"
++
++
++class TestSDKSyncStateAccess:
++    def test_unsupported_provider_is_rejected(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++        response = client.get(
++            ENDPOINT.format(user_id=user.id),
++            params={"provider": "garmin"},
++            headers={"X-Open-Wearables-API-Key": ApiKeyFactory().plain_key},
++        )
++        assert response.status_code == 400
++
++    def test_token_for_another_user_is_forbidden(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++        token = create_sdk_user_token("app_1", str(uuid4()))
++        response = client.get(
++            ENDPOINT.format(user_id=user.id),
++            params={"provider": "apple"},
++            headers={"Authorization": f"Bearer {token}"},
++        )
++        assert response.status_code == 403
++
++    def test_unknown_user_is_not_found(self, client: TestClient, db: Session) -> None:
++        response = client.get(
++            ENDPOINT.format(user_id=uuid4()),
++            params={"provider": "apple"},
++            headers={"X-Open-Wearables-API-Key": ApiKeyFactory().plain_key},
++        )
++        assert response.status_code == 404
++
++    def test_requires_auth(self, client: TestClient, db: Session) -> None:
++        response = client.get(ENDPOINT.format(user_id=uuid4()), params={"provider": "apple"})
++        assert response.status_code == 401
+diff --git a/backend/tests/integrations/test_sdk_import.py b/backend/tests/integrations/test_sdk_import.py
+index dcbebe39f7..3bc65f7fbe 100644
+--- a/backend/tests/integrations/test_sdk_import.py
++++ b/backend/tests/integrations/test_sdk_import.py
+@@ -175,6 +175,19 @@ def test_import_workout_with_statistics(
+         assert details.energy_burned == Decimal("180.00")  # 131.41 + 48.59
+         assert details.total_elevation_gain == Decimal("15.57")
+ 
++    def test_spans_cover_only_types_the_device_exports_itself(
++        self,
++        db: Session,
++        import_service: ImportService,
++        sample_sdk_payload: dict[str, Any],
++    ) -> None:
++        """A series filled from workout statistics has no export of its own on the device."""
++        result = import_service.load_data(db, sample_sdk_payload, str(UserFactory().id))
++
++        assert "weather_temperature" in result["types"]
++        assert "weather_temperature" not in result["spans"]
++        assert {"workouts", "sleep"} <= result["spans"].keys()
++
+     def test_workout_statistics_are_mirrored_onto_their_workout(
+         self,
+         db: Session,
+diff --git a/backend/tests/tasks/test_process_sdk_upload_task.py b/backend/tests/tasks/test_process_sdk_upload_task.py
+index f34a840137..aaf8156e45 100644
+--- a/backend/tests/tasks/test_process_sdk_upload_task.py
++++ b/backend/tests/tasks/test_process_sdk_upload_task.py
+@@ -4,6 +4,7 @@
+ Tests Apple Health data import processing with user validation.
+ """
+ 
++from datetime import datetime, timezone
+ from typing import Any
+ from unittest.mock import MagicMock, patch
+ from uuid import uuid4
+@@ -12,7 +13,8 @@
+ from sqlalchemy.orm import Session
+ 
+ from app.config import settings
+-from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_upload
++from app.integrations.celery.tasks.process_sdk_upload_task import _batch_outcomes, process_sdk_upload
++from app.schemas.sync_status import SyncScope, SyncStatus
+ from tests.factories import UserFactory
+ 
+ 
+@@ -280,3 +282,26 @@ def test_kept_when_the_import_fails(self, db: Session, mock_celery_app: MagicMoc
+         mock_delete = _run_offloaded_batch(db, UserFactory(), archival="disabled", status_code=500)
+ 
+         mock_delete.assert_not_called()
++
++
++class TestBatchOutcomes:
++    START, END = datetime(2026, 10, 1, tzinfo=timezone.utc), datetime(2026, 10, 2, tzinfo=timezone.utc)
++
++    def test_historical_batch_leaves_out_series_written_only_from_workouts(self) -> None:
++        """weather_temperature comes from workout statistics: no end event will ever close it."""
++        spans = {"heart_rate": (self.START, self.END), "workouts": (self.START, self.END)}
++
++        outcomes = _batch_outcomes(["heart_rate", "weather_temperature"], spans, 1, 0, SyncScope.HISTORICAL)
++
++        assert [(o.data_type, o.status, o.covered_start, o.covered_end) for o in outcomes] == [
++            ("heart_rate", SyncStatus.IN_PROGRESS, self.START, self.END),
++            ("workouts", SyncStatus.IN_PROGRESS, self.START, self.END),
++        ]
++
++    def test_live_batch_reports_every_series_it_wrote(self) -> None:
++        outcomes = _batch_outcomes(["heart_rate", "weather_temperature"], {}, 0, 0, SyncScope.LIVE)
++
++        assert [(o.data_type, o.status) for o in outcomes] == [
++            ("heart_rate", SyncStatus.SUCCESS),
++            ("weather_temperature", SyncStatus.SUCCESS),
++        ]
+diff --git a/docs/docs.json b/docs/docs.json
+index 3feed91314..466c51797e 100644
+--- a/docs/docs.json
++++ b/docs/docs.json
+@@ -325,6 +325,7 @@
+             "group": "Mobile SDK",
+             "pages": [
+               "POST /api/v1/sdk/users/{user_id}/sync",
++              "GET /api/v1/sdk/users/{user_id}/sync/status",
+               "POST /api/v1/users/{user_id}/token",
+               "POST /api/v1/users/{user_id}/invitation-code",
+               "POST /api/v1/invitation-code/redeem"
+diff --git a/docs/openapi.json b/docs/openapi.json
+index 91e0910235..725e5c9ce9 100644
+--- a/docs/openapi.json
++++ b/docs/openapi.json
+@@ -8054,6 +8054,82 @@
+         }
+       }
+     },
++    "/api/v1/sdk/users/{user_id}/sync/status": {
++      "get": {
++        "tags": [
++          "External: Mobile SDK"
++        ],
++        "summary": "Get Sdk Sync Status",
++        "description": "Where the user's SDK sync for one provider stands, as the server sees it.\n\nThe server is the source of truth for sync progress; the device's own state is only a\ncache. Call this after login, before starting a sync, to restore that state:\n\n- `historicalSyncCompleted: true` - the historical export finished; only live sync is\n  left, continuing from `syncedUntil`.\n- `historicalSyncCompleted: false` - the export has not finished. It runs newest first, so\n  each type in `dataTypes` with `historicalSyncCompleted: false` resumes backwards from its\n  `exportedRange.startDate`. Types not listed have no data on the server yet.\n- `historicalSyncCompleted: null` - no historical export on record: nothing synced yet, or\n  an SDK version that does not send `syncSessionId`, so the server cannot tell. The same\n  applies per type in `dataTypes`.\n- `syncedUntil: null` and empty `dataTypes` - nothing synced yet; start a full export.\n\nA user who has never synced gets that empty state with 200, not 404.",
++        "operationId": "get_sdk_sync_status_api_v1_sdk_users__user_id__sync_status_get",
++        "security": [
++          {
++            "OAuth2PasswordBearer": []
++          }
++        ],
++        "parameters": [
++          {
++            "name": "user_id",
++            "in": "path",
++            "required": true,
++            "schema": {
++              "type": "string",
++              "format": "uuid",
++              "title": "User Id"
++            }
++          },
++          {
++            "name": "provider",
++            "in": "query",
++            "required": true,
++            "schema": {
++              "type": "string",
++              "description": "SDK provider slug, e.g. `apple`, `samsung`, `health_connect`.",
++              "title": "Provider"
++            },
++            "description": "SDK provider slug, e.g. `apple`, `samsung`, `health_connect`."
++          },
++          {
++            "name": "X-Open-Wearables-API-Key",
++            "in": "header",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "X-Open-Wearables-Api-Key"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "Successful Response",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/SDKSyncState"
++                }
++              }
++            }
++          },
++          "422": {
++            "description": "Validation Error",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            }
++          }
++        }
++      }
++    },
+     "/api/v1/users/{user_id}/token": {
+       "post": {
+         "tags": [
+@@ -12440,6 +12516,28 @@
+         ],
+         "title": "CoverageResponse"
+       },
++      "CoveredRange": {
++        "properties": {
++          "startDate": {
++            "type": "string",
++            "format": "date-time",
++            "title": "Startdate",
++            "description": "Earliest timestamp in the span."
++          },
++          "endDate": {
++            "type": "string",
++            "format": "date-time",
++            "title": "Enddate",
++            "description": "Latest timestamp in the span."
++          }
++        },
++        "type": "object",
++        "required": [
++          "startDate",
++          "endDate"
++        ],
++        "title": "CoveredRange"
++      },
+       "DataGranularity": {
+         "type": "string",
+         "enum": [
+@@ -15844,6 +15942,66 @@
+         "title": "Resolution",
+         "description": "Bucket width requested when reading time series. RAW returns stored samples untouched; day, week\nand month read the day aggregates instead of the samples."
+       },
++      "SDKDataTypeSyncState": {
++        "properties": {
++          "type": {
++            "type": "string",
++            "title": "Type",
++            "description": "Canonical data type: a series type slug (e.g. `heart_rate`) or an event category (`sleep`, `workout`).",
++            "examples": [
++              "heart_rate"
++            ]
++          },
++          "kind": {
++            "$ref": "#/components/schemas/DataTypeKind",
++            "description": "`series` for time series samples, `event` for sleep and workouts."
++          },
++          "historicalSyncCompleted": {
++            "anyOf": [
++              {
++                "type": "boolean"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Historicalsynccompleted",
++            "description": "Whether a historical export finished this type. When false, resume it backwards from `exportedRange.startDate`. Null when no historical export reported this type, e.g. on SDK versions that do not send `syncSessionId`."
++          },
++          "lastSyncedAt": {
++            "type": "string",
++            "format": "date-time",
++            "title": "Lastsyncedat",
++            "description": "When data of this type was last written on the server. For data held before this was tracked, the time of its newest sample instead."
++          },
++          "coveredRange": {
++            "$ref": "#/components/schemas/CoveredRange",
++            "description": "Oldest and newest data held for this type from any sync. Gaps inside it are not shown, and retention moves its start forward, so it is no resume point."
++          },
++          "exportedRange": {
++            "anyOf": [
++              {
++                "$ref": "#/components/schemas/CoveredRange"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "What the latest historical export has sent of this type so far. The export runs newest first, so an unfinished type resumes backwards from `exportedRange.startDate`. Null when no export recorded a span, e.g. data synced before the server tracked it."
++          }
++        },
++        "type": "object",
++        "required": [
++          "type",
++          "kind",
++          "historicalSyncCompleted",
++          "lastSyncedAt",
++          "coveredRange",
++          "exportedRange"
++        ],
++        "title": "SDKDataTypeSyncState",
++        "description": "What the server holds for one data type from this provider."
++      },
+       "SDKLogRequest": {
+         "properties": {
+           "sdkVersion": {
+@@ -15909,6 +16067,62 @@
+         "title": "SDKLogRequest",
+         "description": "Top-level request for SDK log events endpoint."
+       },
++      "SDKSyncState": {
++        "properties": {
++          "provider": {
++            "type": "string",
++            "title": "Provider",
++            "description": "Canonical SDK provider slug.",
++            "examples": [
++              "apple"
++            ]
++          },
++          "historicalSyncCompleted": {
++            "anyOf": [
++              {
++                "type": "boolean"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Historicalsynccompleted",
++            "description": "Whether a historical export for this provider has finished every data type it covered. False when one exists but has not finished. Null when there is no historical export on record: nothing synced yet, or an SDK version that does not send `syncSessionId`."
++          },
++          "syncedUntil": {
++            "anyOf": [
++              {
++                "type": "string",
++                "format": "date-time"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Synceduntil",
++            "description": "Newest data held from this provider, across all types: where live sync continues from. Null when nothing has been synced yet.",
++            "examples": [
++              "2026-11-01T22:15:00Z"
++            ]
++          },
++          "dataTypes": {
++            "items": {
++              "$ref": "#/components/schemas/SDKDataTypeSyncState"
++            },
++            "type": "array",
++            "title": "Datatypes",
++            "description": "Data held per type from this provider. Empty when nothing has been synced yet."
++          }
++        },
++        "type": "object",
++        "required": [
++          "provider",
++          "historicalSyncCompleted",
++          "syncedUntil"
++        ],
++        "title": "SDKSyncState",
++        "description": "Where the server says a user's SDK sync for one provider stands.\n\nThe server is the source of truth: a device that lost its local state (e.g. after a\nlogout) reads this to know where to resume from."
++      },
+       "SDKTokenRequest": {
+         "properties": {
+           "app_id": {

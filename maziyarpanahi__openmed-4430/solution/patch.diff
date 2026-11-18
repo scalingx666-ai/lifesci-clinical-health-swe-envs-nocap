@@ -1,0 +1,663 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 615b7df865..40166a7f7e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ### Added
+ 
++- Mute timed identifiers in a separate local PCM buffer under the original retention deadline; uncertain alignment withholds the entire derivative (#3838).
++
+ - Gate local OpenMedKit multimodal work on Apple thermal notifications, measured queue age and rolling latency, with explicit cadence/window limits, sustained cooling before recovery and value-free evidence (#3836).
+ 
+ - Gate ambient capture on unanimous consent in Python and OpenMedKit, with explicit interruption/resume, non-renewable retention, revocable owned-memory references and draft-only review exports with conservative deletion accounting (#3208).
+diff --git a/docs/multimodal/streaming/audio-retention.md b/docs/multimodal/streaming/audio-retention.md
+index 10fd780c94..d9633bf03a 100644
+--- a/docs/multimodal/streaming/audio-retention.md
++++ b/docs/multimodal/streaming/audio-retention.md
+@@ -77,3 +77,26 @@ The fixture's original bytes literal is deliberately outside the owner's cleanup
+ ## Validation
+ 
+ Run `.venv/bin/python -m pytest tests/unit/multimodal/streaming/privacy/test_audio_retention.py -q`. Synthetic tests inspect actual overwritten buffers and removed files, cancellation during inference, provider errors, deadlines and clock failures, resource limits, incomplete inventories, failed cleanup retries, file replacement and link attacks, unexpected entries, conservative restart recovery, malformed checkpoints and value-free offline reports. POSIX file tests are platform-scoped; portable buffer tests and unsupported-file-adapter rejection run on every supported Python platform.
++
++## Mute identifiers in a retained utterance
++
++Use `mute_retained_clip` from `openmed.multimodal.streaming.privacy.audio_muting` to create a second, verified buffer inside an existing retention session. Declare both source and destination as separate expected buffers before capture. The destination inherits the same deadline and cleanup inventory. No file or export is created. The source stays intact until its ordinary destruction.
++
++Use one complete, already screened utterance per clip, in interleaved signed 16-bit little-endian PCM. WAV containers, compressed audio and unknown filter delay are not accepted as PCM lineage. The host must verify the codec, frame count, channel layout, stream origin and synchronization, bind the capture digest to that utterance, and establish that retention is permitted. Mislabeling a partial transcript as complete can leave identifiers outside its scope. Muting known spans does not prove that a detector found every identifier, and does not anonymize a speaker's voice.
++
++At the trusted screening handoff, keep the `ReleasedSpeechSegment` from `WithholdingBuffer` and its `screened_segment_digest(release)` together with the capture's SHA-256. Pin those digests there, not from untrusted input later. Construct `RetainedClipAlignment` with them, the session reference, source and ASR rates, source frames/channels, and the stream-relative millisecond origin of target frame zero. Only declare `TimingEvidence.TOKENS` for reliable, synchronized timing. Each known identifier must be completely covered; a partial word uses the entire token. Mapping rounds outwards in the ASR and source frame domains, pads in source frames, and merges overlaps. Every channel in each reported half-open frame range is verified silent; samples outside those ranges are verified unchanged.
++
++If only the bounds of the **complete utterance** are known reliably, select `TimingEvidence.SEGMENT` explicitly: a single identifier mutes the entire clip. `UNCERTAIN` refuses the whole operation. There is no automatic switch to a weaker timing source or partial output on a missing span.
++
++```python
++from openmed.multimodal.streaming.privacy.audio_muting import mute_retained_clip
++
++# retention already owns source_ref; destination_ref was reserved in its inventory.
++report = mute_retained_clip(
++    retention, source_ref, destination_ref, alignment, release, padding_ms=30,
++)
++# Safe evidence contains frame ranges, counts and digests only.
++evidence = report.to_json()
++# Protected access uses retention.infer(destination_ref, trusted_local_consumer).
++# retention.finish() accounts for both original and derived buffers.
++```
+diff --git a/openmed/multimodal/streaming/privacy/audio_muting.py b/openmed/multimodal/streaming/privacy/audio_muting.py
+new file mode 100644
+index 0000000000..e5c12202b7
+--- /dev/null
++++ b/openmed/multimodal/streaming/privacy/audio_muting.py
+@@ -0,0 +1,295 @@
++"""Mute finalized speech identifiers in one retained, aligned local PCM clip."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++from bisect import bisect_right
++from dataclasses import asdict, dataclass
++from enum import Enum
++
++from ...audio_resample_plan import plan_audio_resampling
++from ..transcript.revision_ledger import REVISION_SCHEMA_VERSION, TranscriptToken
++from .audio_retention import AudioRetentionSession
++from .withholding_buffer import RedactionMapping, ReleasedSpeechSegment
++
++_MAX_FRAMES = 16 * 1024 * 1024
++_ZERO = bytes(8192)
++_DIGEST = re.compile(r"[a-f0-9]{64}\Z")
++_REF = re.compile(r"[a-f0-9]{32}\Z")
++
++
++class AudioMutingError(ValueError):
++    """Controlled refusal; no speech, samples, paths or identifiers."""
++
++
++class TimingEvidence(str, Enum):
++    """Explicit host evidence about a complete utterance and its source clip."""
++
++    TOKENS = "reliable_tokens"
++    SEGMENT = "reliable_whole_segment"
++    UNCERTAIN = "uncertain"
++
++
++def _require(condition: bool) -> None:
++    if not condition:
++        raise AudioMutingError("audio_muting_unverified")
++
++
++def _int(value: object, low: int, high: int) -> bool:
++    return type(value) is int and low <= value <= high
++
++
++def _digest(value: object) -> bool:
++    return type(value) is str and _DIGEST.fullmatch(value) is not None
++
++
++def screened_segment_digest(release: ReleasedSpeechSegment) -> str:
++    """Bind the final release mappings and lineage at trusted screening handoff."""
++    _require(type(release) is ReleasedSpeechSegment)
++    _require(
++        type(release.lineage_json) is str
++        and len(release.lineage_json) <= 2_097_152
++        and release.lineage_json.isascii()
++    )
++    _require(type(release.mappings) is tuple and len(release.mappings) <= 8193)
++    _require(type(release.text) is str and len(release.text) <= 131072)
++    _require(
++        type(release.segment_ref) is str
++        and _REF.fullmatch(release.segment_ref) is not None
++    )
++    _require(_int(release.revision, 1, 4096))
++    _require(_digest(release.request_digest) and _digest(release.output_digest))
++    for row in release.mappings:
++        _require(type(row) is RedactionMapping and type(row.redacted) is bool)
++        _require(
++            all(
++                _int(i, 0, 131072)
++                for i in (
++                    row.source_start,
++                    row.source_end,
++                    row.output_start,
++                    row.output_end,
++                )
++            )
++        )
++    bound = release.to_dict()
++    bound["lineage_sha256"] = hashlib.sha256(
++        release.lineage_json.encode("ascii")
++    ).hexdigest()
++    return hashlib.sha256(
++        json.dumps(bound, sort_keys=True, separators=(",", ":")).encode()
++    ).hexdigest()
++
++
++@dataclass(frozen=True, slots=True, kw_only=True)
++class RetainedClipAlignment:
++    """Trusted alignment for one complete utterance in interleaved S16LE PCM.
++
++    Capture these digests and coordinates at the trusted recording/screening
++    boundary. The target-rate clock begins at stream_start_ms, with no codec
++    delay, trimming or gaps. Unresolved offsets require a refusal upstream.
++    """
++
++    session_ref: str
++    source_sha256: str
++    screened_sha256: str
++    source_rate_hz: int
++    target_rate_hz: int
++    source_frames: int
++    channels: int
++    stream_start_ms: int
++    timing: TimingEvidence
++
++    def __post_init__(self) -> None:
++        _require(
++            type(self.session_ref) is str
++            and _REF.fullmatch(self.session_ref) is not None
++        )
++        _require(_digest(self.source_sha256) and _digest(self.screened_sha256))
++        _require(
++            _int(self.source_rate_hz, 1, 384000)
++            and _int(self.target_rate_hz, 1, 384000)
++        )
++        _require(_int(self.source_frames, 1, _MAX_FRAMES) and _int(self.channels, 1, 8))
++        _require(self.source_frames * self.channels * 2 <= 64 * 1024 * 1024)
++        _require(
++            _int(self.stream_start_ms, 0, 86400000)
++            and type(self.timing) is TimingEvidence
++        )
++
++
++@dataclass(frozen=True, slots=True)
++class MutedAudioReport:
++    """Source-frame ranges [start, end), counts and digests; no audio or transcript."""
++
++    ranges: tuple[tuple[int, int], ...]
++    span_count: int
++    muted_frames: int
++    source_sha256: str
++    output_sha256: str
++    screened_sha256: str
++
++    def to_json(self) -> str:
++        """Serialize value-free evidence for this derivative."""
++        return json.dumps(asdict(self), separators=(",", ":"), sort_keys=True)
++
++
++def _ranges(
++    clip: RetainedClipAlignment, release: ReleasedSpeechSegment, padding_ms: int
++) -> tuple[int, tuple[tuple[int, int], ...]]:
++    _require(clip.timing is not TimingEvidence.UNCERTAIN)
++    _require(screened_segment_digest(release) == clip.screened_sha256)
++    _require(hashlib.sha256(release.text.encode()).hexdigest() == release.output_digest)
++    lineage = json.loads(release.lineage_json)
++    _require(
++        type(lineage) is dict
++        and lineage.get("schema_version") == REVISION_SCHEMA_VERSION
++    )
++    _require(
++        lineage.get("finalized") is True
++        and lineage.get("session_ref") == clip.session_ref
++    )
++    _require(
++        lineage.get("segment_ref") == release.segment_ref
++        and type(lineage.get("revision")) is int
++        and lineage["revision"] == release.revision
++    )
++    length = lineage["length"]
++    _require(_int(length, 1, 65536))
++    spans = []
++    source_at = output_at = 0
++    for row in release.mappings:
++        _require(source_at == row.source_start < row.source_end <= length)
++        _require(output_at == row.output_start < row.output_end <= len(release.text))
++        if row.redacted:
++            _require(release.text[output_at : row.output_end] == "[REDACTED]")
++            spans.append((source_at, row.source_end))
++        else:
++            _require(row.source_end - source_at == row.output_end - output_at)
++        source_at, output_at = row.source_end, row.output_end
++    _require(source_at == length and output_at == len(release.text))
++    if clip.timing is TimingEvidence.SEGMENT:
++        return len(spans), ((0, clip.source_frames),) if spans else ()
++
++    records = lineage["tokens"]
++    _require(type(records) is list and 0 < len(records) <= 4096)
++    tokens = [TranscriptToken(**row) for row in records]
++    _require(len({t.token_ref for t in tokens}) == len(tokens))
++    plan = plan_audio_resampling(
++        clip.source_rate_hz, clip.target_rate_hz, clip.source_frames
++    )
++    target_frames = plan.target_frames
++    _require(target_frames > 0)
++
++    def target(ms: int, end: bool) -> int:
++        rel = ms - clip.stream_start_ms
++        _require(rel >= 0)
++        return (rel * clip.target_rate_hz + (999 if end else 0)) // 1000
++
++    for i, t in enumerate(tokens):
++        _require(
++            t.end <= length
++            and clip.stream_start_ms <= t.start_ms < t.end_ms
++            and target(t.end_ms, True) <= target_frames
++        )
++        if i:
++            left = tokens[i - 1]
++            _require(
++                left.end <= t.start
++                and left.start_ms <= t.start_ms
++                and left.end_ms <= t.end_ms
++            )
++    ends = [t.end for t in tokens]
++    padding = (padding_ms * clip.source_rate_hz + 999) // 1000
++    merged: list[tuple[int, int]] = []
++    for start, end in spans:
++        i = bisect_right(ends, start)
++        _require(i < len(tokens) and tokens[i].start <= start)
++        first = last = tokens[i]
++        while last.end < end:
++            i += 1
++            _require(i < len(tokens) and tokens[i].start == last.end)
++            last = tokens[i]
++        first_frame = (
++            target(first.start_ms, False) * clip.source_rate_hz // clip.target_rate_hz
++        )
++        end_frame = -(
++            -target(last.end_ms, True) * clip.source_rate_hz // clip.target_rate_hz
++        )
++        _require(0 <= first_frame < end_frame and first_frame < clip.source_frames)
++        # A rounded-up target frame can extend beyond the last real source frame.
++        lo, hi = (
++            max(0, first_frame - padding),
++            min(clip.source_frames, end_frame + padding),
++        )
++        if merged and lo <= merged[-1][1]:
++            merged[-1] = (merged[-1][0], max(hi, merged[-1][1]))
++        else:
++            merged.append((lo, hi))
++    return len(spans), tuple(merged)
++
++
++def mute_retained_clip(
++    session: AudioRetentionSession,
++    source_ref: str,
++    destination_ref: str,
++    clip: RetainedClipAlignment,
++    release: ReleasedSpeechSegment,
++    *,
++    padding_ms: int,
++) -> MutedAudioReport:
++    """Create a separately inventoried muted buffer under the source deadline.
++
++    Use only a trusted complete final screening of this exact single-utterance
++    clip. The caller owns consent and the quality of acoustic/screening evidence.
++    Never pass provisional text or an arbitrary subset of a longer recording.
++    The output remains inside the session and is never an export authorization.
++    """
++    _require(type(clip) is RetainedClipAlignment and _int(padding_ms, 0, 5000))
++    try:
++        span_count, ranges = _ranges(clip, release, padding_ms)
++    except (
++        ValueError,
++        KeyError,
++        AttributeError,
++        TypeError,
++        OverflowError,
++        RecursionError,
++    ):
++        pass
++    else:
++
++        def render(source: memoryview, output: memoryview) -> MutedAudioReport:
++            _require(hashlib.sha256(source).hexdigest() == clip.source_sha256)
++            # The new buffer starts zeroed. Only copy ranges outside all PHI.
++            stride = clip.channels * 2
++            cursor = 0
++            for lo, hi in ranges:
++                a, b = lo * stride, hi * stride
++                output[cursor:a] = source[cursor:a]
++                _require(output[cursor:a] == source[cursor:a])
++                for offset in range(a, b, len(_ZERO)):
++                    stop = min(b, offset + len(_ZERO))
++                    _require(output[offset:stop] == _ZERO[: stop - offset])
++                cursor = b
++            output[cursor:] = source[cursor:]
++            _require(output[cursor:] == source[cursor:])
++            return MutedAudioReport(
++                ranges,
++                span_count,
++                sum(hi - lo for lo, hi in ranges),
++                clip.source_sha256,
++                hashlib.sha256(output).hexdigest(),
++                clip.screened_sha256,
++            )
++
++        return session._derive_buffer(
++            clip.session_ref,
++            source_ref,
++            destination_ref,
++            clip.source_frames * clip.channels * 2,
++            render,
++        )
++    raise AudioMutingError("audio_muting_unverified")
+diff --git a/openmed/multimodal/streaming/privacy/audio_retention.py b/openmed/multimodal/streaming/privacy/audio_retention.py
+index 39316192f3..4a11c0a9ee 100644
+--- a/openmed/multimodal/streaming/privacy/audio_retention.py
++++ b/openmed/multimodal/streaming/privacy/audio_retention.py
+@@ -378,6 +378,49 @@ def capture(self, artifact_ref: str, audio: bytes | bytearray) -> None:
+                 self.finish(SessionEnd.FAILURE)
+                 raise AudioRetentionError("audio_capture_failed")
+ 
++    def _derive_buffer(
++        self,
++        session_ref: str,
++        source_ref: str,
++        destination_ref: str,
++        expected_bytes: int,
++        render: Callable[[memoryview, memoryview], _T],
++    ) -> _T:
++        """Render into a new owned buffer; never expose an unverified derivative.
++
++        Only trusted package renderers may use this primitive. They run under
++        the inventory lock, may not re-enter the session, and must not retain
++        views. Check the non-renewable deadline again before making it usable.
++        """
++        with self._lock:
++            self._active()
++            _require(session_ref == self._session_ref and source_ref != destination_ref)
++            source = self._artifact(source_ref)
++            destination = self._artifact(destination_ref)
++            _require(source.buffer is not None and len(source.buffer) == expected_bytes)
++            _require(
++                destination.expected.kind is ArtifactKind.BUFFER
++                and not destination.used
++            )
++            self._reserve(expected_bytes)
++            assert source.buffer is not None
++            try:
++                destination.buffer = bytearray(expected_bytes)
++                destination.size = expected_bytes
++                with (
++                    memoryview(source.buffer).toreadonly() as original,
++                    memoryview(destination.buffer) as output,
++                ):
++                    report = render(original, output)
++                destination.used = True
++            except BaseException:
++                self.finish(SessionEnd.FAILURE)
++            else:
++                if self.expire():
++                    raise AudioRetentionError("audio_result_discarded")
++                return report
++            raise AudioRetentionError("audio_derivation_failed")
++
+     def _reserve(self, size: int) -> None:
+         if size > self._policy.max_bytes - self._owned_bytes:
+             self._violations.add("byte_limit")
+diff --git a/tests/unit/multimodal/streaming/privacy/test_audio_muting.py b/tests/unit/multimodal/streaming/privacy/test_audio_muting.py
+new file mode 100644
+index 0000000000..97fd586afb
+--- /dev/null
++++ b/tests/unit/multimodal/streaming/privacy/test_audio_muting.py
+@@ -0,0 +1,258 @@
++"""Synthetic stereo PCM exercises real final screening, muting and destruction."""
++
++import hashlib
++import json
++import struct
++from dataclasses import replace
++
++import pytest
++
++from openmed.multimodal.streaming.privacy import (
++    ArtifactKind,
++    AudioRetentionError,
++    AudioRetentionPolicy,
++    AudioRetentionSession,
++    DestructionAction,
++    ExpectedAudioArtifact,
++    PhiRedactionSpan,
++    PhiResolution,
++    PhiScreenDeclaration,
++    PhiScreenResult,
++    SegmentPhiDecision,
++    WithholdingBuffer,
++)
++from openmed.multimodal.streaming.privacy.audio_muting import (
++    AudioMutingError,
++    RetainedClipAlignment,
++    TimingEvidence,
++    mute_retained_clip,
++    screened_segment_digest,
++)
++from openmed.multimodal.streaming.transcript import TranscriptToken
++
++SESSION, SOURCE, DEST, SEG, WORD, OTHER = (f"{i:032x}" for i in range(6))
++TEXT = "Say Ivy and May!"
++# A deterministic nonzero square wave on both channels, at 44.1 kHz for 100 ms.
++PCM = b"".join(
++    struct.pack("<hh", (i % 2 * 2 - 1) * 2000, (i % 4 // 2 * 2 - 1) * 1000)
++    for i in range(4410)
++)
++
++
++class Screen:
++    declaration = PhiScreenDeclaration(artifact_digest="a" * 64)
++
++    def screen(self, request):
++        (row,) = request.segments
++        return PhiScreenResult(
++            request_digest=request.request_digest,
++            decisions=(
++                SegmentPhiDecision(
++                    segment_ref=row.segment_ref,
++                    revision=row.revision,
++                    resolution=PhiResolution.RESOLVED,
++                    redactions=(PhiRedactionSpan(4, 7), PhiRedactionSpan(12, 15)),
++                ),
++            ),
++        )
++
++
++def released(tokens=None):
++    if tokens is None:
++        tokens = (
++            TranscriptToken(token_ref=WORD, start=4, end=7, start_ms=510, end_ms=520),
++            TranscriptToken(
++                token_ref=OTHER, start=12, end=15, start_ms=524, end_ms=533
++            ),
++        )
++    with WithholdingBuffer(SESSION, Screen(), clock=lambda: 0.0) as buf:
++        assert buf.append(SEG, TEXT, tokens)
++        assert buf.finalize(SEG, expected_revision=0)
++        (row,) = buf.finish()
++    return row
++
++
++def alignment(row, **changes):
++    return replace(
++        RetainedClipAlignment(
++            session_ref=SESSION,
++            source_sha256=hashlib.sha256(PCM).hexdigest(),
++            screened_sha256=screened_segment_digest(row),
++            source_rate_hz=44100,
++            target_rate_hz=16000,
++            source_frames=4410,
++            channels=2,
++            stream_start_ms=500,
++            timing=TimingEvidence.TOKENS,
++        ),
++        **changes,
++    )
++
++
++def retained(**kwargs):
++    s = AudioRetentionSession(
++        SESSION,
++        tuple(ExpectedAudioArtifact(r, ArtifactKind.BUFFER) for r in (SOURCE, DEST)),
++        automatic_expiry=False,
++        **kwargs,
++    )
++    s.capture(SOURCE, PCM)
++    return s
++
++
++def test_stereo_resampled_outward_padding_and_bounds_receipts():
++    row = released()
++    with retained() as session:
++        report = mute_retained_clip(
++            session, SOURCE, DEST, alignment(row), row, padding_ms=3
++        )
++        # 10..20 and 24..33 ms, rounded out via 16 kHz then padded by ceil(132.3).
++        assert report.ranges == ((441 - 133, 1456 + 133),)
++        lo, hi = report.ranges[0]
++        assert report.muted_frames == hi - lo and report.span_count == 2
++        expected = PCM[: lo * 4] + bytes((hi - lo) * 4) + PCM[hi * 4 :]
++        assert session.infer(DEST, bytes) == expected
++        assert session.infer(SOURCE, bytes) == PCM
++        assert report.output_sha256 == hashlib.sha256(expected).hexdigest()
++        public = json.loads(report.to_json())
++        assert set(public) == {
++            "ranges",
++            "span_count",
++            "muted_frames",
++            "source_sha256",
++            "output_sha256",
++            "screened_sha256",
++        }
++        assert "Ivy" not in report.to_json() and "May" not in repr(report)
++    audit = session.audit()
++    assert audit.passed
++    assert {r.artifact_ref for r in audit.receipts} == {SOURCE, DEST}
++    assert {r.binding_digest for r in audit.receipts} == {audit.binding_digest}
++    assert all(r.action is DestructionAction.BUFFER_OVERWRITTEN for r in audit.receipts)
++
++
++def test_explicit_whole_segment_alignment_mutes_all_channels_even_without_tokens():
++    row = released(())
++    with retained() as session:
++        report = mute_retained_clip(
++            session,
++            SOURCE,
++            DEST,
++            alignment(row, timing=TimingEvidence.SEGMENT),
++            row,
++            padding_ms=0,
++        )
++        assert report.ranges == ((0, 4410),)
++        assert session.infer(DEST, bytes) == bytes(len(PCM))
++        assert session.infer(SOURCE, bytes) == PCM
++
++
++@pytest.mark.parametrize(
++    "broken",
++    [
++        "uncertain",
++        "missing_last",
++        "partial_token",
++        "zero_time",
++        "out_of_clip",
++        "provisional",
++        "revision",
++        "mappings",
++        "other_screen",
++        "offset",
++        "malformed",
++    ],
++)
++def test_entire_derivative_withheld_for_unreliable_or_stale_lineage(broken):
++    row = released()
++    clip = alignment(row)
++    data = json.loads(row.lineage_json)
++    if broken in {
++        "missing_last",
++        "partial_token",
++        "zero_time",
++        "out_of_clip",
++        "provisional",
++        "revision",
++        "malformed",
++    }:
++        if broken == "missing_last":
++            data["tokens"].pop()
++        elif broken == "partial_token":
++            data["tokens"][-1]["start"] += 1
++        elif broken == "zero_time":
++            data["tokens"][-1]["end_ms"] = data["tokens"][-1]["start_ms"]
++        elif broken == "out_of_clip":
++            data["tokens"][-1]["end_ms"] = 1000
++        elif broken == "provisional":
++            data["finalized"] = False
++        elif broken == "revision":
++            data["revision"] += 1
++        else:
++            data["tokens"] = [{"private": "synthetic private text"}]
++        row = replace(row, lineage_json=json.dumps(data))
++        clip = alignment(row)
++    elif broken == "uncertain":
++        clip = replace(clip, timing=TimingEvidence.UNCERTAIN)
++    elif broken == "mappings":
++        row = replace(row, mappings=row.mappings[:-1])
++        clip = alignment(row)
++    elif broken == "other_screen":
++        clip = replace(clip, screened_sha256="b" * 64)
++    else:
++        clip = replace(clip, stream_start_ms=600)
++    with retained() as session:
++        with pytest.raises(AudioMutingError) as error:
++            mute_retained_clip(session, SOURCE, DEST, clip, row, padding_ms=1)
++        assert (
++            str(error.value) == "audio_muting_unverified"
++            and error.value.__context__ is None
++        )
++        with pytest.raises(AudioRetentionError):
++            session.infer(DEST, bytes)
++        assert session.infer(SOURCE, bytes) == PCM
++
++
++def test_non_identifier_token_before_capture_invalidates_whole_alignment():
++    row = released()
++    data = json.loads(row.lineage_json)
++    data["tokens"].insert(
++        0, dict(token_ref=SEG, start=0, end=3, start_ms=499, end_ms=505)
++    )
++    row = replace(row, lineage_json=json.dumps(data))
++    with retained() as session, pytest.raises(AudioMutingError):
++        mute_retained_clip(session, SOURCE, DEST, alignment(row), row, padding_ms=0)
++
++
++def test_unknown_capture_or_insufficient_capacity_cannot_expose_partial_output():
++    row = released()
++    for kwargs, changes in (
++        ({}, {"source_sha256": "c" * 64}),
++        ({"policy": AudioRetentionPolicy(max_bytes=len(PCM))}, {}),
++    ):
++        with retained(**kwargs) as session:
++            with pytest.raises(AudioRetentionError):
++                mute_retained_clip(
++                    session, SOURCE, DEST, alignment(row, **changes), row, padding_ms=0
++                )
++            with pytest.raises(AudioRetentionError):
++                session.infer(DEST, bytes)
++
++
++def test_refuses_overwrite_and_does_not_renew_or_extend_deadline():
++    clock = [0.0]
++    row = released()
++    with retained(
++        clock=lambda: clock[0], policy=AudioRetentionPolicy(max_lifetime_ms=100)
++    ) as session:
++        with pytest.raises(AudioRetentionError):
++            mute_retained_clip(
++                session, SOURCE, SOURCE, alignment(row), row, padding_ms=0
++            )
++        clock[0] = 0.09
++        mute_retained_clip(session, SOURCE, DEST, alignment(row), row, padding_ms=0)
++        assert session.infer(SOURCE, bytes) == PCM
++        clock[0] = 0.1
++        with pytest.raises(AudioRetentionError):
++            session.infer(DEST, bytes)
++        assert session.audit().passed and len(session.audit().receipts) == 2

@@ -1,0 +1,3904 @@
+diff --git a/js/openmedkit-web/README.md b/js/openmedkit-web/README.md
+index 6aa98489de..7f06bc6792 100644
+--- a/js/openmedkit-web/README.md
++++ b/js/openmedkit-web/README.md
+@@ -129,6 +129,89 @@ await session.dispose();
+ The session also emits local-only warm/cold per-device benchmark records and
+ provides fail-closed Python-reference parity and critical-label recall gates.
+ 
++## Inference Workers
++
++Run tokenization and inference in a dedicated worker so long notes do not block
++the UI thread. The worker serves a token-classification pipeline; the page
++routes calls through a bounded, cancellable client and keeps hashing and
++redaction on the host.
++
++```ts
++// openmed.worker.ts, bundled as a module worker
++import { loadOnnxModel, serveInferenceWorker } from "openmed";
++
++serveInferenceWorker({
++  async load(spec) {
++    const pipeline = await loadOnnxModel(spec.modelRef, {
++      localFilesOnly: spec.localOnly,
++    });
++    return { pipeline, backend: "wasm", localOnly: spec.localOnly };
++  },
++});
++```
++
++```ts
++import { createInferenceWorkerClient, deidentify } from "openmed";
++
++const client = createInferenceWorkerClient({
++  createWorker: () =>
++    new Worker(new URL("./openmed.worker.ts", import.meta.url), {
++      type: "module",
++    }),
++  maxQueueSize: 8,
++});
++await client.load({
++  modelRef: "/models/openmed/pii",
++  allowedBackends: ["webgpu", "wasm"],
++});
++
++const controller = new AbortController();
++const result = await deidentify(clinicalNote, {
++  pipeline: client.pipeline({ signal: controller.signal }),
++});
++```
++
++- **Bounded admission.** Up to `maxQueueSize` requests (default 16) wait on
++  the host and `maxInFlight` (default 1) run in the worker. Overflow rejects
++  at once with an `InferenceWorkerError` whose `code` is `queue_full`. The
++  worker server keeps its own bounded queue as well.
++- **Cancellation.** Aborting the signal drops a queued request before its
++  text is sent, or tells the worker, which aborts the `context.signal` passed
++  as the pipeline's third argument. The promise rejects with `cancelled`
++  immediately. A cancelled request keeps its in-flight slot until the worker
++  acknowledges it, the worker posts no result for it, and any late result is
++  dropped and counted in `stats().suppressedLateResults`.
++- **Model generations.** Each `load()` starts a new generation. Outstanding
++  requests from earlier generations reject with `superseded`, and a pipeline
++  returned by `client.pipeline()` rejects with `stale_generation` once a later
++  `load()` replaces its model.
++- **Device loss and restarts.** Return the `lost` promise of the runtime's
++  `GPUDevice` as `deviceLost`. On loss the worker releases the runtime and the
++  client becomes `invalidated`: calls reject with `device_lost` or
++  `plan_invalidated` until `recover()` succeeds. A worker `error`,
++  `messageerror` or malformed message makes the client `failed`, and
++  `recover()` starts a fresh worker. Call `invalidate()` when the page itself
++  sees device loss or replaces the runtime. Recovery reloads with
++  `localOnly: true` and must return a plan with the same model reference, the
++  same `modelDigest` when one was reported, and an allowed backend; otherwise
++  it fails with `plan_incompatible`. A verified recovery keeps the generation,
++  so existing pipelines resume. A new load waits for the running request to
++  stop, so pass `{ restart: true }` to `load()` or `recover()` to replace a
++  worker whose runtime cannot be interrupted.
++- **Local-only loads.** `load()` defaults to `localOnly: true`, rejects
++  remote URL model references, and requires the worker to report a
++  local-only runtime.
++- **Transfer and privacy.** Input text crosses as a transferred UTF-16 buffer,
++  so offsets match the source exactly. Results come back as transferred
++  typed-array columns holding only labels, scores, token indices and offsets;
++  token text is dropped after alignment in the worker. Errors carry a fixed
++  message and a code from `INFERENCE_WORKER_ERROR_CODES`, never input text or
++  an underlying error message. The client cancels worker `error` events so the
++  browser does not report their messages to the console, and neither side
++  logs, caches or stores input text.
++- **Teardown.** `dispose()` rejects outstanding work with `disposed`, asks the
++  worker to release its runtime and terminates it.
++
+ ## Privacy and Safety
+ 
+ - No telemetry is enabled by default.
+diff --git a/js/openmedkit-web/package.json b/js/openmedkit-web/package.json
+index 9074bfc0f1..c2902c989e 100644
+--- a/js/openmedkit-web/package.json
++++ b/js/openmedkit-web/package.json
+@@ -36,7 +36,7 @@
+     "build": "tsup src/index.ts --format esm,cjs --dts --sourcemap --clean --out-dir dist",
+     "typecheck": "tsc --noEmit",
+     "test": "npm run build && npm run typecheck && npm run test:node",
+-    "test:node": "tsx --test ../../tests/web/test_npm_deidentify.spec.ts ../../tests/web/test_ort_web_loader.spec.ts ../../tests/web/test_webgpu_session.spec.ts",
++    "test:node": "tsx --test ../../tests/web/test_npm_deidentify.spec.ts ../../tests/web/test_ort_web_loader.spec.ts ../../tests/web/test_webgpu_session.spec.ts ../../tests/web/test_inference_worker.spec.ts",
+     "prepack": "npm run build"
+   },
+   "peerDependencies": {
+diff --git a/js/openmedkit-web/src/index.ts b/js/openmedkit-web/src/index.ts
+index 83f769092b..9461a52a27 100644
+--- a/js/openmedkit-web/src/index.ts
++++ b/js/openmedkit-web/src/index.ts
+@@ -125,6 +125,44 @@ export type {
+   WebGpuTokenClassificationSessionOptions,
+   WebGpuTokenSpan,
+ } from "./runtime/webgpu-session";
++export {
++  INFERENCE_WORKER_ERROR_CODES,
++  INFERENCE_WORKER_PROTOCOL_VERSION,
++  InferenceWorkerError,
++} from "./worker/protocol";
++export type {
++  InferenceWorkerErrorCode,
++  InferenceWorkerLoadReason,
++  InferenceWorkerLoadSpec,
++  InferenceWorkerPlan,
++  NormalizedInferenceWorkerLoadSpec,
++} from "./worker/protocol";
++export {
++  InferenceWorkerClient,
++  createInferenceWorkerClient,
++} from "./worker/client";
++export type {
++  InferenceWorkerClientOptions,
++  InferenceWorkerEndpoint,
++  InferenceWorkerEventListener,
++  InferenceWorkerLoadOptions,
++  InferenceWorkerPipelineOptions,
++  InferenceWorkerRecoverOptions,
++  InferenceWorkerRunOptions,
++  InferenceWorkerState,
++  InferenceWorkerStats,
++} from "./worker/client";
++export { serveInferenceWorker } from "./worker/server";
++export type {
++  InferenceWorkerLoadContext,
++  InferenceWorkerPipeline,
++  InferenceWorkerRunContext,
++  InferenceWorkerRuntime,
++  InferenceWorkerScope,
++  InferenceWorkerServer,
++  InferenceWorkerServerStats,
++  ServeInferenceWorkerOptions,
++} from "./worker/server";
+ 
+ export const DEFAULT_MODEL_ID =
+   "OpenMed/OpenMed-PII-ClinicalE5-Small-33M-v1-onnx-android";
+diff --git a/js/openmedkit-web/src/worker/client.ts b/js/openmedkit-web/src/worker/client.ts
+new file mode 100644
+index 0000000000..9ded808499
+--- /dev/null
++++ b/js/openmedkit-web/src/worker/client.ts
+@@ -0,0 +1,1014 @@
++import type {
++  TokenClassificationCallOptions,
++  TokenClassificationEntity,
++  TokenClassificationPipeline,
++} from "../types";
++import {
++  DEFAULT_INFERENCE_WORKER_MAX_IN_FLIGHT,
++  DEFAULT_INFERENCE_WORKER_MAX_INPUT_CHARS,
++  DEFAULT_INFERENCE_WORKER_MAX_QUEUE_SIZE,
++  INFERENCE_WORKER_PROTOCOL_VERSION,
++  InferenceWorkerError,
++  decodeInferenceTokens,
++  encodeTextUnits,
++  isInferenceWorkerErrorCode,
++  isOfflineModelRef,
++  isPlainData,
++  isPositiveId,
++  isRecord,
++  resolveBound,
++  type HostToWorkerMessage,
++  type InferenceWorkerErrorCode,
++  type InferenceWorkerLoadReason,
++  type InferenceWorkerLoadSpec,
++  type InferenceWorkerPlan,
++  type NormalizedInferenceWorkerLoadSpec,
++} from "./protocol";
++
++/** Listener shape shared by `Worker`, `MessagePort`, and test doubles. */
++export type InferenceWorkerEventListener = (event: {
++  data?: unknown;
++  preventDefault?: () => void;
++}) => void;
++
++/** Minimal host-side view of a dedicated worker (a DOM `Worker` fits). */
++export interface InferenceWorkerEndpoint {
++  postMessage(message: unknown, transfer: Transferable[]): void;
++  addEventListener(
++    type: "message" | "messageerror" | "error",
++    listener: InferenceWorkerEventListener,
++  ): void;
++  removeEventListener(
++    type: "message" | "messageerror" | "error",
++    listener: InferenceWorkerEventListener,
++  ): void;
++  terminate?(): void;
++}
++
++/** Lifecycle state of an {@link InferenceWorkerClient}. */
++export type InferenceWorkerState =
++  | "idle"
++  | "loading"
++  | "ready"
++  | "invalidated"
++  | "failed"
++  | "disposed";
++
++/** Options for {@link createInferenceWorkerClient}. */
++export interface InferenceWorkerClientOptions {
++  /** Creates a fresh worker; called lazily and again on restart. */
++  createWorker: () => InferenceWorkerEndpoint;
++  /** Requests that may wait on the host before `queue_full`. Defaults to 16. */
++  maxQueueSize?: number;
++  /** Requests outstanding in the worker, cancelled ones included. Defaults to 1. */
++  maxInFlight?: number;
++  /** Per-request input bound in UTF-16 code units. Defaults to 1,000,000. */
++  maxInputChars?: number;
++  /**
++   * Extra plan check run after the built-in verification.
++   *
++   * `previous` is the last verified plan during `recover()`, otherwise null.
++   * Returning false or throwing rejects the plan with `plan_incompatible`.
++   */
++  acceptPlan?: (
++    plan: InferenceWorkerPlan,
++    previous: InferenceWorkerPlan | null,
++  ) => boolean;
++}
++
++/** Options for {@link InferenceWorkerClient.run}. */
++export interface InferenceWorkerRunOptions {
++  /** Cancels the request; the worker is told and late results are dropped. */
++  signal?: AbortSignal;
++  /** Plain-data pipeline options forwarded to the worker pipeline. */
++  callOptions?: TokenClassificationCallOptions;
++  /** Model generation that must still own the worker. Defaults to the current one. */
++  generation?: number;
++}
++
++/** Options for {@link InferenceWorkerClient.load}. */
++export interface InferenceWorkerLoadOptions {
++  signal?: AbortSignal;
++  /** Replace the worker first, for example when a runtime ignores aborts. */
++  restart?: boolean;
++}
++
++/** Options for {@link InferenceWorkerClient.recover}. */
++export interface InferenceWorkerRecoverOptions {
++  signal?: AbortSignal;
++  /** Replace the worker even if it is still alive. */
++  restart?: boolean;
++}
++
++/** Options for {@link InferenceWorkerClient.pipeline}. */
++export interface InferenceWorkerPipelineOptions {
++  /** Signal applied to every call made through the returned pipeline. */
++  signal?: AbortSignal;
++}
++
++/** Value-free counters describing the client. */
++export interface InferenceWorkerStats {
++  state: InferenceWorkerState;
++  generation: number;
++  epoch: number;
++  queued: number;
++  inFlight: number;
++  draining: number;
++  maxQueueSize: number;
++  maxInFlight: number;
++  workerStarts: number;
++  completed: number;
++  cancelled: number;
++  rejectedQueueFull: number;
++  suppressedLateResults: number;
++}
++
++interface PendingRequest {
++  id: number;
++  generation: number;
++  epoch: number;
++  text: string | null;
++  callOptions: Record<string, unknown>;
++  phase: "queued" | "dispatched" | "draining";
++  settled: boolean;
++  resolve: (tokens: TokenClassificationEntity[]) => void;
++  reject: (error: InferenceWorkerError) => void;
++  cleanup: () => void;
++}
++
++interface PendingLoad {
++  id: number;
++  epoch: number;
++  generation: number;
++  spec: NormalizedInferenceWorkerLoadSpec;
++  previous: InferenceWorkerPlan | null;
++  resolve: (plan: InferenceWorkerPlan) => void;
++  reject: (error: InferenceWorkerError) => void;
++  cleanup: () => void;
++}
++
++type ListenerSet = Record<
++  "message" | "messageerror" | "error",
++  InferenceWorkerEventListener
++>;
++
++/**
++ * Host-side facade that routes token classification through a dedicated worker.
++ *
++ * Requests are admitted into a bounded queue, carry request ids and the model
++ * generation that owns them, and can be cancelled with an `AbortSignal`.
++ * Cancelled, superseded, and invalidated requests never receive results. Input
++ * text is transferred as a UTF-16 buffer and dropped once dispatched; errors are
++ * {@link InferenceWorkerError} values with controlled codes only.
++ */
++export class InferenceWorkerClient {
++  private readonly createWorker: () => InferenceWorkerEndpoint;
++  private readonly maxQueueSize: number;
++  private readonly maxInFlight: number;
++  private readonly maxInputChars: number;
++  private readonly acceptPlan: InferenceWorkerClientOptions["acceptPlan"];
++  private endpoint: InferenceWorkerEndpoint | null = null;
++  private listeners: ListenerSet | null = null;
++  private stateValue: InferenceWorkerState = "idle";
++  private generationValue = 0;
++  private epochValue = 0;
++  private nextId = 1;
++  private queue: PendingRequest[] = [];
++  private readonly inFlight = new Map<number, PendingRequest>();
++  private pendingLoad: PendingLoad | null = null;
++  private verifiedPlan: InferenceWorkerPlan | null = null;
++  private verifiedSpec: NormalizedInferenceWorkerLoadSpec | null = null;
++  private workerStarts = 0;
++  private completed = 0;
++  private cancelled = 0;
++  private rejectedQueueFull = 0;
++  private suppressedLateResults = 0;
++
++  /**
++   * Creates a client; the worker itself starts on the first `load()`.
++   *
++   * Args:
++   *   options: Worker factory and queue bounds.
++   *
++   * Raises:
++   *   TypeError: If `createWorker` is not a function.
++   *   RangeError: If a bound is not a positive integer.
++   */
++  constructor(options: InferenceWorkerClientOptions) {
++    if (typeof options?.createWorker !== "function") {
++      throw new TypeError("Inference worker client requires createWorker.");
++    }
++    this.createWorker = options.createWorker;
++    this.maxQueueSize = resolveBound(
++      options.maxQueueSize,
++      DEFAULT_INFERENCE_WORKER_MAX_QUEUE_SIZE,
++    );
++    this.maxInFlight = resolveBound(
++      options.maxInFlight,
++      DEFAULT_INFERENCE_WORKER_MAX_IN_FLIGHT,
++    );
++    this.maxInputChars = resolveBound(
++      options.maxInputChars,
++      DEFAULT_INFERENCE_WORKER_MAX_INPUT_CHARS,
++    );
++    this.acceptPlan = options.acceptPlan;
++  }
++
++  /** Current lifecycle state. */
++  get state(): InferenceWorkerState {
++    return this.stateValue;
++  }
++
++  /** Current model generation; increments on every `load()`. */
++  get generation(): number {
++    return this.generationValue;
++  }
++
++  /** Last verified plan while the client is ready, otherwise null. */
++  get plan(): InferenceWorkerPlan | null {
++    return this.stateValue === "ready" && this.verifiedPlan !== null
++      ? { ...this.verifiedPlan }
++      : null;
++  }
++
++  /**
++   * Loads a model into the worker and starts a new model generation.
++   *
++   * Outstanding requests from earlier generations are rejected with
++   * `superseded`, and pipelines created for them reject with `stale_generation`.
++   *
++   * Args:
++   *   spec: Structured-clone-safe model description; `localOnly` defaults to true.
++   *   options: Optional abort signal and `restart` to force a fresh worker.
++   *
++   * Returns:
++   *   The verified execution plan reported by the worker.
++   *
++   * Raises:
++   *   InferenceWorkerError: `invalid_request`, `load_failed`,
++   *     `plan_incompatible`, `cancelled`, `superseded`, `worker_failed`, or
++   *     `disposed`.
++   */
++  load(
++    spec: InferenceWorkerLoadSpec,
++    options: InferenceWorkerLoadOptions = {},
++  ): Promise<InferenceWorkerPlan> {
++    if (this.stateValue === "disposed") {
++      return rejected("disposed");
++    }
++    const normalized = normalizeLoadSpec(spec);
++    if (normalized === null) {
++      return rejected("invalid_request");
++    }
++    if (options.signal?.aborted === true) {
++      return rejected("cancelled");
++    }
++    this.generationValue += 1;
++    this.verifiedPlan = null;
++    this.verifiedSpec = null;
++    return this.beginLoad(
++      normalized,
++      "load",
++      null,
++      options.signal,
++      options.restart === true,
++    );
++  }
++
++  /**
++   * Reloads the last verified model after device loss, invalidation, or failure.
++   *
++   * Recovery never widens network access: the reload is forced to
++   * `localOnly: true`, and the new plan must match the previous model reference
++   * and digest before the generation is reused. A failed worker is replaced.
++   *
++   * Args:
++   *   options: Optional abort signal and `restart` to force a fresh worker.
++   *
++   * Returns:
++   *   The newly verified plan; the model generation is unchanged.
++   *
++   * Raises:
++   *   InferenceWorkerError: `not_loaded` when no plan was ever verified, or
++   *     the same codes as `load()`.
++   */
++  recover(options: InferenceWorkerRecoverOptions = {}): Promise<InferenceWorkerPlan> {
++    if (this.stateValue === "disposed") {
++      return rejected("disposed");
++    }
++    const previous = this.verifiedPlan;
++    const spec = this.verifiedSpec;
++    if (previous === null || spec === null) {
++      return rejected("not_loaded");
++    }
++    if (this.stateValue === "loading") {
++      return rejected("invalid_request");
++    }
++    if (this.stateValue === "ready" && options.restart !== true) {
++      return Promise.resolve({ ...previous });
++    }
++    if (options.signal?.aborted === true) {
++      return rejected("cancelled");
++    }
++    const restart =
++      options.restart === true ||
++      this.stateValue === "failed" ||
++      this.endpoint === null;
++    return this.beginLoad(
++      {
++        ...spec,
++        localOnly: true,
++        modelDigest: spec.modelDigest ?? previous.modelDigest,
++      },
++      "recover",
++      previous,
++      options.signal,
++      restart,
++    );
++  }
++
++  /**
++   * Runs token classification in the worker.
++   *
++   * Args:
++   *   text: Source text; it is transferred to the worker and not retained.
++   *   options: Abort signal, plain-data call options, and owning generation.
++   *
++   * Returns:
++   *   Aligned token entities with labels, scores, indices and offsets only.
++   *
++   * Raises:
++   *   InferenceWorkerError: `queue_full`, `cancelled`, `stale_generation`,
++   *     `superseded`, `not_loaded`, `plan_invalidated`, `device_lost`,
++   *     `input_too_large`, `invalid_request`, `inference_failed`,
++   *     `alignment_failed`, `worker_failed`, or `disposed`.
++   */
++  run(
++    text: string,
++    options: InferenceWorkerRunOptions = {},
++  ): Promise<TokenClassificationEntity[]> {
++    if (this.stateValue === "disposed") {
++      return rejected("disposed");
++    }
++    if (typeof text !== "string") {
++      return rejected("invalid_request");
++    }
++    if (text.length > this.maxInputChars) {
++      return rejected("input_too_large");
++    }
++    const callOptions = options.callOptions ?? {};
++    if (!isRecord(callOptions) || !isPlainData(callOptions)) {
++      return rejected("invalid_request");
++    }
++    const signal = options.signal;
++    if (signal?.aborted === true) {
++      this.cancelled += 1;
++      return rejected("cancelled");
++    }
++    const generation = options.generation ?? this.generationValue;
++    const admission = this.admissionError(generation);
++    if (admission !== null) {
++      return rejected(admission);
++    }
++    if (this.queue.length >= this.maxQueueSize) {
++      this.rejectedQueueFull += 1;
++      return rejected("queue_full");
++    }
++    return new Promise<TokenClassificationEntity[]>((resolve, reject) => {
++      const request: PendingRequest = {
++        id: this.nextId++,
++        generation,
++        epoch: 0,
++        text,
++        callOptions: { ...callOptions },
++        phase: "queued",
++        settled: false,
++        resolve,
++        reject,
++        cleanup: noop,
++      };
++      if (signal !== undefined) {
++        const onAbort = () => this.cancelRequest(request);
++        signal.addEventListener("abort", onAbort, { once: true });
++        request.cleanup = () => signal.removeEventListener("abort", onAbort);
++      }
++      this.queue.push(request);
++      this.pump();
++    });
++  }
++
++  /**
++   * Returns a token-classification pipeline owned by the current generation.
++   *
++   * Pass it to `extractPii()` or `deidentify()`; hashing and redaction stay on
++   * the host. Calls after a later `load()` reject with `stale_generation`.
++   *
++   * Args:
++   *   options: Optional abort signal applied to every call.
++   *
++   * Returns:
++   *   A pipeline function routed through this client.
++   */
++  pipeline(options: InferenceWorkerPipelineOptions = {}): TokenClassificationPipeline {
++    const generation = this.generationValue;
++    const signal = options.signal;
++    return (text: string, callOptions?: TokenClassificationCallOptions) => {
++      const runOptions: InferenceWorkerRunOptions = { generation };
++      if (signal !== undefined) {
++        runOptions.signal = signal;
++      }
++      if (callOptions !== undefined) {
++        runOptions.callOptions = callOptions;
++      }
++      return this.run(text, runOptions);
++    };
++  }
++
++  /**
++   * Invalidates the current execution plan, for example after the host sees
++   * GPU device loss or replaces the runtime. Outstanding requests reject with
++   * `plan_invalidated`; call `recover()` before reuse.
++   */
++  invalidate(): void {
++    if (this.stateValue === "disposed" || this.stateValue === "failed") {
++      return;
++    }
++    this.epochValue += 1;
++    const pending = this.pendingLoad;
++    if (pending !== null) {
++      this.postCancel(pending.id);
++      this.settleLoad(pending, "plan_invalidated");
++    }
++    this.rejectAll("plan_invalidated");
++    this.stateValue = this.verifiedPlan === null ? "idle" : "invalidated";
++  }
++
++  /**
++   * Rejects outstanding work with `disposed`, asks the worker to release its
++   * runtime, and terminates it. Later calls reject with `disposed`.
++   */
++  dispose(): Promise<void> {
++    if (this.stateValue === "disposed") {
++      return Promise.resolve();
++    }
++    this.stateValue = "disposed";
++    if (this.pendingLoad !== null) {
++      this.settleLoad(this.pendingLoad, "disposed");
++    }
++    this.rejectAll("disposed");
++    this.post({ protocol: INFERENCE_WORKER_PROTOCOL_VERSION, type: "dispose" });
++    this.releaseEndpoint();
++    this.verifiedPlan = null;
++    this.verifiedSpec = null;
++    return Promise.resolve();
++  }
++
++  /** Returns value-free counters; never includes text or model references. */
++  stats(): InferenceWorkerStats {
++    let draining = 0;
++    for (const request of this.inFlight.values()) {
++      if (request.phase === "draining") {
++        draining += 1;
++      }
++    }
++    return {
++      state: this.stateValue,
++      generation: this.generationValue,
++      epoch: this.epochValue,
++      queued: this.queue.length,
++      inFlight: this.inFlight.size,
++      draining,
++      maxQueueSize: this.maxQueueSize,
++      maxInFlight: this.maxInFlight,
++      workerStarts: this.workerStarts,
++      completed: this.completed,
++      cancelled: this.cancelled,
++      rejectedQueueFull: this.rejectedQueueFull,
++      suppressedLateResults: this.suppressedLateResults,
++    };
++  }
++
++  private beginLoad(
++    spec: NormalizedInferenceWorkerLoadSpec,
++    reason: InferenceWorkerLoadReason,
++    previous: InferenceWorkerPlan | null,
++    signal: AbortSignal | undefined,
++    restart: boolean,
++  ): Promise<InferenceWorkerPlan> {
++    this.epochValue += 1;
++    const epoch = this.epochValue;
++    const generation = this.generationValue;
++    if (this.pendingLoad !== null) {
++      this.settleLoad(this.pendingLoad, "superseded");
++    }
++    this.rejectAll("superseded");
++    if (!this.ensureEndpoint(restart)) {
++      this.stateValue = "failed";
++      return rejected("worker_failed");
++    }
++    this.stateValue = "loading";
++    return new Promise<InferenceWorkerPlan>((resolve, reject) => {
++      const pending: PendingLoad = {
++        id: this.nextId++,
++        epoch,
++        generation,
++        spec,
++        previous,
++        resolve,
++        reject,
++        cleanup: noop,
++      };
++      if (signal !== undefined) {
++        const onAbort = () => this.cancelLoad(pending);
++        signal.addEventListener("abort", onAbort, { once: true });
++        pending.cleanup = () => signal.removeEventListener("abort", onAbort);
++      }
++      this.pendingLoad = pending;
++      const posted = this.post({
++        protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++        type: "load",
++        id: pending.id,
++        generation,
++        epoch,
++        reason,
++        spec,
++      });
++      if (!posted) {
++        this.failWorker("worker_failed");
++      }
++    });
++  }
++
++  private admissionError(generation: number): InferenceWorkerErrorCode | null {
++    if (this.generationValue === 0 || generation === 0) {
++      return "not_loaded";
++    }
++    if (generation !== this.generationValue) {
++      return "stale_generation";
++    }
++    switch (this.stateValue) {
++      case "loading":
++      case "ready":
++        return null;
++      case "invalidated":
++        return "plan_invalidated";
++      case "failed":
++        return "worker_failed";
++      case "disposed":
++        return "disposed";
++      case "idle":
++        return "not_loaded";
++    }
++  }
++
++  private pump(): void {
++    if (this.stateValue !== "ready" || this.endpoint === null) {
++      return;
++    }
++    while (this.inFlight.size < this.maxInFlight && this.queue.length > 0) {
++      const request = this.queue.shift();
++      if (request !== undefined) {
++        this.dispatch(request);
++      }
++    }
++  }
++
++  private dispatch(request: PendingRequest): void {
++    const input = encodeTextUnits(request.text ?? "");
++    request.text = null;
++    request.phase = "dispatched";
++    request.epoch = this.epochValue;
++    this.inFlight.set(request.id, request);
++    const posted = this.post(
++      {
++        protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++        type: "infer",
++        id: request.id,
++        epoch: request.epoch,
++        input,
++        callOptions: request.callOptions,
++      },
++      [input],
++    );
++    if (!posted) {
++      this.inFlight.delete(request.id);
++      this.settleRequest(request, "invalid_request");
++    }
++  }
++
++  private cancelRequest(request: PendingRequest): void {
++    if (request.settled) {
++      return;
++    }
++    this.cancelled += 1;
++    if (request.phase === "queued") {
++      const position = this.queue.indexOf(request);
++      if (position !== -1) {
++        this.queue.splice(position, 1);
++      }
++      request.text = null;
++      this.settleRequest(request, "cancelled");
++      return;
++    }
++    request.phase = "draining";
++    this.postCancel(request.id);
++    this.settleRequest(request, "cancelled");
++  }
++
++  private cancelLoad(pending: PendingLoad): void {
++    if (this.pendingLoad !== pending) {
++      return;
++    }
++    this.postCancel(pending.id);
++    this.settleLoad(pending, "cancelled");
++    this.stateValue = pending.previous === null ? "idle" : "invalidated";
++    this.rejectQueued(pending.previous === null ? "not_loaded" : "plan_invalidated");
++  }
++
++  private onMessage(data: unknown): void {
++    if (!isRecord(data) || data.protocol !== INFERENCE_WORKER_PROTOCOL_VERSION) {
++      this.failWorker("protocol_error");
++      return;
++    }
++    switch (data.type) {
++      case "ready":
++        this.onReady(data);
++        return;
++      case "result":
++        this.onResult(data);
++        return;
++      case "error":
++        this.onError(data);
++        return;
++      case "cancelled":
++        this.onCancelled(data);
++        return;
++      case "device_lost":
++        this.onDeviceLost(data);
++        return;
++      case "disposed":
++        return;
++      default:
++        this.failWorker("protocol_error");
++    }
++  }
++
++  private onReady(data: Record<string, unknown>): void {
++    const pending = this.pendingLoad;
++    if (pending === null || data.id !== pending.id) {
++      this.suppressedLateResults += 1;
++      return;
++    }
++    const plan = parsePlan(data.plan);
++    if (plan === null || data.epoch !== pending.epoch) {
++      this.failWorker("protocol_error");
++      return;
++    }
++    if (!this.verifyPlan(plan, pending)) {
++      this.settleLoad(pending, "plan_incompatible");
++      this.stateValue = pending.previous === null ? "idle" : "invalidated";
++      this.rejectQueued(pending.previous === null ? "not_loaded" : "plan_invalidated");
++      return;
++    }
++    this.pendingLoad = null;
++    pending.cleanup();
++    this.verifiedPlan = plan;
++    this.verifiedSpec = pending.spec;
++    this.stateValue = "ready";
++    pending.resolve({ ...plan });
++    this.pump();
++  }
++
++  private onResult(data: Record<string, unknown>): void {
++    const request = this.takeInFlight(data);
++    if (request === null) {
++      return;
++    }
++    const tokens = decodeInferenceTokens(data.tokens);
++    if (tokens === null) {
++      this.settleRequest(request, "protocol_error");
++      this.failWorker("protocol_error");
++      return;
++    }
++    if (!request.settled) {
++      this.completed += 1;
++      request.settled = true;
++      request.cleanup();
++      request.resolve(tokens);
++    }
++    this.pump();
++  }
++
++  private onError(data: Record<string, unknown>): void {
++    const code = isInferenceWorkerErrorCode(data.code) ? data.code : null;
++    if (code === null) {
++      this.failWorker("protocol_error");
++      return;
++    }
++    const pending = this.pendingLoad;
++    if (pending !== null && data.id === pending.id) {
++      this.settleLoad(pending, code);
++      this.stateValue = pending.previous === null ? "idle" : "invalidated";
++      this.rejectQueued(pending.previous === null ? "not_loaded" : "plan_invalidated");
++      return;
++    }
++    const request = this.takeInFlight(data);
++    if (request === null) {
++      return;
++    }
++    this.settleRequest(request, code);
++    this.pump();
++  }
++
++  private onCancelled(data: Record<string, unknown>): void {
++    const request = isPositiveId(data.id) ? this.inFlight.get(data.id) : undefined;
++    if (request === undefined) {
++      return;
++    }
++    if (data.epoch !== request.epoch) {
++      this.failWorker("protocol_error");
++      return;
++    }
++    this.inFlight.delete(request.id);
++    this.settleRequest(request, "cancelled");
++    this.pump();
++  }
++
++  private onDeviceLost(data: Record<string, unknown>): void {
++    if (data.epoch !== this.epochValue || this.stateValue !== "ready") {
++      return;
++    }
++    this.stateValue = "invalidated";
++    this.rejectAll("device_lost");
++  }
++
++  /** Removes the addressed in-flight request; late or stale replies return null. */
++  private takeInFlight(data: Record<string, unknown>): PendingRequest | null {
++    const request = isPositiveId(data.id) ? this.inFlight.get(data.id) : undefined;
++    if (request === undefined) {
++      this.suppressedLateResults += 1;
++      return null;
++    }
++    if (data.epoch !== request.epoch) {
++      this.failWorker("protocol_error");
++      return null;
++    }
++    this.inFlight.delete(request.id);
++    if (request.phase === "draining") {
++      this.suppressedLateResults += 1;
++      this.pump();
++      return null;
++    }
++    return request;
++  }
++
++  private verifyPlan(plan: InferenceWorkerPlan, pending: PendingLoad): boolean {
++    const spec = pending.spec;
++    const previous = pending.previous;
++    const builtIn =
++      plan.generation === pending.generation &&
++      plan.epoch === pending.epoch &&
++      plan.modelRef === spec.modelRef &&
++      (!spec.localOnly || plan.localOnly) &&
++      (spec.allowedBackends === null || spec.allowedBackends.includes(plan.backend)) &&
++      (spec.modelDigest === null || plan.modelDigest === spec.modelDigest) &&
++      (previous === null ||
++        (plan.localOnly &&
++          plan.modelRef === previous.modelRef &&
++          (previous.modelDigest === null ||
++            plan.modelDigest === previous.modelDigest)));
++    if (!builtIn) {
++      return false;
++    }
++    if (this.acceptPlan === undefined) {
++      return true;
++    }
++    try {
++      return (
++        this.acceptPlan(
++          { ...plan },
++          previous === null ? null : { ...previous },
++        ) === true
++      );
++    } catch {
++      return false;
++    }
++  }
++
++  private ensureEndpoint(restart: boolean): boolean {
++    if (this.endpoint !== null && !restart) {
++      return true;
++    }
++    this.releaseEndpoint();
++    let endpoint: InferenceWorkerEndpoint;
++    try {
++      endpoint = this.createWorker();
++    } catch {
++      return false;
++    }
++    const listeners: ListenerSet = {
++      message: (event) => this.onMessage(event?.data),
++      messageerror: () => this.failWorker("protocol_error"),
++      error: (event) => {
++        // Cancel default reporting so a worker error message never reaches
++        // the console; the client only surfaces a controlled code.
++        try {
++          event?.preventDefault?.();
++        } catch {
++          // Ignore hosts whose error events cannot be cancelled.
++        }
++        this.failWorker("worker_failed");
++      },
++    };
++    try {
++      endpoint.addEventListener("message", listeners.message);
++      endpoint.addEventListener("messageerror", listeners.messageerror);
++      endpoint.addEventListener("error", listeners.error);
++    } catch {
++      terminate(endpoint);
++      return false;
++    }
++    this.endpoint = endpoint;
++    this.listeners = listeners;
++    this.workerStarts += 1;
++    return true;
++  }
++
++  private releaseEndpoint(): void {
++    const endpoint = this.endpoint;
++    const listeners = this.listeners;
++    this.endpoint = null;
++    this.listeners = null;
++    if (endpoint === null) {
++      return;
++    }
++    if (listeners !== null) {
++      for (const type of ["message", "messageerror", "error"] as const) {
++        try {
++          endpoint.removeEventListener(type, listeners[type]);
++        } catch {
++          // Listener removal is best effort during teardown.
++        }
++      }
++    }
++    terminate(endpoint);
++  }
++
++  private failWorker(code: InferenceWorkerErrorCode): void {
++    if (this.stateValue === "disposed") {
++      return;
++    }
++    this.releaseEndpoint();
++    this.epochValue += 1;
++    this.stateValue = "failed";
++    if (this.pendingLoad !== null) {
++      this.settleLoad(this.pendingLoad, code);
++    }
++    this.rejectAll(code);
++  }
++
++  private rejectAll(code: InferenceWorkerErrorCode): void {
++    const inFlight = [...this.inFlight.values()];
++    this.inFlight.clear();
++    for (const request of inFlight) {
++      this.settleRequest(request, code);
++    }
++    this.rejectQueued(code);
++  }
++
++  private rejectQueued(code: InferenceWorkerErrorCode): void {
++    const queued = this.queue;
++    this.queue = [];
++    for (const request of queued) {
++      request.text = null;
++      this.settleRequest(request, code);
++    }
++  }
++
++  private settleRequest(request: PendingRequest, code: InferenceWorkerErrorCode): void {
++    if (request.settled) {
++      return;
++    }
++    request.settled = true;
++    request.cleanup();
++    request.reject(new InferenceWorkerError(code));
++  }
++
++  private settleLoad(pending: PendingLoad, code: InferenceWorkerErrorCode): void {
++    if (this.pendingLoad === pending) {
++      this.pendingLoad = null;
++    }
++    pending.cleanup();
++    pending.reject(new InferenceWorkerError(code));
++  }
++
++  private postCancel(id: number): void {
++    this.post({ protocol: INFERENCE_WORKER_PROTOCOL_VERSION, type: "cancel", id });
++  }
++
++  private post(message: HostToWorkerMessage, transfer: ArrayBuffer[] = []): boolean {
++    if (this.endpoint === null) {
++      return false;
++    }
++    try {
++      this.endpoint.postMessage(message, transfer);
++      return true;
++    } catch {
++      return false;
++    }
++  }
++}
++
++/**
++ * Creates an {@link InferenceWorkerClient}.
++ *
++ * Args:
++ *   options: Worker factory and queue bounds.
++ *
++ * Returns:
++ *   A client in the `idle` state; call `load()` before running requests.
++ */
++export function createInferenceWorkerClient(
++  options: InferenceWorkerClientOptions,
++): InferenceWorkerClient {
++  return new InferenceWorkerClient(options);
++}
++
++function normalizeLoadSpec(
++  spec: InferenceWorkerLoadSpec,
++): NormalizedInferenceWorkerLoadSpec | null {
++  if (!isRecord(spec)) {
++    return null;
++  }
++  const { modelRef, allowedBackends, modelDigest } = spec;
++  const localOnly = spec.localOnly ?? true;
++  const options = spec.options ?? {};
++  if (
++    typeof modelRef !== "string" ||
++    modelRef.trim().length === 0 ||
++    typeof localOnly !== "boolean" ||
++    !(
++      allowedBackends === undefined ||
++      (Array.isArray(allowedBackends) &&
++        allowedBackends.length > 0 &&
++        allowedBackends.every((backend) => typeof backend === "string"))
++    ) ||
++    !(modelDigest === undefined || typeof modelDigest === "string") ||
++    !isRecord(options) ||
++    !isPlainData(options)
++  ) {
++    return null;
++  }
++  if (localOnly && !isOfflineModelRef(modelRef)) {
++    return null;
++  }
++  return {
++    modelRef,
++    localOnly,
++    allowedBackends: allowedBackends === undefined ? null : [...allowedBackends],
++    modelDigest: modelDigest ?? null,
++    options: { ...options },
++  };
++}
++
++function parsePlan(value: unknown): InferenceWorkerPlan | null {
++  if (!isRecord(value)) {
++    return null;
++  }
++  const { protocol, generation, epoch, modelRef, backend, localOnly, modelDigest } =
++    value;
++  if (
++    protocol !== INFERENCE_WORKER_PROTOCOL_VERSION ||
++    !isPositiveId(generation) ||
++    !isPositiveId(epoch) ||
++    typeof modelRef !== "string" ||
++    typeof backend !== "string" ||
++    typeof localOnly !== "boolean" ||
++    !(modelDigest === null || typeof modelDigest === "string")
++  ) {
++    return null;
++  }
++  return {
++    protocol,
++    generation,
++    epoch,
++    modelRef,
++    backend,
++    localOnly,
++    modelDigest,
++  };
++}
++
++function rejected<T>(code: InferenceWorkerErrorCode): Promise<T> {
++  return Promise.reject(new InferenceWorkerError(code));
++}
++
++function terminate(endpoint: InferenceWorkerEndpoint): void {
++  try {
++    endpoint.terminate?.();
++  } catch {
++    // Termination is best effort; the endpoint is no longer referenced.
++  }
++}
++
++function noop(): void {}
+diff --git a/js/openmedkit-web/src/worker/protocol.ts b/js/openmedkit-web/src/worker/protocol.ts
+new file mode 100644
+index 0000000000..4575eaad0a
+--- /dev/null
++++ b/js/openmedkit-web/src/worker/protocol.ts
+@@ -0,0 +1,446 @@
++import { assertOfflineAssetPath } from "../runtime/ort-web-loader";
++import type { TokenClassificationEntity } from "../types";
++
++/** Version of the host/worker message protocol; both sides must agree. */
++export const INFERENCE_WORKER_PROTOCOL_VERSION = 1 as const;
++
++/** Default number of requests that may wait on the host before admission fails. */
++export const DEFAULT_INFERENCE_WORKER_MAX_QUEUE_SIZE = 16;
++
++/** Default number of requests the host keeps outstanding in the worker. */
++export const DEFAULT_INFERENCE_WORKER_MAX_IN_FLIGHT = 1;
++
++/** Default per-request input bound, in UTF-16 code units. */
++export const DEFAULT_INFERENCE_WORKER_MAX_INPUT_CHARS = 1_000_000;
++
++/**
++ * Value-free failure codes shared by the worker client and server.
++ *
++ * Errors carry one of these codes and a fixed message. They never include
++ * input text, model output, file paths, or the message of an underlying error.
++ */
++export const INFERENCE_WORKER_ERROR_CODES = [
++  "alignment_failed",
++  "cancelled",
++  "device_lost",
++  "disposed",
++  "inference_failed",
++  "input_too_large",
++  "invalid_request",
++  "load_failed",
++  "not_loaded",
++  "plan_incompatible",
++  "plan_invalidated",
++  "protocol_error",
++  "queue_full",
++  "stale_generation",
++  "superseded",
++  "worker_failed",
++] as const;
++
++export type InferenceWorkerErrorCode =
++  (typeof INFERENCE_WORKER_ERROR_CODES)[number];
++
++const ERROR_MESSAGES: Readonly<Record<InferenceWorkerErrorCode, string>> = {
++  alignment_failed:
++    "Inference worker could not align token offsets; provide source offsets.",
++  cancelled: "Inference worker request was cancelled.",
++  device_lost: "Inference worker lost its GPU device; recover before reuse.",
++  disposed: "Inference worker client was disposed.",
++  inference_failed: "Inference worker could not complete the request.",
++  input_too_large: "Inference worker input exceeds the configured size limit.",
++  invalid_request: "Inference worker request is invalid.",
++  load_failed: "Inference worker could not load the model.",
++  not_loaded: "Inference worker has no verified execution plan.",
++  plan_incompatible: "Inference worker execution plan failed verification.",
++  plan_invalidated:
++    "Inference worker execution plan was invalidated; recover before reuse.",
++  protocol_error: "Inference worker sent a malformed message.",
++  queue_full: "Inference worker queue is full.",
++  stale_generation:
++    "Inference worker request targets a model generation that is no longer loaded.",
++  superseded: "Inference worker request was superseded by a newer model load.",
++  worker_failed: "Inference worker failed; recover before reuse.",
++};
++
++const ERROR_CODE_SET: ReadonlySet<string> = new Set(INFERENCE_WORKER_ERROR_CODES);
++
++/**
++ * Typed, value-free failure raised by the inference worker client or server.
++ *
++ * The message is fixed per `code`, so it is safe to log. No `cause` is attached.
++ */
++export class InferenceWorkerError extends Error {
++  /** Stable machine-readable reason. */
++  readonly code: InferenceWorkerErrorCode;
++
++  /**
++   * Creates an error for a controlled failure code.
++   *
++   * Args:
++   *   code: The value-free reason for the failure.
++   */
++  constructor(code: InferenceWorkerErrorCode) {
++    super(ERROR_MESSAGES[code]);
++    this.name = "InferenceWorkerError";
++    this.code = code;
++  }
++}
++
++/** Returns whether `value` is one of the controlled worker error codes. */
++export function isInferenceWorkerErrorCode(
++  value: unknown,
++): value is InferenceWorkerErrorCode {
++  return typeof value === "string" && ERROR_CODE_SET.has(value);
++}
++
++/** Why the worker is being asked to load a runtime. */
++export type InferenceWorkerLoadReason = "load" | "recover";
++
++/** Structured-clone-safe description of the model the worker should load. */
++export interface InferenceWorkerLoadSpec {
++  /** Model id or local path passed to the worker's `load` handler. */
++  modelRef: string;
++  /** Require a local-only runtime (no remote model fetches). Defaults to true. */
++  localOnly?: boolean;
++  /** Backends the host accepts, for example `["webgpu", "wasm-basic"]`. */
++  allowedBackends?: readonly string[];
++  /** Expected model digest; the reported plan must match when set. */
++  modelDigest?: string;
++  /** Handler-specific plain data (strings, numbers, booleans, arrays, objects). */
++  options?: Readonly<Record<string, unknown>>;
++}
++
++/** Normalised load spec as it crosses the worker boundary. */
++export interface NormalizedInferenceWorkerLoadSpec {
++  modelRef: string;
++  localOnly: boolean;
++  allowedBackends: string[] | null;
++  modelDigest: string | null;
++  options: Record<string, unknown>;
++}
++
++/** Verified execution plan reported by the worker for one load. */
++export interface InferenceWorkerPlan {
++  protocol: typeof INFERENCE_WORKER_PROTOCOL_VERSION;
++  /** Model generation: changes on every `load()`, kept across `recover()`. */
++  generation: number;
++  /** Plan epoch: changes on every load and recovery. */
++  epoch: number;
++  modelRef: string;
++  backend: string;
++  localOnly: boolean;
++  modelDigest: string | null;
++}
++
++/** Columnar, transferable encoding of aligned token-classification output. */
++export interface EncodedInferenceTokens {
++  count: number;
++  labels: string[];
++  entity: Int32Array;
++  entityGroup: Int32Array;
++  start: Float64Array;
++  end: Float64Array;
++  score: Float64Array;
++  index: Float64Array;
++  flags: Uint8Array;
++}
++
++export type HostToWorkerMessage =
++  | {
++      protocol: typeof INFERENCE_WORKER_PROTOCOL_VERSION;
++      type: "load";
++      id: number;
++      generation: number;
++      epoch: number;
++      reason: InferenceWorkerLoadReason;
++      spec: NormalizedInferenceWorkerLoadSpec;
++    }
++  | {
++      protocol: typeof INFERENCE_WORKER_PROTOCOL_VERSION;
++      type: "infer";
++      id: number;
++      epoch: number;
++      input: ArrayBuffer;
++      callOptions: Record<string, unknown>;
++    }
++  | {
++      protocol: typeof INFERENCE_WORKER_PROTOCOL_VERSION;
++      type: "cancel";
++      id: number;
++    }
++  | {
++      protocol: typeof INFERENCE_WORKER_PROTOCOL_VERSION;
++      type: "dispose";
++    };
++
++export type WorkerToHostMessage =
++  | {
++      protocol: typeof INFERENCE_WORKER_PROTOCOL_VERSION;
++      type: "ready";
++      id: number;
++      epoch: number;
++      plan: InferenceWorkerPlan;
++    }
++  | {
++      protocol: typeof INFERENCE_WORKER_PROTOCOL_VERSION;
++      type: "result";
++      id: number;
++      epoch: number;
++      tokens: EncodedInferenceTokens;
++    }
++  | {
++      protocol: typeof INFERENCE_WORKER_PROTOCOL_VERSION;
++      type: "error";
++      id: number;
++      epoch: number;
++      code: InferenceWorkerErrorCode;
++    }
++  | {
++      protocol: typeof INFERENCE_WORKER_PROTOCOL_VERSION;
++      type: "cancelled";
++      id: number;
++      epoch: number;
++    }
++  | {
++      protocol: typeof INFERENCE_WORKER_PROTOCOL_VERSION;
++      type: "device_lost";
++      epoch: number;
++    }
++  | {
++      protocol: typeof INFERENCE_WORKER_PROTOCOL_VERSION;
++      type: "disposed";
++    };
++
++const FLAG_SCORE = 1;
++const FLAG_INDEX = 2;
++const MAX_PLAIN_DATA_DEPTH = 32;
++const DECODE_CHUNK = 8192;
++
++/** Copies text into a fresh UTF-16 code-unit buffer so it can be transferred. */
++export function encodeTextUnits(text: string): ArrayBuffer {
++  const units = new Uint16Array(text.length);
++  for (let offset = 0; offset < text.length; offset += 1) {
++    units[offset] = text.charCodeAt(offset);
++  }
++  return units.buffer;
++}
++
++/** Rebuilds the exact source string, lone surrogates included. */
++export function decodeTextUnits(buffer: ArrayBuffer): string {
++  const units = new Uint16Array(buffer);
++  let text = "";
++  for (let offset = 0; offset < units.length; offset += DECODE_CHUNK) {
++    text += String.fromCharCode(...units.subarray(offset, offset + DECODE_CHUNK));
++  }
++  return text;
++}
++
++/**
++ * Packs aligned tokens into typed-array columns; token surface text is dropped.
++ *
++ * Only labels, scores, token indices, and character offsets cross the boundary.
++ */
++export function encodeInferenceTokens(tokens: readonly TokenClassificationEntity[]): {
++  tokens: EncodedInferenceTokens;
++  transfer: ArrayBuffer[];
++} {
++  const count = tokens.length;
++  const labels: string[] = [];
++  const labelIds = new Map<string, number>();
++  const labelId = (label: unknown): number => {
++    if (typeof label !== "string") {
++      return -1;
++    }
++    let id = labelIds.get(label);
++    if (id === undefined) {
++      id = labels.length;
++      labels.push(label);
++      labelIds.set(label, id);
++    }
++    return id;
++  };
++  const entity = new Int32Array(count);
++  const entityGroup = new Int32Array(count);
++  const start = new Float64Array(count);
++  const end = new Float64Array(count);
++  const score = new Float64Array(count);
++  const index = new Float64Array(count);
++  const flags = new Uint8Array(count);
++  tokens.forEach((token, position) => {
++    entity[position] = labelId(token.entity);
++    entityGroup[position] = labelId(token.entity_group);
++    start[position] = Number(token.start);
++    end[position] = Number(token.end);
++    let tokenFlags = 0;
++    if (typeof token.score === "number") {
++      score[position] = token.score;
++      tokenFlags |= FLAG_SCORE;
++    }
++    if (typeof token.index === "number") {
++      index[position] = token.index;
++      tokenFlags |= FLAG_INDEX;
++    }
++    flags[position] = tokenFlags;
++  });
++  return {
++    tokens: { count, labels, entity, entityGroup, start, end, score, index, flags },
++    transfer: [
++      entity.buffer,
++      entityGroup.buffer,
++      start.buffer,
++      end.buffer,
++      score.buffer,
++      index.buffer,
++      flags.buffer,
++    ],
++  };
++}
++
++/** Rebuilds token entities from columns, or returns null for malformed data. */
++export function decodeInferenceTokens(
++  value: unknown,
++): TokenClassificationEntity[] | null {
++  if (!isRecord(value)) {
++    return null;
++  }
++  const { count, labels } = value;
++  if (!isCount(count) || !Array.isArray(labels)) {
++    return null;
++  }
++  if (!labels.every((label) => typeof label === "string")) {
++    return null;
++  }
++  const entity = value.entity;
++  const entityGroup = value.entityGroup;
++  const start = value.start;
++  const end = value.end;
++  const score = value.score;
++  const index = value.index;
++  const flags = value.flags;
++  if (
++    !(entity instanceof Int32Array) ||
++    !(entityGroup instanceof Int32Array) ||
++    !(start instanceof Float64Array) ||
++    !(end instanceof Float64Array) ||
++    !(score instanceof Float64Array) ||
++    !(index instanceof Float64Array) ||
++    !(flags instanceof Uint8Array) ||
++    [entity, entityGroup, start, end, score, index, flags].some(
++      (column) => column.length !== count,
++    )
++  ) {
++    return null;
++  }
++  const labelAt = (id: number): string | undefined | null => {
++    if (id === -1) {
++      return undefined;
++    }
++    const label = labels[id] as string | undefined;
++    return label === undefined ? null : label;
++  };
++  const tokens: TokenClassificationEntity[] = [];
++  for (let position = 0; position < count; position += 1) {
++    const entityLabel = labelAt(entity[position] as number);
++    const groupLabel = labelAt(entityGroup[position] as number);
++    if (entityLabel === null || groupLabel === null) {
++      return null;
++    }
++    const token: TokenClassificationEntity = {
++      start: start[position] as number,
++      end: end[position] as number,
++    };
++    if (entityLabel !== undefined) {
++      token.entity = entityLabel;
++    }
++    if (groupLabel !== undefined) {
++      token.entity_group = groupLabel;
++    }
++    const tokenFlags = flags[position] as number;
++    if ((tokenFlags & FLAG_SCORE) !== 0) {
++      token.score = score[position] as number;
++    }
++    if ((tokenFlags & FLAG_INDEX) !== 0) {
++      token.index = index[position] as number;
++    }
++    tokens.push(token);
++  }
++  return tokens;
++}
++
++/** Returns whether a value is a plain, structured-clone-safe data tree. */
++export function isPlainData(value: unknown): boolean {
++  return isPlainDataAt(value, new Set<object>(), 0);
++}
++
++function isPlainDataAt(value: unknown, seen: Set<object>, depth: number): boolean {
++  if (value === null) {
++    return true;
++  }
++  switch (typeof value) {
++    case "string":
++    case "number":
++    case "boolean":
++    case "bigint":
++    case "undefined":
++      return true;
++    case "object":
++      break;
++    default:
++      return false;
++  }
++  const node = value as object;
++  if (depth >= MAX_PLAIN_DATA_DEPTH || seen.has(node)) {
++    return false;
++  }
++  seen.add(node);
++  let plain: boolean;
++  if (Array.isArray(node)) {
++    plain = node.every((entry) => isPlainDataAt(entry, seen, depth + 1));
++  } else {
++    const prototype = Object.getPrototypeOf(node) as unknown;
++    plain =
++      (prototype === Object.prototype || prototype === null) &&
++      Object.values(node).every((entry) => isPlainDataAt(entry, seen, depth + 1));
++  }
++  seen.delete(node);
++  return plain;
++}
++
++/** Returns whether a model reference avoids remote URL schemes. */
++export function isOfflineModelRef(modelRef: string): boolean {
++  try {
++    assertOfflineAssetPath(modelRef, "model reference");
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++/** Returns whether a value is a non-null, non-array object. */
++export function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++/** Returns whether a value is a positive safe integer message id or epoch. */
++export function isPositiveId(value: unknown): value is number {
++  return Number.isSafeInteger(value) && (value as number) > 0;
++}
++
++function isCount(value: unknown): value is number {
++  return Number.isSafeInteger(value) && (value as number) >= 0;
++}
++
++/** Validates a positive integer bound, falling back to a default. */
++export function resolveBound(
++  value: number | undefined,
++  fallback: number,
++): number {
++  if (value === undefined) {
++    return fallback;
++  }
++  if (!Number.isSafeInteger(value) || value < 1) {
++    throw new RangeError("Inference worker bounds must be positive integers.");
++  }
++  return value;
++}
+diff --git a/js/openmedkit-web/src/worker/server.ts b/js/openmedkit-web/src/worker/server.ts
+new file mode 100644
+index 0000000000..64261c08b5
+--- /dev/null
++++ b/js/openmedkit-web/src/worker/server.ts
+@@ -0,0 +1,779 @@
++import { flattenTokenClassificationOutput } from "../decoder";
++import { alignTokenOffsets } from "../offsets";
++import type {
++  RawTokenClassificationOutput,
++  TokenClassificationCallOptions,
++  TokenClassificationEntity,
++} from "../types";
++import {
++  DEFAULT_INFERENCE_WORKER_MAX_INPUT_CHARS,
++  DEFAULT_INFERENCE_WORKER_MAX_QUEUE_SIZE,
++  INFERENCE_WORKER_PROTOCOL_VERSION,
++  InferenceWorkerError,
++  decodeTextUnits,
++  encodeInferenceTokens,
++  isOfflineModelRef,
++  isPlainData,
++  isPositiveId,
++  isRecord,
++  resolveBound,
++  type HostToWorkerMessage,
++  type InferenceWorkerErrorCode,
++  type InferenceWorkerLoadReason,
++  type InferenceWorkerPlan,
++  type NormalizedInferenceWorkerLoadSpec,
++  type WorkerToHostMessage,
++} from "./protocol";
++
++/** Per-request context handed to a worker pipeline. */
++export interface InferenceWorkerRunContext {
++  /** Aborted when the host cancels the request or the plan is invalidated. */
++  signal: AbortSignal;
++}
++
++/**
++ * Token-classification pipeline that runs inside the worker.
++ *
++ * Any `RawTokenClassificationPipeline` fits; pipelines that can stop early may
++ * also observe the third `context.signal` argument.
++ */
++export type InferenceWorkerPipeline = (
++  text: string,
++  options?: TokenClassificationCallOptions,
++  context?: InferenceWorkerRunContext,
++) => RawTokenClassificationOutput | Promise<RawTokenClassificationOutput>;
++
++/** Runtime returned by the worker's `load` handler. */
++export interface InferenceWorkerRuntime {
++  /** Pipeline that tokenizes and classifies text inside the worker. */
++  pipeline: InferenceWorkerPipeline;
++  /** Selected backend, for example `"webgpu"` or `"wasm-basic"`. */
++  backend: string;
++  /** True only when the runtime makes no remote model or asset requests. */
++  localOnly: boolean;
++  /** Optional digest of the loaded model artifact for plan verification. */
++  modelDigest?: string | null;
++  /** Settles when the GPU device is lost, for example `GPUDevice.lost`. */
++  deviceLost?: PromiseLike<unknown>;
++  /** Releases the runtime; defaults to `pipeline.dispose()` when present. */
++  dispose?: () => void | Promise<void>;
++}
++
++/** Context passed to the worker's `load` handler. */
++export interface InferenceWorkerLoadContext {
++  /** Model generation owning this runtime. */
++  generation: number;
++  /** Plan epoch assigned by the host for this load. */
++  epoch: number;
++  /** `"recover"` after device loss, invalidation, or a worker restart. */
++  reason: InferenceWorkerLoadReason;
++  /** Aborted when the load is cancelled or superseded. */
++  signal: AbortSignal;
++}
++
++/** Minimal dedicated-worker scope used by the server. */
++export interface InferenceWorkerScope {
++  postMessage(message: unknown, transfer: Transferable[]): void;
++  addEventListener(
++    type: "message",
++    listener: (event: { data?: unknown }) => void,
++  ): void;
++  removeEventListener(
++    type: "message",
++    listener: (event: { data?: unknown }) => void,
++  ): void;
++  close?(): void;
++}
++
++/** Options for {@link serveInferenceWorker}. */
++export interface ServeInferenceWorkerOptions {
++  /** Loads a runtime for a verified, normalised load spec. */
++  load: (
++    spec: NormalizedInferenceWorkerLoadSpec,
++    context: InferenceWorkerLoadContext,
++  ) => InferenceWorkerRuntime | Promise<InferenceWorkerRuntime>;
++  /** Worker scope; defaults to `globalThis` inside a dedicated worker. */
++  scope?: InferenceWorkerScope;
++  /** Requests the worker holds before replying `queue_full`. Defaults to 16. */
++  maxQueueSize?: number;
++  /** Per-request input bound in UTF-16 code units. Defaults to 1,000,000. */
++  maxInputChars?: number;
++  /** Close the scope after a host `dispose` message. Defaults to true. */
++  closeOnDispose?: boolean;
++}
++
++/** Value-free counters describing the worker server. */
++export interface InferenceWorkerServerStats {
++  loaded: boolean;
++  epoch: number;
++  queued: number;
++  running: boolean;
++  completed: number;
++  cancelled: number;
++  failed: number;
++}
++
++/** Handle returned by {@link serveInferenceWorker}. */
++export interface InferenceWorkerServer {
++  /** Returns value-free counters; never includes input text or model refs. */
++  stats(): InferenceWorkerServerStats;
++  /** Stops listening, cancels queued work and releases the runtime. */
++  close(): Promise<void>;
++}
++
++interface InferJob {
++  id: number;
++  epoch: number;
++  input: ArrayBuffer | null;
++  callOptions: Record<string, unknown>;
++  controller: AbortController;
++  cancelled: boolean;
++  supersededBy: InferenceWorkerErrorCode | null;
++}
++
++interface LoadJob {
++  controller: AbortController;
++  cancelled: boolean;
++}
++
++type ParsedHostMessage =
++  | { ok: true; message: HostToWorkerMessage }
++  | { ok: false; id: number; epoch: number; code: InferenceWorkerErrorCode };
++
++const HANDLER_ERROR_CODES: ReadonlySet<InferenceWorkerErrorCode> = new Set([
++  "alignment_failed",
++  "cancelled",
++  "device_lost",
++  "inference_failed",
++  "input_too_large",
++  "invalid_request",
++  "load_failed",
++  "plan_incompatible",
++]);
++
++const MAX_MODEL_REF_CHARS = 4096;
++
++/**
++ * Serves OpenMed token-classification requests from inside a dedicated worker.
++ *
++ * The server runs one request at a time from a bounded queue, aborts work the
++ * host cancels, never posts results for cancelled or superseded requests,
++ * invalidates its runtime on GPU device loss, and reports failures only as
++ * controlled codes. It never logs, stores, or echoes input text.
++ *
++ * Args:
++ *   options: The runtime loader, optional scope, and queue bounds.
++ *
++ * Returns:
++ *   A handle exposing value-free stats and an explicit `close()`.
++ *
++ * Raises:
++ *   TypeError: If no worker scope is available.
++ *   RangeError: If a bound is not a positive integer.
++ */
++export function serveInferenceWorker(
++  options: ServeInferenceWorkerOptions,
++): InferenceWorkerServer {
++  if (typeof options?.load !== "function") {
++    throw new TypeError("serveInferenceWorker requires a load handler.");
++  }
++  const scope = options.scope ?? defaultScope();
++  const server = new InferenceWorkerServerImpl(scope, options);
++  return {
++    stats: () => server.stats(),
++    close: () => server.close(),
++  };
++}
++
++class InferenceWorkerServerImpl {
++  private readonly scope: InferenceWorkerScope;
++  private readonly loadRuntime: ServeInferenceWorkerOptions["load"];
++  private readonly maxQueueSize: number;
++  private readonly maxInputChars: number;
++  private readonly closeOnDispose: boolean;
++  private readonly listener: (event: { data?: unknown }) => void;
++  private runtime: InferenceWorkerRuntime | null = null;
++  private epoch = 0;
++  private lostEpoch = 0;
++  private latestLoadEpoch = 0;
++  private readonly loads = new Map<number, LoadJob>();
++  private lane: Promise<void> = Promise.resolve();
++  private queue: InferJob[] = [];
++  private running: InferJob | null = null;
++  private runningDone: Promise<void> = Promise.resolve();
++  private closed = false;
++  private completed = 0;
++  private cancelledCount = 0;
++  private failed = 0;
++
++  constructor(scope: InferenceWorkerScope, options: ServeInferenceWorkerOptions) {
++    this.scope = scope;
++    this.loadRuntime = options.load;
++    this.maxQueueSize = resolveBound(
++      options.maxQueueSize,
++      DEFAULT_INFERENCE_WORKER_MAX_QUEUE_SIZE,
++    );
++    this.maxInputChars = resolveBound(
++      options.maxInputChars,
++      DEFAULT_INFERENCE_WORKER_MAX_INPUT_CHARS,
++    );
++    this.closeOnDispose = options.closeOnDispose ?? true;
++    this.listener = (event) => this.onMessage(event?.data);
++    scope.addEventListener("message", this.listener);
++  }
++
++  stats(): InferenceWorkerServerStats {
++    return {
++      loaded: this.runtime !== null,
++      epoch: this.runtime === null ? 0 : this.epoch,
++      queued: this.queue.length,
++      running: this.running !== null,
++      completed: this.completed,
++      cancelled: this.cancelledCount,
++      failed: this.failed,
++    };
++  }
++
++  close(): Promise<void> {
++    if (!this.closed) {
++      this.closed = true;
++      this.scope.removeEventListener("message", this.listener);
++      this.shutdown(false);
++    }
++    return this.lane;
++  }
++
++  private onMessage(data: unknown): void {
++    if (this.closed) {
++      return;
++    }
++    const parsed = this.parse(data);
++    if (!parsed.ok) {
++      this.post({
++        protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++        type: "error",
++        id: parsed.id,
++        epoch: parsed.epoch,
++        code: parsed.code,
++      });
++      return;
++    }
++    const message = parsed.message;
++    switch (message.type) {
++      case "load":
++        this.onLoad(message);
++        return;
++      case "infer":
++        this.onInfer(message);
++        return;
++      case "cancel":
++        this.onCancel(message.id);
++        return;
++      case "dispose":
++        this.closed = true;
++        this.shutdown(true);
++        return;
++    }
++  }
++
++  private onLoad(message: Extract<HostToWorkerMessage, { type: "load" }>): void {
++    this.latestLoadEpoch = Math.max(this.latestLoadEpoch, message.epoch);
++    for (const load of this.loads.values()) {
++      load.controller.abort();
++    }
++    this.supersedeWork("superseded");
++    const job: LoadJob = { controller: new AbortController(), cancelled: false };
++    this.loads.set(message.id, job);
++    this.enqueueLane(async () => {
++      try {
++        await this.performLoad(message, job);
++      } finally {
++        this.loads.delete(message.id);
++      }
++    });
++  }
++
++  private async performLoad(
++    message: Extract<HostToWorkerMessage, { type: "load" }>,
++    job: LoadJob,
++  ): Promise<void> {
++    await this.runningDone;
++    await this.releaseRuntime();
++    const interrupted = (): InferenceWorkerErrorCode | null => {
++      if (job.cancelled) {
++        return "cancelled";
++      }
++      if (job.controller.signal.aborted || message.epoch !== this.latestLoadEpoch) {
++        return "superseded";
++      }
++      return this.closed ? "disposed" : null;
++    };
++    const early = interrupted();
++    if (early !== null) {
++      this.postError(message.id, message.epoch, early);
++      return;
++    }
++    let runtime: InferenceWorkerRuntime;
++    try {
++      runtime = await this.loadRuntime(message.spec, {
++        generation: message.generation,
++        epoch: message.epoch,
++        reason: message.reason,
++        signal: job.controller.signal,
++      });
++    } catch (error) {
++      this.postError(
++        message.id,
++        message.epoch,
++        interrupted() ?? handlerErrorCode(error, "load_failed"),
++      );
++      return;
++    }
++    const late = interrupted();
++    if (late !== null) {
++      await disposeRuntime(runtime);
++      this.postError(message.id, message.epoch, late);
++      return;
++    }
++    const plan = verifyRuntime(runtime, message);
++    if (typeof plan === "string") {
++      await disposeRuntime(runtime);
++      this.postError(message.id, message.epoch, plan);
++      return;
++    }
++    this.runtime = runtime;
++    this.epoch = message.epoch;
++    this.watchDeviceLoss(runtime, message.epoch);
++    this.post({
++      protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++      type: "ready",
++      id: message.id,
++      epoch: message.epoch,
++      plan,
++    });
++  }
++
++  private onInfer(message: Extract<HostToWorkerMessage, { type: "infer" }>): void {
++    if (this.runtime === null) {
++      const code = message.epoch === this.lostEpoch ? "device_lost" : "not_loaded";
++      this.postError(message.id, message.epoch, code);
++      return;
++    }
++    if (message.epoch !== this.epoch || this.latestLoadEpoch !== this.epoch) {
++      this.postError(message.id, message.epoch, "stale_generation");
++      return;
++    }
++    if (this.queue.length >= this.maxQueueSize) {
++      this.postError(message.id, message.epoch, "queue_full");
++      return;
++    }
++    this.queue.push({
++      id: message.id,
++      epoch: message.epoch,
++      input: message.input,
++      callOptions: message.callOptions,
++      controller: new AbortController(),
++      cancelled: false,
++      supersededBy: null,
++    });
++    this.pump();
++  }
++
++  private onCancel(id: number): void {
++    const load = this.loads.get(id);
++    if (load !== undefined) {
++      load.cancelled = true;
++      load.controller.abort();
++      return;
++    }
++    const queued = this.queue.findIndex((job) => job.id === id);
++    if (queued !== -1) {
++      const [job] = this.queue.splice(queued, 1);
++      if (job !== undefined) {
++        job.input = null;
++        this.cancelledCount += 1;
++        this.post({
++          protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++          type: "cancelled",
++          id: job.id,
++          epoch: job.epoch,
++        });
++      }
++      return;
++    }
++    if (this.running?.id === id) {
++      this.running.cancelled = true;
++      this.running.controller.abort();
++    }
++  }
++
++  private pump(): void {
++    const runtime = this.runtime;
++    if (this.running !== null || runtime === null) {
++      return;
++    }
++    const job = this.queue.shift();
++    if (job === undefined) {
++      return;
++    }
++    this.running = job;
++    this.runningDone = this.execute(job, runtime).then(
++      () => this.finishJob(job),
++      () => this.finishJob(job),
++    );
++  }
++
++  private finishJob(job: InferJob): void {
++    if (this.running === job) {
++      this.running = null;
++    }
++    this.pump();
++  }
++
++  private async execute(job: InferJob, runtime: InferenceWorkerRuntime): Promise<void> {
++    let aligned: TokenClassificationEntity[] | null = null;
++    let code: InferenceWorkerErrorCode | null = null;
++    let text: string | null = decodeTextUnits(job.input ?? new ArrayBuffer(0));
++    job.input = null;
++    try {
++      const output = await runtime.pipeline(
++        text,
++        job.callOptions as TokenClassificationCallOptions,
++        { signal: job.controller.signal },
++      );
++      if (!Array.isArray(output)) {
++        code = "inference_failed";
++      } else if (!job.controller.signal.aborted) {
++        try {
++          aligned = alignTokenOffsets(text, flattenTokenClassificationOutput(output));
++        } catch {
++          code = "alignment_failed";
++        }
++      }
++    } catch (error) {
++      code = handlerErrorCode(error, "inference_failed");
++    } finally {
++      text = null;
++    }
++
++    if (job.cancelled) {
++      this.cancelledCount += 1;
++      this.post({
++        protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++        type: "cancelled",
++        id: job.id,
++        epoch: job.epoch,
++      });
++      return;
++    }
++    if (job.supersededBy !== null) {
++      this.postError(job.id, job.epoch, job.supersededBy);
++      return;
++    }
++    if (code === "device_lost") {
++      this.onDeviceLost(runtime, job.epoch);
++    }
++    if (code !== null || aligned === null) {
++      this.failed += 1;
++      this.postError(job.id, job.epoch, code ?? "inference_failed");
++      return;
++    }
++    const encoded = encodeInferenceTokens(aligned);
++    const posted = this.post(
++      {
++        protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++        type: "result",
++        id: job.id,
++        epoch: job.epoch,
++        tokens: encoded.tokens,
++      },
++      encoded.transfer,
++    );
++    if (posted) {
++      this.completed += 1;
++    } else {
++      this.failed += 1;
++      this.postError(job.id, job.epoch, "inference_failed");
++    }
++  }
++
++  private watchDeviceLoss(runtime: InferenceWorkerRuntime, epoch: number): void {
++    if (runtime.deviceLost === undefined || runtime.deviceLost === null) {
++      return;
++    }
++    const lost = () => this.onDeviceLost(runtime, epoch);
++    Promise.resolve(runtime.deviceLost).then(lost, lost);
++  }
++
++  private onDeviceLost(runtime: InferenceWorkerRuntime, epoch: number): void {
++    if (this.runtime !== runtime || this.epoch !== epoch) {
++      return;
++    }
++    this.runtime = null;
++    this.lostEpoch = epoch;
++    this.supersedeWork("device_lost");
++    this.post({
++      protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++      type: "device_lost",
++      epoch,
++    });
++    this.enqueueLane(async () => {
++      await this.runningDone;
++      await disposeRuntime(runtime);
++    });
++  }
++
++  private supersedeWork(code: InferenceWorkerErrorCode): void {
++    const queued = this.queue;
++    this.queue = [];
++    for (const job of queued) {
++      job.input = null;
++      this.postError(job.id, job.epoch, code);
++    }
++    const running = this.running;
++    if (running !== null && running.supersededBy === null) {
++      running.supersededBy = code;
++      running.controller.abort();
++    }
++  }
++
++  private shutdown(announce: boolean): void {
++    for (const load of this.loads.values()) {
++      load.controller.abort();
++    }
++    this.supersedeWork("disposed");
++    this.enqueueLane(async () => {
++      await this.runningDone;
++      await this.releaseRuntime();
++      if (announce) {
++        this.post({ protocol: INFERENCE_WORKER_PROTOCOL_VERSION, type: "disposed" });
++        this.scope.removeEventListener("message", this.listener);
++        if (this.closeOnDispose) {
++          try {
++            this.scope.close?.();
++          } catch {
++            // Closing is best effort; the host terminates the worker anyway.
++          }
++        }
++      }
++    });
++  }
++
++  private async releaseRuntime(): Promise<void> {
++    const runtime = this.runtime;
++    this.runtime = null;
++    if (runtime !== null) {
++      await disposeRuntime(runtime);
++    }
++  }
++
++  private enqueueLane(task: () => Promise<void>): void {
++    this.lane = this.lane.then(task).catch(() => undefined);
++  }
++
++  private postError(id: number, epoch: number, code: InferenceWorkerErrorCode): void {
++    this.post({
++      protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++      type: "error",
++      id,
++      epoch,
++      code,
++    });
++  }
++
++  private post(message: WorkerToHostMessage, transfer: ArrayBuffer[] = []): boolean {
++    try {
++      this.scope.postMessage(message, transfer);
++      return true;
++    } catch {
++      return false;
++    }
++  }
++
++  private parse(data: unknown): ParsedHostMessage {
++    if (!isRecord(data) || data.protocol !== INFERENCE_WORKER_PROTOCOL_VERSION) {
++      return { ok: false, id: 0, epoch: 0, code: "protocol_error" };
++    }
++    const id = isPositiveId(data.id) ? data.id : 0;
++    const epoch = isPositiveId(data.epoch) ? data.epoch : 0;
++    switch (data.type) {
++      case "dispose":
++        return {
++          ok: true,
++          message: { protocol: INFERENCE_WORKER_PROTOCOL_VERSION, type: "dispose" },
++        };
++      case "cancel":
++        return id === 0
++          ? { ok: false, id, epoch, code: "invalid_request" }
++          : {
++              ok: true,
++              message: {
++                protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++                type: "cancel",
++                id,
++              },
++            };
++      case "infer":
++        return this.parseInfer(data, id, epoch);
++      case "load":
++        return parseLoad(data, id, epoch);
++      default:
++        return { ok: false, id, epoch, code: "protocol_error" };
++    }
++  }
++
++  private parseInfer(
++    data: Record<string, unknown>,
++    id: number,
++    epoch: number,
++  ): ParsedHostMessage {
++    const { input, callOptions } = data;
++    if (
++      id === 0 ||
++      epoch === 0 ||
++      !(input instanceof ArrayBuffer) ||
++      input.byteLength % 2 !== 0 ||
++      !isRecord(callOptions) ||
++      !isPlainData(callOptions)
++    ) {
++      return { ok: false, id, epoch, code: "invalid_request" };
++    }
++    if (input.byteLength / 2 > this.maxInputChars) {
++      return { ok: false, id, epoch, code: "input_too_large" };
++    }
++    return {
++      ok: true,
++      message: {
++        protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++        type: "infer",
++        id,
++        epoch,
++        input,
++        callOptions,
++      },
++    };
++  }
++}
++
++function parseLoad(
++  data: Record<string, unknown>,
++  id: number,
++  epoch: number,
++): ParsedHostMessage {
++  const { generation, reason, spec } = data;
++  if (
++    id === 0 ||
++    epoch === 0 ||
++    !isPositiveId(generation) ||
++    (reason !== "load" && reason !== "recover") ||
++    !isRecord(spec)
++  ) {
++    return { ok: false, id, epoch, code: "invalid_request" };
++  }
++  const { modelRef, localOnly, allowedBackends, modelDigest, options } = spec;
++  if (
++    typeof modelRef !== "string" ||
++    modelRef.trim().length === 0 ||
++    modelRef.length > MAX_MODEL_REF_CHARS ||
++    typeof localOnly !== "boolean" ||
++    !(
++      allowedBackends === null ||
++      (Array.isArray(allowedBackends) &&
++        allowedBackends.every((backend) => typeof backend === "string"))
++    ) ||
++    !(modelDigest === null || typeof modelDigest === "string") ||
++    !isRecord(options) ||
++    !isPlainData(options)
++  ) {
++    return { ok: false, id, epoch, code: "invalid_request" };
++  }
++  if (localOnly && !isOfflineModelRef(modelRef)) {
++    return { ok: false, id, epoch, code: "invalid_request" };
++  }
++  return {
++    ok: true,
++    message: {
++      protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++      type: "load",
++      id,
++      generation,
++      epoch,
++      reason,
++      spec: {
++        modelRef,
++        localOnly,
++        allowedBackends: allowedBackends as string[] | null,
++        modelDigest,
++        options,
++      },
++    },
++  };
++}
++
++function verifyRuntime(
++  runtime: unknown,
++  message: Extract<HostToWorkerMessage, { type: "load" }>,
++): InferenceWorkerPlan | InferenceWorkerErrorCode {
++  if (!isRecord(runtime) || typeof runtime.pipeline !== "function") {
++    return "load_failed";
++  }
++  const { backend, localOnly } = runtime;
++  const modelDigest = runtime.modelDigest ?? null;
++  const spec = message.spec;
++  if (
++    typeof backend !== "string" ||
++    backend.length === 0 ||
++    typeof localOnly !== "boolean" ||
++    (spec.localOnly && !localOnly) ||
++    (spec.allowedBackends !== null && !spec.allowedBackends.includes(backend)) ||
++    !(modelDigest === null || typeof modelDigest === "string") ||
++    (spec.modelDigest !== null && modelDigest !== spec.modelDigest)
++  ) {
++    return "plan_incompatible";
++  }
++  return {
++    protocol: INFERENCE_WORKER_PROTOCOL_VERSION,
++    generation: message.generation,
++    epoch: message.epoch,
++    modelRef: spec.modelRef,
++    backend,
++    localOnly,
++    modelDigest,
++  };
++}
++
++async function disposeRuntime(runtime: InferenceWorkerRuntime): Promise<void> {
++  try {
++    if (typeof runtime.dispose === "function") {
++      await runtime.dispose();
++      return;
++    }
++    const pipelineDispose = (runtime.pipeline as { dispose?: unknown }).dispose;
++    if (typeof pipelineDispose === "function") {
++      await (pipelineDispose as () => unknown).call(runtime.pipeline);
++    }
++  } catch {
++    // Release failures are swallowed so no runtime message reaches the host.
++  }
++}
++
++function handlerErrorCode(
++  error: unknown,
++  fallback: InferenceWorkerErrorCode,
++): InferenceWorkerErrorCode {
++  return error instanceof InferenceWorkerError && HANDLER_ERROR_CODES.has(error.code)
++    ? error.code
++    : fallback;
++}
++
++function defaultScope(): InferenceWorkerScope {
++  const candidate = globalThis as unknown as Partial<InferenceWorkerScope>;
++  if (
++    typeof candidate.postMessage !== "function" ||
++    typeof candidate.addEventListener !== "function" ||
++    typeof candidate.removeEventListener !== "function"
++  ) {
++    throw new TypeError("serveInferenceWorker requires a dedicated worker scope.");
++  }
++  return candidate as InferenceWorkerScope;
++}
+diff --git a/tests/web/__snapshots__/openmedkit-web-public-api.json b/tests/web/__snapshots__/openmedkit-web-public-api.json
+index 9eb147d7ba..c492f8ed47 100644
+--- a/tests/web/__snapshots__/openmedkit-web-public-api.json
++++ b/tests/web/__snapshots__/openmedkit-web-public-api.json
+@@ -5,6 +5,10 @@
+     "DEFAULT_MODEL_ID",
+     "DEFAULT_WEBGPU_LOGIT_TOLERANCE",
+     "DEFAULT_WEBGPU_MAX_RECALL_DELTA",
++    "INFERENCE_WORKER_ERROR_CODES",
++    "INFERENCE_WORKER_PROTOCOL_VERSION",
++    "InferenceWorkerClient",
++    "InferenceWorkerError",
+     "OPENMED_SPAN_SCHEMA_VERSION",
+     "POLICY_LABELS",
+     "SPAN_ACTIONS",
+@@ -17,6 +21,7 @@
+     "certifyWebGpuReference",
+     "clearOrtWebSessionCache",
+     "configureOrtWebRuntime",
++    "createInferenceWorkerClient",
+     "createWebGpuClassificationHead",
+     "decodeBioTokenSpans",
+     "decodeWebGpuTokenSpans",
+@@ -38,6 +43,7 @@
+     "probeOrtWebCapabilities",
+     "refinePrivacyFilterSpan",
+     "selectOrtWebBackend",
++    "serveInferenceWorker",
+     "spansToRedactedText",
+     "trimSpanWhitespace"
+   ],
+diff --git a/tests/web/fixtures/inference_worker_parity_vectors.json b/tests/web/fixtures/inference_worker_parity_vectors.json
+new file mode 100644
+index 0000000000..238681e39c
+--- /dev/null
++++ b/tests/web/fixtures/inference_worker_parity_vectors.json
+@@ -0,0 +1,328 @@
++{
++  "schema": "openmed-inference-worker-parity/v1",
++  "description": "Synthetic parity vectors: direct and worker-routed extraction must return identical spans for each vector.",
++  "hashSecret": "synthetic-parity-secret",
++  "vectors": [
++    {
++      "name": "python-golden-offsets",
++      "text": "Patient Alice Nguyen, DOB 1979-04-12, email alice@example.org.",
++      "tokens": [
++        {
++          "score": 0.99,
++          "index": 0,
++          "word": "Alice",
++          "start": 8,
++          "end": 13,
++          "entity": "B-NAME"
++        },
++        {
++          "score": 0.97,
++          "index": 1,
++          "word": "Nguyen",
++          "start": 14,
++          "end": 20,
++          "entity": "E-NAME"
++        },
++        {
++          "score": 0.96,
++          "index": 2,
++          "word": "1979-04-12",
++          "start": 26,
++          "end": 36,
++          "entity": "S-DATE_OF_BIRTH"
++        },
++        {
++          "score": 0.98,
++          "index": 3,
++          "word": "alice@example.org",
++          "start": 44,
++          "end": 61,
++          "entity": "S-EMAIL"
++        }
++      ]
++    },
++    {
++      "name": "transformersjs-wordpiece-without-offsets",
++      "text": "Patient Alice Nguyen, DOB 1979-04-12, email alice@example.org.",
++      "tokens": [
++        {
++          "entity": "O",
++          "score": 0.9,
++          "index": 0,
++          "word": "[CLS]"
++        },
++        {
++          "entity": "O",
++          "score": 0.9,
++          "index": 1,
++          "word": "patient"
++        },
++        {
++          "entity": "B-NAME",
++          "score": 0.9,
++          "index": 2,
++          "word": "alice"
++        },
++        {
++          "entity": "I-NAME",
++          "score": 0.9,
++          "index": 3,
++          "word": "ng"
++        },
++        {
++          "entity": "I-NAME",
++          "score": 0.9,
++          "index": 4,
++          "word": "##uy"
++        },
++        {
++          "entity": "I-NAME",
++          "score": 0.9,
++          "index": 5,
++          "word": "##en"
++        },
++        {
++          "entity": "O",
++          "score": 0.9,
++          "index": 6,
++          "word": ","
++        },
++        {
++          "entity": "O",
++          "score": 0.9,
++          "index": 7,
++          "word": "do"
++        },
++        {
++          "entity": "O",
++          "score": 0.9,
++          "index": 8,
++          "word": "##b"
++        },
++        {
++          "entity": "B-DATE_OF_BIRTH",
++          "score": 0.9,
++          "index": 9,
++          "word": "1979"
++        },
++        {
++          "entity": "I-DATE_OF_BIRTH",
++          "score": 0.9,
++          "index": 10,
++          "word": "-"
++        },
++        {
++          "entity": "I-DATE_OF_BIRTH",
++          "score": 0.9,
++          "index": 11,
++          "word": "04"
++        },
++        {
++          "entity": "I-DATE_OF_BIRTH",
++          "score": 0.9,
++          "index": 12,
++          "word": "-"
++        },
++        {
++          "entity": "I-DATE_OF_BIRTH",
++          "score": 0.9,
++          "index": 13,
++          "word": "12"
++        },
++        {
++          "entity": "O",
++          "score": 0.9,
++          "index": 14,
++          "word": ","
++        },
++        {
++          "entity": "O",
++          "score": 0.9,
++          "index": 15,
++          "word": "email"
++        },
++        {
++          "entity": "B-EMAIL",
++          "score": 0.9,
++          "index": 16,
++          "word": "alice"
++        },
++        {
++          "entity": "I-EMAIL",
++          "score": 0.9,
++          "index": 17,
++          "word": "@"
++        },
++        {
++          "entity": "I-EMAIL",
++          "score": 0.9,
++          "index": 18,
++          "word": "example"
++        },
++        {
++          "entity": "I-EMAIL",
++          "score": 0.9,
++          "index": 19,
++          "word": "."
++        },
++        {
++          "entity": "I-EMAIL",
++          "score": 0.9,
++          "index": 20,
++          "word": "org"
++        },
++        {
++          "entity": "O",
++          "score": 0.9,
++          "index": 21,
++          "word": "."
++        },
++        {
++          "entity": "O",
++          "score": 0.9,
++          "index": 22,
++          "word": "[SEP]"
++        }
++      ]
++    },
++    {
++      "name": "batched-nested-output",
++      "text": "Synthetic patient Bao Tran visited Riverside Clinic on 2031-02-03.",
++      "batches": [
++        [
++          {
++            "score": 0.91,
++            "index": 0,
++            "word": "Bao",
++            "start": 18,
++            "end": 21,
++            "entity": "B-NAME"
++          },
++          {
++            "score": 0.93,
++            "index": 1,
++            "word": "Tran",
++            "start": 22,
++            "end": 26,
++            "entity": "I-NAME"
++          }
++        ],
++        [
++          {
++            "score": 0.81,
++            "index": 2,
++            "word": "Riverside",
++            "start": 35,
++            "end": 44,
++            "entity": "B-ORGANIZATION"
++          },
++          {
++            "score": 0.84,
++            "index": 3,
++            "word": "Clinic",
++            "start": 45,
++            "end": 51,
++            "entity": "I-ORGANIZATION"
++          },
++          {
++            "score": 0.95,
++            "index": 4,
++            "word": "2031-02-03",
++            "start": 55,
++            "end": 65,
++            "entity": "S-DATE"
++          }
++        ]
++      ]
++    },
++    {
++      "name": "astral-plane-and-accented-text",
++      "text": "Dr. Zo\u00eb \u00c5ngstr\u00f6m \ud83e\ude7a phoned +1-555-0100 from Caf\u00e9 Lumi\u00e8re.",
++      "tokens": [
++        {
++          "score": 0.88,
++          "index": 0,
++          "word": "Zo\u00eb",
++          "start": 4,
++          "end": 7,
++          "entity": "B-NAME"
++        },
++        {
++          "score": 0.86,
++          "index": 1,
++          "word": "\u00c5ngstr\u00f6m",
++          "start": 8,
++          "end": 16,
++          "entity": "I-NAME"
++        },
++        {
++          "score": 0.97,
++          "index": 2,
++          "word": "+1-555-0100",
++          "start": 27,
++          "end": 38,
++          "entity": "S-PHONE"
++        },
++        {
++          "score": 0.7,
++          "index": 3,
++          "word": "Caf\u00e9",
++          "start": 44,
++          "end": 48,
++          "entity": "B-LOCATION"
++        },
++        {
++          "score": 0.72,
++          "index": 4,
++          "word": "Lumi\u00e8re",
++          "start": 49,
++          "end": 56,
++          "entity": "E-LOCATION"
++        }
++      ]
++    },
++    {
++      "name": "aggregated-entity-groups",
++      "text": "Contact synthetic.user@example.net or user name dlee42 today.",
++      "tokens": [
++        {
++          "score": 0.99,
++          "index": 0,
++          "word": "synthetic.user@example.net",
++          "start": 8,
++          "end": 34,
++          "entity_group": "EMAIL"
++        },
++        {
++          "index": 1,
++          "word": "dlee42",
++          "start": 48,
++          "end": 54,
++          "entity_group": "USERNAME"
++        }
++      ]
++    },
++    {
++      "name": "lone-surrogate-text",
++      "text": "Note \ud83d from Mira Okafor.",
++      "tokens": [
++        {
++          "entity": "B-NAME",
++          "score": 0.9,
++          "index": 0,
++          "word": "Mira",
++          "start": 12,
++          "end": 16
++        },
++        {
++          "entity": "I-NAME",
++          "score": 0.92,
++          "index": 1,
++          "word": "Okafor",
++          "start": 17,
++          "end": 23
++        }
++      ]
++    }
++  ]
++}
+diff --git a/tests/web/fixtures/inference_worker_thread.ts b/tests/web/fixtures/inference_worker_thread.ts
+new file mode 100644
+index 0000000000..1c1e310fb4
+--- /dev/null
++++ b/tests/web/fixtures/inference_worker_thread.ts
+@@ -0,0 +1,58 @@
++// Worker-thread entry used by tests/web/test_inference_worker.spec.ts.
++//
++// It serves the synthetic parity vectors through the real worker server and
++// can simulate a runtime crash that escapes the server (an uncaught exception
++// whose message embeds the input text) to exercise host-side failure handling.
++import { readFileSync } from "node:fs";
++import { parentPort } from "node:worker_threads";
++
++import {
++  serveInferenceWorker,
++  type InferenceWorkerScope,
++  type RawTokenClassificationOutput,
++} from "../../../js/openmedkit-web/src/index";
++
++// Keep in sync with CRASH_MARKER in test_inference_worker.spec.ts.
++const CRASH_MARKER = "[crash-worker]";
++
++interface ParityVector {
++  text: string;
++  tokens?: unknown[];
++  batches?: unknown[][];
++}
++
++const vectors = (
++  JSON.parse(
++    readFileSync(
++      new URL("./inference_worker_parity_vectors.json", import.meta.url),
++      "utf8",
++    ),
++  ) as { vectors: ParityVector[] }
++).vectors;
++
++if (parentPort === null) {
++  throw new Error("inference worker fixture must run in a worker thread");
++}
++
++serveInferenceWorker({
++  scope: parentPort as unknown as InferenceWorkerScope,
++  load(spec) {
++    return {
++      backend: "wasm-basic",
++      localOnly: spec.localOnly,
++      modelDigest: "sha256:synthetic-thread-fixture",
++      pipeline(text) {
++        if (text.startsWith(CRASH_MARKER)) {
++          setTimeout(() => {
++            throw new Error(`synthetic runtime crash while reading ${text}`);
++          }, 0);
++          return new Promise<RawTokenClassificationOutput>(() => undefined);
++        }
++        const vector = vectors.find((candidate) => candidate.text === text);
++        return structuredClone(
++          vector?.batches ?? vector?.tokens ?? [],
++        ) as RawTokenClassificationOutput;
++      },
++    };
++  },
++});
+diff --git a/tests/web/test_inference_worker.spec.ts b/tests/web/test_inference_worker.spec.ts
+new file mode 100644
+index 0000000000..a3f8e1ad50
+--- /dev/null
++++ b/tests/web/test_inference_worker.spec.ts
+@@ -0,0 +1,1056 @@
++import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++import { fileURLToPath } from "node:url";
++import test from "node:test";
++import { Worker as NodeWorker } from "node:worker_threads";
++
++import {
++  INFERENCE_WORKER_ERROR_CODES,
++  InferenceWorkerError,
++  createInferenceWorkerClient,
++  deidentify,
++  extractPii,
++  serveInferenceWorker,
++  type InferenceWorkerClient,
++  type InferenceWorkerEndpoint,
++  type InferenceWorkerErrorCode,
++  type InferenceWorkerEventListener,
++  type InferenceWorkerLoadSpec,
++  type InferenceWorkerPipeline,
++  type InferenceWorkerRuntime,
++  type InferenceWorkerScope,
++  type InferenceWorkerServer,
++  type OpenMedDeidentifyResult,
++  type OpenMedSpan,
++  type RawTokenClassificationOutput,
++  type ServeInferenceWorkerOptions,
++  type TokenClassificationEntity,
++} from "../../js/openmedkit-web/src/index";
++import {
++  decodeTextUnits,
++  encodeInferenceTokens,
++} from "../../js/openmedkit-web/src/worker/protocol";
++
++// Synthetic sentinel: it must never appear in errors, events, or worker output.
++const SENTINEL = "Zyxwv Sentinel-PHI 4242";
++const CRASH_MARKER = "[crash-worker]";
++const LOCAL_SPEC: InferenceWorkerLoadSpec = {
++  modelRef: "/models/openmed/synthetic-token-classifier",
++  allowedBackends: ["webgpu", "wasm-basic"],
++};
++const DIGEST = "sha256:synthetic-model";
++
++interface ParityVector {
++  name: string;
++  text: string;
++  tokens?: Record<string, unknown>[];
++  batches?: Record<string, unknown>[][];
++}
++
++const fixturesDir = fileURLToPath(new URL("./fixtures/", import.meta.url));
++const parity = JSON.parse(
++  readFileSync(`${fixturesDir}inference_worker_parity_vectors.json`, "utf8"),
++) as { hashSecret: string; vectors: ParityVector[] };
++const pythonGolden = JSON.parse(
++  readFileSync(`${fixturesDir}npm_deidentify_golden.json`, "utf8"),
++) as OpenMedDeidentifyResult;
++
++const vectorPipeline: InferenceWorkerPipeline = (text) => {
++  const vector = parity.vectors.find((candidate) => candidate.text === text);
++  return structuredClone(
++    vector?.batches ?? vector?.tokens ?? [],
++  ) as RawTokenClassificationOutput;
++};
++
++test("admission is bounded and overflow rejects with a typed queue_full code", async () => {
++  const worker = new FakeWorker();
++  const client = createInferenceWorkerClient({
++    createWorker: () => worker,
++    maxQueueSize: 2,
++    maxInFlight: 1,
++  });
++  try {
++    await loadFake(client, worker);
++    const first = client.run(`${SENTINEL} one`);
++    const second = client.run(`${SENTINEL} two`);
++    const third = client.run(`${SENTINEL} three`);
++    const overflow = await rejection(client.run(`${SENTINEL} four`));
++
++    assertWorkerError(overflow, "queue_full");
++    assert.deepEqual(
++      pick(client.stats(), ["queued", "inFlight", "rejectedQueueFull"]),
++      { queued: 2, inFlight: 1, rejectedQueueFull: 1 },
++    );
++    assert.equal(worker.messages("infer").length, 1);
++
++    for (const pending of [first, second, third]) {
++      const infer = worker.lastMessage("infer");
++      worker.result(infer, [{ entity: "O", start: 0, end: 4, score: 1 }]);
++      assert.deepEqual(await pending, [{ entity: "O", start: 0, end: 4, score: 1 }]);
++    }
++    assert.equal(worker.messages("infer").length, 3);
++    assert.equal(client.stats().completed, 3);
++  } finally {
++    await client.dispose();
++  }
++});
++
++test("cancelling a queued request never sends its text to the worker", async () => {
++  const worker = new FakeWorker();
++  const client = createInferenceWorkerClient({ createWorker: () => worker });
++  try {
++    await loadFake(client, worker);
++    const active = client.run("synthetic active request");
++    const controller = new AbortController();
++    const queued = client.run(`${SENTINEL} queued`, { signal: controller.signal });
++    const next = client.run("synthetic next request");
++
++    controller.abort();
++    assertWorkerError(await rejection(queued), "cancelled");
++    assert.equal(client.stats().queued, 1);
++
++    worker.result(worker.lastMessage("infer"), []);
++    assert.deepEqual(await active, []);
++    worker.result(worker.lastMessage("infer"), []);
++    assert.deepEqual(await next, []);
++
++    const sentTexts = worker
++      .messages("infer")
++      .map((message) => decodeTextUnits(message.input as ArrayBuffer));
++    assert.deepEqual(sentTexts, ["synthetic active request", "synthetic next request"]);
++    assert.equal(worker.messages("cancel").length, 0);
++  } finally {
++    await client.dispose();
++  }
++});
++
++test("in-flight cancellation reaches the worker and late results are suppressed", async () => {
++  const worker = new FakeWorker();
++  const client = createInferenceWorkerClient({ createWorker: () => worker });
++  try {
++    await loadFake(client, worker);
++    const controller = new AbortController();
++    let delivered = false;
++    const cancelled = client
++      .run("synthetic in-flight request", { signal: controller.signal })
++      .then((tokens) => {
++        delivered = true;
++        return tokens;
++      });
++    const waiting = client.run("synthetic waiting request");
++    const cancelledInfer = worker.lastMessage("infer");
++
++    controller.abort();
++    assertWorkerError(await rejection(cancelled), "cancelled");
++    assert.deepEqual(worker.lastMessage("cancel").id, cancelledInfer.id);
++    // The cancelled request keeps its slot until the worker settles it.
++    assert.deepEqual(pick(client.stats(), ["inFlight", "draining", "queued"]), {
++      inFlight: 1,
++      draining: 1,
++      queued: 1,
++    });
++    assert.equal(worker.messages("infer").length, 1);
++
++    worker.result(cancelledInfer, [{ entity: "B-NAME", start: 0, end: 9, score: 1 }]);
++    await flush();
++    assert.equal(delivered, false);
++    assert.equal(client.stats().suppressedLateResults, 1);
++    assert.equal(worker.messages("infer").length, 2);
++
++    worker.result(worker.lastMessage("infer"), []);
++    assert.deepEqual(await waiting, []);
++  } finally {
++    await client.dispose();
++  }
++});
++
++test("the worker aborts a running pipeline and posts cancelled instead of a result", async () => {
++  const started = deferred<AbortSignal>();
++  const release = deferred<void>();
++  const channel = connectWorker({
++    load: () =>
++      runtime(async (_text, _options, context) => {
++        started.resolve(context?.signal as AbortSignal);
++        await release.promise;
++        return [{ entity: "B-NAME", start: 0, end: 4, score: 1 }];
++      }),
++  });
++  const client = createInferenceWorkerClient({ createWorker: () => channel.endpoint });
++  try {
++    await client.load(LOCAL_SPEC);
++    const controller = new AbortController();
++    const request = client.run("synthetic running request", {
++      signal: controller.signal,
++    });
++    const signal = await started.promise;
++    assert.equal(signal.aborted, false);
++
++    controller.abort();
++    assertWorkerError(await rejection(request), "cancelled");
++    await waitFor(() => signal.aborted);
++    release.resolve();
++    await waitFor(() => channel.posted.some((message) => message.type === "cancelled"));
++
++    assert.equal(countPosted(channel, "result"), 0);
++    assert.equal(channel.server.stats().cancelled, 1);
++    await waitFor(() => client.stats().inFlight === 0);
++    assert.equal(client.stats().suppressedLateResults, 0);
++  } finally {
++    await client.dispose();
++    channel.close();
++  }
++});
++
++test("a new model generation supersedes in-flight work and stales old pipelines", async () => {
++  const started = deferred<void>();
++  let loads = 0;
++  const channel = connectWorker({
++    load: () => {
++      loads += 1;
++      if (loads === 1) {
++        return runtime((_text, _options, context) => {
++          started.resolve();
++          return abortable(context);
++        });
++      }
++      return runtime(vectorPipeline);
++    },
++  });
++  const client = createInferenceWorkerClient({ createWorker: () => channel.endpoint });
++  try {
++    const firstPlan = await client.load(LOCAL_SPEC);
++    const firstPipeline = client.pipeline();
++    const inFlight = rejection(client.run("synthetic first-generation request"));
++    await started.promise;
++
++    const secondPlan = await client.load({ ...LOCAL_SPEC, modelDigest: DIGEST });
++    assertWorkerError(await inFlight, "superseded");
++    assert.equal(firstPlan.generation, 1);
++    assert.equal(secondPlan.generation, 2);
++    assertWorkerError(
++      await rejection(Promise.resolve(firstPipeline(parity.vectors[0]!.text))),
++      "stale_generation",
++    );
++
++    const tokens = await client.pipeline()(parity.vectors[0]!.text);
++    assert.equal((tokens as TokenClassificationEntity[]).length, 4);
++    assert.equal(countPosted(channel, "result"), 1);
++  } finally {
++    await client.dispose();
++    channel.close();
++  }
++});
++
++test("GPU device loss invalidates the plan until a verified local-only recovery", async () => {
++  const lost = deferred<void>();
++  const started = deferred<void>();
++  const loadCalls: Array<{ localOnly: boolean; reason: string }> = [];
++  let disposals = 0;
++  let recoveryDigest = DIGEST;
++  let recoveryLocalOnly = true;
++  const channel = connectWorker({
++    load: (spec, context) => {
++      loadCalls.push({ localOnly: spec.localOnly, reason: context.reason });
++      if (context.reason === "load") {
++        return {
++          ...runtime((text, _options, runContext) => {
++            if (text === "synthetic stalled request") {
++              started.resolve();
++              return abortable(runContext);
++            }
++            return vectorPipeline(text);
++          }, "webgpu"),
++          localOnly: false,
++          modelDigest: DIGEST,
++          deviceLost: lost.promise,
++          dispose: () => {
++            disposals += 1;
++          },
++        };
++      }
++      return {
++        ...runtime(vectorPipeline, "wasm-basic"),
++        localOnly: recoveryLocalOnly,
++        modelDigest: recoveryDigest,
++      };
++    },
++  });
++  const client = createInferenceWorkerClient({ createWorker: () => channel.endpoint });
++  try {
++    // A first load may download artifacts; recovery must never widen access.
++    const plan = await client.load({ ...LOCAL_SPEC, localOnly: false });
++    assert.deepEqual(pick(plan, ["backend", "localOnly", "modelDigest"]), {
++      backend: "webgpu",
++      localOnly: false,
++      modelDigest: DIGEST,
++    });
++    const pipeline = client.pipeline();
++    const stalled = client.run("synthetic stalled request");
++    await started.promise;
++
++    lost.resolve();
++    assertWorkerError(await rejection(stalled), "device_lost");
++    assert.equal(client.state, "invalidated");
++    assertWorkerError(
++      await rejection(client.run(parity.vectors[0]!.text)),
++      "plan_invalidated",
++    );
++    await waitFor(() => disposals === 1);
++    assert.equal(channel.server.stats().loaded, false);
++
++    recoveryDigest = "sha256:different-model";
++    assertWorkerError(await rejection(client.recover()), "plan_incompatible");
++    assert.equal(client.state, "invalidated");
++    recoveryDigest = DIGEST;
++    recoveryLocalOnly = false;
++    assertWorkerError(await rejection(client.recover()), "plan_incompatible");
++    assert.equal(client.state, "invalidated");
++
++    recoveryLocalOnly = true;
++    const recovered = await client.recover();
++    assert.deepEqual(
++      pick(recovered, ["generation", "backend", "localOnly", "modelDigest"]),
++      { generation: 1, backend: "wasm-basic", localOnly: true, modelDigest: DIGEST },
++    );
++    assert.deepEqual(loadCalls, [
++      { localOnly: false, reason: "load" },
++      { localOnly: true, reason: "recover" },
++      { localOnly: true, reason: "recover" },
++      { localOnly: true, reason: "recover" },
++    ]);
++    // The generation survived a verified compatible recovery, so its pipeline works.
++    const spans = await extractPii(parity.vectors[0]!.text, {
++      pipeline,
++      hashSecret: parity.hashSecret,
++    });
++    assert.equal(spans.length, 3);
++  } finally {
++    await client.dispose();
++    channel.close();
++  }
++});
++
++test("host-side invalidation requires recovery before reuse", async () => {
++  const channel = connectWorker({ load: () => runtime(vectorPipeline) });
++  const client = createInferenceWorkerClient({ createWorker: () => channel.endpoint });
++  try {
++    await client.load({ ...LOCAL_SPEC, modelDigest: DIGEST });
++    const runtimeReplacedPlan = client.plan;
++    client.invalidate();
++    assert.equal(client.plan, null);
++    assertWorkerError(
++      await rejection(client.run(parity.vectors[0]!.text)),
++      "plan_invalidated",
++    );
++    const recovered = await client.recover();
++    assert.equal(recovered.generation, runtimeReplacedPlan?.generation);
++    assert.ok(recovered.epoch > (runtimeReplacedPlan?.epoch ?? 0));
++    assert.equal((await client.run(parity.vectors[0]!.text)).length, 4);
++  } finally {
++    await client.dispose();
++    channel.close();
++  }
++});
++
++test("worker failure hides the worker error and recovery restarts a verified worker", async () => {
++  const workers: FakeWorker[] = [];
++  const client = createInferenceWorkerClient({
++    createWorker: () => {
++      const worker = new FakeWorker();
++      workers.push(worker);
++      return worker;
++    },
++  });
++  try {
++    const loading = client.load({ ...LOCAL_SPEC, modelDigest: DIGEST });
++    workers[0]!.ready(workers[0]!.lastMessage("load"), { modelDigest: DIGEST });
++    await loading;
++    const outcomes = [
++      client.run(`${SENTINEL} crash`),
++      client.run(`${SENTINEL} queued`),
++    ].map(rejection);
++    let prevented = false;
++    workers[0]!.emit("error", {
++      message: `Uncaught Error: ${SENTINEL}`,
++      preventDefault: () => {
++        prevented = true;
++      },
++    } as never);
++
++    for (const outcome of outcomes) {
++      assertWorkerError(await outcome, "worker_failed");
++    }
++    assert.equal(prevented, true);
++    assert.equal(workers[0]!.terminated, true);
++    assert.equal(client.state, "failed");
++    assertWorkerError(await rejection(client.run("synthetic")), "worker_failed");
++
++    const recovery = client.recover();
++    assert.equal(workers.length, 2);
++    const load = workers[1]!.lastMessage("load");
++    assert.equal(load.reason, "recover");
++    assert.equal((load.spec as { localOnly: boolean }).localOnly, true);
++    assert.equal((load.spec as { modelDigest: string }).modelDigest, DIGEST);
++    workers[1]!.ready(load, { modelRef: "/models/other" });
++    assertWorkerError(await rejection(recovery), "plan_incompatible");
++
++    const retry = client.recover({ restart: true });
++    assert.equal(workers.length, 3);
++    workers[2]!.ready(workers[2]!.lastMessage("load"), { modelDigest: DIGEST });
++    assert.equal((await retry).generation, 1);
++    const tokens = client.run("synthetic after restart");
++    workers[2]!.result(workers[2]!.lastMessage("infer"), []);
++    assert.deepEqual(await tokens, []);
++
++    // A stuck runtime can be replaced outright when loading the next model.
++    const reloading = client.load(
++      { ...LOCAL_SPEC, modelDigest: DIGEST },
++      { restart: true },
++    );
++    assert.equal(workers.length, 4);
++    assert.equal(workers[2]!.terminated, true);
++    workers[3]!.ready(workers[3]!.lastMessage("load"), { modelDigest: DIGEST });
++    assert.equal((await reloading).generation, 2);
++    assert.equal(client.stats().workerStarts, 4);
++  } finally {
++    await client.dispose();
++  }
++});
++
++test("dispose tears down queued and in-flight work and releases the runtime", async () => {
++  const started = deferred<void>();
++  let disposals = 0;
++  const channel = connectWorker({
++    load: () => ({
++      ...runtime((_text, _options, context) => {
++        started.resolve();
++        return abortable(context);
++      }),
++      dispose: () => {
++        disposals += 1;
++      },
++    }),
++  });
++  const client = createInferenceWorkerClient({ createWorker: () => channel.endpoint });
++  await client.load(LOCAL_SPEC);
++  const outcomes = [
++    client.run("synthetic in-flight request"),
++    client.run("synthetic queued request"),
++  ].map(rejection);
++  await started.promise;
++
++  await client.dispose();
++  for (const outcome of outcomes) {
++    assertWorkerError(await outcome, "disposed");
++  }
++  assert.equal(channel.terminated, true);
++  await waitFor(() => disposals === 1 && countPosted(channel, "disposed") === 1);
++  assert.deepEqual(pick(channel.server.stats(), ["loaded", "queued", "running"]), {
++    loaded: false,
++    queued: 0,
++    running: false,
++  });
++  assertWorkerError(await rejection(client.run("synthetic")), "disposed");
++  assertWorkerError(await rejection(client.load(LOCAL_SPEC)), "disposed");
++  assert.equal(client.state, "disposed");
++  channel.close();
++});
++
++test("worker errors, events and output never carry input text", async () => {
++  const consoleCalls = spyOnConsole();
++  const storageAccess = guardStorage();
++  const channel = connectWorker({
++    load: () =>
++      runtime((text) => {
++        if (text.includes("throw")) {
++          throw new Error(`pipeline failed on ${text}`);
++        }
++        if (text.includes("misaligned")) {
++          return [{ entity: "B-NAME", word: "absent-token", score: 1 }];
++        }
++        return [
++          {
++            entity: "B-NAME",
++            word: SENTINEL,
++            start: text.indexOf(SENTINEL),
++            end: text.indexOf(SENTINEL) + SENTINEL.length,
++            score: 0.9,
++            index: 0,
++          },
++        ];
++      }),
++  });
++  const client = createInferenceWorkerClient({ createWorker: () => channel.endpoint });
++  try {
++    await client.load(LOCAL_SPEC);
++    const failure = await rejection(client.run(`throw ${SENTINEL}`));
++    assertWorkerError(failure, "inference_failed");
++    const misaligned = await rejection(client.run(`misaligned ${SENTINEL}`));
++    assertWorkerError(misaligned, "alignment_failed");
++    const tooLarge = await rejection(
++      createInferenceWorkerClient({
++        createWorker: () => new FakeWorker(),
++        maxInputChars: 8,
++      }).run(SENTINEL),
++    );
++    assertWorkerError(tooLarge, "input_too_large");
++
++    const tokens = await client.run(`Patient ${SENTINEL} seen.`);
++    assert.deepEqual(tokens, [
++      { entity: "B-NAME", start: 8, end: 8 + SENTINEL.length, score: 0.9, index: 0 },
++    ]);
++    // Results carry offsets, labels and scores; token surface text stays in the worker.
++    assert.equal(channel.hostTransfers.length, 3);
++    assert.ok(channel.hostTransfers.every((buffer) => buffer.byteLength === 0));
++
++    for (const error of [failure, misaligned, tooLarge]) {
++      assertNoSentinel(error);
++    }
++    assertNoSentinel(channel.posted);
++    assertNoSentinel(channel.server.stats());
++    assertNoSentinel(client.stats());
++    assert.deepEqual(consoleCalls.calls, []);
++    assert.deepEqual(storageAccess.accessed, []);
++  } finally {
++    consoleCalls.restore();
++    storageAccess.restore();
++    await client.dispose();
++    channel.close();
++  }
++});
++
++test("direct and worker-routed extraction return identical spans on the parity vectors", async () => {
++  const workerTexts: string[] = [];
++  const channel = connectWorker({
++    load: () =>
++      runtime((text, options, context) => {
++        workerTexts.push(text);
++        return vectorPipeline(text, options, context);
++      }),
++  });
++  const client = createInferenceWorkerClient({ createWorker: () => channel.endpoint });
++  try {
++    await client.load(LOCAL_SPEC);
++    assert.ok(parity.vectors.length >= 5);
++    for (const vector of parity.vectors) {
++      const options = { hashSecret: parity.hashSecret, docId: vector.name };
++      const direct = await extractPii(vector.text, {
++        ...options,
++        pipeline: vectorPipeline,
++      });
++      const routed = await extractPii(vector.text, {
++        ...options,
++        pipeline: client.pipeline(),
++      });
++      assert.ok(direct.length > 0, vector.name);
++      assert.deepEqual(routed, direct, vector.name);
++    }
++    // The UTF-16 transfer is lossless, lone surrogates included.
++    assert.deepEqual(
++      workerTexts,
++      parity.vectors.map((vector) => vector.text),
++    );
++
++    const golden = parity.vectors[0]!;
++    const goldenOptions = {
++      docId: "web-fixture",
++      hashSecret: "test-secret",
++      detector: "fixture-token-classifier",
++      metadata: { fixture: "python-generated" },
++    };
++    const routed = await deidentify(golden.text, {
++      ...goldenOptions,
++      pipeline: client.pipeline(),
++    });
++    const direct = await deidentify(golden.text, {
++      ...goldenOptions,
++      pipeline: vectorPipeline,
++    });
++    assert.deepEqual(routed, direct);
++    assert.equal(routed.deidentifiedText, pythonGolden.deidentifiedText);
++    assertSpansClose(routed.spans, pythonGolden.spans);
++  } finally {
++    await client.dispose();
++    channel.close();
++  }
++});
++
++test("a real worker thread keeps parity, isolates crashes and restarts on recovery", async () => {
++  const threads: NodeWorker[] = [];
++  const client = createInferenceWorkerClient({
++    createWorker: () => {
++      const thread = new NodeWorker(
++        new URL("./fixtures/inference_worker_thread.ts", import.meta.url),
++      );
++      threads.push(thread);
++      return nodeWorkerEndpoint(thread);
++    },
++  });
++  try {
++    const plan = await client.load({
++      ...LOCAL_SPEC,
++      modelDigest: "sha256:synthetic-thread-fixture",
++    });
++    assert.equal(plan.localOnly, true);
++    await assertParity(client);
++
++    const crash = await rejection(client.run(`${CRASH_MARKER} ${SENTINEL}`));
++    assertWorkerError(crash, "worker_failed");
++    assertNoSentinel(crash);
++    await once(threads[0]!, "exit");
++
++    const recovered = await client.recover();
++    assert.equal(recovered.generation, plan.generation);
++    assert.equal(threads.length, 2);
++    await assertParity(client);
++
++    const exited = once(threads[1]!, "exit");
++    await client.dispose();
++    await exited;
++  } finally {
++    await client.dispose();
++    for (const thread of threads) {
++      await thread.terminate();
++    }
++  }
++});
++
++test("malformed traffic and requests fail closed with controlled codes", async () => {
++  const worker = new FakeWorker();
++  const client = createInferenceWorkerClient({ createWorker: () => worker });
++  try {
++    assertWorkerError(await rejection(client.run("synthetic")), "not_loaded");
++    assertWorkerError(
++      await rejection(client.load({ modelRef: "https://models.example.invalid/m" })),
++      "invalid_request",
++    );
++    assertWorkerError(
++      await rejection(client.load({ ...LOCAL_SPEC, options: { hook: () => 1 } })),
++      "invalid_request",
++    );
++    assert.equal(worker.posted.length, 0);
++    assertWorkerError(await rejection(client.recover()), "not_loaded");
++
++    await loadFake(client, worker);
++    assertWorkerError(
++      await rejection(
++        client.run("synthetic", {
++          callOptions: { signal: new AbortController().signal },
++        }),
++      ),
++      "invalid_request",
++    );
++    const inFlight = client.run("synthetic");
++    worker.reply({ protocol: 99, type: "result" });
++    assertWorkerError(await rejection(inFlight), "protocol_error");
++    assert.equal(client.state, "failed");
++    assert.equal(worker.terminated, true);
++    assert.deepEqual(
++      [...INFERENCE_WORKER_ERROR_CODES].sort(),
++      [...INFERENCE_WORKER_ERROR_CODES],
++    );
++  } finally {
++    await client.dispose();
++  }
++});
++
++test("the worker server bounds its own queue and rejects stale epochs", async () => {
++  const releases: Array<() => void> = [];
++  const channel = connectWorker({
++    maxQueueSize: 1,
++    maxInputChars: 32,
++    load: () =>
++      runtime(
++        () =>
++          new Promise<RawTokenClassificationOutput>((resolve) => {
++            releases.push(() => resolve([]));
++          }),
++      ),
++  });
++  const client = createInferenceWorkerClient({
++    createWorker: () => channel.endpoint,
++    maxInFlight: 3,
++  });
++  try {
++    await client.load(LOCAL_SPEC);
++    const running = client.run("synthetic running");
++    const waiting = client.run("synthetic waiting");
++    const overflow = client.run("synthetic overflow");
++    assertWorkerError(await rejection(overflow), "queue_full");
++    await waitFor(() => releases.length === 1);
++    releases.shift()?.();
++    assert.deepEqual(await running, []);
++    await waitFor(() => releases.length === 1);
++    releases.shift()?.();
++    assert.deepEqual(await waiting, []);
++
++    // The worker enforces its own input bound even when the host allows more.
++    assertWorkerError(
++      await rejection(client.run(`${SENTINEL} ${"x".repeat(32)}`)),
++      "input_too_large",
++    );
++    assert.equal(client.stats().inFlight, 0);
++
++    channel.endpoint.postMessage(
++      {
++        protocol: 1,
++        type: "infer",
++        id: 999,
++        epoch: 99,
++        input: new ArrayBuffer(2),
++        callOptions: {},
++      },
++      [],
++    );
++    await waitFor(() => channel.posted.some((message) => message.id === 999));
++    assert.equal(
++      channel.posted.find((message) => message.id === 999)?.code,
++      "stale_generation",
++    );
++  } finally {
++    await client.dispose();
++    channel.close();
++  }
++});
++
++// ---------------------------------------------------------------------------
++// Helpers
++
++async function assertParity(client: InferenceWorkerClient): Promise<void> {
++  for (const vector of parity.vectors) {
++    const options = { hashSecret: parity.hashSecret, docId: vector.name };
++    const direct = await extractPii(vector.text, {
++      ...options,
++      pipeline: vectorPipeline,
++    });
++    const routed = await extractPii(vector.text, {
++      ...options,
++      pipeline: client.pipeline(),
++    });
++    assert.deepEqual(routed, direct, vector.name);
++  }
++}
++
++function runtime(
++  pipeline: InferenceWorkerPipeline,
++  backend = "wasm-basic",
++): InferenceWorkerRuntime {
++  return { pipeline, backend, localOnly: true, modelDigest: DIGEST };
++}
++
++function abortable(
++  context: { signal: AbortSignal } | undefined,
++): Promise<RawTokenClassificationOutput> {
++  return new Promise((_resolve, reject) => {
++    context?.signal.addEventListener("abort", () => reject(new Error("aborted")), {
++      once: true,
++    });
++  });
++}
++
++type PostedMessage = Record<string, unknown>;
++
++class FakeWorker implements InferenceWorkerEndpoint {
++  readonly posted: PostedMessage[] = [];
++  terminated = false;
++  private readonly listeners = new Map<string, Set<InferenceWorkerEventListener>>();
++
++  postMessage(message: unknown): void {
++    this.posted.push(message as PostedMessage);
++  }
++
++  addEventListener(type: string, listener: InferenceWorkerEventListener): void {
++    const set = this.listeners.get(type) ?? new Set();
++    set.add(listener);
++    this.listeners.set(type, set);
++  }
++
++  removeEventListener(type: string, listener: InferenceWorkerEventListener): void {
++    this.listeners.get(type)?.delete(listener);
++  }
++
++  terminate(): void {
++    this.terminated = true;
++  }
++
++  emit(type: string, event: Parameters<InferenceWorkerEventListener>[0]): void {
++    for (const listener of [...(this.listeners.get(type) ?? [])]) {
++      listener(event);
++    }
++  }
++
++  reply(data: unknown): void {
++    this.emit("message", { data });
++  }
++
++  messages(type: string): PostedMessage[] {
++    return this.posted.filter((message) => message.type === type);
++  }
++
++  lastMessage(type: string): PostedMessage {
++    const messages = this.messages(type);
++    const last = messages[messages.length - 1];
++    assert.ok(last, `no ${type} message posted`);
++    return last;
++  }
++
++  ready(load: PostedMessage, overrides: Record<string, unknown> = {}): void {
++    const spec = load.spec as Record<string, unknown>;
++    this.reply({
++      protocol: 1,
++      type: "ready",
++      id: load.id,
++      epoch: load.epoch,
++      plan: {
++        protocol: 1,
++        generation: load.generation,
++        epoch: load.epoch,
++        modelRef: spec.modelRef,
++        backend: "wasm-basic",
++        localOnly: true,
++        modelDigest: null,
++        ...overrides,
++      },
++    });
++  }
++
++  result(infer: PostedMessage, tokens: TokenClassificationEntity[]): void {
++    this.reply({
++      protocol: 1,
++      type: "result",
++      id: infer.id,
++      epoch: infer.epoch,
++      tokens: encodeInferenceTokens(tokens).tokens,
++    });
++  }
++}
++
++async function loadFake(
++  client: InferenceWorkerClient,
++  worker: FakeWorker,
++  overrides: Record<string, unknown> = {},
++): Promise<void> {
++  const loading = client.load({ ...LOCAL_SPEC, ...overrides });
++  worker.ready(worker.lastMessage("load"), overrides);
++  await loading;
++}
++
++interface ConnectedWorker {
++  endpoint: InferenceWorkerEndpoint;
++  server: InferenceWorkerServer;
++  /** Worker-to-host messages, serialised before transfer for inspection. */
++  posted: PostedMessage[];
++  /** Input buffers the host transferred to the worker. */
++  hostTransfers: ArrayBuffer[];
++  terminated: boolean;
++  close(): void;
++}
++
++/** Runs the real worker server behind a MessageChannel (clone and transfer). */
++function connectWorker(
++  options: Omit<ServeInferenceWorkerOptions, "scope">,
++): ConnectedWorker {
++  const { port1, port2 } = new MessageChannel();
++  const connected: ConnectedWorker = {
++    posted: [],
++    hostTransfers: [],
++    terminated: false,
++    endpoint: {
++      postMessage(message, transfer) {
++        for (const item of transfer) {
++          if (item instanceof ArrayBuffer) {
++            connected.hostTransfers.push(item);
++          }
++        }
++        port1.postMessage(message, transfer as never);
++      },
++      addEventListener: (type, listener) =>
++        port1.addEventListener(type, listener as never),
++      removeEventListener: (type, listener) =>
++        port1.removeEventListener(type, listener as never),
++      terminate() {
++        connected.terminated = true;
++      },
++    },
++    server: undefined as unknown as InferenceWorkerServer,
++    close() {
++      port1.close();
++      port2.close();
++    },
++  };
++  const scope: InferenceWorkerScope = {
++    postMessage(message, transfer) {
++      connected.posted.push(JSON.parse(JSON.stringify(message, typedArrayReplacer)));
++      port2.postMessage(message, transfer as never);
++    },
++    addEventListener: (type, listener) =>
++      port2.addEventListener(type, listener as never),
++    removeEventListener: (type, listener) =>
++      port2.removeEventListener(type, listener as never),
++    close: () => port2.close(),
++  };
++  connected.server = serveInferenceWorker({ ...options, scope });
++  port1.start();
++  port2.start();
++  return connected;
++}
++
++function countPosted(channel: ConnectedWorker, type: string): number {
++  return channel.posted.filter((message) => message.type === type).length;
++}
++
++function nodeWorkerEndpoint(thread: NodeWorker): InferenceWorkerEndpoint {
++  const handlers = new Map<InferenceWorkerEventListener, (value: unknown) => void>();
++  return {
++    postMessage: (message, transfer) => thread.postMessage(message, transfer as never),
++    addEventListener(type, listener) {
++      const handler =
++        type === "message"
++          ? (data: unknown) => listener({ data })
++          : (error: unknown) =>
++              listener({ data: error, preventDefault: () => undefined });
++      handlers.set(listener, handler);
++      thread.on(type, handler);
++    },
++    removeEventListener(type, listener) {
++      const handler = handlers.get(listener);
++      if (handler !== undefined) {
++        thread.off(type, handler);
++      }
++    },
++    terminate: () => void thread.terminate(),
++  };
++}
++
++function typedArrayReplacer(_key: string, value: unknown): unknown {
++  return ArrayBuffer.isView(value)
++    ? Array.from(value as unknown as ArrayLike<number>)
++    : value;
++}
++
++function assertWorkerError(error: unknown, code: InferenceWorkerErrorCode): void {
++  assert.ok(error instanceof InferenceWorkerError, `expected ${code}`);
++  assert.equal(error.code, code);
++  assert.equal(error.name, "InferenceWorkerError");
++  assert.equal(error.cause, undefined);
++  assertNoSentinel(error);
++}
++
++function assertNoSentinel(value: unknown): void {
++  const rendered =
++    value instanceof Error
++      ? [value.name, value.message, value.stack ?? "", String(value.cause ?? "")].join(
++          "\n",
++        )
++      : JSON.stringify(value, typedArrayReplacer);
++  assert.ok(!rendered.includes(SENTINEL), "input text leaked");
++  assert.ok(!rendered.includes("Zyxwv"), "input text leaked");
++}
++
++function spyOnConsole(): { calls: unknown[][]; restore(): void } {
++  const calls: unknown[][] = [];
++  const methods = ["log", "info", "warn", "error", "debug", "trace"] as const;
++  const originals = methods.map((method) => console[method]);
++  for (const method of methods) {
++    console[method] = (...args: unknown[]) => {
++      calls.push([method, ...args]);
++    };
++  }
++  return {
++    calls,
++    restore() {
++      methods.forEach((method, index) => {
++        console[method] = originals[index] as (typeof console)[typeof method];
++      });
++    },
++  };
++}
++
++/** Negative control: no browser storage API may be touched by the worker path. */
++function guardStorage(): { accessed: string[]; restore(): void } {
++  const accessed: string[] = [];
++  const names = ["localStorage", "sessionStorage", "indexedDB", "caches"];
++  const originals = names.map((name) =>
++    Object.getOwnPropertyDescriptor(globalThis, name),
++  );
++  for (const name of names) {
++    Object.defineProperty(globalThis, name, {
++      configurable: true,
++      get() {
++        accessed.push(name);
++        return undefined;
++      },
++    });
++  }
++  return {
++    accessed,
++    restore() {
++      names.forEach((name, index) => {
++        const original = originals[index];
++        if (original === undefined) {
++          delete (globalThis as Record<string, unknown>)[name];
++        } else {
++          Object.defineProperty(globalThis, name, original);
++        }
++      });
++    },
++  };
++}
++
++function assertSpansClose(actual: OpenMedSpan[], expected: OpenMedSpan[]): void {
++  assert.equal(actual.length, expected.length);
++  for (const [index, actualSpan] of actual.entries()) {
++    const expectedSpan = expected[index];
++    assert.ok(expectedSpan, `missing expected span at ${index}`);
++    const { score: actualScore, ...actualRest } = actualSpan;
++    const { score: expectedScore, ...expectedRest } = expectedSpan;
++    assert.deepEqual(actualRest, expectedRest);
++    assert.ok(actualScore !== null && expectedScore !== null);
++    assert.ok(Math.abs(actualScore - expectedScore) <= 1e-12);
++  }
++}
++
++function pick<T extends object, K extends keyof T>(value: T, keys: K[]): Pick<T, K> {
++  return Object.fromEntries(keys.map((key) => [key, value[key]])) as Pick<T, K>;
++}
++
++async function rejection(promise: Promise<unknown>): Promise<unknown> {
++  try {
++    await promise;
++  } catch (error) {
++    return error;
++  }
++  assert.fail("expected the promise to reject");
++}
++
++function deferred<T>(): {
++  promise: Promise<T>;
++  resolve: (value: T) => void;
++} {
++  let resolve!: (value: T) => void;
++  const promise = new Promise<T>((settle) => {
++    resolve = settle;
++  });
++  return { promise, resolve };
++}
++
++function once(thread: NodeWorker, event: "exit"): Promise<void> {
++  return new Promise((resolve) => thread.once(event, () => resolve()));
++}
++
++async function flush(): Promise<void> {
++  for (let turn = 0; turn < 5; turn += 1) {
++    await new Promise((resolve) => setImmediate(resolve));
++  }
++}
++
++/** Polls by event-loop turns (no wall-clock thresholds). */
++async function waitFor(predicate: () => boolean, turns = 500): Promise<void> {
++  for (let turn = 0; turn < turns; turn += 1) {
++    if (predicate()) {
++      return;
++    }
++    await new Promise((resolve) => setImmediate(resolve));
++  }
++  assert.fail("condition not reached");
++}

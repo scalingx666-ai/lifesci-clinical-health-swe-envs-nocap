@@ -1,0 +1,150 @@
+diff --git a/packages/server/src/cloud/aws/textract.test.ts b/packages/server/src/cloud/aws/textract.test.ts
+index a804349e53f..9ae5bd29da9 100644
+--- a/packages/server/src/cloud/aws/textract.test.ts
++++ b/packages/server/src/cloud/aws/textract.test.ts
+@@ -8,6 +8,7 @@ import {
+   TextractClient,
+ } from '@aws-sdk/client-textract';
+ import { ContentType } from '@medplum/core';
++import type { Binary, Media } from '@medplum/fhirtypes';
+ import type { AwsClientStub } from 'aws-sdk-client-mock';
+ import { mockClient } from 'aws-sdk-client-mock';
+ import express from 'express';
+@@ -56,14 +57,39 @@ describe('AWS Textract', () => {
+     mockComprehendClient.restore();
+   });
+ 
++  async function getOutputBinary(accessToken: string): Promise<Binary> {
++    const searchRes = await request(app)
++      .get('/fhir/R4/Media?_sort=-_lastUpdated&_count=1')
++      .set('Authorization', 'Bearer ' + accessToken);
++    expect(searchRes).toHaveStatus(200);
++    const output = searchRes.body.entry[0].resource as Media;
++    // content.url is a presigned storage URL of the form /storage/<id>/<versionId>
++    const binaryId = new URL(output.content.url as string).pathname.split('/').filter(Boolean)[1];
++    const binaryRes = await request(app)
++      .get(`/fhir/R4/Binary/${binaryId}`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .set('Accept', ContentType.FHIR_JSON);
++    expect(binaryRes).toHaveStatus(200);
++    return binaryRes.body as Binary;
++  }
++
+   test('Happy path', async () => {
+     const accessToken = await initTestAuth({ project: { features: ['aws-textract'] } });
+ 
++    const patientRes = await request(app)
++      .post('/fhir/R4/Patient')
++      .set('Authorization', 'Bearer ' + accessToken)
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .send({ resourceType: 'Patient' });
++    expect(patientRes).toHaveStatus(201);
++    const patientRef = 'Patient/' + patientRes.body.id;
++
+     // Step 1: Create a PDF Binary
+     const res1 = await request(app)
+       .post('/fhir/R4/Binary')
+       .set('Authorization', 'Bearer ' + accessToken)
+       .set('Content-Type', ContentType.TEXT)
++      .set('X-Security-Context', patientRef)
+       .send('Hello world');
+     expect(res1).toHaveStatus(201);
+ 
+@@ -88,6 +114,9 @@ describe('AWS Textract', () => {
+       .set('Authorization', 'Bearer ' + accessToken);
+     expect(res3).toHaveStatus(200);
+     expect(res3.body.Blocks).toBeDefined();
++
++    const output = await getOutputBinary(accessToken);
++    expect(output.securityContext?.reference).toStrictEqual(patientRef);
+   });
+ 
+   test('Paginated results', async () => {
+@@ -211,6 +240,9 @@ describe('AWS Textract', () => {
+       .set('Authorization', 'Bearer ' + accessToken);
+     expect(res3).toHaveStatus(200);
+     expect(res3.body.Blocks).toBeDefined();
++
++    const output = await getOutputBinary(accessToken);
++    expect(output.securityContext?.reference).toStrictEqual('DocumentReference/' + res2.body.id);
+   });
+ 
+   test('DocumentReference with Comprehend', async () => {
+diff --git a/packages/server/src/cloud/aws/textract.ts b/packages/server/src/cloud/aws/textract.ts
+index faae18c15b8..ba44070120c 100644
+--- a/packages/server/src/cloud/aws/textract.ts
++++ b/packages/server/src/cloud/aws/textract.ts
+@@ -6,9 +6,9 @@ import {
+   StartDocumentTextDetectionCommand,
+   TextractClient,
+ } from '@aws-sdk/client-textract';
+-import { ContentType, allOk, badRequest, getReferenceString, sleep } from '@medplum/core';
++import { ContentType, allOk, badRequest, createReference, getReferenceString, sleep } from '@medplum/core';
+ import type { FhirRequest, FhirResponse } from '@medplum/fhir-router';
+-import type { Binary, DocumentReference, Media, Resource } from '@medplum/fhirtypes';
++import type { Binary, DocumentReference, Media, Reference, Resource } from '@medplum/fhirtypes';
+ import { Readable } from 'node:stream';
+ import { getConfig } from '../../config/loader';
+ import { getAuthenticatedContext } from '../../context';
+@@ -37,11 +37,13 @@ export async function awsTextractHandler(req: FhirRequest): Promise<FhirResponse
+ 
+   let inputBinary: Binary;
+   let subject: any;
++  let source: Reference<Media | DocumentReference>;
+ 
+   if (resourceType === 'Media') {
+     const inputMedia = await repo.readResource<Media>('Media', id);
+     inputBinary = await repo.readReference<Binary>({ reference: inputMedia.content.url });
+     subject = inputMedia.subject;
++    source = createReference(inputMedia);
+   } else {
+     // DocumentReference
+     const inputDocRef = await repo.readResource<DocumentReference>('DocumentReference', id);
+@@ -56,8 +58,12 @@ export async function awsTextractHandler(req: FhirRequest): Promise<FhirResponse
+ 
+     inputBinary = await repo.readReference<Binary>({ reference: attachment.url });
+     subject = inputDocRef.subject;
++    source = createReference(inputDocRef);
+   }
+ 
++  // Output files share the input file's securityContext, or else reference the source resource
++  const securityContext = inputBinary.securityContext ?? source;
++
+   const { awsRegion } = getConfig();
+   const bucket = storage.bucket;
+   const key = storage.getKey(inputBinary);
+@@ -122,7 +128,8 @@ export async function awsTextractHandler(req: FhirRequest): Promise<FhirResponse
+     JSON.stringify(textractResult, null, 2),
+     ContentType.JSON,
+     'textract.json',
+-    mediaProps
++    mediaProps,
++    securityContext
+   );
+ 
+   const options = req.body as undefined | { comprehend?: boolean };
+@@ -136,7 +143,8 @@ export async function awsTextractHandler(req: FhirRequest): Promise<FhirResponse
+       JSON.stringify(comprehendResult, null, 2),
+       ContentType.JSON,
+       'comprehend.json',
+-      mediaProps
++      mediaProps,
++      securityContext
+     );
+   }
+ 
+@@ -148,11 +156,13 @@ async function createBinaryAndMedia(
+   content: string,
+   contentType: string,
+   filename: string,
+-  mediaProps: Partial<Media>
++  mediaProps: Partial<Media>,
++  securityContext: Reference
+ ): Promise<Media> {
+   const binary = await repo.createResource<Binary>({
+     resourceType: 'Binary',
+     contentType,
++    securityContext,
+   });
+ 
+   await getBinaryStorage().writeBinary(binary, filename, contentType, Readable.from(content));

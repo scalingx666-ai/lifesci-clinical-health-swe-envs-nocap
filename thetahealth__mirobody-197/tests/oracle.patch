@@ -1,0 +1,114 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2e0be39f..0dffafe6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,18 @@
+ ## Unreleased
+ 
++### Fixed
++
++- **A keyword search reaches every series that shares a name.** `_by_keywords`
++  kept one series per printed or display name (`dict.setdefault`), so when a
++  lab and a device filed the same analyte under the same name, the second
++  series could not be found by keyword: asked for a CGM's fasting glucose on a
++  day, the agent answered that there was none, though 1,007 readings were
++  stored. A matching name now brings all its series; their rows already carry
++  the series, file and modality that tell them apart. On a local deployment of
++  `main` with the 20 ESL-Bench synthetic users (lab results and devices seeded
++  as structured data), 86 questions comparing a lab value with the same day's
++  device value went from 22 to 86 answered correctly.
++
+ ## 1.5.9
+ 
+ ### Added
+diff --git a/mirobody/collect/query.py b/mirobody/collect/query.py
+index 9e0070a6..484cf87f 100644
+--- a/mirobody/collect/query.py
++++ b/mirobody/collect/query.py
+@@ -645,17 +645,26 @@ async def _by_keywords(self, subject_id: str, keywords: tuple[str, ...], window:
+ 
+         The tiers are per keyword: in ["血压", "头痛"] a lexical hit on the
+         first must not stop the second from reaching an entry written 头疼,
+-        which only the code (NS01) connects."""
++        which only the code (NS01) connects.
++
++        A name can belong to several series: a lab's fasting glucose and a
++        CGM's, a clinic's weight and a scale's. A name that matches brings
++        every series printed or displayed under it, so the model sees them all
++        and tells them apart by their rows (series, file, modality)."""
+         kws = [k.strip() for k in keywords if k and k.strip()]
+         if not kws:
+             return []
+         labels = await self._labels(subject_id, window)
+-        by_label: dict[str, str] = {}
++        by_label: dict[str, list[str]] = {}
+         for label, sid in labels:
+-            by_label.setdefault(label, sid)
++            by_label.setdefault(label, []).append(sid)
+         found: list[str] = []
+         for kw in kws:
+-            ranked = [by_label[label] for label in query.rank_catalog(kw, list(by_label), limit=MAX_KEYWORD_NAMES)]
++            ranked = [
++                sid
++                for label in query.rank_catalog(kw, list(by_label), limit=MAX_KEYWORD_NAMES)
++                for sid in by_label[label]
++            ]
+             if not ranked:
+                 named = self._series_for(kw)
+                 ranked = [sid for _label, sid in labels if sid in named]
+diff --git a/mirobody/tests/test_collect_regressions.py b/mirobody/tests/test_collect_regressions.py
+index 0eee5bba..b1c4b445 100644
+--- a/mirobody/tests/test_collect_regressions.py
++++ b/mirobody/tests/test_collect_regressions.py
+@@ -274,3 +274,22 @@ async def test_a_character_cut_does_not_suggest_an_invalid_medication_view():
+     # A display cut must not discard the complete original result used by Python.
+     assert "truncated" in result["result"]
+     assert (result["status"], result["row_count"], result["truncated"]) == (tools.STATUS_OK, meds.MAX_ROWS, False)
++
++
++@pytest.fixture
++def health_query():
++    return import_module("mirobody.collect.query").PostgresHealthQuery()
++
++
++async def test_a_keyword_reaches_every_series_sharing_a_name(health_query, monkeypatch):
++    """A lab's fasting glucose and a CGM's share the printed name. Keeping one
++    series per name hid the device series: asked for the CGM value of a day,
++    the model answered that there was none (ESL-Bench same-day questions)."""
++    lab, cgm = "loinc:glucose^post cfst|Ser/Plas|Pt|Qn|QCnc", "mirobody-device:FastingBloodGlucose-FBG"
++    labels = [("FastingBloodGlucose-FBG", lab), ("Fasting glucose [Moles/volume] in Serum or Plasma", lab),
++              ("FastingBloodGlucose-FBG", cgm), ("BodyWeight", "mirobody-device:BodyWeight")]
++    monkeypatch.setattr(health_query, "_labels", AsyncMock(return_value=labels))
++    monkeypatch.setattr(health_query, "_series_for", lambda keyword: set())
++    found = await health_query._by_keywords("1", ("fasting glucose",), None)
++    assert found == [lab, cgm]
++    assert await health_query._by_keywords("1", ("FastingBloodGlucose-FBG",), None) == [lab, cgm]
+diff --git a/mirobody/tests/test_postgres_regressions.py b/mirobody/tests/test_postgres_regressions.py
+index 25f73413..c9acc998 100644
+--- a/mirobody/tests/test_postgres_regressions.py
++++ b/mirobody/tests/test_postgres_regressions.py
+@@ -487,6 +487,24 @@ async def test_stats_sum_is_the_total_over_every_reading_of_an_unelected_day(dat
+     assert stats["avg"] == pytest.approx(900_000)
+ 
+ 
++async def test_a_keyword_reaches_a_lab_and_a_device_series_under_one_name(database):
++    from mirobody.collect import observations
++    from mirobody.collect.query import PostgresHealthQuery
++
++    at = datetime(2026, 1, 1, 8, tzinfo=UTC)
++    await observations.ingest("1", [observations.Draft(name_text="Glucose", value_text="7.4", unit_text="mmol/L",
++                                                       observed_start=at)],
++                              observations.Provenance("lab-report", "file", "th_files:synthetic-lab"), user_tz="UTC")
++    await observations.ingest("1", [observations.Draft(name_text="Glucose", value_text="6.9", unit_text="mmol/L",
++                                                       observed_start=at)],
++                              observations.Provenance("device-sensed", "device", "device:synthetic-cgm",
++                                                      vendor="synthetic-cgm"), user_tz="UTC")
++    series = {r["series_id"] for r in await database("SELECT series_id FROM v_observation", log_sql=False)}
++    assert len(series) == 2  # a device reading keeps its own namespace, not the lab's LOINC
++    found = await PostgresHealthQuery()._by_keywords("1", ("glucose",), None)
++    assert set(found) == series
++
++
+ def test_trend_citation_definition_tracks_its_actual_daily_input_without_values():
+     from mirobody.collect.citations import aggregate_definition, aggregate_key
+ 

@@ -1,0 +1,33 @@
+# Issue
+
+**Title:** Fix manual sync is not triggered, issue #2492
+
+## Description
+
+**IMPORTANT: All PRs must be linked to an issue (except for extremely trivial and straightforward changes).**
+
+
+
+**Description**
+It should trigger the manual sync, and sync the patient.
+
+**Alternative(s) considered**
+Have you considered any alternatives? And if so, why have you chosen the approach in this PR?
+
+**Type**
+Choose one: (Bug fix)
+
+**Screenshots (if applicable)**
+
+**Checklist**
+- :heavy_check_mark: I have read and acknowledged the [Code of conduct](https://github.com/google/android-fhir/blob/master/CODE_OF_CONDUCT.md).
+- :heavy_check_mark: I have read the [Contributing](https://github.com/google/android-fhir/wiki/Contributing) page.
+- :heavy_check_mark: I have signed the Google [Individual CLA](https://cla.developers.google.com/about/google-individual), or I am covered by my company's [Corporate CLA](https://cla.developers.google.com/about/google-corporate ).
+- :heavy_check_mark: I have discussed my proposed solution with code owners in the linked issue(s) and we have agreed upon the general approach.
+- :heavy_check_mark: I have run `./gradlew spotlessApply` and `./gradlew spotlessCheck` to check my code follows the style guide of this project.
+- :heavy_check_mark: I have run `./gradlew check` and `./gradlew connectedCheck` to test my changes locally.
+- :heavy_check_mark: I have built and run the demo app(s) to verify my change fixes the issue and/or does not break the demo app(s).
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `56339b4520d5`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

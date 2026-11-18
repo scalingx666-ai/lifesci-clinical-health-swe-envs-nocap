@@ -1,0 +1,144 @@
+diff --git a/mirobody/agent/chat/adapters/base.py b/mirobody/agent/chat/adapters/base.py
+index 298b4ce6f..e7944afc4 100644
+--- a/mirobody/agent/chat/adapters/base.py
++++ b/mirobody/agent/chat/adapters/base.py
+@@ -24,11 +24,12 @@
+     save_message,
+     get_last_message,
+ )
+-from ..model import ChatStreamRequest
++from ..model import ChatStreamRequest, has_attachment
+ 
+ from ....user.care_circle import CareCircleDenied, resolve_subject
+ from ....utils import execute_query, safe_read_cfg
+ from ....utils.config import get_default_timezone
++from ....utils.i18n import t
+ from ....utils.tasks import spawn
+ 
+ #-----------------------------------------------------------------------------
+@@ -479,7 +480,29 @@ async def handle_request(
+             if not await self.validate_permissions(params, params.user_id):
+                 yield self.encode_chunk({"type": "error", "content": "No permission to chat for this user"})
+                 return
+-            
++
++            # An attachment-only turn asks "read this" — say it out loud, ONCE,
++            # before anything downstream reads `params.question`. Everything
++            # that turn touches keys on that field: `_save_question_if_needed`
++            # (so the turn leaves a user row and the session gets a title
++            # instead of an assistant answer whose `question_id` points at a
++            # row that does not exist), the `question` kwarg BaseAgent renders
++            # its prompt from (`detect_language("")` is English, so a Chinese
++            # user who typed nothing got an English-instructed prompt), and the
++            # message the model receives. Substituting later, at message-build
++            # time, fixed only the last of those — and even that only until a
++            # `current_turn_note` was folded in ahead of it, which left the user
++            # message a bare time hint asking nothing at all.
++            #
++            # The empty message this replaces is not a harmless no-op: Anthropic
++            # rejects a zero-length text block outright (400), and LangGraph
++            # checkpoints the turn's input BEFORE the model node runs, so the
++            # failed turn stays in the session thread and is replayed on every
++            # later turn of that session.
++            if not params.question and has_attachment(params.file_list):
++                params.question = t("attachment_only_question",
++                                    params.language or "en", module="chat")
++
+             question_msg_id = params.question_id or f"q_{uuid.uuid4()}"
+             
+             parallel_tasks = [
+diff --git a/mirobody/agent/chat/model.py b/mirobody/agent/chat/model.py
+index 9c970750e..533a9e242 100644
+--- a/mirobody/agent/chat/model.py
++++ b/mirobody/agent/chat/model.py
+@@ -94,6 +94,30 @@ def __init__(
+ 
+ #-----------------------------------------------------------------------------
+ 
++
++def has_attachment(file_list: Any) -> bool:
++    """True when this turn really carries a file the agent can reach.
++
++    Truthiness of `file_list` is not the same question. `[{}]` and `"x"` are
++    both truthy and neither names a file: `/uploads/` would be empty and
++    `_attachment_reminder` would return None, while the guard had already let
++    the turn through and the stand-in question had already promised the model
++    an attachment. `file_key` is what the whole upload path keys on, so it is
++    what counts here. Entries arrive as dicts from the JSON body; the
++    `ChatFileObject` branch is for callers that build the request in Python.
++    """
++    if not isinstance(file_list, (list, tuple)):
++        return False
++    for f in file_list:
++        if isinstance(f, dict):
++            if f.get("file_key"):
++                return True
++        elif getattr(f, "file_key", ""):
++            return True
++    return False
++
++#-----------------------------------------------------------------------------
++
+ class UserInfo(BaseModel):
+     user_id: str = Field(..., description="User ID")
+     user_name: str = Field(..., description="User Name")
+diff --git a/mirobody/agent/chat/service.py b/mirobody/agent/chat/service.py
+index c68fcabdb..4607f5aaa 100644
+--- a/mirobody/agent/chat/service.py
++++ b/mirobody/agent/chat/service.py
+@@ -13,7 +13,7 @@
+     get_session_summaries_by_person,
+     delete_session
+ )
+-from .model import ChatStreamRequest
++from .model import ChatStreamRequest, has_attachment
+ from .message import (
+     get_chat_history,
+     set_message_rating
+@@ -398,7 +398,13 @@ async def chat_handler(self, request: Request) -> Response:
+             return json_response_with_code(-2, "Invalid question.", request=request)
+ 
+         params["question"] = params["question"].strip()
+-        if not params["question"]:
++        # An attachment-only turn is a real request ("read this"), so a missing
++        # question is only empty when nothing else came with it. This guard used
++        # to reject on the text alone, which made "attach an image, press send"
++        # a hard -3 for every client. `has_attachment` rather than truthiness:
++        # `[{}]` names no file, and letting it through would promise the model
++        # an attachment that `/uploads/` cannot serve.
++        if not params["question"] and not has_attachment(params.get("file_list")):
+             return json_response_with_code(-3, "Empty question.", request=request)
+ 
+         #-------------------------------------------------
+diff --git a/mirobody/utils/i18n.py b/mirobody/utils/i18n.py
+index a750d345c..3ee4e22e3 100644
+--- a/mirobody/utils/i18n.py
++++ b/mirobody/utils/i18n.py
+@@ -22,6 +22,12 @@ class I18n:
+         "zh_cn": "zh",
+         "zh-hans": "zh",
+         "zh_hans": "zh",
++        # Traditional variants map to the Simplified bundle: we ship a
++        # README.zh-TW.md, and Chinese text is closer than the English default.
++        "zh-tw": "zh",
++        "zh_tw": "zh",
++        "zh-hant": "zh",
++        "zh_hant": "zh",
+         "en": "en",
+         "fr": "fr",
+         "ja": "ja",
+diff --git a/mirobody/utils/locales/chat.json b/mirobody/utils/locales/chat.json
+new file mode 100644
+index 000000000..cf9bc3fba
+--- /dev/null
++++ b/mirobody/utils/locales/chat.json
+@@ -0,0 +1,9 @@
++{
++  "attachment_only_question": {
++    "zh": "请阅读我这次上传的文件，并给出解读。",
++    "en": "Please read the file(s) I attached to this message and tell me what they say.",
++    "fr": "Merci de lire le ou les fichiers que j'ai joints à ce message et de m'expliquer ce qu'ils contiennent.",
++    "ja": "今回アップロードしたファイルを読んで、内容を説明してください。",
++    "es": "Por favor, lee el archivo o los archivos que he adjuntado a este mensaje y explícame qué dicen."
++  }
++}

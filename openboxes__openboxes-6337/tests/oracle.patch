@@ -1,0 +1,268 @@
+diff --git a/grails-app/i18n/messages.properties b/grails-app/i18n/messages.properties
+index cf915250f5..7de3c28353 100644
+--- a/grails-app/i18n/messages.properties
++++ b/grails-app/i18n/messages.properties
+@@ -2403,7 +2403,7 @@ receiptCompleteRequestCommand.receipt.nullable=Receipt cannot be null
+ receiptCompleteRequestCommand.dateDelivered.future=Delivery date {0} cannot be in the future
+ receiptCompleteRequestCommand.receipt.notPending=Cannot complete receipt {0} because it is not pending
+ receiptCompleteRequestCommand.receipt.isDifferentLocation=You must be logged into the destination to complete the receipt
+-receiptCompleteRequestCommand.receipt.nothingReceived=Cannot complete receipt {0} because nothing was received on it
++receiptCompleteRequestCommand.receipt.nothingReceived=Cannot complete receipt {0} because nothing was received or cancelled
+ receiptCompleteRequestCommand.receipt.binLocationMissing=Bin location is required for receipt item(s) ({0})
+ receiptCompleteRequestCommand.receipt.binLocationInactive=Bin location {0} is inactive. Change the bin for receipt item {1}
+ receiptCompleteRequestCommand.receipt.missingLotAndExpiry=Product [{0}][{1}] must have a lot and expiry entered for all lines
+diff --git a/grails-app/services/org/pih/warehouse/api/receiving/v2/ReceiptV2Service.groovy b/grails-app/services/org/pih/warehouse/api/receiving/v2/ReceiptV2Service.groovy
+index 69833e7d8b..6fe003e1f2 100644
+--- a/grails-app/services/org/pih/warehouse/api/receiving/v2/ReceiptV2Service.groovy
++++ b/grails-app/services/org/pih/warehouse/api/receiving/v2/ReceiptV2Service.groovy
+@@ -361,9 +361,11 @@ class ReceiptV2Service {
+                 new ShipmentStatusTransitionEvent(receipt, ShipmentStatusCode.RECEIVED))
+ 
+         // Trigger product availability refresh
+-        transaction.disableRefresh = Boolean.FALSE
+-        grailsApplication.mainContext.publishEvent(new RefreshProductAvailabilityEvent(
+-                transaction, transaction.associatedLocation, transaction.associatedProducts, false))
++        if (transaction) {
++            transaction.disableRefresh = Boolean.FALSE
++            grailsApplication.mainContext.publishEvent(new RefreshProductAvailabilityEvent(
++                    transaction, transaction.associatedLocation, transaction.associatedProducts, false))
++        }
+ 
+         return ReceiptDto.from(receipt)
+     }
+diff --git a/src/main/groovy/org/pih/warehouse/receiving/ReceiptCompleteRequestCommandValidator.groovy b/src/main/groovy/org/pih/warehouse/receiving/ReceiptCompleteRequestCommandValidator.groovy
+index a9aeff354c..e4131c51f6 100644
+--- a/src/main/groovy/org/pih/warehouse/receiving/ReceiptCompleteRequestCommandValidator.groovy
++++ b/src/main/groovy/org/pih/warehouse/receiving/ReceiptCompleteRequestCommandValidator.groovy
+@@ -2,10 +2,12 @@ package org.pih.warehouse.receiving
+ 
+ import java.time.Instant
+ 
++import org.springframework.beans.factory.annotation.Autowired
+ import org.springframework.stereotype.Component
+ import org.springframework.validation.ObjectError
+ 
+ import org.pih.warehouse.auth.AuthService
++import org.pih.warehouse.core.ActivityCode
+ import org.pih.warehouse.core.Location
+ import org.pih.warehouse.core.validation.ObjectValidationResult
+ import org.pih.warehouse.core.validation.ObjectValidator
+@@ -15,6 +17,9 @@ import org.pih.warehouse.product.Product
+ @Component
+ class ReceiptCompleteRequestCommandValidator extends ObjectValidator<ReceiptCompleteRequestCommand> {
+ 
++    @Autowired
++    ShipmentReceivingCalculator shipmentReceivingCalculator
++
+     @Override
+     protected ObjectValidationResult doValidate(ReceiptCompleteRequestCommand command) {
+         return new ObjectValidationResult(
+@@ -80,23 +85,44 @@ class ReceiptCompleteRequestCommandValidator extends ObjectValidator<ReceiptComp
+ 
+     /**
+      * A receipt must have received something to be completed: at least one of its lines with a quantity received
+-     * above zero. Completing one that received nothing would record an inbound transaction carrying no entries at
+-     * all (see {@link ReceiptTransactionManager#createInboundTransaction}).
++     * above zero. The exception is a receipt that cancels some remaining quantity - it can be completed without
++     * receiving anything, and then no transaction is recorded for it (see
++     * {@link ReceiptTransactionManager#createInboundTransaction}).
+      */
+     private ObjectError validateSomethingWasReceived(ReceiptCompleteRequestCommand command) {
+         if (!command.receipt) {
+             return null
+         }
+ 
+-        // The same lines the transaction credits: a null quantity received is a line that was never given one.
+-        boolean nothingReceived = !(command.receipt.receiptItems ?: []).any { ReceiptItem receiptItem ->
++        // At least one line on this receipt has a quantity received above zero (null counts as zero)
++        boolean hasReceivedLines = (command.receipt.receiptItems ?: []).any { ReceiptItem receiptItem ->
+             (receiptItem.quantityReceived ?: 0) > 0
+         }
+ 
+-        return nothingReceived ?
+-                rejectField("receipt", command.receipt, "receiptCompleteRequestCommand.receipt.nothingReceived",
+-                        [command.receipt.receiptNumber]) :
+-                null
++        // Something was received, so there is no need to check what gets canceled
++        if (hasReceivedLines) {
++            return null
++        }
++
++        Location destination = command.receipt.shipment?.destination
++
++        // At least one line that the completion cancels still has a remaining quantity. With partial receiving these
++        // are the lines marked with cancelRemainingQuantity in the request, without it all lines
++        boolean hasLinesWithQuantityToCancel = destination?.supports(ActivityCode.PARTIAL_RECEIVING)
++                ? command.itemsToComplete.any { ReceiptItemCompleteRequest item ->
++                    item.cancelRemainingQuantity &&
++                        shipmentReceivingCalculator.getShipmentItemQuantityRemaining(item.receiptItem?.shipmentItem) > 0
++                }
++                : (command.receipt.receiptItems ?: []).any { ReceiptItem receiptItem ->
++                    shipmentReceivingCalculator.getShipmentItemQuantityRemaining(receiptItem.shipmentItem) > 0
++                }
++
++        if (!hasLinesWithQuantityToCancel) {
++            return rejectField("receipt", command.receipt, "receiptCompleteRequestCommand.receipt.nothingReceived",
++                    [command.receipt.receiptNumber])
++        }
++
++        return null
+     }
+ 
+     /**
+diff --git a/src/main/groovy/org/pih/warehouse/receiving/ReceiptTransactionManager.groovy b/src/main/groovy/org/pih/warehouse/receiving/ReceiptTransactionManager.groovy
+index da6af05633..ddc003e608 100644
+--- a/src/main/groovy/org/pih/warehouse/receiving/ReceiptTransactionManager.groovy
++++ b/src/main/groovy/org/pih/warehouse/receiving/ReceiptTransactionManager.groovy
+@@ -38,10 +38,35 @@ class ReceiptTransactionManager {
+     /**
+      * Records the inbound stock transaction of a completed receipt: one entry per line that received something,
+      * crediting the received quantities to the destination's inventory. Lines completed with nothing received get
+-     * no entry.
++     * no entry. A receipt that received nothing records no transaction, so null is returned for it.
+      */
+     Transaction createInboundTransaction(Receipt receipt) {
+         Shipment shipment = receipt.shipment
++
++        boolean hasReceivedLines = receipt.receiptItems.any { ReceiptItem receiptItem ->
++            (receiptItem.quantityReceived ?: 0) > 0
++        }
++
++        // Nothing was received, so no transaction is recorded. The order summary is refreshed by the shipment's
++        // afterUpdate, but if the shipment has nothing to update (such as when it is already partially received and
++        // its status does not change), afterUpdate is not called, so the refresh is published by hand after the save.
++        // The save has to flush, because the refresh reads the data straight from the database with plain SQL, so
++        // without the flush it would still see the data from before this receipt
++        if (!hasReceivedLines) {
++            if (!shipment.save(flush: true)) {
++                throw new ValidationException("Shipment is invalid", shipment.errors)
++            }
++
++            // Has to stay after the save. The shipment has disableRefresh = true by default, so the refresh that its
++            // afterUpdate publishes during the save is ignored. If this line were moved above the save, a shipment
++            // that does get updated (its status changes, for example on the receipt that closes it) would refresh the
++            // order summary twice, once in afterUpdate during the save and once in publishRefreshEvent below. The
++            // result would be the same, only the refresh query would run twice
++            shipment.disableRefresh = false
++            shipment.publishRefreshEvent()
++            return null
++        }
++
+         if (!shipment.destination?.inventory) {
+             throw new IllegalStateException(
+                     "Destination ${shipment.destination?.name} must have an inventory in order to receive stock")
+diff --git a/src/main/groovy/org/pih/warehouse/receiving/ShipmentReceivingCalculator.groovy b/src/main/groovy/org/pih/warehouse/receiving/ShipmentReceivingCalculator.groovy
+index df806942a2..5c67a4b553 100644
+--- a/src/main/groovy/org/pih/warehouse/receiving/ShipmentReceivingCalculator.groovy
++++ b/src/main/groovy/org/pih/warehouse/receiving/ShipmentReceivingCalculator.groovy
+@@ -28,12 +28,12 @@ class ShipmentReceivingCalculator {
+      * exactly as {@link ShipmentItemReceivingSummaryDto} totals them for the receiving client.
+      */
+     Integer getShipmentItemQuantityRemaining(ShipmentItem shipmentItem) {
+-        int quantityReceivedAndCanceled = (shipmentItem.receiptItems ?: []).sum(0) { ReceiptItem receiptItem ->
++        int quantityReceivedAndCanceled = (shipmentItem?.receiptItems ?: []).sum(0) { ReceiptItem receiptItem ->
+             receiptItem.receipt?.receiptStatusCode == ReceiptStatusCode.RECEIVED
+                     ? (receiptItem.quantityReceived ?: 0) + (receiptItem.quantityCanceled ?: 0)
+                     : 0
+         } as int
+-        return (shipmentItem.quantity ?: 0) - quantityReceivedAndCanceled
++        return (shipmentItem?.quantity ?: 0) - quantityReceivedAndCanceled
+     }
+ 
+     /**
+diff --git a/src/test/groovy/org/pih/warehouse/api/receiving/v2/ReceiptV2ServiceSpec.groovy b/src/test/groovy/org/pih/warehouse/api/receiving/v2/ReceiptV2ServiceSpec.groovy
+index c9ff3b7fe3..08a2c9d61b 100644
+--- a/src/test/groovy/org/pih/warehouse/api/receiving/v2/ReceiptV2ServiceSpec.groovy
++++ b/src/test/groovy/org/pih/warehouse/api/receiving/v2/ReceiptV2ServiceSpec.groovy
+@@ -1244,6 +1244,10 @@ class ReceiptV2ServiceSpec extends Specification implements ServiceUnitTest<Rece
+ 
+         then: 'the "nothing entered yet" null does not outlive the pending receipt'
+         assert receiptItem.quantityReceived == 0
++
++        and: 'nothing was received, so no transaction is recorded'
++        assert Transaction.count() == 0
++        1 * mainContext.publishEvent(_ as ShipmentStatusTransitionEvent)
+     }
+ 
+     void 'completeReceipt should not record a transaction entry for a line left out of a partial receipt'() {
+diff --git a/src/test/groovy/org/pih/warehouse/receiving/ReceiptCompleteRequestCommandValidatorSpec.groovy b/src/test/groovy/org/pih/warehouse/receiving/ReceiptCompleteRequestCommandValidatorSpec.groovy
+index bda308bca0..98ebe56c41 100644
+--- a/src/test/groovy/org/pih/warehouse/receiving/ReceiptCompleteRequestCommandValidatorSpec.groovy
++++ b/src/test/groovy/org/pih/warehouse/receiving/ReceiptCompleteRequestCommandValidatorSpec.groovy
+@@ -15,14 +15,18 @@ import org.pih.warehouse.core.validation.ObjectValidationResult
+ import org.pih.warehouse.inventory.InventoryItem
+ import org.pih.warehouse.product.Product
+ import org.pih.warehouse.shipping.Shipment
++import org.pih.warehouse.shipping.ShipmentItem
+ 
+ @Unroll
+ class ReceiptCompleteRequestCommandValidatorSpec extends Specification implements DataTest {
+ 
+-    ReceiptCompleteRequestCommandValidator validator = new ReceiptCompleteRequestCommandValidator()
++    static final String NOTHING_RECEIVED = "receiptCompleteRequestCommand.receipt.nothingReceived"
++
++    ReceiptCompleteRequestCommandValidator validator = new ReceiptCompleteRequestCommandValidator(
++            shipmentReceivingCalculator: new ShipmentReceivingCalculator())
+ 
+     void setupSpec() {
+-        mockDomains(Receipt, ReceiptItem, Product, Shipment, Location)
++        mockDomains(Receipt, ReceiptItem, Product, Shipment, ShipmentItem, Location)
+ 
+         // ReceiptItemCompleteRequest implements ObjectValidatable, whose validate() performs javax validation
+         // through the "defaultValidator" bean. A running app gets that bean from Boot's autoconfiguration, but
+@@ -129,6 +133,37 @@ class ReceiptCompleteRequestCommandValidatorSpec extends Specification implement
+         assert result.valid
+     }
+ 
++    void 'doValidate should return errors #errorCodes for a receipt that #scenario'() {
++        given: 'a receipt whose lines each still had the given quantity remaining before it'
++        Receipt receipt = buildPendingReceipt()
++        List<ReceiptItem> receiptItems = quantitiesReceived.collect { Integer quantityReceived ->
++            buildReceiptItem(receipt, false, quantityReceived)
++        }
++        receiveInto(receipt, supportedActivity)
++        receiptItems.eachWithIndex { ReceiptItem receiptItem, int index ->
++            receiptItem.shipmentItem = buildShipmentItem(quantitiesRemaining[index])
++        }
++
++        expect:
++        assert validator.doValidate(new ReceiptCompleteRequestCommand(
++                receipt: receipt,
++                itemsToComplete: receiptItems.collect { ReceiptItem receiptItem ->
++                    new ReceiptItemCompleteRequest(receiptItem: receiptItem, cancelRemainingQuantity: canceled)
++                },
++        )).errors*.code == errorCodes
++
++        where:
++        scenario                                                          | quantitiesReceived | quantitiesRemaining | canceled | supportedActivity              || errorCodes
++        "receives nothing and cancels all remaining"                      | [0]                | [4]                 | true     | ActivityCode.PARTIAL_RECEIVING || []
++        "receives nothing and cancels with some lines fully received"     | [0, 0]             | [0, 4]              | true     | ActivityCode.PARTIAL_RECEIVING || []
++        "receives some and cancels all remaining"                         | [2, 0]             | [4, 4]              | true     | ActivityCode.PARTIAL_RECEIVING || []
++        "receives nothing and cancels nothing"                            | [0]                | [4]                 | false    | ActivityCode.PARTIAL_RECEIVING || [NOTHING_RECEIVED]
++        "receives nothing and cancels only lines with nothing left"       | [0]                | [0]                 | true     | ActivityCode.PARTIAL_RECEIVING || [NOTHING_RECEIVED]
++        "receives nothing and cancels after partial receiving turned off" | [0]                | [4]                 | true     | ActivityCode.MANAGE_INVENTORY  || []
++        "receives nothing and flags no line without partial receiving"    | [0]                | [4]                 | false    | ActivityCode.MANAGE_INVENTORY  || []
++        "receives nothing without partial receiving and has nothing left" | [0]                | [0]                 | false    | ActivityCode.MANAGE_INVENTORY  || [NOTHING_RECEIVED]
++    }
++
+     void 'doValidate should reject the cancel-remaining flag on a split item'() {
+         given: 'a pending receipt with an original line and a split line'
+         Receipt receipt = buildPendingReceipt()
+@@ -412,6 +447,17 @@ class ReceiptCompleteRequestCommandValidatorSpec extends Specification implement
+         ))
+     }
+ 
++    /**
++     * A shipment item of 10 whose earlier received receipt took everything but the given quantity remaining.
++     */
++    private static ShipmentItem buildShipmentItem(Integer quantityRemaining) {
++        ReceiptItem earlierReceiptItem = new ReceiptItem(
++                receipt: new Receipt(receiptStatusCode: ReceiptStatusCode.RECEIVED),
++                quantityReceived: 10 - quantityRemaining,
++        )
++        return new ShipmentItem(quantity: 10, receiptItems: [earlierReceiptItem] as Set)
++    }
++
+     /**
+      * Persists a location so that it carries an id, which is what the current location is compared by.
+      */

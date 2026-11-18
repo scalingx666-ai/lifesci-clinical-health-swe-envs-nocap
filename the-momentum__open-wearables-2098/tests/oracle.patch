@@ -1,0 +1,576 @@
+diff --git a/backend/app/api/routes/v1/oauth.py b/backend/app/api/routes/v1/oauth.py
+index b4c9a95dd..9f10c6728 100644
+--- a/backend/app/api/routes/v1/oauth.py
++++ b/backend/app/api/routes/v1/oauth.py
+@@ -1,5 +1,6 @@
+ from datetime import datetime, timezone
+ from typing import Annotated
++from urllib.parse import urlencode
+ from uuid import UUID
+ 
+ from fastapi import APIRouter, HTTPException, Query, status
+@@ -21,7 +22,8 @@
+ from app.services.providers.base_strategy import BaseProviderStrategy
+ from app.services.providers.factory import ProviderFactory
+ from app.utils.auth import ConnectAuthDep
+-from app.utils.exceptions import UnsupportedProviderError, unknown_provider
++from app.utils.exceptions import AppError, UnsupportedProviderError, unknown_provider
++from app.utils.redirect_allowlist import is_allowed_redirect, with_result
+ 
+ router = APIRouter()
+ factory = ProviderFactory()
+@@ -34,6 +36,14 @@ def resolve_provider(slug: str) -> ProviderName:
+         raise unknown_provider(slug, ("path", "provider"), (p.value for p in ProviderName)) from None
+ 
+ 
++def _error_redirect(return_to: str | None, provider: ProviderName, message: str) -> RedirectResponse:
++    """Back to the flow's redirect_uri with the error, or to the JSON error page when it had none."""
++    if return_to:
++        url = with_result(return_to, provider=provider.value, status="error", message=message)
++        return RedirectResponse(url=url, status_code=303)
++    return RedirectResponse(url=f"/api/v1/oauth/error?{urlencode({'message': message})}", status_code=303)
++
++
+ def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
+     """Helper to get provider strategy and ensure it supports OAuth."""
+     strategy = factory.get_provider(provider.value)
+@@ -51,9 +61,13 @@ def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
+ )
+ def authorize_provider(
+     provider: str,
++    db: DbSession,
+     auth: ConnectAuthDep,
+     user_id: Annotated[UUID, Query(description="User ID to connect")],
+-    redirect_uri: Annotated[str | None, Query(description="Optional redirect URI after authorization")] = None,
++    redirect_uri: Annotated[
++        str | None,
++        Query(description="Where to send the browser after the provider sign-in; must be on the allowlist"),
++    ] = None,
+ ):
+     """
+     Initiate OAuth flow for a provider.
+@@ -62,11 +76,24 @@ def authorize_provider(
+ 
+     Requires an API key, a developer token, or a token scoped to `user_id`: an SDK user token
+     or a connect token (`X-Open-Wearables-Connect-Token`, from `POST /users/{user_id}/connect-token`).
++    `redirect_uri` must match `OAUTH_REDIRECT_ALLOWLIST` (default `openwearables://oauth/callback`),
++    the dashboard origin (`FRONTEND_URL`) or `CORS_ORIGINS`. After the sign-in the browser is sent
++    there with `provider`, `status` (`success` or `error`) and, on error, `message` in the query,
++    replacing any parameters of the same name.
+     """
+     if auth.auth_type in ("sdk_token", "connect_token") and auth.user_id != user_id:
+         raise HTTPException(status.HTTP_403_FORBIDDEN, "Token does not match user_id")
+ 
+-    strategy = get_oauth_strategy(resolve_provider(provider))
++    provider_name = resolve_provider(provider)
++    strategy = get_oauth_strategy(provider_name)
++    setting = provider_settings_service.get_settings_map(db).get(provider_name.value)
++    if setting is not None and not setting.is_enabled:
++        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Provider '{provider_name.value}' is not enabled")
++    if redirect_uri is not None and not is_allowed_redirect(redirect_uri):
++        raise HTTPException(
++            status.HTTP_400_BAD_REQUEST,
++            "redirect_uri is not allowed; add it to OAUTH_REDIRECT_ALLOWLIST",
++        )
+ 
+     assert strategy.oauth
+     auth_url, state = strategy.oauth.get_authorization_url(user_id, redirect_uri)
+@@ -91,25 +118,28 @@ def oauth_callback(
+     """
+     OAuth callback endpoint.
+ 
+-    Provider redirects here after user authorizes. Exchanges code for tokens.
++    Provider redirects here after user authorizes. Exchanges code for tokens. When the
++    flow was started with a redirect_uri, the browser goes back there on success and on
++    failure, so an app's sign-in sheet never ends on a JSON page.
+     """
++    provider_name = resolve_provider(provider)
++    strategy = get_oauth_strategy(provider_name)
++    assert strategy.oauth
++    started = strategy.oauth.peek_state(state) if state else None
++    return_to = started.redirect_uri if started else None
++
+     if error:
+-        return RedirectResponse(
+-            url=f"/api/v1/oauth/error?message={error}:+{error_description or 'Unknown+error'}",
+-            status_code=303,
+-        )
++        if state:
++            strategy.oauth.discard_state(state)
++        return _error_redirect(return_to, provider_name, f"{error}: {error_description or 'Unknown error'}")
+ 
+     if not code or not state:
+-        return RedirectResponse(
+-            url="/api/v1/oauth/error?message=Missing+OAuth+parameters",
+-            status_code=303,
+-        )
+-
+-    provider_name = resolve_provider(provider)
+-    strategy = get_oauth_strategy(provider_name)
++        return _error_redirect(return_to, provider_name, "Missing OAuth parameters")
+ 
+-    assert strategy.oauth
+-    oauth_state = strategy.oauth.handle_callback(db, code, state)
++    try:
++        oauth_state = strategy.oauth.handle_callback(db, code, state)
++    except AppError as exc:
++        return _error_redirect(return_to, provider_name, exc.detail)
+ 
+     # Stamp last_synced_at=now so the first periodic sync uses the connection
+     # timestamp as its live-sync cursor and won't attempt to pull all history.
+@@ -138,9 +168,10 @@ def oauth_callback(
+                 is_historical=True,
+             )
+ 
+-    # If a specific redirect_uri was requested (e.g. by frontend), redirect there
++    # If a specific redirect_uri was requested (e.g. by frontend or an app), redirect there
+     if oauth_state.redirect_uri:
+-        return RedirectResponse(url=oauth_state.redirect_uri, status_code=303)
++        url = with_result(oauth_state.redirect_uri, provider=provider_name.value, status="success")
++        return RedirectResponse(url=url, status_code=303)
+ 
+     # Otherwise, redirect to internal success page
+     return RedirectResponse(
+diff --git a/backend/app/config.py b/backend/app/config.py
+index fc7afac24..d42a0a618 100644
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -305,6 +305,8 @@ class Settings(BaseSettings):
+ 
+     # Lifetime of the token a shareable pairing link carries.
+     connect_token_expire_days: int = 7
++    # Extra OAuth redirect_uri targets, comma-separated; FRONTEND_URL and CORS_ORIGINS are always allowed.
++    oauth_redirect_allowlist: str = "openwearables://oauth/callback"
+ 
+     # AWS SETTINGS
+     aws_bucket_name: str | None = None
+diff --git a/backend/app/services/providers/templates/base_oauth.py b/backend/app/services/providers/templates/base_oauth.py
+index 64525b475..b149df37a 100644
+--- a/backend/app/services/providers/templates/base_oauth.py
++++ b/backend/app/services/providers/templates/base_oauth.py
+@@ -258,6 +258,19 @@ def _generate_pkce_pair(self) -> tuple[str, str]:
+ 
+         return code_verifier, code_challenge
+ 
++    def peek_state(self, state: str) -> OAuthState | None:
++        """The stored state without consuming it, to know where to send the user if the flow fails."""
++        state_data = self.redis_client.get(f"oauth_state:{state}")
++        if not state_data:
++            return None
++        state_dict = json.loads(state_data.decode("utf-8") if isinstance(state_data, bytes) else str(state_data))
++        state_dict.pop("code_verifier", None)
++        return OAuthState.model_validate(state_dict)
++
++    def discard_state(self, state: str) -> None:
++        """Drop a state the provider ended with an error; it can never complete."""
++        self.redis_client.delete(f"oauth_state:{state}")
++
+     def _validate_state(self, state: str) -> tuple[OAuthState, str | None]:
+         """Validates and consumes the OAuth state from Redis."""
+         redis_key = f"oauth_state:{state}"
+diff --git a/backend/app/utils/redirect_allowlist.py b/backend/app/utils/redirect_allowlist.py
+new file mode 100644
+index 000000000..04cfa2b98
+--- /dev/null
++++ b/backend/app/utils/redirect_allowlist.py
+@@ -0,0 +1,53 @@
++"""Which redirect_uri the OAuth flow may send a browser back to.
++
++Without a check, the callback was an open redirect: any site could start a
++provider sign-in on this instance and have the user land on a page of its choice.
++"""
++
++from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
++
++from app.config import settings
++
++_WEB_SCHEMES = ("http", "https")
++
++
++def _origin(url: str) -> str | None:
++    parts = urlsplit(url.strip())
++    if parts.scheme not in _WEB_SCHEMES or not parts.netloc:
++        return None
++    return f"{parts.scheme}://{parts.netloc}".lower()
++
++
++def _allowed() -> tuple[set[str], set[str]]:
++    """(web origins, exact app callbacks) currently allowed."""
++    entries = [e.strip() for e in settings.oauth_redirect_allowlist.split(",") if e.strip()]
++    entries += [settings.frontend_url, *(str(origin) for origin in settings.cors_origins)]
++    origins = {origin for entry in entries if (origin := _origin(entry))}
++    callbacks = {_without_query(entry) for entry in entries if _origin(entry) is None}
++    return origins, callbacks
++
++
++def _without_query(uri: str) -> str:
++    parts = urlsplit(uri.strip())
++    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, "", ""))
++
++
++def is_allowed_redirect(uri: str) -> bool:
++    origins, callbacks = _allowed()
++    try:
++        parts = urlsplit(uri)
++        if parts.scheme in _WEB_SCHEMES:
++            return _origin(uri) in origins
++        if not parts.scheme or parts.scheme in ("javascript", "data", "file", "vbscript"):
++            return False
++        return _without_query(uri) in callbacks
++    except ValueError:
++        return False
++
++
++def with_result(uri: str, **params: str) -> str:
++    """uri with the outcome added to its query, keeping what was there."""
++    parts = urlsplit(uri)
++    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k not in params]
++    query += list(params.items())
++    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+diff --git a/backend/config/.env.example b/backend/config/.env.example
+index 9f33013e7..1393bc0ff 100644
+--- a/backend/config/.env.example
++++ b/backend/config/.env.example
+@@ -35,6 +35,7 @@ FRONTEND_URL=http://localhost:3000
+ # EMAIL_MAX_RETRIES=5  # Retries for failed email sends
+ # USER_INVITATION_CODE_EXPIRE_DAYS=7  # SDK user invitation code lifetime
+ # CONNECT_TOKEN_EXPIRE_DAYS=7  # Lifetime of a shareable provider pairing link
++# OAUTH_REDIRECT_ALLOWLIST=openwearables://oauth/callback  # Allowed OAuth redirect_uri values besides FRONTEND_URL and CORS_ORIGINS
+ 
+ #--- DB ---#
+ DB_HOST=db
+diff --git a/backend/tests/api/v1/test_oauth.py b/backend/tests/api/v1/test_oauth.py
+index 24371b145..20eb76be4 100644
+--- a/backend/tests/api/v1/test_oauth.py
++++ b/backend/tests/api/v1/test_oauth.py
+@@ -57,7 +57,7 @@ def test_authorize_provider_with_redirect_uri(self, client: TestClient, auth_hea
+         """Test OAuth flow with optional redirect URI."""
+         # Arrange
+         user_id = uuid4()
+-        redirect_uri = "https://myapp.com/oauth/callback"
++        redirect_uri = "openwearables://oauth/callback"
+ 
+         # Act
+         response = client.get(
+diff --git a/backend/tests/api/v1/test_oauth_redirects.py b/backend/tests/api/v1/test_oauth_redirects.py
+new file mode 100644
+index 000000000..54a8c1d9c
+--- /dev/null
++++ b/backend/tests/api/v1/test_oauth_redirects.py
+@@ -0,0 +1,146 @@
++"""Tests for the OAuth redirect_uri allowlist, authorize auth and callback redirects."""
++
++from unittest.mock import patch
++from urllib.parse import parse_qs, urlsplit
++from uuid import uuid4
++
++from fastapi.testclient import TestClient
++from httpx import Response
++from sqlalchemy.orm import Session
++
++from app.config import settings
++from app.schemas.model_crud.credentials import OAuthState
++from app.services.sdk_token_service import create_sdk_user_token
++from app.utils.exceptions import InvalidInputError
++from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
++from tests.utils import api_key_headers, developer_auth_headers
++
++APP_CALLBACK = "openwearables://oauth/callback"
++
++
++def authorize(
++    client: TestClient, redirect_uri: str | None, headers: dict | None = None, user_id: str | None = None
++) -> Response:
++    params = {"user_id": user_id or str(uuid4())}
++    if redirect_uri is not None:
++        params["redirect_uri"] = redirect_uri
++    headers = headers if headers is not None else api_key_headers(ApiKeyFactory().plain_key)
++    return client.get("/api/v1/oauth/garmin/authorize", params=params, headers=headers)
++
++
++class TestRedirectAllowlist:
++    def test_app_callback_is_allowed(self, client: TestClient, db: Session) -> None:
++        assert authorize(client, APP_CALLBACK).status_code == 200
++
++    def test_dashboard_origin_is_allowed_on_any_path(self, client: TestClient, db: Session) -> None:
++        assert authorize(client, f"{settings.frontend_url}/users/x/pair/success?ok=1").status_code == 200
++
++    def test_other_sites_are_refused(self, client: TestClient, db: Session) -> None:
++        response = authorize(client, "https://evil.example.com/collect")
++
++        assert response.status_code == 400
++        assert "OAUTH_REDIRECT_ALLOWLIST" in response.json()["detail"]
++
++    def test_lookalike_scheme_path_is_refused(self, client: TestClient, db: Session) -> None:
++        assert authorize(client, "openwearables://oauth/other").status_code == 400
++        assert authorize(client, "javascript:alert(1)").status_code == 400
++
++    def test_malformed_uri_is_refused(self, client: TestClient, db: Session) -> None:
++        assert authorize(client, "http://[::1").status_code == 400
++
++    def test_allowlist_is_configurable(self, client: TestClient, db: Session) -> None:
++        with patch.object(settings, "oauth_redirect_allowlist", "acme://cb,https://partner.example.com"):
++            assert authorize(client, "acme://cb?x=1").status_code == 200
++            assert authorize(client, "https://partner.example.com/done").status_code == 200
++            assert authorize(client, APP_CALLBACK).status_code == 400
++
++    def test_no_redirect_uri_still_works(self, client: TestClient, db: Session) -> None:
++        assert authorize(client, None).status_code == 200
++
++
++class TestAuthorizeAuth:
++    def test_sdk_token_connects_its_own_user(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++        headers = {"Authorization": f"Bearer {create_sdk_user_token('app', str(user.id))}"}
++
++        assert authorize(client, APP_CALLBACK, headers, str(user.id)).status_code == 200
++
++    def test_sdk_token_cannot_connect_another_user(self, client: TestClient, db: Session) -> None:
++        headers = {"Authorization": f"Bearer {create_sdk_user_token('app', str(uuid4()))}"}
++
++        assert authorize(client, APP_CALLBACK, headers).status_code == 403
++
++    def test_a_bad_token_is_refused_rather_than_ignored(self, client: TestClient, db: Session) -> None:
++        assert authorize(client, APP_CALLBACK, {"Authorization": "Bearer not-a-token"}).status_code == 401
++
++    def test_disabled_provider_cannot_be_connected(self, client: TestClient, db: Session) -> None:
++        headers = developer_auth_headers(DeveloperFactory().id)
++        client.put("/api/v1/oauth/providers/garmin", json={"is_enabled": False}, headers=headers)
++
++        response = authorize(client, APP_CALLBACK)
++
++        assert response.status_code == 400
++        assert "not enabled" in response.json()["detail"]
++
++
++class TestCallbackRedirects:
++    def _start(self, client: TestClient) -> str:
++        return authorize(client, APP_CALLBACK).json()["state"]
++
++    def test_provider_error_returns_to_the_app(self, client: TestClient, db: Session) -> None:
++        state = self._start(client)
++
++        response = client.get(
++            "/api/v1/oauth/garmin/callback",
++            params={"state": state, "error": "access_denied", "error_description": "User cancelled"},
++            follow_redirects=False,
++        )
++
++        assert response.status_code == 303
++        target = urlsplit(response.headers["location"])
++        assert f"{target.scheme}://{target.netloc}{target.path}" == APP_CALLBACK
++        query = parse_qs(target.query)
++        assert query["provider"] == ["garmin"]
++        assert query["status"] == ["error"]
++        assert "User cancelled" in query["message"][0]
++
++    def test_failed_token_exchange_returns_to_the_app(self, client: TestClient, db: Session) -> None:
++        state = self._start(client)
++
++        with patch(
++            "app.services.providers.templates.base_oauth.BaseOAuthTemplate._exchange_token",
++            side_effect=InvalidInputError("Token exchange failed"),
++        ):
++            response = client.get(
++                "/api/v1/oauth/garmin/callback", params={"state": state, "code": "c"}, follow_redirects=False
++            )
++
++        query = parse_qs(urlsplit(response.headers["location"]).query)
++        assert response.headers["location"].startswith(APP_CALLBACK)
++        assert query["status"] == ["error"]
++
++    def test_success_returns_to_the_app(self, client: TestClient, db: Session) -> None:
++        user = UserFactory()
++        done = OAuthState(user_id=user.id, provider="garmin", redirect_uri=APP_CALLBACK)
++
++        with (
++            patch(
++                "app.services.providers.templates.base_oauth.BaseOAuthTemplate.handle_callback",
++                return_value=done,
++            ),
++            patch("app.api.routes.v1.oauth.start_garmin_full_backfill.delay"),
++        ):
++            response = client.get(
++                "/api/v1/oauth/garmin/callback", params={"state": "s", "code": "c"}, follow_redirects=False
++            )
++
++        assert response.status_code == 303
++        assert response.headers["location"] == f"{APP_CALLBACK}?provider=garmin&status=success"
++
++    def test_unknown_state_without_redirect_ends_on_the_error_page(self, client: TestClient, db: Session) -> None:
++        response = client.get(
++            "/api/v1/oauth/garmin/callback", params={"state": "unknown", "code": "c"}, follow_redirects=False
++        )
++
++        assert response.status_code == 303
++        assert response.headers["location"].startswith("/api/v1/oauth/error?message=")
+diff --git a/docs/api-reference/guides/quick-integration.mdx b/docs/api-reference/guides/quick-integration.mdx
+index 2b19cb2c2..dab1e291c 100644
+--- a/docs/api-reference/guides/quick-integration.mdx
++++ b/docs/api-reference/guides/quick-integration.mdx
+@@ -78,6 +78,10 @@ curl -X GET "http://localhost:8000/api/v1/oauth/garmin/authorize?user_id=550e840
+ 
+ Redirect the user to `authorization_url`. After they authorize, they'll be redirected back to your `redirect_uri`.
+ 
++<Note>
++  `redirect_uri` must be allowed by the instance: its origin must be `FRONTEND_URL` or one of `CORS_ORIGINS`, or it must be listed in `OAUTH_REDIRECT_ALLOWLIST` (comma-separated; web URLs match by origin, app schemes such as `myapp://oauth/callback` match exactly). Any other value gets a `400`. The user comes back with `provider`, `status` (`success` or `error`) and, on error, `message` in the query, replacing any parameters of the same name. Errors land there too, so check `status` rather than assuming the connection succeeded.
++</Note>
++
+ <Warning>
+   Provider names must be **lowercase**: `garmin`, `polar`, `suunto`, `apple`
+ </Warning>
+diff --git a/docs/deployment/docker.mdx b/docs/deployment/docker.mdx
+index 5d1cd846e..fe72645e7 100644
+--- a/docs/deployment/docker.mdx
++++ b/docs/deployment/docker.mdx
+@@ -162,6 +162,7 @@ The defaults in `.env.example` are development values. Override at least these f
+ | `CORS_ORIGINS` | your frontend origin, e.g. `["https://app.example.com"]` |
+ | `FRONTEND_URL` | public URL of the frontend |
+ | `API_BASE_URL` | public URL of the API, used for provider OAuth redirect URIs |
++| `OAUTH_REDIRECT_ALLOWLIST` | extra places the provider sign-in may return to besides `FRONTEND_URL` and `CORS_ORIGINS`, e.g. `myapp://oauth/callback` (default allows the Open Wearables Connect app) |
+ | `VITE_API_URL` | URL of the API as reached from the browser |
+ | `LOG_FORMAT` | `json` if a log collector reads the container output (see [Logs](#logs)) |
+ 
+diff --git a/docs/openapi.json b/docs/openapi.json
+index b12116953..32c153112 100644
+--- a/docs/openapi.json
++++ b/docs/openapi.json
+@@ -4697,7 +4697,7 @@
+           "External: Providers"
+         ],
+         "summary": "Get Provider Authorization URL",
+-        "description": "Initiate OAuth flow for a provider.\n\nReturns authorization URL where user should be redirected to log in.\n\nRequires an API key, a developer token, or a token scoped to `user_id`: an SDK user token\nor a connect token (`X-Open-Wearables-Connect-Token`, from `POST /users/{user_id}/connect-token`).",
++        "description": "Initiate OAuth flow for a provider.\n\nReturns authorization URL where user should be redirected to log in.\n\nRequires an API key, a developer token, or a token scoped to `user_id`: an SDK user token\nor a connect token (`X-Open-Wearables-Connect-Token`, from `POST /users/{user_id}/connect-token`).\n`redirect_uri` must match `OAUTH_REDIRECT_ALLOWLIST` (default `openwearables://oauth/callback`),\nthe dashboard origin (`FRONTEND_URL`) or `CORS_ORIGINS`. After the sign-in the browser is sent\nthere with `provider`, `status` (`success` or `error`) and, on error, `message` in the query,\nreplacing any parameters of the same name.",
+         "operationId": "authorize_provider_api_v1_oauth__provider__authorize_get",
+         "security": [
+           {
+@@ -4739,10 +4739,10 @@
+                   "type": "null"
+                 }
+               ],
+-              "description": "Optional redirect URI after authorization",
++              "description": "Where to send the browser after the provider sign-in; must be on the allowlist",
+               "title": "Redirect Uri"
+             },
+-            "description": "Optional redirect URI after authorization"
++            "description": "Where to send the browser after the provider sign-in; must be on the allowlist"
+           },
+           {
+             "name": "X-Open-Wearables-API-Key",
+@@ -4886,7 +4886,7 @@
+           "System: OAuth"
+         ],
+         "summary": "Oauth Callback",
+-        "description": "OAuth callback endpoint.\n\nProvider redirects here after user authorizes. Exchanges code for tokens.",
++        "description": "OAuth callback endpoint.\n\nProvider redirects here after user authorizes. Exchanges code for tokens. When the\nflow was started with a redirect_uri, the browser goes back there on success and on\nfailure, so an app's sign-in sheet never ends on a JSON page.",
+         "operationId": "oauth_callback_api_v1_oauth__provider__callback_get",
+         "parameters": [
+           {
+diff --git a/frontend/e2e/mock-api.ts b/frontend/e2e/mock-api.ts
+index f7c885fbe..bdbec3c54 100644
+--- a/frontend/e2e/mock-api.ts
++++ b/frontend/e2e/mock-api.ts
+@@ -292,9 +292,18 @@ const server = Bun.serve({
+ 				return problem(400, 'Provider credentials are not configured.', 'BAD_REQUEST');
+ 			}
+ 			// A real provider sends the browser to redirect_uri once the person
+-			// consents, so handing it straight back walks the same path.
+-			const redirectUri = new URL(request.url).searchParams.get('redirect_uri') ?? '/';
+-			return json({ authorization_url: redirectUri, state: 'state-1' });
++			// consents, and the callback adds the result, so handing it straight back walks the same path.
++			const redirectUri = new URL(
++				new URL(request.url).searchParams.get('redirect_uri') ?? '/',
++				'http://placeholder'
++			);
++			redirectUri.searchParams.set('provider', provider);
++			redirectUri.searchParams.set('status', 'success');
++			const target =
++				redirectUri.origin === 'http://placeholder'
++					? `${redirectUri.pathname}${redirectUri.search}`
++					: redirectUri.toString();
++			return json({ authorization_url: target, state: 'state-1' });
+ 		}
+ 
+ 		if (pathname === '/api/v1/webhooks/event-types') {
+diff --git a/frontend/e2e/pairing.e2e.ts b/frontend/e2e/pairing.e2e.ts
+index 754be4410..3419be66c 100644
+--- a/frontend/e2e/pairing.e2e.ts
++++ b/frontend/e2e/pairing.e2e.ts
+@@ -21,7 +21,7 @@ test('walks the provider round trip and names what connected', async ({ page })
+ 
+ 	// The mock hands redirect_uri straight back, so this is what the API received:
+ 	// the token must not be in it, or it lands in the API's request logs.
+-	await expect(page).toHaveURL(new RegExp(`${BASE}/success\\?provider=garmin$`));
++	await expect(page).toHaveURL(new RegExp(`${BASE}/success\\?provider=garmin&status=success$`));
+ 	await expect(page.getByRole('heading', { name: 'Garmin is connected' })).toBeVisible();
+ 	await expect(page.getByRole('link', { name: 'Connect another device' })).toHaveAttribute(
+ 		'href',
+diff --git a/frontend/src/routes/users/[id]/pair/success/+page.server.ts b/frontend/src/routes/users/[id]/pair/success/+page.server.ts
+index f2f81b183..0c9a56eb6 100644
+--- a/frontend/src/routes/users/[id]/pair/success/+page.server.ts
++++ b/frontend/src/routes/users/[id]/pair/success/+page.server.ts
+@@ -8,6 +8,8 @@ export const load: PageServerLoad = async ({ params, url, cookies }) => {
+ 	const token = cookies.get(PAIR_TOKEN_COOKIE);
+ 
+ 	return {
++		connected: url.searchParams.get('status') === 'success',
++		message: url.searchParams.get('message'),
+ 		provider: slug ? providerLabel(await fetchCloudProviders(), slug) : null,
+ 		returnUrl: safeReturnUrl(url.searchParams.get('redirect_url')),
+ 		pairAnother: token ? pairingPath(params.id, token) : null
+diff --git a/frontend/src/routes/users/[id]/pair/success/+page.svelte b/frontend/src/routes/users/[id]/pair/success/+page.svelte
+index 1b6b90d42..3bc9a1ae4 100644
+--- a/frontend/src/routes/users/[id]/pair/success/+page.svelte
++++ b/frontend/src/routes/users/[id]/pair/success/+page.svelte
+@@ -1,6 +1,7 @@
+ <script lang="ts">
+ 	import ArrowRight from '@lucide/svelte/icons/arrow-right';
+ 	import Check from '@lucide/svelte/icons/check';
++	import X from '@lucide/svelte/icons/x';
+ 	import LinkButton from '$lib/components/ui/LinkButton.svelte';
+ 	import PairingShell from '$lib/components/pairing/PairingShell.svelte';
+ 	import type { PageData } from './$types';
+@@ -11,20 +12,34 @@
+ </script>
+ 
+ <svelte:head>
+-	<title>Connected · Open Wearables</title>
++	<title>{data.connected ? 'Connected' : 'Not connected'} · Open Wearables</title>
+ </svelte:head>
+ 
+-<PairingShell title="{what} is connected" lead="Data will start arriving shortly.">
++<PairingShell
++	title={data.connected ? `${what} is connected` : `${what} was not connected`}
++	lead={data.connected
++		? 'Data will start arriving shortly.'
++		: (data.message ?? 'The sign-in did not complete.')}
++>
+ 	<div class="flex flex-col items-center gap-6">
+-		<span
+-			aria-hidden="true"
+-			class="grid size-16 place-items-center rounded-full bg-success/12 text-success"
+-		>
+-			<Check size={30} />
+-		</span>
++		{#if data.connected}
++			<span
++				aria-hidden="true"
++				class="grid size-16 place-items-center rounded-full bg-success/12 text-success"
++			>
++				<Check size={30} />
++			</span>
++		{:else}
++			<span
++				aria-hidden="true"
++				class="grid size-16 place-items-center rounded-full bg-danger/12 text-danger"
++			>
++				<X size={30} />
++			</span>
++		{/if}
+ 
+ 		<div class="flex w-full flex-col gap-2">
+-			{#if data.returnUrl}
++			{#if data.connected && data.returnUrl}
+ 				<LinkButton href={data.returnUrl} rel="noreferrer">
+ 					Continue
+ 					<ArrowRight size={16} aria-hidden="true" />

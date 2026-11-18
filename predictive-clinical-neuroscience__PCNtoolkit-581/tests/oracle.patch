@@ -1,0 +1,534 @@
+diff --git a/pcntoolkit/math_functions/shash.py b/pcntoolkit/math_functions/shash.py
+index af383842..93faf4bc 100644
+--- a/pcntoolkit/math_functions/shash.py
++++ b/pcntoolkit/math_functions/shash.py
+@@ -32,7 +32,6 @@
+ from functools import lru_cache
+ from typing import Any, List, Optional, Sequence, Tuple, Union
+ 
+-import dask.array as da
+ import numpy as np
+ import scipy.special as spp  # type: ignore
+ from numpy.random import Generator
+@@ -47,6 +46,8 @@
+ from pytensor.tensor.elemwise import Elemwise
+ from pytensor.tensor.random.op import RandomVariable  # type: ignore
+ 
++from pcntoolkit.util.data_utils import dedupe, elementwise
++
+ # pylint: disable=arguments-differ
+ 
+ # Constant that controls the accuracy of the finite difference approximation of dkv/dp
+@@ -68,36 +69,49 @@ def S_inv(
+     return np.sinh((np.arcsinh(x) + e) / d)
+ 
+ 
+-# def K(p: NDArray[np.float64], x: float) -> NDArray[np.float64]:
+-#     """Bessel function of the second kind for unique values.
+-#     """
+-#     ps, idxs = np.unique(p, return_inverse=True)
+-#     return spp.kv(ps, x)[idxs].reshape(p.shape)
+-
++def K(
++    p: Union[float, ArrayLike], x: float, chunks: Any = None
++) -> Union[float, NDArray[np.float64]]:
++    """Modified Bessel function of the second kind, ``K_p(x)``.
+ 
+-# def K(p: NDArray[np.float64], x: float) -> NDArray[np.float64]:
+-#     """Bessel function of the second kind for unique values."""
+-#     return spp.kv(p, x)
++    Computed once per repeated value of ``p`` (see ``dedupe``).
+ 
++    Parameters
++    ----------
++    p : float or array_like
++        Orders.
++    x : float
++        Argument.
++    chunks : Any, optional
++        Not used. Kept for backward compatibility.
+ 
+-# Fast version 3: Dask parallelized (best for large arrays, multi-core)
+-def K(p, x, chunks=None):
++    Returns
++    -------
++    float or NDArray[np.float64]
++        ``K_p(x)``, with the shape of ``p``.
++    """
+     if isinstance(p, float):
+         return spp.kv(p, x)
+-    return da.map_blocks(
+-        lambda c: spp.kv(c, x),
+-        da.from_array(p, chunks=chunks or "auto"),
+-        dtype=np.float64,
+-    )
++    values, expand = dedupe(p)
++    return expand(elementwise(lambda v: spp.kv(v, x), values)[0])
+ 
+ 
+-def P(q: NDArray[np.float64]) -> NDArray[np.float64]:
+-    """The P function as given in Jones et al."""
++def _P(q: NDArray[np.float64]) -> NDArray[np.float64]:
+     frac = np.exp(1 / 4) / np.sqrt(8 * np.pi)
+-    K1 = K((q + 1) / 2, 1 / 4, chunks=(1000, 1000))
+-    K2 = K((q - 1) / 2, 1 / 4, chunks=(1000, 1000))
+-    a = (K1 + K2) * frac
+-    return a
++    K1 = spp.kv((q + 1) / 2, 1 / 4)
++    K2 = spp.kv((q - 1) / 2, 1 / 4)
++    return (K1 + K2) * frac
++
++
++def P(q: Union[float, ArrayLike]) -> Union[float, NDArray[np.float64]]:
++    """The P function as given in Jones et al.
++
++    Computed once per repeated value of ``q`` (see ``dedupe``).
++    """
++    if np.ndim(q) == 0:
++        return _P(q)  # type: ignore[arg-type]
++    values, expand = dedupe(q)
++    return expand(elementwise(_P, values)[0])
+ 
+ 
+ def m(
+@@ -115,11 +129,35 @@ def m(
+     return frac1 * acc
+ 
+ 
+-def m1m2(epsilon: float, delta: float) -> Tuple[float, float]:
+-    inv_delta = 1.0 / delta
+-    two_inv_delta = 2.0 * inv_delta
+-    p1 = P(inv_delta)
+-    p2 = P(two_inv_delta)
++def m1m2(
++    epsilon: Union[float, ArrayLike], delta: Union[float, ArrayLike]
++) -> Tuple[Any, Any]:
++    """Mean and raw second moment of the SHASH distribution (Jones et al.).
++
++    ``P`` is computed once per repeated value of ``delta`` (see ``dedupe``).
++
++    Parameters
++    ----------
++    epsilon : float or array_like
++        Skewness parameter.
++    delta : float or array_like
++        Tail weight parameter.
++
++    Returns
++    -------
++    mean : float or NDArray[np.float64]
++        First moment.
++    raw_second : float or NDArray[np.float64]
++        Raw (uncentered) second moment.
++    """
++    if np.ndim(delta) == 0:
++        inv_delta = 1.0 / delta  # type: ignore[operator]
++        p1, p2 = _P(inv_delta), _P(2.0 * inv_delta)
++    else:
++        values, expand = dedupe(delta)
++        inv_delta = 1.0 / values
++        two_inv_delta = 2.0 * inv_delta
++        p1, p2 = map(expand, elementwise(_P, inv_delta, two_inv_delta))
+     eps_delta = epsilon / delta
+     sinh_eps_delta = np.sinh(eps_delta)
+     cosh_2eps_delta = np.cosh(2 * eps_delta)
+diff --git a/pcntoolkit/util/data_utils.py b/pcntoolkit/util/data_utils.py
+index 5f3239f6..f4d4cecd 100644
+--- a/pcntoolkit/util/data_utils.py
++++ b/pcntoolkit/util/data_utils.py
+@@ -8,10 +8,13 @@
+ 
+ from __future__ import annotations
+ 
++from functools import partial
+ from itertools import product
+-from typing import Generator
++from typing import Callable, Generator
+ 
++import dask.array as da
+ import numpy as np
++from numpy.typing import ArrayLike, NDArray
+ 
+ 
+ def iter_batch_combinations(
+@@ -80,3 +83,192 @@ def iter_batch_combinations(
+         # Yield: return one combination at a time (memory-efficient)
+         # instead of returning all of them in a list.
+         yield combination, mask
++
++
++# dedupe uses np.unique only on arrays larger than UNIQUE_SAMPLE_SIZE, and only
++# if at most MAX_UNIQUE_FRACTION of a sample of that size is distinct.
++UNIQUE_SAMPLE_SIZE = 100_000
++MAX_UNIQUE_FRACTION = 0.5
++
++# Number of elements per dask chunk in elementwise
++CHUNK_SIZE = 1_000_000
++
++
++def elementwise(
++    func: Callable[[NDArray[np.float64]], NDArray[np.float64]],
++    *arrays: NDArray[np.float64],
++    chunk_size: int = CHUNK_SIZE,
++) -> tuple[NDArray[np.float64], ...]:
++    """Apply an elementwise function to each array, on dask's threads.
++
++    Arrays with at most ``chunk_size`` elements are computed directly.
++    Larger arrays are split into chunks of ``chunk_size`` elements, and all
++    chunks of all arrays are computed in one call to dask.
++
++    Parameters
++    ----------
++    func : Callable[[NDArray[np.float64]], NDArray[np.float64]]
++        Function that works value by value and keeps the shape of its input.
++    *arrays : NDArray[np.float64]
++        Input arrays.
++    chunk_size : int, optional
++        Number of elements per dask chunk. Default is ``CHUNK_SIZE``.
++
++    Returns
++    -------
++    tuple[NDArray[np.float64], ...]
++        ``func(a)`` for each array ``a``, with the shape of ``a``.
++    """
++    if all(a.size <= chunk_size for a in arrays):
++        return tuple(func(a) for a in arrays)
++    lazy = [
++        da.map_blocks(
++            func, da.from_array(a.reshape(-1), chunks=chunk_size), dtype=float
++        )
++        for a in arrays
++    ]
++    results = da.compute(*lazy)
++    return tuple(r.reshape(a.shape) for r, a in zip(results, arrays, strict=True))
++
++
++# Positions of the distinct values that dedupe found last:
++# (shape, flat index of the first copy of each distinct value, inverse indices)
++_index_cache: (
++    tuple[tuple[int, ...], NDArray[np.intp], NDArray[np.unsignedinteger]] | None
++) = None
++
++
++def clear_dedupe_cache() -> None:
++    """Remove the positions of distinct values that ``dedupe`` keeps."""
++    global _index_cache
++    _index_cache = None
++
++
++def _same_grouping(
++    flat: NDArray[np.float64],
++    index: NDArray[np.intp],
++    inverse: NDArray[np.unsignedinteger],
++) -> bool:
++    """Return True if ``flat[index][inverse]`` gives back ``flat`` bit for bit.
++
++    The comparison is on the bits, so ``-0.0`` and ``0.0``, or two NaNs with
++    different bits, are not put in the same group.
++    """
++    return np.array_equal(
++        flat[index][inverse].view(np.uint64).reshape(-1), flat.view(np.uint64)
++    )
++
++
++def _unique_positions(
++    q: NDArray[np.float64], use_cache: bool
++) -> tuple[NDArray[np.intp], NDArray[np.unsignedinteger]] | None:
++    """Return the positions of the distinct values of ``q``, or None.
++
++    The positions from the last call are used again if the values of ``q``
++    are grouped in the same way, also if the values themselves are new.
++    Returns None if ``np.unique`` would put different bits in one group.
++    """
++    global _index_cache
++    flat = q.reshape(-1)
++    cached = _index_cache if use_cache else None
++    if cached is not None and cached[0] == q.shape:
++        if _same_grouping(flat, cached[1], cached[2]):
++            return cached[1], cached[2]
++    _, index, inverse = np.unique(flat, return_index=True, return_inverse=True)
++    # The smallest index type uses less memory: uint16 for 8 000 values.
++    inverse = inverse.reshape(q.shape).astype(np.min_scalar_type(index.size - 1))
++    if not _same_grouping(flat, index, inverse):
++        return None
++    if use_cache:
++        _index_cache = (q.shape, index, inverse)
++    return index, inverse
++
++
++def _broadcast_copy(
++    r: NDArray[np.float64],
++    inner: Callable[[NDArray[np.float64]], NDArray[np.float64]],
++    shape: tuple[int, ...],
++) -> NDArray[np.float64]:
++    """Expand ``r`` with ``inner``, then copy it along the reduced axis."""
++    return np.broadcast_to(inner(r), shape).copy()
++
++
++def dedupe(
++    q: ArrayLike,
++    sample_size: int = UNIQUE_SAMPLE_SIZE,
++    max_unique_fraction: float = MAX_UNIQUE_FRACTION,
++    use_cache: bool = True,
++) -> tuple[NDArray[np.float64], Callable[[NDArray[np.float64]], NDArray[np.float64]]]:
++    """Reduce ``q`` to its repeated values, for an elementwise function.
++
++    If most values of ``q`` repeat, an expensive elementwise function needs
++    to be computed only once per distinct value. For example, in SHASH
++    models delta is often the same for all subjects (one value per posterior
++    sample), or takes one value per batch effect level. Because the function
++    is elementwise, ``expand(f(reduced))`` is bit-identical to ``f(q)``.
++
++    ``q`` is reduced in one of these ways:
++
++    1. If ``q`` is constant along an axis (same bits), keep one slice.
++    2. If ``q`` has more than ``sample_size`` elements, and at most
++       ``max_unique_fraction`` of a sample of ``sample_size`` elements is
++       distinct, keep each distinct value once (``np.unique``).
++    3. Otherwise, keep all values.
++
++    The sample in step 2 makes sure that input where all values are distinct
++    does not pay for a full sort.
++
++    Step 2 keeps the positions of the distinct values for the next call.
++    The next array often has the same grouping, also if its values are new:
++    for example, ``compute_centiles`` computes the SHASH moments of delta
++    once per centile and per response variable, and a random-effect delta
++    always has one value per batch effect level and posterior sample. The
++    kept positions are used only if they give back the new array bit for
++    bit (about 0.09 s for 8 million values, compared to about 1.5 s for
++    ``np.unique``). Thus the cache never gives a wrong result, and it is not
++    necessary to clear it when a new model is made. ``clear_dedupe_cache``
++    frees the memory.
++
++    Parameters
++    ----------
++    q : ArrayLike
++        Input array.
++    sample_size : int, optional
++        Minimum array size for ``np.unique``, and size of the sample that
++        estimates the number of distinct values. Default is
++        ``UNIQUE_SAMPLE_SIZE``.
++    max_unique_fraction : float, optional
++        Use ``np.unique`` only if at most this fraction of the sample is
++        distinct. Default is ``MAX_UNIQUE_FRACTION``.
++    use_cache : bool, optional
++        Use and keep the positions of the distinct values from the last
++        call. Default is True.
++
++    Returns
++    -------
++    reduced : NDArray[np.float64]
++        The values to compute the function on.
++    expand : Callable[[NDArray[np.float64]], NDArray[np.float64]]
++        Maps the function of ``reduced`` back to the shape of ``q``.
++    """
++    q = np.asarray(q, dtype=np.float64)
++    shape = q.shape
++    if q.size == 0:
++        return q, lambda r: r
++    # Compare bits, as in _same_grouping: keeps -0.0 and 0.0 apart, and
++    # finds an axis constant also if it holds NaN.
++    bits = q.view(np.uint64)
++    for axis in range(q.ndim):
++        first = np.take(q, [0], axis=axis)
++        first_bits = np.broadcast_to(first.view(np.uint64), shape)
++        if shape[axis] > 1 and np.array_equal(bits, first_bits):
++            reduced, inner = dedupe(first, sample_size, max_unique_fraction, use_cache)
++            return reduced, partial(_broadcast_copy, inner=inner, shape=shape)
++    if q.size > sample_size:
++        sample = q.reshape(-1)[:: q.size // sample_size]
++        if np.unique(sample).size <= max_unique_fraction * sample.size:
++            positions = _unique_positions(q, use_cache)
++            if positions is not None:
++                index, inverse = positions
++                return q.reshape(-1)[index], lambda r: r[inverse]
++    return q, lambda r: r
+diff --git a/test/test_math/test_shash.py b/test/test_math/test_shash.py
+new file mode 100644
+index 00000000..ca047d12
+--- /dev/null
++++ b/test/test_math/test_shash.py
+@@ -0,0 +1,55 @@
++import numpy as np
++import pytest
++import scipy.special as spp
++
++from pcntoolkit.math_functions.shash import K, P, m1m2
++from pcntoolkit.util.data_utils import clear_dedupe_cache
++
++
++def _P_reference(q: np.ndarray) -> np.ndarray:
++    frac = np.exp(1 / 4) / np.sqrt(8 * np.pi)
++    return (spp.kv((q + 1) / 2, 1 / 4) + spp.kv((q - 1) / 2, 1 / 4)) * frac
++
++
++def _m1m2_reference(epsilon: np.ndarray, delta: np.ndarray) -> tuple:
++    p1 = _P_reference(1.0 / delta)
++    p2 = _P_reference(2.0 / delta)
++    eps_delta = epsilon / delta
++    return np.sinh(eps_delta) * p1, (np.cosh(2 * eps_delta) * p2 - 1) / 2
++
++
++def _deltas() -> dict[str, np.ndarray]:
++    rng = np.random.default_rng(0)
++    n, s = 3000, 50
++    return {
++        "fixed": np.broadcast_to(rng.uniform(0.5, 2, (1, s)), (n, s)).copy(),
++        "random_effect": rng.uniform(0.5, 2, (20, s))[rng.integers(0, 20, n)],
++        "linear": rng.uniform(0.5, 2, (n, s)),
++    }
++
++
++@pytest.mark.parametrize("kind", ["fixed", "random_effect", "linear"])
++def test_m1m2_bit_identical(kind):
++    clear_dedupe_cache()
++    delta = _deltas()[kind]
++    epsilon = np.random.default_rng(1).normal(size=delta.shape)
++    expected = _m1m2_reference(epsilon, delta)
++    # The second call can use the dedupe cache.
++    for _ in range(2):
++        mean, raw_second = m1m2(epsilon, delta)
++        assert np.array_equal(mean, expected[0])
++        assert np.array_equal(raw_second, expected[1])
++
++
++def test_P_and_K_bit_identical():
++    delta = _deltas()["random_effect"]
++    assert np.array_equal(P(delta), _P_reference(delta))
++    assert np.array_equal(K(delta, 0.25), spp.kv(delta, 0.25))
++
++
++def test_scalar_inputs():
++    mean, raw_second = m1m2(0.3, 1.1)
++    expected = _m1m2_reference(np.float64(0.3), np.float64(1.1))
++    assert mean == expected[0] and raw_second == expected[1]
++    assert np.ndim(P(1.5)) == 0
++    assert K(1.5, 0.25) == spp.kv(1.5, 0.25)
+diff --git a/test/test_util/test_data_utils.py b/test/test_util/test_data_utils.py
+new file mode 100644
+index 00000000..19c6125f
+--- /dev/null
++++ b/test/test_util/test_data_utils.py
+@@ -0,0 +1,121 @@
++import numpy as np
++import pytest
++
++from pcntoolkit.util import data_utils
++from pcntoolkit.util.data_utils import clear_dedupe_cache, dedupe, elementwise
++
++
++@pytest.fixture(autouse=True)
++def empty_cache():
++    clear_dedupe_cache()
++    yield
++    clear_dedupe_cache()
++
++
++def _roundtrip(q: np.ndarray, **kwargs) -> tuple[np.ndarray, np.ndarray]:
++    reduced, expand = dedupe(q, **kwargs)
++    return reduced, expand(np.sqrt(reduced))
++
++
++def test_dedupe_constant_axis():
++    rng = np.random.default_rng(0)
++    q = np.broadcast_to(rng.uniform(1, 2, (1, 30)), (50, 30)).copy()
++    reduced, out = _roundtrip(q)
++    assert reduced.size == 30
++    assert np.array_equal(out, np.sqrt(q))
++
++
++def test_dedupe_few_distinct():
++    rng = np.random.default_rng(0)
++    q = rng.uniform(1, 2, (5, 30))[rng.integers(0, 5, 200)]
++    reduced, out = _roundtrip(q, sample_size=1000)
++    assert reduced.size == 150
++    assert np.array_equal(out, np.sqrt(q))
++
++
++def test_dedupe_all_distinct_skips_unique():
++    q = np.random.default_rng(0).uniform(1, 2, (200, 30))
++    reduced, out = _roundtrip(q, sample_size=1000)
++    assert reduced is q
++    assert np.array_equal(out, np.sqrt(q))
++    assert data_utils._index_cache is None
++
++
++def test_dedupe_empty_and_small():
++    for q in [np.zeros((0, 3)), np.array([1.0, 2.0])]:
++        reduced, out = _roundtrip(q)
++        assert np.array_equal(out, np.sqrt(q))
++
++
++def _grouped(rng: np.random.Generator, idx: np.ndarray) -> np.ndarray:
++    return rng.uniform(1, 2, (5, 30))[idx]
++
++
++def test_dedupe_cache_reuses_positions_for_new_values():
++    # Same grouping, new values (e.g. the next response variable).
++    rng = np.random.default_rng(0)
++    idx = rng.integers(0, 5, 200)
++    dedupe(_grouped(rng, idx), sample_size=1000)
++    cached = data_utils._index_cache
++    q2 = _grouped(rng, idx)
++    reduced, out = _roundtrip(q2, sample_size=1000)
++    assert data_utils._index_cache is cached
++    assert reduced.size == 150
++    assert np.array_equal(out, np.sqrt(q2))
++
++
++def test_dedupe_cache_checks_grouping():
++    # Same shape, but one value leaves its group: the cache must not be used.
++    rng = np.random.default_rng(0)
++    q1 = _grouped(rng, rng.integers(0, 5, 200))
++    dedupe(q1, sample_size=1000)
++    cached = data_utils._index_cache
++    q2 = q1.copy()
++    q2[1, 1] = 9.0
++    reduced, out = _roundtrip(q2, sample_size=1000)
++    assert data_utils._index_cache is not cached
++    assert 9.0 in reduced
++    assert np.array_equal(out, np.sqrt(q2))
++
++
++def test_dedupe_keeps_signed_zeros_apart():
++    rng = np.random.default_rng(0)
++    q = rng.choice([0.0, -0.0, 1.0], size=(200, 30))
++    reduced, expand = dedupe(q, sample_size=1000)
++    with np.errstate(divide="ignore"):
++        assert np.array_equal(expand(1 / reduced), 1 / q)
++
++
++def test_dedupe_constant_axis_keeps_signed_zeros_apart():
++    # 0.0 == -0.0, but the bits differ, so axis 0 is not constant.
++    q = np.ones((50, 30))
++    q[::2, 0] = 0.0
++    q[1::2, 0] = -0.0
++    reduced, expand = dedupe(q)
++    with np.errstate(divide="ignore"):
++        assert np.array_equal(expand(1 / reduced), 1 / q)
++
++
++def test_dedupe_constant_axis_with_nan():
++    # NaN != NaN, but a column of the same NaN bits is constant.
++    q = np.broadcast_to(np.array([[np.nan, 1.0, 2.0]]), (50, 3)).copy()
++    reduced, out = _roundtrip(q)
++    assert reduced.size == 3
++    assert np.array_equal(out, np.sqrt(q), equal_nan=True)
++
++
++def test_dedupe_without_cache():
++    rng = np.random.default_rng(0)
++    q = _grouped(rng, rng.integers(0, 5, 200))
++    reduced, out = _roundtrip(q, sample_size=1000, use_cache=False)
++    assert reduced.size == 150
++    assert np.array_equal(out, np.sqrt(q))
++    assert data_utils._index_cache is None
++
++
++def test_elementwise_chunks():
++    a = np.random.default_rng(0).uniform(1, 2, (40, 30))
++    b = a[:10]
++    out_a, out_b = elementwise(np.sqrt, a, b, chunk_size=100)
++    assert np.array_equal(out_a, np.sqrt(a))
++    assert np.array_equal(out_b, np.sqrt(b))

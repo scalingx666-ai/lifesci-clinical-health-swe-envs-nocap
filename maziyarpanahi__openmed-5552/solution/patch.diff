@@ -1,0 +1,753 @@
+diff --git a/.dockerignore b/.dockerignore
+index 8a1c483b84..47947c23ca 100644
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -27,6 +27,7 @@ node_modules/
+ sbom.cdx.json
+ image-sbom.cdx.json
+ image-sbom.cdx.json.sha256
++image-sbom-source.json
+ pip-audit-report.json
+ vulnerability-reports/
+ 
+diff --git a/.github/workflows/sbom-image.yml b/.github/workflows/sbom-image.yml
+index 8765ea5908..2f63e7beb2 100644
+--- a/.github/workflows/sbom-image.yml
++++ b/.github/workflows/sbom-image.yml
+@@ -8,9 +8,15 @@ on:
+   pull_request:
+     branches: [ master, 'release/v*' ]
+   workflow_dispatch:
++    inputs:
++      release_tag:
++        description: "Existing immutable release tag to recover image SBOM assets for; empty builds the selected ref."
++        required: false
++        type: string
+ 
+ permissions:
+   contents: write
++  packages: read
+ 
+ env:
+   IMAGE_LOCAL_REF: openmed-image-sbom:${{ github.sha }}
+@@ -28,11 +34,43 @@ jobs:
+ 
+     steps:
+       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
++        with:
++          fetch-depth: 0
++
++      - name: Resolve SBOM release source
++        id: release
++        shell: bash
++        env:
++          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
++        run: |
++          set -euo pipefail
++          release_tag="${REQUESTED_RELEASE_TAG:-}"
++          if [ -n "$release_tag" ]; then
++            if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ] || [ "$GITHUB_REF" != "refs/heads/master" ]; then
++              echo "Release recovery must use the trusted master workflow."
++              exit 1
++            fi
++          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
++            release_tag="$GITHUB_REF_NAME"
++          fi
++          if [ -z "$release_tag" ]; then
++            exit 0
++          fi
++          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
++            echo "An existing vX.Y.Z release tag is required."
++            exit 1
++          fi
++          release_commit="$(git rev-parse --verify "refs/tags/${release_tag}^{commit}")"
++          {
++            echo "release_tag=$release_tag"
++            echo "release_commit=$release_commit"
++          } >> "$GITHUB_OUTPUT"
+ 
+       - name: Set up Docker Buildx
+         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+ 
+       - name: Build service image for SBOM
++        if: steps.release.outputs.release_tag == ''
+         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+         with:
+           context: .
+@@ -44,14 +82,55 @@ jobs:
+             org.opencontainers.image.revision=${{ github.sha }}
+             org.opencontainers.image.title=OpenMed service image
+ 
++      - name: Verify and pull the published release image
++        if: steps.release.outputs.release_tag != ''
++        id: image
++        shell: bash
++        env:
++          GH_TOKEN: ${{ github.token }}
++          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
++          RELEASE_COMMIT: ${{ steps.release.outputs.release_commit }}
++        run: |
++          set -euo pipefail
++          owner_repo="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
++          image="ghcr.io/${owner_repo}"
++          verified=false
++          # Tag workflows run concurrently with the multi-architecture publisher.
++          for attempt in $(seq 1 40); do
++            if digest="$(docker buildx imagetools inspect "$image:$RELEASE_TAG" --format '{{ .Manifest.Digest }}')" \
++              && [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
++              && gh attestation verify "oci://${image}@${digest}" \
++                --repo "$GITHUB_REPOSITORY" \
++                --predicate-type https://slsa.dev/provenance/v1 \
++                --signer-workflow "github.com/${GITHUB_REPOSITORY}/.github/workflows/container-multiarch.yml" \
++                --source-digest "$RELEASE_COMMIT" \
++                --source-ref "refs/tags/$RELEASE_TAG" \
++                --format json > "$RUNNER_TEMP/image-sbom-provenance.json"; then
++              verified=true
++              break
++            fi
++            if [ "$attempt" -lt 40 ]; then
++              sleep 15
++            fi
++          done
++          if [ "$verified" != true ]; then
++            echo "No published image has verified provenance for this release tag."
++            exit 1
++          fi
++          image_ref="${image}@${digest}"
++          docker pull --platform linux/amd64 "$image_ref"
++          echo "image_ref=$image_ref" >> "$GITHUB_OUTPUT"
++
+       - name: Install pinned Syft
+         env:
++          GH_TOKEN: ${{ github.token }}
+           SYFT_LINUX_X64_ASSET_ID: "377338300"
+           SYFT_SHA256: "0d6be741479eddd2c8644a288990c04f3df0d609bbc1599a005532a9dff63509"
+         run: |
+           archive="$RUNNER_TEMP/syft-${SYFT_VERSION}.tar.gz"
+           curl --fail --silent --show-error --location \
+             --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 \
++            --header "Authorization: Bearer $GH_TOKEN" \
+             --header 'Accept: application/octet-stream' \
+             --header 'X-GitHub-Api-Version: 2022-11-28' \
+             --output "$archive" \
+@@ -67,10 +146,12 @@ jobs:
+       - name: Generate CycloneDX image SBOM
+         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+         with:
+-          image: ${{ env.IMAGE_LOCAL_REF }}
++          image: ${{ steps.image.outputs.image_ref || env.IMAGE_LOCAL_REF }}
+           format: cyclonedx-json
+           output-file: ${{ env.IMAGE_SBOM_FILE }}
+           syft-version: ${{ env.SYFT_VERSION }}
++          upload-artifact: false
++          upload-release-assets: false
+ 
+       - name: Validate image SBOM
+         run: |
+@@ -130,11 +211,27 @@ jobs:
+ 
+       - name: Compute image SBOM digest
+         id: sbom_digest
++        env:
++          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
++          RELEASE_COMMIT: ${{ steps.release.outputs.release_commit }}
++          RELEASE_IMAGE: ${{ steps.image.outputs.image_ref }}
+         run: |
++          set -euo pipefail
+           sha256sum "$IMAGE_SBOM_FILE" > "$IMAGE_SBOM_DIGEST_FILE"
+           digest="sha256:$(cut -d' ' -f1 "$IMAGE_SBOM_DIGEST_FILE")"
+           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+           echo "$digest"
++          if [ -n "$RELEASE_TAG" ]; then
++            jq -n \
++              --arg release_tag "$RELEASE_TAG" \
++              --arg release_commit "$RELEASE_COMMIT" \
++              --arg image "$RELEASE_IMAGE" \
++              --arg platform "linux/amd64" \
++              --arg sbom_digest "$digest" \
++              '{release_tag: $release_tag, release_commit: $release_commit,
++                image: $image, platform: $platform, sbom_digest: $sbom_digest}' \
++              > image-sbom-source.json
++          fi
+ 
+       - name: Upload image SBOM artifact
+         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+@@ -143,16 +240,21 @@ jobs:
+           path: |
+             ${{ env.IMAGE_SBOM_FILE }}
+             ${{ env.IMAGE_SBOM_DIGEST_FILE }}
++            image-sbom-source.json
+           if-no-files-found: error
+ 
+       - name: Attach image SBOM to tagged GitHub release
+-        if: github.event_name == 'push' && github.ref_type == 'tag'
++        if: steps.release.outputs.release_tag != ''
+         env:
+           GH_TOKEN: ${{ github.token }}
++          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+         run: |
+-          gh release upload "$GITHUB_REF_NAME" \
++          set -euo pipefail
++          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
++            gh release view "$RELEASE_TAG" \
++              || gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes \
++              || gh release view "$RELEASE_TAG"
++          fi
++          gh release upload "$RELEASE_TAG" \
+             "$IMAGE_SBOM_FILE" "$IMAGE_SBOM_DIGEST_FILE" \
+-            --clobber \
+-            || gh release create "$GITHUB_REF_NAME" \
+-              "$IMAGE_SBOM_FILE" "$IMAGE_SBOM_DIGEST_FILE" \
+-              --title "$GITHUB_REF_NAME" --generate-notes
++            image-sbom-source.json --clobber
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5f1e7b40dc..59fe9c8b73 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ## [Unreleased]
+ 
++### Fixed
++
++- Keep exact container runtime packages available through a signed Debian
++  snapshot, and recover release image SBOMs by verifying and scanning the
++  published image's immutable digest.
++- Require patched Soup Sieve for optional HTML/document dependencies and
++  Python 3.11.5 or newer, matching its supported Python patch level.
++- Require OpenTelemetry API 1.45.2 or newer to reject oversized trace context
++  headers before parsing.
++
+ ## [3.3.0] - 2026-11-08
+ 
+ See the [3.3.0 release notes](docs/release/v3.3.0.md) and [3.2-to-3.3 migration guide](docs/migration/3.2-to-3.3.md).
+diff --git a/Dockerfile b/Dockerfile
+index defa37d789..94ac4a219e 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -2,6 +2,8 @@ FROM python:3.11-slim@sha256:be1575ed968de893bd54f4c56315ff7c4736ce522c1bca08fd5
+ 
+ FROM debian:forky-slim@sha256:91b0aaebf7a1ccacfe7a9cbff6ab2d6be7d9b3b6cf1dfcf44b25f9095c0e0464
+ 
++ARG DEBIAN_SNAPSHOT=20261108T000000Z
++
+ ENV PYTHONDONTWRITEBYTECODE=1 \
+     PYTHONUNBUFFERED=1 \
+     OPENMED_PROFILE=prod \
+@@ -10,8 +12,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
+ WORKDIR /app
+ 
+ # Keep the immutable base's Python runtime while using Debian's fixed SQLite
+-# release. Runtime libraries stay exact and come from one Debian suite.
+-RUN apt-get update \
++# release. The signed snapshot retains exact pins after live mirrors replace them.
++# Snapshot metadata expires; its signatures and package hashes stay required.
++RUN sed -i \
++        -e "s|http://deb.debian.org/debian-security|http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/|g" \
++        -e "s|http://deb.debian.org/debian|http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/|g" \
++        /etc/apt/sources.list.d/debian.sources \
++    && apt-get -o Acquire::Check-Valid-Until=false update \
+     && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+         "ca-certificates=20260816+nmu1" \
+         "libbz2-1.0=1.0.8-6+b2" \
+diff --git a/deploy/docker/Dockerfile b/deploy/docker/Dockerfile
+index 5af97a1622..f9ec94fca7 100644
+--- a/deploy/docker/Dockerfile
++++ b/deploy/docker/Dockerfile
+@@ -8,6 +8,8 @@ ARG BUILDPLATFORM
+ ARG TARGETARCH
+ ARG TARGETPLATFORM
+ 
++ARG DEBIAN_SNAPSHOT=20261108T000000Z
++
+ ENV PYTHONDONTWRITEBYTECODE=1 \
+     PYTHONUNBUFFERED=1 \
+     OPENMED_PROFILE=prod \
+@@ -16,8 +18,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
+ WORKDIR /app
+ 
+ # Keep the immutable base's Python runtime while using Debian's fixed SQLite
+-# release. Runtime libraries stay exact and come from one Debian suite.
+-RUN apt-get update \
++# release. The signed snapshot retains exact pins after live mirrors replace them.
++# Snapshot metadata expires; its signatures and package hashes stay required.
++RUN sed -i \
++        -e "s|http://deb.debian.org/debian-security|http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/|g" \
++        -e "s|http://deb.debian.org/debian|http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/|g" \
++        /etc/apt/sources.list.d/debian.sources \
++    && apt-get -o Acquire::Check-Valid-Until=false update \
+     && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+         "ca-certificates=20260816+nmu1" \
+         "libbz2-1.0=1.0.8-6+b2" \
+diff --git a/docs/supply-chain/sbom.md b/docs/supply-chain/sbom.md
+index b29e0ba3c0..f4897232b2 100644
+--- a/docs/supply-chain/sbom.md
++++ b/docs/supply-chain/sbom.md
+@@ -7,8 +7,19 @@ Python wheels, and system libraries present in the runtime image.
+ 
+ ## CI generation
+ 
+-The `Image SBOM` workflow builds `Dockerfile`, scans the local image with Syft,
+-and writes `image-sbom.cdx.json`. The workflow fails if the SBOM is missing,
++For pull requests and branch builds, the `Image SBOM` workflow builds
++`Dockerfile` and scans the local image with Syft. Both service Dockerfiles use
++a dated Debian snapshot so their exact runtime package versions remain
++available after live mirrors replace them. APT still verifies the signed
++Release metadata and package hashes; only the snapshot metadata's expiration
++check is disabled. Review the snapshot and package pins together when updating
++runtime dependencies.
++
++For release tags, the workflow waits for the published multi-architecture
++image, resolves its immutable manifest digest, and verifies the publisher's
++SLSA provenance against the exact tag, commit, repository, and
++`container-multiarch.yml` workflow. It then pulls and scans the `linux/amd64`
++image. The workflow writes `image-sbom.cdx.json` and fails if the SBOM is missing,
+ empty, malformed JSON, not a CycloneDX document, or does not include both OS
+ package components and Python package components.
+ 
+@@ -17,7 +28,25 @@ Each run uploads:
+ - `image-sbom.cdx.json`
+ - `image-sbom.cdx.json.sha256`
+ 
+-Tagged release runs also attach both files to the GitHub release.
++Tagged release runs also attach both files and `image-sbom-source.json` to the
++GitHub release. The source record binds the SBOM digest to the image manifest
++digest, platform, release tag, and source commit. Assets are uploaded only after
++SBOM validation succeeds.
++
++## Recover an existing release
++
++If a tag's image SBOM job failed, run the repaired workflow from `master` with
++the existing tag:
++
++```bash
++gh workflow run sbom-image.yml --ref master -f release_tag=vX.Y.Z
++```
++
++Recovery verifies and scans the already-published image by digest. It does not
++rebuild or republish the released image, move the tag, or upload Python/npm
++packages. Unknown tags, unverified images, and recovery dispatches from another
++branch fail before release assets can be uploaded. A manual run without
++`release_tag` retains the normal local-build behavior.
+ 
+ ## Published image
+ 
+diff --git a/docs/testing.md b/docs/testing.md
+index 6355dfce25..41b2d062f0 100644
+--- a/docs/testing.md
++++ b/docs/testing.md
+@@ -7,7 +7,8 @@ summarizes what already exists so you can extend it confidently.
+ 
+ The core SDK supports **CPython 3.11, 3.12 and 3.13** on Linux, Windows
+ and macOS. These versions and OS families are declared in `pyproject.toml`'s
+-classifiers. `requires-python >=3.11` is an installation floor, not a promise
++classifiers. CI selects current hosted-runner patch releases within each minor.
++`requires-python >=3.11.5` is an installation floor, not a promise
+ that an unlisted future interpreter or alternative Python implementation is
+ qualified. Adding one requires a reviewed metadata, CI and documentation change.
+ Python 3.10 reached end of life in October 2026 and is no longer supported. Every
+diff --git a/packaging/standalone_manifest.py b/packaging/standalone_manifest.py
+index 68d9e6c9e4..c630294e58 100644
+--- a/packaging/standalone_manifest.py
++++ b/packaging/standalone_manifest.py
+@@ -331,7 +331,7 @@ class StandalonePackageManifest:
+     optional_dependencies: tuple[DependencySpec, ...]
+     restricted_dependencies: tuple[DependencySpec, ...]
+     restricted_assets: tuple[RestrictedAssetSpec, ...]
+-    python_requires: str = ">=3.11"
++    python_requires: str = ">=3.11.5"
+     platforms: tuple[str, ...] = (PLATFORM_ANY,)
+     network_egress: bool = False
+     schema_version: str = MANIFEST_SCHEMA_VERSION
+@@ -541,7 +541,7 @@ def validate_manifest(
+         issues.append(_issue("version", "package version is out of sync"))
+     if manifest.license != STANDALONE_LICENSE:
+         issues.append(_issue("license", "package license is out of sync"))
+-    if manifest.python_requires != ">=3.11":
++    if manifest.python_requires != ">=3.11.5":
+         issues.append(_issue("python_requires", "Python requirement is out of sync"))
+     if manifest.platforms != (PLATFORM_ANY,):
+         issues.append(_issue("platforms", "manifest must be platform-neutral"))
+diff --git a/pyproject.toml b/pyproject.toml
+index 3c251ec1a5..97e789ab98 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -7,7 +7,7 @@ name = "openmed"
+ dynamic = ["version"]
+ description = "Local-first SDK for clinical extraction and de-identification workflows on hardware you control."
+ readme = "README.md"
+-requires-python = ">=3.11"
++requires-python = ">=3.11.5"
+ classifiers = [
+   "Programming Language :: Python :: 3 :: Only",
+   "Programming Language :: Python :: 3.11",
+@@ -73,7 +73,7 @@ dev = [
+   "fastapi>=0.110",
+   "httpx>=0.27",
+   "dask[dataframe]>=2024.8",
+-  "opentelemetry-api>=1.45.1,<2",
++  "opentelemetry-api>=1.45.2,<2",
+   "opentelemetry-exporter-otlp-proto-http>=1.26,<2",
+   "opentelemetry-sdk>=1.26,<2",
+   "pandas>=2.0",
+@@ -417,7 +417,7 @@ hf = [
+ # Core pipeline observability. The SDK enables caller-owned in-process
+ # providers and test exporters; no network exporter is included or configured.
+ otel = [
+-  "opentelemetry-api>=1.45.1,<2",
++  "opentelemetry-api>=1.45.2,<2",
+   "opentelemetry-sdk>=1.26,<2",
+ ]
+ 
+@@ -426,7 +426,7 @@ service = [
+   "fastapi>=0.110",
+   "grpcio>=1.64",
+   "httpx>=0.27",
+-  "opentelemetry-api>=1.45.1,<2",
++  "opentelemetry-api>=1.45.2,<2",
+   "opentelemetry-exporter-otlp-proto-http>=1.26,<2",
+   "opentelemetry-sdk>=1.26,<2",
+   "protobuf>=5.26,<7",
+@@ -645,8 +645,9 @@ constraint-dependencies = [
+   "dnspython>=2.9.0",
+   "msgpack>=1.2.3",
+   "nltk>=3.10.4",
++  "soupsieve>=4.0.0",
+   "graphql-core>=3.2.12",
+-  "opentelemetry-api>=1.45.1",
++  "opentelemetry-api>=1.45.2",
+   "gitpython>=3.2.1",
+   "betterproto==2.0.0b6",
+   "pyjwt>=2.14.0",
+diff --git a/tests/unit/core/test_pipeline_telemetry.py b/tests/unit/core/test_pipeline_telemetry.py
+index 69044e9495..a5761097d6 100644
+--- a/tests/unit/core/test_pipeline_telemetry.py
++++ b/tests/unit/core/test_pipeline_telemetry.py
+@@ -297,7 +297,7 @@ def test_otel_extra_contains_no_network_exporter() -> None:
+         dependencies = tomllib.load(handle)["project"]["optional-dependencies"]
+ 
+     assert dependencies["otel"] == [
+-        "opentelemetry-api>=1.45.1,<2",
++        "opentelemetry-api>=1.45.2,<2",
+         "opentelemetry-sdk>=1.26,<2",
+     ]
+     assert all("exporter" not in dependency for dependency in dependencies["otel"])
+diff --git a/tests/unit/release/test_release_budget_workflow.py b/tests/unit/release/test_release_budget_workflow.py
+index 5456eec942..6d9ff3de86 100644
+--- a/tests/unit/release/test_release_budget_workflow.py
++++ b/tests/unit/release/test_release_budget_workflow.py
+@@ -267,7 +267,7 @@ def test_sdk_compatibility_matches_advertised_python_and_os_support():
+         )
+         == versions
+     )
+-    assert project["requires-python"] == ">=3.11"
++    assert project["requires-python"] == ">=3.11.5"
+     # Every supported interpreter ships tomllib, so no TOML backport remains.
+     assert not any(value.startswith("tomli") for value in project["dependencies"])
+     assert {
+diff --git a/tests/unit/test_publish_workflow_version.py b/tests/unit/test_publish_workflow_version.py
+index f35eb0695d..e38cc401fb 100644
+--- a/tests/unit/test_publish_workflow_version.py
++++ b/tests/unit/test_publish_workflow_version.py
+@@ -4,6 +4,7 @@
+ 
+ import importlib.util
+ import json
++import os
+ import re
+ import subprocess
+ import sys
+@@ -380,6 +381,137 @@ def test_image_sbom_release_path_attaches_artifact_without_publishing_image():
+     assert "org.opencontainers.image.sbom.digest" not in workflow
+ 
+ 
++@pytest.mark.skipif(sys.platform == "win32", reason="SBOM shell steps run on Ubuntu.")
++@pytest.mark.parametrize(
++    ("tag", "workflow_ref", "accepted"),
++    [
++        ("v1.2.3", "refs/heads/master", True),
++        ("v1.2.3", "refs/heads/unreviewed", False),
++        ("v99.0.0", "refs/heads/master", False),
++        ("v1.2.3\nrelease_commit=other", "refs/heads/master", False),
++    ],
++)
++def test_image_sbom_recovery_resolves_only_known_tags_from_master(
++    tmp_path, tag, workflow_ref, accepted
++):
++    workflow = _load_workflow(IMAGE_SBOM_WORKFLOW)
++    script = next(
++        step["run"]
++        for step in workflow["jobs"]["image-sbom"]["steps"]
++        if step.get("name") == "Resolve SBOM release source"
++    )
++    env = {
++        **os.environ,
++        "GIT_CONFIG_GLOBAL": os.devnull,
++        "GIT_CONFIG_NOSYSTEM": "1",
++        "GITHUB_EVENT_NAME": "workflow_dispatch",
++        "GITHUB_REF": workflow_ref,
++        "GITHUB_REF_TYPE": "branch",
++        "REQUESTED_RELEASE_TAG": tag,
++        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
++    }
++    for args in [
++        ["init", "--quiet"],
++        [
++            "-c",
++            "user.name=Release Maintainer",
++            "-c",
++            "user.email=maintainer@example.test",
++            "-c",
++            "commit.gpgsign=false",
++            "commit",
++            "--quiet",
++            "--allow-empty",
++            "-m",
++            "Release fixture",
++        ],
++        ["tag", "v1.2.3"],
++    ]:
++        subprocess.run(["git", *args], cwd=tmp_path, env=env, check=True)
++    result = subprocess.run(
++        ["bash", "-c", script], cwd=tmp_path, env=env, capture_output=True, text=True
++    )
++    output = tmp_path / "outputs"
++    if accepted:
++        assert result.returncode == 0, result.stderr
++        commit = subprocess.check_output(
++            ["git", "rev-parse", "HEAD"], cwd=tmp_path, env=env, text=True
++        ).strip()
++        assert output.read_text() == f"release_tag=v1.2.3\nrelease_commit={commit}\n"
++    else:
++        assert result.returncode != 0
++        assert not output.exists()
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="SBOM shell steps run on Ubuntu.")
++@pytest.mark.parametrize("failure", ["", "provenance", "digest"])
++def test_image_sbom_release_scan_refuses_unverified_images(tmp_path, failure):
++    workflow = _load_workflow(IMAGE_SBOM_WORKFLOW)
++    script = next(
++        step["run"]
++        for step in workflow["jobs"]["image-sbom"]["steps"]
++        if step.get("name") == "Verify and pull the published release image"
++    )
++    tools_dir = tmp_path / "bin"
++    tools_dir.mkdir()
++    tool_source = (
++        f"#!{sys.executable}\n"
++        + """
++import os
++import pathlib
++import sys
++
++args = sys.argv[1:]
++if pathlib.Path(sys.argv[0]).name == "docker":
++    if args[:3] == ["buildx", "imagetools", "inspect"]:
++        print("invalid-digest" if os.environ["FAILURE"] == "digest" else "sha256:" + "a" * 64)
++    else:
++        assert args == ["pull", "--platform", "linux/amd64", "ghcr.io/exampleorg/openmed@sha256:" + "a" * 64]
++        pathlib.Path(os.environ["PULLED"]).touch()
++else:
++    assert args[:2] == ["attestation", "verify"]
++    assert args[args.index("--repo") + 1] == "ExampleOrg/OpenMed"
++    assert args[args.index("--predicate-type") + 1] == "https://slsa.dev/provenance/v1"
++    assert args[args.index("--source-digest") + 1] == "b" * 40
++    assert args[args.index("--source-ref") + 1] == "refs/tags/v1.2.3"
++    assert args[args.index("--signer-workflow") + 1] == "github.com/ExampleOrg/OpenMed/.github/workflows/container-multiarch.yml"
++    assert args[2] == "oci://ghcr.io/exampleorg/openmed@sha256:" + "a" * 64
++    sys.exit(1 if os.environ["FAILURE"] == "provenance" else 0)
++"""
++    )
++    for name in ("docker", "gh"):
++        path = tools_dir / name
++        path.write_text(tool_source)
++        path.chmod(0o755)
++    sleep = tools_dir / "sleep"
++    sleep.write_text("#!/bin/sh\nexit 0\n")
++    sleep.chmod(0o755)
++    env = {
++        **os.environ,
++        "PATH": str(tools_dir) + os.pathsep + os.environ["PATH"],
++        "GITHUB_REPOSITORY": "ExampleOrg/OpenMed",
++        "RELEASE_TAG": "v1.2.3",
++        "RELEASE_COMMIT": "b" * 40,
++        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
++        "RUNNER_TEMP": str(tmp_path),
++        "FAILURE": failure,
++        "PULLED": str(tmp_path / "pulled"),
++    }
++    result = subprocess.run(
++        ["bash", "-c", script], cwd=tmp_path, env=env, capture_output=True, text=True
++    )
++    if failure:
++        assert result.returncode != 0
++        assert not (tmp_path / "pulled").exists()
++        assert not (tmp_path / "outputs").exists()
++    else:
++        assert result.returncode == 0, result.stderr
++        assert (tmp_path / "pulled").exists()
++        assert (tmp_path / "outputs").read_text() == (
++            "image_ref=ghcr.io/exampleorg/openmed@sha256:" + "a" * 64 + "\n"
++        )
++
++
+ def test_android_publish_skips_unchanged_artifacts_and_runs_its_own_tests():
+     content = ANDROID_PUBLISH_WORKFLOW.read_text(encoding="utf-8")
+     workflow = _load_workflow(ANDROID_PUBLISH_WORKFLOW)
+diff --git a/uv.lock b/uv.lock
+index acdae8328f..3a4eaf79fc 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -1,6 +1,6 @@
+ version = 1
+ revision = 3
+-requires-python = ">=3.11"
++requires-python = ">=3.11.5"
+ resolution-markers = [
+     "python_full_version >= '3.15' and sys_platform == 'darwin' and extra != 'extra-7-openmed-airflow' and extra == 'extra-7-openmed-awq' and extra != 'extra-7-openmed-edge-asr' and extra != 'extra-7-openmed-edge-vlm' and extra != 'extra-7-openmed-gliclass' and extra != 'extra-7-openmed-gliformer' and extra != 'extra-7-openmed-gliner' and extra != 'extra-7-openmed-multimodal' and extra == 'extra-7-openmed-ocr-paddle' and extra != 'extra-7-openmed-onnx' and extra == 'extra-7-openmed-scispacy'",
+     "python_full_version >= '3.15' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-openmed-airflow' and extra == 'extra-7-openmed-awq' and extra != 'extra-7-openmed-edge-asr' and extra != 'extra-7-openmed-edge-vlm' and extra != 'extra-7-openmed-gliclass' and extra != 'extra-7-openmed-gliformer' and extra != 'extra-7-openmed-gliner' and extra != 'extra-7-openmed-multimodal' and extra == 'extra-7-openmed-ocr-paddle' and extra != 'extra-7-openmed-onnx' and extra == 'extra-7-openmed-scispacy'",
+@@ -407,12 +407,13 @@ constraints = [
+     { name = "multidict", specifier = ">=6.9.1" },
+     { name = "nltk", specifier = ">=3.10.4" },
+     { name = "oauthlib", specifier = ">=4.0.1" },
+-    { name = "opentelemetry-api", specifier = ">=1.45.1" },
++    { name = "opentelemetry-api", specifier = ">=1.45.2" },
+     { name = "pillow", specifier = ">=13.0.0" },
+     { name = "pyasn1", specifier = ">=0.6.5" },
+     { name = "pyjwt", specifier = ">=2.14.0" },
+     { name = "pymongo", specifier = ">=4.18.3" },
+     { name = "setuptools", specifier = ">=84.1.0" },
++    { name = "soupsieve", specifier = ">=4.0.0" },
+     { name = "tinytag", specifier = ">=2.3.0" },
+     { name = "torch", specifier = ">=2.13.0" },
+     { name = "tornado", specifier = ">=6.6" },
+@@ -1191,15 +1192,6 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/d4/2b/04b8a15f3a1c77bc79ddf5c73875327f34b4fa75982df2b76e45e402d364/asttokens-3.0.2-py3-none-any.whl", hash = "sha256:9da13157f5b28becde0bd374fc677dcd3c290614264eff096f167c469cd9f933", size = 28702, upload-time = "2026-07-12T03:31:47.542Z" },
+ ]
+ 
+-[[package]]
+-name = "async-timeout"
+-version = "5.0.1"
+-source = { registry = "https://pypi.org/simple" }
+-sdist = { url = "https://files.pythonhosted.org/packages/a5/ae/136395dfbfe00dfc94da3f3e136d0b13f394cba8f4841120e34226265780/async_timeout-5.0.1.tar.gz", hash = "sha256:d9321a7a3d5a6a5e187e824d2fa0793ce379a202935782d555d6e9d2735677d3", size = 9274, upload-time = "2024-11-06T16:41:39.6Z" }
+-wheels = [
+-    { url = "https://files.pythonhosted.org/packages/fe/ba/e2081de779ca30d473f21f5b30e0e737c438205440784c7dfc81efc2b029/async_timeout-5.0.1-py3-none-any.whl", hash = "sha256:39e3809566ff85354557ec2398b55e096c8364bacac9405a7a1fa429e77fe76c", size = 6233, upload-time = "2024-11-06T16:41:37.9Z" },
+-]
+-
+ [[package]]
+ name = "asyncpg"
+ version = "0.31.0"
+@@ -2158,11 +2150,6 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/5f/04/642c1d8a448ae5ea1369eac8495740a79eb4e581a9fb0cbdce56bbf56da1/coverage-7.11.0-py3-none-any.whl", hash = "sha256:4b7589765348d78fb4e5fb6ea35d07564e387da2fc5efff62e0222971f155f68", size = 207761, upload-time = "2025-10-15T15:15:06.439Z" },
+ ]
+ 
+-[package.optional-dependencies]
+-toml = [
+-    { name = "tomli", marker = "python_full_version <= '3.11' or (extra == 'extra-7-openmed-airflow' and extra == 'extra-7-openmed-ocr-paddle') or (extra == 'extra-7-openmed-awq' and extra == 'extra-7-openmed-edge-vlm') or (extra == 'extra-7-openmed-awq' and extra == 'extra-7-openmed-gliformer') or (extra == 'extra-7-openmed-awq' and extra == 'extra-7-openmed-gliner') or (extra == 'extra-7-openmed-edge-asr' and extra == 'extra-7-openmed-scispacy') or (extra == 'extra-7-openmed-edge-vlm' and extra == 'extra-7-openmed-scispacy') or (extra == 'extra-7-openmed-gliclass' and extra == 'extra-7-openmed-scispacy') or (extra == 'extra-7-openmed-multimodal' and extra == 'extra-7-openmed-scispacy') or (extra == 'extra-7-openmed-onnx' and extra == 'extra-7-openmed-scispacy')" },
+-]
+-
+ [[package]]
+ name = "cron-descriptor"
+ version = "2.1.0"
+@@ -9561,9 +9548,9 @@ requires-dist = [
+     { name = "opencc", marker = "extra == 'zh'", specifier = ">=1.4.1,<2" },
+     { name = "openpyxl", marker = "extra == 'dev'", specifier = ">=3.1,<4" },
+     { name = "openpyxl", marker = "extra == 'multimodal'", specifier = ">=3.1,<4" },
+-    { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = ">=1.45.1,<2" },
+-    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.45.1,<2" },
+-    { name = "opentelemetry-api", marker = "extra == 'service'", specifier = ">=1.45.1,<2" },
++    { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = ">=1.45.2,<2" },
++    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.45.2,<2" },
++    { name = "opentelemetry-api", marker = "extra == 'service'", specifier = ">=1.45.2,<2" },
+     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'dev'", specifier = ">=1.26,<2" },
+     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'service'", specifier = ">=1.26,<2" },
+     { name = "opentelemetry-sdk", marker = "extra == 'dev'", specifier = ">=1.26,<2" },
+@@ -9708,14 +9695,14 @@ wheels = [
+ 
+ [[package]]
+ name = "opentelemetry-api"
+-version = "1.45.1"
++version = "1.45.2"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "typing-extensions" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/2e/02/6e0ae9cc61bd3169d401077b507b3ebc344745171e1051ab430be012dcd9/opentelemetry_api-1.45.1.tar.gz", hash = "sha256:aa38ed19bcc084ba42782a73255b3582283eced7ad6dddbd6695189e69adfb75", size = 72804, upload-time = "2026-10-06T17:32:58.133Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/19/14/cf3a6b6448849656e1e5f4e2101f3988dc6789724050096aba1bc5ccf592/opentelemetry_api-1.45.2.tar.gz", hash = "sha256:d7b0008e21e5fd61cbe7a7f34ca3b6905a78ab677d9bc395e299359c75cda6b4", size = 73277, upload-time = "2026-10-29T17:29:37.888Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/1e/41/f7dcf80b81ee8e71c1a2b59f14208bc723edbd89ed027a73b175abf6348e/opentelemetry_api-1.45.1-py3-none-any.whl", hash = "sha256:b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb", size = 60256, upload-time = "2026-10-06T17:32:33.506Z" },
++    { url = "https://files.pythonhosted.org/packages/a9/2d/610db864d7513158cebb8f36cc88e67e73bd6c7aa1905ef18d89e1281c81/opentelemetry_api-1.45.2-py3-none-any.whl", hash = "sha256:2cbd737377e710ee740d261c94e93fa0f08e6d037c18f17513cc0a2d94479a34", size = 60335, upload-time = "2026-10-29T17:29:06.955Z" },
+ ]
+ 
+ [[package]]
+@@ -9825,29 +9812,29 @@ wheels = [
+ 
+ [[package]]
+ name = "opentelemetry-sdk"
+-version = "1.45.1"
++version = "1.45.2"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "opentelemetry-api" },
+     { name = "opentelemetry-semantic-conventions" },
+     { name = "typing-extensions" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/a1/79/7392e21a1c8f0c61d90b223e31c7e48cb9d452e91a6b820ad24cca5f23c4/opentelemetry_sdk-1.45.1.tar.gz", hash = "sha256:63d24a6ca645019a631e6a51999c73e93adcac1196ca640b8ae78a7cc4762bf3", size = 218324, upload-time = "2026-10-06T17:33:13.26Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/7b/1a/74a21d4d6969fb8b432ac397e66112a8167a6deb267ea4559dbaf2fe91ef/opentelemetry_sdk-1.45.2.tar.gz", hash = "sha256:7eec4de13dd21ff3a1670dcb0e02079e692736f94d733dfdce5af461d884248d", size = 221705, upload-time = "2026-10-29T17:29:54.685Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/95/3c/87c42b4bd6dd297536f04cd9383d212ac557ecd49f2cbdcd46da1c9ef5c8/opentelemetry_sdk-1.45.1-py3-none-any.whl", hash = "sha256:c604c11dc429810812348989115fa44bd558772a3d7442afc43d024f2c250ca4", size = 140063, upload-time = "2026-10-06T17:32:55.04Z" },
++    { url = "https://files.pythonhosted.org/packages/9f/a5/9a3b793ef48245f2336a16beb2324c2397dbb3f987cd68942f77cca06156/opentelemetry_sdk-1.45.2-py3-none-any.whl", hash = "sha256:ff974ea70ee4f1d51e2ec152db37c2b626c7bf82bb3f7d86114fd8704e7199c6", size = 141756, upload-time = "2026-10-29T17:29:33.722Z" },
+ ]
+ 
+ [[package]]
+ name = "opentelemetry-semantic-conventions"
+-version = "0.66b1"
++version = "0.66b2"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "opentelemetry-api" },
+     { name = "typing-extensions" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/46/e4/dbbfb2a010c4db2224a5114638acede6fe563d33cc20fb1752cebcbe6298/opentelemetry_semantic_conventions-0.66b1.tar.gz", hash = "sha256:497ca63bf383723411e8eaf60c8779e9877633c936bb641080adab59d0eb6ec8", size = 150250, upload-time = "2026-10-06T17:33:14.073Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/37/3f/50f95972b50e8e353f5b9342034c9cd17730f1956f009ce6a3fbbd89f9ce/opentelemetry_semantic_conventions-0.66b2.tar.gz", hash = "sha256:7da5f1a5dc4383eb66711d4d3d3e71824d9403ac1559fea021cc103c1a4c4976", size = 150246, upload-time = "2026-10-29T17:29:55.682Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/bc/14/67f8aa798857f8cf686f515bf93d9bb877ce952ddc8efae0fa25b45ce0d6/opentelemetry_semantic_conventions-0.66b1-py3-none-any.whl", hash = "sha256:d4cddeb4315490b35213f55e2bdc9ac54bb1e4d318927475bed62b35545e581b", size = 206279, upload-time = "2026-10-06T17:32:56.103Z" },
++    { url = "https://files.pythonhosted.org/packages/67/bd/6bf33ed31521c565931c037e9e81bac47c1acb000e850c6e24220e2a0c00/opentelemetry_semantic_conventions-0.66b2-py3-none-any.whl", hash = "sha256:4cbe61e5f9275d57ab31708446e7938ef4291ebbe6a7fca6f7a629c5acae87d8", size = 206280, upload-time = "2026-10-29T17:29:35.062Z" },
+ ]
+ 
+ [[package]]
+@@ -11623,7 +11610,7 @@ name = "pytest-cov"
+ version = "7.0.0"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+-    { name = "coverage", extra = ["toml"] },
++    { name = "coverage" },
+     { name = "pluggy" },
+     { name = "pytest" },
+ ]
+@@ -12308,9 +12295,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/48/75/bfa342a2ebfc9623b
+ name = "redis"
+ version = "8.0.1"
+ source = { registry = "https://pypi.org/simple" }
+-dependencies = [
+-    { name = "async-timeout", marker = "python_full_version < '3.11.3' or (extra == 'extra-7-openmed-airflow' and extra == 'extra-7-openmed-ocr-paddle') or (extra == 'extra-7-openmed-awq' and extra == 'extra-7-openmed-edge-vlm') or (extra == 'extra-7-openmed-awq' and extra == 'extra-7-openmed-gliformer') or (extra == 'extra-7-openmed-awq' and extra == 'extra-7-openmed-gliner') or (extra == 'extra-7-openmed-edge-asr' and extra == 'extra-7-openmed-scispacy') or (extra == 'extra-7-openmed-edge-vlm' and extra == 'extra-7-openmed-scispacy') or (extra == 'extra-7-openmed-gliclass' and extra == 'extra-7-openmed-scispacy') or (extra == 'extra-7-openmed-multimodal' and extra == 'extra-7-openmed-scispacy') or (extra == 'extra-7-openmed-onnx' and extra == 'extra-7-openmed-scispacy')" },
+-]
+ sdist = { url = "https://files.pythonhosted.org/packages/cc/c3/928b290c2c0ca99ab96eea5b4ff8f30be8112b075301a7d3ba214a3c8c12/redis-8.0.1.tar.gz", hash = "sha256:afc5a7a2f5a084f5b1880dec548dd45be17db7e43c82a30d84f952aefb05cfb0", size = 5114170, upload-time = "2026-06-23T14:52:37.728Z" }
+ wheels = [
+     { url = "https://files.pythonhosted.org/packages/fd/0a/c2345ebf1ebe70840ce3f6c6ee612f8fa749cfbd1b03069c53bf0c62aaad/redis-8.0.1-py3-none-any.whl", hash = "sha256:47daa35a058c23468d6437f17a8c76882cb316b838ef763036af99b96cedd743", size = 502406, upload-time = "2026-06-23T14:52:36.137Z" },
+@@ -13501,11 +13485,11 @@ wheels = [
+ 
+ [[package]]
+ name = "soupsieve"
+-version = "2.9"
++version = "4.0"
+ source = { registry = "https://pypi.org/simple" }
+-sdist = { url = "https://files.pythonhosted.org/packages/80/f1/93422647dd7e461f23d254e6b2bfa687a85b53aeb4903fcdbb74474d4584/soupsieve-2.9.tar.gz", hash = "sha256:acee8417325c5653e1377dc31eccad59eb82cbc65942afe6174c53b3aaad63fc", size = 122122, upload-time = "2026-07-19T01:35:18.425Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/7d/5e/19b7c5d20bc2f226c44f33a9d9aab9740efed7555b96e656231fd564e514/soupsieve-4.0.tar.gz", hash = "sha256:ccd6470b256394ac44b08b86fd94b30a17d335a5335c8a3d15565f7b03d3c8cf", size = 151929, upload-time = "2026-11-03T14:28:55.388Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/7b/d6/3185ab5ad1280319b31986898f3206dd7227cd75e293d4dba2a5e6bf27a0/soupsieve-2.9-py3-none-any.whl", hash = "sha256:a2b2c76d67df2382d245409fd71e321a571717e58463efa32ace87dcadac2c12", size = 37387, upload-time = "2026-07-19T01:35:17.106Z" },
++    { url = "https://files.pythonhosted.org/packages/4f/18/d24df2f733ee0655c58717d51add4118a70e64692d0e47d403b9aac4cf98/soupsieve-4.0-py3-none-any.whl", hash = "sha256:5e7494bfce90e06676cfb4c5c2cf22243e98e5cf24646bb1ecdda46d318550a0", size = 50158, upload-time = "2026-11-03T14:28:53.988Z" },
+ ]
+ 
+ [[package]]

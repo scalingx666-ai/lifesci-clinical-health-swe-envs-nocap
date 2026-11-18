@@ -1,0 +1,365 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9a6b4a04..b37ed663 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -29,6 +29,19 @@
+   device samples (an intraday heart-rate stream, a burst of uploads) were shown
+   at one instant. They now keep the stored microseconds, trailing zeros trimmed;
+   whole-second times and bucket periods read as before.
++- **A tool directory configured by path could lose its tools.** Given an
++  absolute path to an importable package, the loader fell back to loading files
++  by location whenever the server ran outside the checkout, and every module
++  with a relative import was skipped: 4 of the 9 built-in tools, including
++  `query_health_indicators`. The directory's own package is now found from its
++  ancestry and the existing import roots; the agent and task loaders share it.
++  Logical import names survive symlinked package directories and import roots,
++  so their modules still load relative helpers outside the checkout.
++  When Python imports that package from somewhere else (a source checkout
++  beside a non-editable install), the directory resolves as before, so the
++  default `mirobody/agent/tools` still reaches the installed copy, and a
++  warning names both locations. This also works for a regular package below a
++  namespace parent that has no `__init__.py`.
+ 
+ ## 1.5.7
+ 
+diff --git a/docs/testing.md b/docs/testing.md
+index eeae57d1..8bb92104 100644
+--- a/docs/testing.md
++++ b/docs/testing.md
+@@ -82,6 +82,7 @@ a clone can re-run it.
+ | `test_postgres_regressions.py` | actual schema, writer, confirmation, statistics, Apple import/re-import and citation lifecycle | needs `[app,test]` and `MIROBODY_TEST_POSTGRES_DSN`; CI supplies PostgreSQL 17 |
+ | `test_extraction_regressions.py` | signed values, range endpoints, unreadable exponents and unverified answer provenance | application tests; the database gate additionally checks all nine views, windows and elected inputs |
+ | `test_citations.py` | every number in an answer traced to the rows it cites (`kernel.citations`) | library-only; the agent, the benchmark and the training judge run the same check |
++| `test_plugin_dir_regressions.py` | configured directories retain relative imports through symlinked packages and import roots; a checkout beside a non-editable install still reaches the installed copy, including below a namespace parent; plain directories keep their own files | library-only; toy packages under `tmp_path` |
+ | `test_local_model_contract.py` | the GPU and CPU presets agree on weights, context and the chat template | reads `docker/*.ini` and `docker/minicpm5-2b.jinja`; no model download |
+ | `test_windows_probe_regressions.py` | the Windows benchmark's speed probes fail on HTTP errors, unfinished streams and timeouts | synthetic local HTTP server; CI also runs it on `windows-latest` |
+ | `test_windows_scripts_regressions.py` | the Windows benchmark's shell orchestration, against stubbed commands | runs the scripts under `bash` with a stubbed `docker`; skips on Windows |
+diff --git a/mirobody/agent/tools/README.md b/mirobody/agent/tools/README.md
+index fb9f81d4..e55204bc 100644
+--- a/mirobody/agent/tools/README.md
++++ b/mirobody/agent/tools/README.md
+@@ -29,6 +29,17 @@ labs = "my_plugin.tools"
+ 
+ `examples/mirobody_example_plugin/` is a complete example.
+ 
++A directory that is an importable package keeps its dotted name however it is
++configured (absolute, relative, with `..`, a trailing slash or a symlink), so its
++modules may use relative imports from any working directory. A symlinked parent
++package keeps its logical import name, including when the import root is also a
++symlink. If Python imports that package from another location (a source checkout
++beside a non-editable install), a warning names both: a spelling that doubles as
++the dotted name, like the default `mirobody/agent/tools`, loads the imported copy,
++and any other spelling loads its own files by location. The installed-copy rule
++also applies to a regular package below a namespace parent without `__init__.py`;
++plain directories still load their own files.
++
+ ### Discovery Rules
+ 
+ 1. **File Location**: Must be a `.py` file inside a configured tool directory.
+diff --git a/mirobody/tests/test_plugin_dir_regressions.py b/mirobody/tests/test_plugin_dir_regressions.py
+new file mode 100644
+index 00000000..ea9aa84f
+--- /dev/null
++++ b/mirobody/tests/test_plugin_dir_regressions.py
+@@ -0,0 +1,189 @@
++"""Plugin directories keep their package wherever they are configured.
++
++`utils/plugin_dirs.resolve_plugin_dir` turns an `MCP_TOOL_DIRS`, `AGENT_DIRS`
++or `TASK_DIRS` entry into a directory and a dotted prefix for all three
++loaders. Each case builds a toy package whose module uses a relative import,
++the thing a package directory loses when it is loaded file by file (4 of the
++9 built-in tools on 1.5.7). Library-only: stdlib and `tmp_path`.
++"""
++
++from __future__ import annotations
++
++import importlib
++import logging
++import os
++import sys
++import uuid
++from pathlib import Path
++
++import pytest
++
++from mirobody.utils.plugin_dirs import import_plugin_module, resolve_plugin_dir
++
++
++@pytest.fixture
++def package():
++    name = f"plugin_pkg_{uuid.uuid4().hex[:8]}"
++    yield name
++    for key in [k for k in sys.modules if k == name or k.startswith(name + ".")]:
++        del sys.modules[key]
++
++
++def make_package(root: Path, name: str, *, namespace_parent: bool = False) -> Path:
++    tools = root / name / "tools"
++    tools.mkdir(parents=True)
++    if not namespace_parent:
++        (root / name / "__init__.py").write_text("")
++    (tools / "__init__.py").write_text("")
++    (tools / "_helper.py").write_text("VALUE = 1\n")
++    (tools / "lab.py").write_text("from ._helper import VALUE\n")
++    return tools
++
++
++def run_from(monkeypatch, cwd: Path, *roots: Path) -> None:
++    """CWD off sys.path, as under the `mirobody serve` console script."""
++    monkeypatch.chdir(cwd)
++    monkeypatch.setattr(sys, "path", [str(r) for r in roots] + [p for p in sys.path if p not in ("", os.getcwd())])
++    importlib.invalidate_caches()
++
++
++def assert_loads(directory: str, prefix: str | None, copy: Path) -> None:
++    _, module = import_plugin_module(directory, prefix, "lab.py")
++    assert module.VALUE == 1
++    assert os.path.realpath(module.__file__) == os.path.realpath(copy / "lab.py")
++
++
++@pytest.mark.parametrize("spelling", ["absolute", "trailing slash", "dotdot", "symlink"])
++def test_a_package_directory_keeps_its_name_from_any_working_directory(tmp_path, monkeypatch, package, spelling):
++    tools = make_package(tmp_path / "checkout", package)
++    elsewhere = tmp_path / "elsewhere"
++    elsewhere.mkdir()
++    configured = {
++        "absolute": str(tools),
++        "trailing slash": str(tools) + os.sep,
++        "dotdot": os.path.join(os.pardir, "checkout", package, "tools"),
++        "symlink": str(tmp_path / "link"),
++    }[spelling]
++    if spelling == "symlink":
++        os.symlink(tools, configured)
++    run_from(monkeypatch, elsewhere, tmp_path / "checkout")
++
++    directory, prefix = resolve_plugin_dir(configured)
++
++    assert prefix == f"{package}.tools"
++    assert os.path.realpath(directory) == os.path.realpath(tools)
++    assert_loads(directory, prefix, tools)
++
++
++@pytest.mark.parametrize("spelling", ["relative", "absolute", "dotdot", "trailing slash"])
++@pytest.mark.parametrize("symlinked_root", [False, True])
++def test_a_symlinked_package_keeps_its_import_name(tmp_path, monkeypatch, package, spelling, symlinked_root):
++    tools = make_package(tmp_path / "releases", f"{package}_release")
++    checkout = tmp_path / "checkout"
++    checkout.mkdir()
++    (checkout / package).symlink_to(tools.parent, target_is_directory=True)
++    import_root = checkout
++    if symlinked_root:
++        import_root = tmp_path / "import-root"
++        import_root.symlink_to(checkout, target_is_directory=True)
++    elsewhere = tmp_path / "elsewhere"
++    elsewhere.mkdir()
++    configured_tools = checkout / package / "tools"
++    configured = {
++        "relative": os.path.relpath(configured_tools, elsewhere),
++        "absolute": str(configured_tools),
++        "dotdot": str(configured_tools / ".." / "tools"),
++        "trailing slash": str(configured_tools) + os.sep,
++    }[spelling]
++    run_from(monkeypatch, elsewhere, import_root)
++    import_path = sys.path[:]
++
++    directory, prefix = resolve_plugin_dir(configured)
++
++    assert prefix == f"{package}.tools"
++    assert os.path.realpath(directory) == os.path.realpath(tools)
++    assert_loads(directory, prefix, tools)
++    assert sys.path == import_path
++
++
++@pytest.mark.parametrize("spelling", ["relative", "absolute below the working directory"])
++@pytest.mark.parametrize("namespace_parent", [False, True])
++def test_a_checkout_beside_an_installed_copy_loads_the_installed_package(
++    tmp_path, monkeypatch, caplog, package, spelling, namespace_parent,
++):
++    """A checkout with a non-editable install, served from the checkout root.
++
++    The checkout copy cannot be imported as its package here, and loading it by
++    file drops every module with a relative import. The dotted spelling reaches
++    the installed copy, as on 1.5.7, and a warning names both locations.
++    """
++    installed = make_package(tmp_path / "site", package, namespace_parent=namespace_parent)
++    checkout = make_package(tmp_path / "checkout", package, namespace_parent=namespace_parent)
++    run_from(monkeypatch, tmp_path / "checkout", tmp_path / "site")
++    configured = f"{package}/tools" if spelling == "relative" else str(checkout)
++
++    with caplog.at_level(logging.WARNING, logger="mirobody.utils.plugin_dirs"):
++        directory, prefix = resolve_plugin_dir(configured)
++
++    assert prefix == f"{package}.tools"
++    assert os.path.realpath(directory) == os.path.realpath(installed)
++    assert_loads(directory, prefix, installed)
++    (warning,) = caplog.messages
++    assert "loading that copy" in warning
++    assert f"directory={os.path.abspath(checkout)}" in warning
++    assert f"imported_from={directory}" in warning
++
++
++def test_an_explicit_path_is_never_swapped_for_the_installed_copy(tmp_path, monkeypatch, caplog, package):
++    """A spelling that names no package keeps its own files, and says why they may fail."""
++    make_package(tmp_path / "site", package)
++    checkout = make_package(tmp_path / "checkout", package)
++    elsewhere = tmp_path / "elsewhere"
++    elsewhere.mkdir()
++    run_from(monkeypatch, elsewhere, tmp_path / "site")
++
++    with caplog.at_level(logging.WARNING, logger="mirobody.utils.plugin_dirs"):
++        directory, prefix = resolve_plugin_dir(str(checkout))
++
++    assert (directory, prefix) == (str(checkout), None)
++    (warning,) = caplog.messages
++    assert "loading its files by location" in warning
++    assert f"directory={checkout}" in warning
++    assert f"imported_from={tmp_path / 'site' / package / 'tools'}" in warning
++
++
++@pytest.mark.parametrize("namespace_parent", [False, True])
++def test_a_directory_that_imports_as_itself_wins_over_an_installed_namesake(
++    tmp_path, monkeypatch, caplog, package, namespace_parent,
++):
++    make_package(tmp_path / "site", package, namespace_parent=namespace_parent)
++    checkout = make_package(tmp_path / "checkout", package, namespace_parent=namespace_parent)
++    elsewhere = tmp_path / "elsewhere"
++    elsewhere.mkdir()
++    run_from(monkeypatch, elsewhere, tmp_path / "checkout", tmp_path / "site")
++
++    with caplog.at_level(logging.WARNING, logger="mirobody.utils.plugin_dirs"):
++        directory, prefix = resolve_plugin_dir(str(checkout))
++
++    assert (directory, prefix) == (str(checkout), f"{package}.tools")
++    assert_loads(directory, prefix, checkout)
++    assert not caplog.messages
++
++
++@pytest.mark.parametrize("checkout_on_path", [False, True])
++def test_a_plain_directory_is_never_replaced_by_an_installed_namesake(
++    tmp_path, monkeypatch, caplog, package, checkout_on_path,
++):
++    make_package(tmp_path / "site", package)
++    plain = tmp_path / "checkout" / package / "tools"
++    plain.mkdir(parents=True)
++    roots = [tmp_path / "site"]
++    if checkout_on_path:
++        roots.insert(0, tmp_path / "checkout")
++    run_from(monkeypatch, tmp_path / "checkout", *roots)
++
++    with caplog.at_level(logging.WARNING, logger="mirobody.utils.plugin_dirs"):
++        directory, prefix = resolve_plugin_dir(f"{package}/tools")
++
++    assert (directory, prefix) == (str(plain), None)
++    assert not caplog.messages
+diff --git a/mirobody/utils/plugin_dirs.py b/mirobody/utils/plugin_dirs.py
+index 11d55324..e6269acf 100644
+--- a/mirobody/utils/plugin_dirs.py
++++ b/mirobody/utils/plugin_dirs.py
+@@ -54,6 +54,7 @@
+ import importlib.util
+ import logging
+ import os
++import sys
+ from importlib.metadata import entry_points
+ from types import ModuleType
+ 
+@@ -98,10 +99,68 @@ def resolve_plugin_dir(configured: str) -> tuple[str | None, str | None]:
+     if not raw:
+         return None, None
+ 
+-    # The historical spelling: CWD-relative, which doubles as a dotted path.
++    # Existing filesystem paths identify the requested directory. Resolve the
++    # package from its real ancestry: CWD may be outside the importable root,
++    # and a same-named installed package must not replace a directory that
++    # imports as itself.
+     relative = raw.removeprefix(os.getcwd()).removeprefix(os.sep).strip()
+     dotted = relative.replace(os.path.sep, ".") if relative else ""
+-
++    shadowed = None
++    for candidate in (raw, relative):
++        if not candidate or not os.path.isdir(candidate):
++            continue
++        directory = os.path.abspath(candidate)
++        real_directory = os.path.realpath(directory)
++        parent = real_directory
++        parts = []
++        while os.path.isfile(os.path.join(parent, "__init__.py")):
++            parts.insert(0, os.path.basename(parent))
++            parent = os.path.dirname(parent)
++        ancestry = ".".join(parts)
++        packages = [ancestry] if parts else []
++        # A namespace parent stops the ancestry scan before the full import
++        # name. Its configured spelling can still reach an installed copy.
++        if parts and dotted:
++            packages.append(dotted)
++        # A regular package can also sit below a namespace parent, which has
++        # no __init__.py. Use existing import roots without extending sys.path.
++        for root in sys.path:
++            if not isinstance(root, str):
++                continue
++            absolute_root = os.path.abspath(root or os.getcwd())
++            real_root = os.path.realpath(absolute_root)
++            # Resolving a package symlink erases its import name. Keep the
++            # logical path too, even when the import root is itself a symlink.
++            for target, base in dict.fromkeys((
++                (directory, absolute_root), (directory, real_root), (real_directory, real_root),
++            )):
++                try:
++                    suffix = os.path.relpath(target, base)
++                except ValueError:
++                    continue
++                if suffix not in (".", os.pardir) and not suffix.startswith(os.pardir + os.sep):
++                    packages.append(suffix.replace(os.sep, "."))
++        for package in dict.fromkeys(packages):
++            try:
++                spec = importlib.util.find_spec(package)
++            except Exception:
++                spec = None
++            if not (spec and spec.origin):
++                continue
++            location = os.path.dirname(spec.origin)
++            if os.path.realpath(location) == real_directory:
++                return directory, package
++            if parts and package in (ancestry, dotted) and spec.submodule_search_locations:
++                shadowed = directory, package, location
++        if shadowed is None:
++            return directory, None
++        # The directory's own package is imported from elsewhere: a checkout
++        # beside a non-editable install, with CWD off sys.path. This copy
++        # cannot get package context, so the spelling resolves as before.
++        break
++
++    # A dotted package or the documented slash spelling can name an installed
++    # package even when its directory is not relative to this working directory.
+     if dotted:
+         try:
+             spec = importlib.util.find_spec(dotted)
+@@ -110,12 +169,22 @@ def resolve_plugin_dir(configured: str) -> tuple[str | None, str | None]:
+         if spec and spec.origin:
+             # An importable package. Trust ITS location, not the string: this is
+             # also how a caller may pass a dotted name instead of a path.
+-            return os.path.dirname(spec.origin), dotted
+-
+-    # Not importable, but the directory may still exist, under either spelling.
+-    for candidate in (raw, relative):
+-        if candidate and os.path.isdir(candidate):
+-            return os.path.abspath(candidate), None
++            found = os.path.dirname(spec.origin)
++            if shadowed:
++                logger.warning(  # phi: ok deployment plugin paths and import names, not health data
++                    "a plugin directory's package is imported from elsewhere; loading that copy: "
++                    "directory=%s package=%s imported_from=%s", shadowed[0], dotted, found,
++                )
++            return found, dotted
++
++    if shadowed:
++        # A path spelling names no package, and an explicit path is never
++        # swapped for another copy, so its files load by location.
++        logger.warning(  # phi: ok deployment plugin paths and import names, not health data
++            "a plugin directory's package is imported from elsewhere; loading its files by location, "
++            "so modules with relative imports fail: directory=%s package=%s imported_from=%s", *shadowed,
++        )
++        return shadowed[0], None
+ 
+     return None, None
+ 

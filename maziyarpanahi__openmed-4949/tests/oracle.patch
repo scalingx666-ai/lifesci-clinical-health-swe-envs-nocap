@@ -1,0 +1,180 @@
+diff --git a/openmed/eval/champion_challenger.py b/openmed/eval/champion_challenger.py
+index 543adb85e..316ff365c 100644
+--- a/openmed/eval/champion_challenger.py
++++ b/openmed/eval/champion_challenger.py
+@@ -47,6 +47,7 @@
+     RELEASABLE,
+     GateReport,
+ )
++from openmed.eval.rollout import _write_text_atomic
+ 
+ #: Labels whose recall is treated as safety-critical for promotion. Sourced from
+ #: the release-gate definition so the two never drift.
+@@ -417,10 +418,7 @@ def load(cls, path: str | Path = CHAMPION_POINTER_PATH) -> "ChampionPointer":
+     def save(self, path: str | Path = CHAMPION_POINTER_PATH) -> Path:
+         """Write the store to *path* with deterministic formatting."""
+ 
+-        pointer_path = Path(path)
+-        pointer_path.parent.mkdir(parents=True, exist_ok=True)
+-        pointer_path.write_text(self.to_json(), encoding="utf-8")
+-        return pointer_path
++        return _write_text_atomic(Path(path), self.to_json())
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/openmed/eval/rollout.py b/openmed/eval/rollout.py
+index f7c027503..4ca6418c9 100644
+--- a/openmed/eval/rollout.py
++++ b/openmed/eval/rollout.py
+@@ -40,6 +40,8 @@
+ import copy
+ import json
+ import math
++import os
++import tempfile
+ from dataclasses import dataclass, field, replace
+ from datetime import datetime, timezone
+ from pathlib import Path
+@@ -496,6 +498,36 @@ def run_shadow_comparison(
+     return tuple(comparisons)
+ 
+ 
++def _write_text_atomic(path: Path, text: str) -> Path:
++    """Write *text* to *path* through a same-directory temporary file.
++
++    A crash or full disk mid-write must never leave a truncated document at
++    *path*: the payload lands in a temporary sibling, is flushed and fsynced,
++    then moved into place with :func:`os.replace`. The temporary file is
++    removed when anything fails.
++    """
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temporary: Path | None = None
++    try:
++        with tempfile.NamedTemporaryFile(
++            "w",
++            dir=path.parent,
++            encoding="utf-8",
++            delete=False,
++        ) as handle:
++            temporary = Path(handle.name)
++            handle.write(text)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary, path)
++    except BaseException:
++        if temporary is not None:
++            temporary.unlink(missing_ok=True)
++        raise
++    return path
++
++
+ @dataclass
+ class RolloutStateMachine:
+     """Guarded shadow/canary/stable state machine over rollout keys."""
+@@ -896,10 +928,7 @@ def load(
+     def save(self, path: str | Path = ROLLOUT_STATE_PATH) -> Path:
+         """Write the machine to ``path`` with deterministic formatting."""
+ 
+-        state_path = Path(path)
+-        state_path.parent.mkdir(parents=True, exist_ok=True)
+-        state_path.write_text(self.to_json(), encoding="utf-8")
+-        return state_path
++        return _write_text_atomic(Path(path), self.to_json())
+ 
+     def copy(self) -> "RolloutStateMachine":
+         """Return a deep copy of the machine, sharing the clock callable."""
+@@ -924,13 +953,10 @@ def audit_to_dict(self) -> dict[str, Any]:
+     def save_audit(self, path: str | Path) -> Path:
+         """Write rollout audit evidence with deterministic formatting."""
+ 
+-        audit_path = Path(path)
+-        audit_path.parent.mkdir(parents=True, exist_ok=True)
+-        audit_path.write_text(
++        return _write_text_atomic(
++            Path(path),
+             json.dumps(self.audit_to_dict(), indent=2, sort_keys=True) + "\n",
+-            encoding="utf-8",
+         )
+-        return audit_path
+ 
+ 
+ @dataclass
+diff --git a/tests/unit/eval/test_champion_challenger.py b/tests/unit/eval/test_champion_challenger.py
+index 9528556a4..768ddb97c 100644
+--- a/tests/unit/eval/test_champion_challenger.py
++++ b/tests/unit/eval/test_champion_challenger.py
+@@ -438,3 +438,26 @@ def test_committed_champion_pointer_is_loadable() -> None:
+ 
+     pointer = ChampionPointer.load()
+     assert pointer.to_dict()["schema_version"] == 1
++
++
++def test_champion_pointer_save_is_atomic_on_write_failure(
++    tmp_path, monkeypatch
++) -> None:
++    """A failed mid-write leaves the committed pointer intact, no temp files."""
++
++    pointer_path = tmp_path / "champion.json"
++    ChampionPointer().save(pointer_path)
++    assert [p.name for p in tmp_path.iterdir()] == ["champion.json"]
++    # Use a different, valid serialization so an in-place overwrite is visible.
++    pointer_path.write_bytes(pointer_path.read_bytes().rstrip(b"\n"))
++    committed = pointer_path.read_bytes()
++
++    def explode(src: object, dst: object) -> None:
++        raise OSError("simulated full disk")
++
++    monkeypatch.setattr(os, "replace", explode)
++    with pytest.raises(OSError, match="simulated full disk"):
++        ChampionPointer().save(pointer_path)
++
++    assert pointer_path.read_bytes() == committed
++    assert [p.name for p in tmp_path.iterdir()] == ["champion.json"]
+diff --git a/tests/unit/eval/test_rollout.py b/tests/unit/eval/test_rollout.py
+index d87aad966..a375fe547 100644
+--- a/tests/unit/eval/test_rollout.py
++++ b/tests/unit/eval/test_rollout.py
+@@ -746,3 +746,42 @@ def test_model_rollout_workflow_is_fail_closed_and_tracks_rollbacks() -> None:
+     assert "gh issue create" in workflow
+     assert "rolled_back" in workflow
+     assert "exit 1" in workflow
++
++
++def test_state_and_audit_saves_are_atomic_on_write_failure(
++    tmp_path, monkeypatch
++) -> None:
++    """A failed mid-write leaves the committed documents intact, no temp files."""
++
++    machine = _machine()
++    machine.seed("pii", "tiny", "mlx-fp", target="v3", now=_EPOCH)
++
++    state_path = tmp_path / "rollout_state.json"
++    audit_path = tmp_path / "rollout_audit.json"
++    machine.save(state_path)
++    machine.save_audit(audit_path)
++    assert sorted(p.name for p in tmp_path.iterdir()) == [
++        "rollout_audit.json",
++        "rollout_state.json",
++    ]
++    # Preserve a valid serialization distinct from the new canonical output.
++    for path in (state_path, audit_path):
++        path.write_bytes(path.read_bytes().rstrip(b"\n"))
++    committed_state = state_path.read_bytes()
++    committed_audit = audit_path.read_bytes()
++
++    def explode(src: object, dst: object) -> None:
++        raise OSError("simulated full disk")
++
++    monkeypatch.setattr(os, "replace", explode)
++    with pytest.raises(OSError, match="simulated full disk"):
++        machine.save(state_path)
++    with pytest.raises(OSError, match="simulated full disk"):
++        machine.save_audit(audit_path)
++
++    assert state_path.read_bytes() == committed_state
++    assert audit_path.read_bytes() == committed_audit
++    assert sorted(p.name for p in tmp_path.iterdir()) == [
++        "rollout_audit.json",
++        "rollout_state.json",
++    ]

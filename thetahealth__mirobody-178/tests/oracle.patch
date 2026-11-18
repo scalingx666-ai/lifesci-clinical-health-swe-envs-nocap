@@ -1,0 +1,1120 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 516a982b..a2d0250b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,56 @@
+ 
+ ### Added
+ 
++- **Answers can cite visible record values without guessing their source.**
++  Automatic citations check the metric, recorded unit and any stated encounter
++  date, retaining ambiguous claims as `auto_uncited`. Compact tables preserve
++  constant columns, escaped cells and aggregate values; chart JSON and existing
++  citations stay intact. Repeated reads of one source remain one candidate.
++  `AUTO_CITE=off` disables automatic insertion.
++
++- **Unit conversion is a chat tool.** `convert_unit` and `normalize_unit` were
++  published to MCP clients only; an answer about a reading recorded in another
++  unit needs them before comparing or charting. They are offline, read-only and
++  carry no user data, so the chat agent gets them too. `resolve_indicator`
++  stays MCP-only.
++
++### Fixed
++
++- **A summarized conversation can retain valid citations.** Rids are minted
++  for the conversation and subject, and remain valid when messages are folded
++  into a summary. The prompt now follows that lifetime; an unminted id or one
++  belonging to another person's record is not a source.
++
++- **External answer review now preserves the frozen evaluation contract.**
++  `benchmarks/local_models/judge.py` verifies the saved manifest hash and sends
++  every typed fact, including duration alternatives, genotypes, ranges and
++  tolerances, with current and historical tool evidence. Explicit replacement
++  manifests have a recorded identity in `judge-meta.json`. Only completed,
++  nonempty answers enter quality grades; missing runs, run failures, unknown
++  cases and invalid or contradictory verdicts remain separate in the selected
++  denominator and produce a failing exit status. Cache identity covers model,
++  endpoint, prompt version, gold and evidence. Recorded and verifiable derived
++  values are both supported.
++
++- **A compacted conversation can be read back.** When the history is summarized,
++  deepagents writes the messages it dropped to `/conversation_history/…` and names
++  the file in the summary; a local model was denied that path, so a long turn that
++  was compacted had no way to recover a detail the summary dropped and could end
++  with no answer at all. Local models get the path now, and the prompt bounds it:
++  at most one page, only when the summary lacks what the question needs.
++  `LOCAL_HISTORY_OFFLOAD=off` restores the previous rule.
++
++- **A calculation could fail before it ran: inputs never arrived.** The sandbox
++  uploaded `data.json`, `main.py` and `runner.py` through `docker exec` with an
++  attached stdin. With some docker SDK/daemon pairs that call returns no exit
++  code and the payload is dropped, so every `python_exec` answered "calculation
++  inputs could not be transferred" while the tool and the query were fine. The
++  files are now written with a base64 body over an ordinary shell command,
++  which needs neither an attach socket nor a writable rootfs (`put_archive` is
++  refused on this read-only container).
++
++### Added
++
+ - **Extra benchmark cases for charts and languages.** The 100-question suite
+   asks for a chart twice and is 60% English, so a model that never draws a
+   chart, or answers only in English, lost little. `expand_cases.py` builds
+diff --git a/benchmarks/local_models/judge.py b/benchmarks/local_models/judge.py
+new file mode 100644
+index 00000000..ee19b98e
+--- /dev/null
++++ b/benchmarks/local_models/judge.py
+@@ -0,0 +1,304 @@
++"""Ask a stronger model whether an answer actually answers the question.
++
++The structural checks in `score.py` are deliberately literal: a number must appear, bind to
++a label, cite a real rid. That keeps them reproducible, and it also rejects correct answers
++phrased differently. This is the second reader for those cases.
++
++It is a *review*, not a replacement, and it is built to be auditable:
++
++* the case list defaults to the manifest frozen in `qa.json` (``case_manifest``), so a gold
++  edited after the run cannot silently change what was judged;
++* the evidence packet carries every tool result of the turn and of the prior turns
++  (``prior_blocks``), untruncated up to a generous cap, because a figure printed in an
++  earlier turn is still supported;
++* the facts keep their kind, tolerance, unit and duration, so "47.6 hours" for a duration
++  gold is judged on meaning rather than string equality;
++* the judge is told to separate a value the record shows, a value derived from record
++  values (a ratio, a difference, a mean, a conversion), and a value from outside;
++* a reply is accepted only if it is the documented shape; anything else is an
++  *evaluator failure*, never a silent pass, and the summary reports the full denominator.
++
++    export JUDGE_BASE_URL=https://api.deepseek.com/v1
++    export JUDGE_API_KEY=...
++    python benchmarks/local_models/judge.py results/full --model deepseek-chat
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++import urllib.error
++import urllib.request
++from pathlib import Path
++from typing import Any
++
++#: Bumped whenever the prompt or the packet changes, so cached verdicts from an older
++#: rubric are never reused under the new one.
++PROMPT_VERSION = "2026-10-25.2"
++
++#: A larger serialized packet is an evaluator failure, never a truncated record
++#: silently sent to the judge as if it were complete.
++MAX_EVIDENCE_CHARS = 200_000
++
++PROMPT = """You are reviewing one answer from a personal health-record assistant.
++
++Judge the answer against the record the assistant had, not against your own medical
++knowledge. Reply with ONE JSON object and nothing else.
++
++Question:
++{question}
++
++Expected facts. Every one must be stated (numbers allow the tolerance shown; a duration may
++be given in any unit that matches the same length of time):
++{facts}
++
++The record the assistant could use, from this turn and from earlier turns of the same
++conversation:
++{evidence}
++
++The assistant's answer:
++{answer}
++
++How to judge a number:
++- "recorded"   the record shows this value (possibly in another unit or after conversion);
++- "derived"    the answer computed it from record values - a ratio, a difference, a mean, a
++               total, a percentage change, a unit conversion - and the inputs are in the
++               record. A derived value is correct when the arithmetic is right, even though
++               that exact number is not printed anywhere;
++- "outside"    neither the record nor a computation over it produces it. This is the one
++               that counts as unsupported.
++
++Reply shape:
++{{"correct": true|false,
++  "missing": ["expected facts the answer does not state"],
++  "unsupported": ["numbers that are neither recorded nor derived"],
++  "note": "one short sentence when correct is false, naming the fault"}}
++
++A differently worded but complete answer is correct. An answer that mixes several plans or
++subjects contradicts itself is not correct even when the numbers it quotes are real."""
++
++
++def _key() -> str:
++    for name in ("JUDGE_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
++        value = os.environ.get(name)
++        if value:
++            return value
++    raise SystemExit("set JUDGE_API_KEY (or DEEPSEEK_API_KEY / OPENAI_API_KEY)")
++
++
++def _base_url() -> str:
++    return (os.environ.get("JUDGE_BASE_URL") or "https://api.deepseek.com/v1").rstrip("/")
++
++
++# ----------------------------------------------------------------------------- evidence
++
++def facts_text(case: dict) -> str:
++    """Keep the complete typed fact, including duration alternatives and scope."""
++    return "\n".join(f"- {fact.get('label') or 'fact'}: {json.dumps(fact, ensure_ascii=False, sort_keys=True)}"
++                     for fact in case.get("facts") or []) or "- (none recorded)"
++
++
++def _tool_blocks(run: dict) -> list[dict]:
++    blocks = list(run.get("prior_blocks") or []) + list(run.get("blocks") or [])
++    return [b for b in blocks if b.get("type") == "tool_result"]
++
++
++def evidence_text(run: dict) -> str:
++    """Every tool result of this turn and of the earlier ones, in order."""
++    chunks = []
++    for index, block in enumerate(_tool_blocks(run), start=1):
++        status = block.get("status") or "ok"
++        name = block.get("name") or block.get("tool") or "tool"
++        content = str(block.get("content") or "")
++        chunks.append(f"[{index}] {name} ({status})\n{content}")
++    text = "\n\n".join(chunks)
++    if len(text) > MAX_EVIDENCE_CHARS:
++        raise ValueError("Serialized tool evidence exceeds the complete-packet budget")
++    return text or "(no tool result)"
++
++
++def answer_text(run: dict) -> str:
++    return "".join(str(b.get("text") or "") for b in run.get("blocks") or [] if b.get("type") == "text")
++
++
++# ----------------------------------------------------------------------------- verdicts
++
++VERDICT_TYPES = {"correct": bool, "missing": list, "unsupported": list}
++
++
++def validate(verdict: Any) -> dict[str, Any]:
++    """The documented shape or an exception: a malformed reply is not a verdict."""
++    if not isinstance(verdict, dict):
++        raise ValueError("verdict is not an object")
++    for field, expected in VERDICT_TYPES.items():
++        if field not in verdict:
++            raise ValueError(f"verdict lacks {field}")
++        if not isinstance(verdict[field], expected):
++            raise ValueError(f"verdict.{field} is not {expected.__name__}")
++    for field in ("missing", "unsupported"):
++        if any(not isinstance(value, str) or not value.strip() for value in verdict[field]):
++            raise ValueError(f"verdict.{field} must contain nonempty strings")
++    if verdict["correct"] and (verdict["missing"] or verdict["unsupported"]):
++        raise ValueError("A correct verdict cannot have missing or unsupported facts")
++    note = verdict.get("note", "")
++    if not isinstance(note, str):
++        raise ValueError("verdict.note is not a string")
++    if not verdict["correct"] and not note.strip():
++        raise ValueError("An incorrect verdict requires an explanation")
++    return {"correct": verdict["correct"], "missing": list(verdict["missing"]),
++            "unsupported": list(verdict["unsupported"]), "note": note}
++
++
++def cache_key(case: dict, run: dict, answer: str, model: str) -> str:
++    """Everything a verdict depends on: the rubric, the judge, the gold and the evidence."""
++    payload = {
++        "rubric": PROMPT_VERSION,
++        "model": model,
++        "endpoint": _base_url(),
++        "case": {"id": case.get("id"), "question": case.get("question"), "facts": case.get("facts")},
++        "evidence": evidence_text(run),
++        "answer": answer,
++    }
++    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
++
++
++def ask(prompt: str, model: str, timeout: int = 180) -> dict[str, Any]:
++    body = json.dumps({"model": model, "temperature": 0, "max_tokens": 500,
++                       "messages": [{"role": "user", "content": prompt}]}).encode()
++    request = urllib.request.Request(
++        f"{_base_url()}/chat/completions", data=body,
++        headers={"Authorization": f"Bearer {_key()}", "Content-Type": "application/json"})
++    with urllib.request.urlopen(request, timeout=timeout) as handle:
++        payload = json.loads(handle.read())
++    if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list) or not payload["choices"]:
++        raise ValueError("Judge response has no completion")
++    choice = payload["choices"][0]
++    if not isinstance(choice, dict) or choice.get("finish_reason") != "stop":
++        raise ValueError("Judge response did not finish normally")
++    message = choice.get("message")
++    content = message.get("content") if isinstance(message, dict) else None
++    if not isinstance(content, str) or not content.strip():
++        raise ValueError("Judge response is empty")
++    start, end = content.find("{"), content.rfind("}")
++    if start < 0 or end <= start:
++        raise ValueError("judge did not answer with JSON")
++    return {**validate(json.loads(content[start:end + 1])), "response_model": payload.get("model")}
++
++
++# ----------------------------------------------------------------------------- driver
++
++def manifest_sha256(cases: list[dict]) -> str:
++    """Use the same canonical JSON identity as provenance.digest_json."""
++    return hashlib.sha256(json.dumps(cases, ensure_ascii=False, sort_keys=True,
++                                     separators=(",", ":")).encode()).hexdigest()
++
++
++def saved_manifest(run_data: dict) -> list[dict]:
++    """The verified question version that produced this run."""
++    manifest = run_data.get("case_manifest") or []
++    if not manifest:
++        raise SystemExit("qa.json carries no case_manifest; re-run the benchmark or pass --cases-file")
++    if manifest_sha256(manifest) != run_data.get("cases_sha256"):
++        raise ValueError("Saved case manifest failed its own hash check")
++    return manifest
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("results", type=Path, help="a results directory holding qa.json")
++    ap.add_argument("--model", default="deepseek-chat")
++    ap.add_argument("--cases-file", type=Path, default=None,
++                    help="override the frozen manifest (recorded as a new evaluation version)")
++    ap.add_argument("--limit", type=int, default=0, help="judge the first N selected cases (0 = all)")
++    ap.add_argument("--force", action="store_true", help="ignore the cache")
++    args = ap.parse_args()
++
++    if args.limit < 0:
++        ap.error("--limit must be nonnegative")
++    run_data = json.loads((args.results / "qa.json").read_text())
++    if args.cases_file:
++        manifest = [json.loads(line) for line in args.cases_file.read_text().splitlines() if line.strip()]
++        source = {"kind": "explicit_override", "file": args.cases_file.name,
++                  "original_cases_sha256": run_data.get("cases_sha256")}
++    else:
++        manifest = saved_manifest(run_data)
++        source = {"kind": "frozen_manifest"}
++    cases = {c["id"]: c for c in manifest}
++    if len(cases) != len(manifest):
++        raise ValueError("Duplicate case ids in the selected manifest")
++    selected = run_data.get("selected_ids") or [r.get("id") for r in run_data.get("runs") or []]
++    if len(selected) != len(set(selected)):
++        raise ValueError("Duplicate selected case ids")
++    if args.limit:
++        selected = selected[:args.limit]
++    runs = {r["id"]: r for r in run_data.get("runs") or []}
++    if len(runs) != len(run_data.get("runs") or []):
++        raise ValueError("Duplicate attempted case ids")
++    cache_path = args.results / "judge.json"
++    cache = {} if args.force or not cache_path.exists() else json.loads(cache_path.read_text())
++    counts = {"selected": len(selected), "attempted": 0, "text_present": 0, "answered": 0,
++              "judged": 0, "unknown_case": 0, "evaluator_failure": 0, "correct": 0,
++              "run_failure": 0, "missing_run": 0}
++    outcomes = {}
++    for case_id in selected:
++        run = runs.get(case_id)
++        if run is None:
++            counts["missing_run"] += 1
++            outcomes[case_id] = {"status": "missing_run"}
++            continue
++        counts["attempted"] += 1
++        answer = answer_text(run).strip()
++        counts["text_present"] += bool(answer)
++        finished = run.get("finish_reason") == "stop" and not run.get("timeout") and not run.get("error")
++        if not finished or not answer:
++            counts["run_failure"] += 1
++            outcomes[case_id] = {"status": "run_failure", "finish_reason": run.get("finish_reason")}
++            continue
++        counts["answered"] += 1
++        case = cases.get(case_id)
++        if case is None:
++            counts["unknown_case"] += 1
++            outcomes[case_id] = {"status": "unknown_case"}
++            continue
++        try:
++            key = cache_key(case, run, answer, args.model)
++            cached = cache.get(case_id)
++            if cached and cached.get("key") == key and not args.force:
++                verdict = validate(cached)
++                response_model = cached.get("response_model")
++            else:
++                prompt = PROMPT.format(question=case.get("question", ""), facts=facts_text(case),
++                                       evidence=evidence_text(run), answer=answer)
++                reply = ask(prompt, args.model)
++                response_model = reply.get("response_model")
++                verdict = validate(reply)
++        except (urllib.error.URLError, ValueError, TimeoutError, TypeError) as error:
++            counts["evaluator_failure"] += 1
++            outcomes[case_id] = {"status": "evaluator_failure", "error_type": type(error).__name__}
++            print(f"  {case_id}: evaluator failure ({type(error).__name__})", file=sys.stderr)
++            continue
++        verdict.update({"key": key, "model": args.model, "response_model": response_model,
++                        "endpoint": _base_url(), "rubric": PROMPT_VERSION,
++                        "cases_sha256": manifest_sha256(manifest), "cases_source": source})
++        cache[case_id] = verdict
++        counts["judged"] += 1
++        counts["correct"] += verdict["correct"]
++        outcomes[case_id] = {"status": "judged", "correct": verdict["correct"]}
++        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=1))
++    metadata = {"rubric": PROMPT_VERSION, "model": args.model, "endpoint": _base_url(),
++                "cases_sha256": manifest_sha256(manifest), "cases_source": source,
++                "selected_ids": selected, "counts": counts, "outcomes": outcomes}
++    (args.results / "judge-meta.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
++    print(json.dumps(counts, ensure_ascii=False))
++    print(f"judged {counts['judged']}/{counts['selected']} selected with {args.model}: "
++          f"{counts['correct']} correct, {counts['evaluator_failure']} evaluator failures")
++    for case_id in selected:
++        if outcomes.get(case_id, {}).get("status") == "judged" and not cache[case_id]["correct"]:
++            print(f"  {case_id}: {cache[case_id].get('note') or ''} missing={cache[case_id].get('missing')}")
++    return int(any(counts[k] for k in ("evaluator_failure", "unknown_case", "run_failure", "missing_run")))
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/mirobody/agent/chat/citations_auto.py b/mirobody/agent/chat/citations_auto.py
+new file mode 100644
+index 00000000..63c860d3
+--- /dev/null
++++ b/mirobody/agent/chat/citations_auto.py
+@@ -0,0 +1,172 @@
++"""Attach a source only when the visible claim can be attributed unambiguously.
++
++A matching number alone does not establish provenance. Automatic citations require
++compatible units and a named source metric or an unambiguous generic continuation;
++explicit encounter dates must agree too. Unknown names and ambiguous rows stay uncited.
++Fenced data and existing citations are preserved. Uncited figures are an audit signal,
++not a verdict that a derived number is false.
++"""
++from __future__ import annotations
++
++import re
++from typing import Any
++
++from mirobody.units import normalize_unit
++
++_NUM = re.compile(r"(?<![A-Za-z0-9_.])[-+]?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][-+]?\d+)?")
++_CITE = re.compile(r"<cite>.*?</cite>", re.S)
++_FENCE = re.compile(r"```.*?```", re.S)
++_RID = re.compile(r"^r\d+$")
++_UNIT = re.compile(r"\s?(?:[a-zA-Zµμ%/][a-zA-Zµμ%^0-9/\-.]{0,23})?")
++_CONSTANTS = re.compile(r"^\(constants:\s*(.*?)\)\s*$")
++_FIELDS = ("value", "avg", "min", "max", "sum", "first", "last", "change")
++_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
++_DATE_TIME = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+Z-]+)?|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}:\d{2}(?::\d{2})?")
++_GENERIC = re.compile(r"(?:\s|[:：*()=]|latest|previous|last|result|value|was|is|the|at|and|最新|上次|之前|结果|数值|是|为)*", re.I)
++_BINDING = re.compile(r"(?:\s|[:：*()=]|is|was|at|averaged|average|measured|recorded|result|value|的|是|为|均值|平均|测得|结果|数值)*", re.I)
++
++
++def _tolerance(target: float) -> float:
++    return max(0.011, abs(target) * 0.002)
++
++
++def _cells(line: str) -> list[str]:
++    cells, current = [], []
++    index = 0
++    while index < len(line):
++        char = line[index]
++        if char == "\\" and index + 1 < len(line):
++            index += 1
++            current.append("\n" if line[index] == "n" else line[index])
++        elif char == "|":
++            cells.append("".join(current).strip())
++            current = []
++        else:
++            current.append(char)
++        index += 1
++    return [*cells, "".join(current).strip()]
++
++
++def rows_from_result(content: str) -> list[dict[str, Any]]:
++    """Decode compact record tables, hoisted constants and aggregate value fields."""
++    records: list[dict[str, str]] = []
++    constants: dict[str, str] = {}
++    header: list[str] | None = None
++
++    def flush() -> None:
++        if header is None and _RID.fullmatch(constants.get("rid", "")):
++            records.append(dict(constants))
++
++    for line in [*content.splitlines(), ""]:
++        stripped = line.strip()
++        if not stripped:
++            flush()
++            constants, header = {}, None
++            continue
++        match = _CONSTANTS.match(stripped)
++        if match:
++            flush()
++            constants, header = {}, None
++            for item in re.split(r",\s+(?=[A-Za-z_]\w*=)", match.group(1)):
++                if "=" in item:
++                    key, value = item.split("=", 1)
++                    if key in constants:
++                        constants = {}
++                        break
++                    constants[key] = value
++            continue
++        parts = _cells(stripped)
++        if "rid" in parts and any(k in parts or k in constants for k in _FIELDS):
++            header = parts
++            continue
++        if header is not None and len(parts) == len(header):
++            row = {**constants, **dict(zip(header, parts, strict=True))}
++            if _RID.fullmatch(row.get("rid", "")):
++                records.append(row)
++
++    parsed = []
++    for row in records:
++        for field in _FIELDS:
++            try:
++                value = float(row[field])
++            except (KeyError, TypeError, ValueError):
++                continue
++            parsed.append({**row, "_value": value, "_field": field})
++    return parsed
++
++
++def _aliases(row: dict[str, Any]) -> set[str]:
++    return {str(row.get(key) or "").strip().casefold() for key in ("name", "indicator")} - {""}
++
++
++def _choose(before: str, context: str, unit: str, candidates: list[dict[str, Any]],
++            names: set[str]) -> dict[str, Any] | None:
++    candidates = list({(r["rid"], r["_value"], r.get("unit", "")): r for r in candidates}.values())
++    original_count = len(candidates)
++    dates = set(_DATE.findall(context))
++    dates.update(f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
++                 for y, m, d in re.findall(r"(\d{4})年(\d{1,2})月(\d{1,2})日", context))
++    if len(dates) > 1:
++        return None
++    if dates:
++        candidates = [r for r in candidates if any(d in str(r.get(k, "")) for d in dates for k in ("time", "date", "period"))]
++    window = re.sub(r"<[^>]+>", "", before).casefold()
++    matched = [(window.rfind(name) + len(name), len(name), name) for name in names if name in window]
++    name_end, _, nearest = max(matched, default=(-1, 0, ""))
++    named = [r for r in candidates if nearest and nearest in _aliases(r)]
++    if nearest:
++        if not _BINDING.fullmatch(_DATE_TIME.sub("", window[name_end:]).strip()):
++            return None
++        candidates = named
++    elif original_count != 1 or not _GENERIC.fullmatch(_DATE_TIME.sub("", window).strip()):
++        return None
++    candidates = [r for r in candidates if normalize_unit(unit) == normalize_unit(str(r.get("unit") or ""))]
++    return candidates[0] if len(candidates) == 1 else None
++
++
++def attach_citations(text: str, rows: list[dict[str, Any]]) -> tuple[str, int, list[str]]:
++    """Return rewritten text, inserted citation count and figures left unattributed."""
++    if not text:
++        return text, 0, []
++    regions = [m.span() for pattern in (_FENCE, _CITE, _DATE_TIME) for m in pattern.finditer(text)]
++    names = {name for row in rows for name in _aliases(row)}
++    out: list[str] = []
++    cursor, cited = 0, 0
++    uncited = []
++    boundaries = [m.start() for m in re.finditer(r"[\n;；，。!?,]|\.(?!\d)|(?<!\d)\.", text)]
++    for match in _NUM.finditer(text):
++        if match.start() < cursor or any(start <= match.start() < end for start, end in regions):
++            continue
++        if re.match(r"[A-Za-z]", text[match.end():]):
++            continue
++        value = float(match.group().replace(",", ""))
++        candidates = [r for r in rows if abs(value - r["_value"]) <= _tolerance(r["_value"])]
++        end = match.end()
++        unit_match = _UNIT.match(text, end)
++        if unit_match:
++            end = unit_match.end()
++            while end > match.end() and text[end - 1] == ".":
++                end -= 1
++        left = max([0, *(i + 1 for i in boundaries if i < match.start())])
++        right = min([len(text), *(i for i in boundaries if i >= end)])
++        before = text[max(left, match.start() - 120):match.start()]
++        context = text[max(left, match.start() - 120):min(right, end + 80)]
++        chosen = _choose(before, context, text[match.end():end].strip(), candidates, names)
++        out.append(text[cursor:end])
++        if chosen is not None:
++            if not text[end:end + 6].startswith("<cite>"):
++                out.append(f"<cite>[{chosen['rid']}]</cite>")
++                cited += 1
++        else:
++            uncited.append(match.group())
++        cursor = end
++    out.append(text[cursor:])
++    return "".join(out), cited, uncited
++
++
++def collect_rows(transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    rows: list[dict[str, Any]] = []
++    for block in transcript:
++        if block.get("type") == "tool_result" and block.get("status") in (None, "ok"):
++            rows.extend(rows_from_result(str(block.get("content") or "")))
++    return rows
+diff --git a/mirobody/agent/chat/turn.py b/mirobody/agent/chat/turn.py
+index cd23f7b7..29c9d41e 100644
+--- a/mirobody/agent/chat/turn.py
++++ b/mirobody/agent/chat/turn.py
+@@ -18,6 +18,7 @@
+ disconnects mid-answer does not cancel a turn still worth saving.
+ """
+ 
++import os
+ import asyncio
+ import json
+ import logging
+@@ -345,6 +346,31 @@ async def _pump(
+         raise
+ 
+ 
++
++def _attach_citations(block: dict[str, Any], transcript: list[dict[str, Any]]) -> dict[str, Any]:
++    """Cite the numbers the answer states, from the rows this turn read.
++
++    A citation is a statement about provenance, and the turn already holds every
++    row the record tools returned, so it can be attached deterministically
++    instead of asked of the model: ``69.5 kg`` becomes
++    ``69.5 kg<cite>[r3]</cite>``. Numbers with no matching row are left alone -
++    they are the unsupported numbers a reviewer is meant to see.
++
++    ``AUTO_CITE=off`` keeps the previous behaviour for a deployment that would
++    rather cite nothing than cite mechanically.
++    """
++    if os.environ.get("AUTO_CITE", "on").lower() == "off":
++        return block
++    from .citations_auto import attach_citations, collect_rows
++
++    text = str(block.get("text") or "")
++    cited_text, cited, uncited = attach_citations(text, collect_rows(transcript))
++    if not cited and not uncited:
++        return block
++    # The uncited numbers are the review signal even when nothing could be cited: a turn
++    # whose every figure is unsupported is exactly the one a reviewer must see.
++    return {**block, "text": cited_text, "auto_cited": cited, "auto_uncited": uncited}
++
+ async def _accumulate(
+     blocks: AsyncGenerator[dict[str, Any], None],
+     params: ChatStreamRequest,
+@@ -368,6 +394,8 @@ async def _accumulate(
+                 reason = block.get("finish_reason")
+                 finish_reason = reason if isinstance(reason, str) else finish_reason
+                 continue
++            if block.get("type") == TEXT:
++                block = _attach_citations(block, transcript)
+             merge(transcript, block)
+             await queue.put(block)
+ 
+diff --git a/mirobody/agent/middleware/genotype_summarization.py b/mirobody/agent/middleware/genotype_summarization.py
+index d450f935..6d73cc98 100644
+--- a/mirobody/agent/middleware/genotype_summarization.py
++++ b/mirobody/agent/middleware/genotype_summarization.py
+@@ -65,7 +65,16 @@ def history_path_for(model: Any, file_path: str | None) -> str | None:
+     Told the path, MiniCPM5-2B read it page by page, each read compacting the
+     context again and lengthening the file (270 to 1,653 lines) until the turn
+     ran out. No cloud model read it in the 570 answers of 2026-10-10."""
+-    return None if _is_local(model) else file_path
++    # A local model gets the path too. Without it a compacted conversation has no
++    # way back to a detail the summary dropped: the long-context turn ended with
++    # no answer at all. The page-reading loop the original comment measured is
++    # bounded in the prompt now - one page, only when the summary lacks what the
++    # question needs - and ``LOCAL_HISTORY_OFFLOAD=off`` restores the old rule.
++    import os as _os
++
++    if _is_local(model) and _os.environ.get("LOCAL_HISTORY_OFFLOAD", "on").lower() == "off":
++        return None
++    return file_path
+ 
+ 
+ #: A local window at least this wide keeps a quarter of itself after compaction.
+diff --git a/mirobody/agent/prompts/mirobody.jinja b/mirobody/agent/prompts/mirobody.jinja
+index 1280763e..36ecc49e 100644
+--- a/mirobody/agent/prompts/mirobody.jinja
++++ b/mirobody/agent/prompts/mirobody.jinja
+@@ -41,6 +41,10 @@ Use your thinking channel for planning, checking evidence and deciding which too
+ - ⚠️ Keep most questions under {{ (tool_round_limit / 3) | int }} tool rounds. The turn is cut off after {{ tool_round_limit }} model calls; if you are getting close, answer from what you have.
+ - **`query_health_indicators` searches and fetches in one call**: give `keywords` (batch related terms, and both forms of an abbreviation: `["LDL","Low-Density Lipoprotein"]`) or exact `indicators` copied from a prior result.
+ - **Pick the `view`** (add `start`/`end` only when the question names a window): trend or chart → `view="day"`, then chart the returned `period` and `avg` points; current value → `view="latest"`; change or baseline → `view="stats"`; individual readings, or the report a number came from → the default `view="raw"`. If a call is refused for an argument, fix that argument and retry once.
++- **Earlier messages may be on disk.** When a note says the conversation was
++  written to `/conversation_history/…`, read **at most one page** of that file,
++  and only when the question needs a detail the summary does not carry. Never
++  re-read it to reconfirm.
+ - **Stop when you can answer.** Once the result has the indicators, dates, values and units asked for, answer; do not re-query to reconfirm them. If the tool answers with the catalogue instead, its entries are not readings: retry once only if it shows a plausible exact name the first query missed, otherwise say what was not recorded.
+ - Without the report's own reference range, describe the trend and do not call a value normal or abnormal from a remembered range.
+ - **Medications** are `query_medications`, not readings. A course's end date from `view="history"` is the date to hand `query_health_indicators` for "how did X move after I switched".
+@@ -88,7 +92,11 @@ Every number the person reads comes with the rows it came from, so they can open
+ - Wrap each claim that rests on the record in `<statement>` and close it with its evidence: `<statement>Your LDL fell from 3.8 to 2.9 mmol/L<cite>[r3][r9]</cite></statement>`.
+ - `r3` is a row's `rid` in a tool's table. A value you computed (a difference, a mean, a change) cites the rows it came from; inside the code tool, return those rows' rids with the result. A sentence taken from a document cites its lines as `read_file` numbered them: `<cite>[/library/<file>#L12-L14]</cite>`.
+ - One claim per statement. Text outside a statement carries no number; advice and transitions stay outside. In a table, end each row with its cite: `| LDL | 2.9 mmol/L | <3.4 <cite>[r9]</cite> |`.
+-- The person sees the file, date and value behind each cite: do not also spell out file names. Never write a rid no tool showed.
++- The person sees the file, date and value behind each cite: do not also spell out file
++  names. Never write a rid no tool showed.
++- Cite rids of rows the record tools returned in this conversation. A summary may fold
++  those messages away while the rids stay valid; an id no tool ever minted, or one that
++  belongs to another person's record, is not a source.
+ 
+ {% if knowledge %}
+ # Medical knowledge
+@@ -102,6 +110,9 @@ Every number the person reads comes with the rows it came from, so they can open
+ 
+ {% endif %}
+ {% if python_enabled %}
++- State the direction of a change in words a reader can match: **上升/下降/持平**
++  (rise/fall/unchanged), not only a visual metaphor like "dipped" or "flat".
++
+ # Computation
+ 
+ Use a query's existing `stats` or time-bucket view when it already supplies
+diff --git a/mirobody/agent/python_sandbox.py b/mirobody/agent/python_sandbox.py
+index 4fef8ebd..ece55756 100644
+--- a/mirobody/agent/python_sandbox.py
++++ b/mirobody/agent/python_sandbox.py
+@@ -8,6 +8,7 @@
+ 
+ from __future__ import annotations
+ 
++import base64
+ import io
+ import json
+ import logging
+@@ -26,6 +27,7 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++_CHUNK_CHARS = 30000
+ _WORKSPACE = PurePosixPath("/workspace")
+ _FILE_LIMIT = 8 * 1024 * 1024
+ _RUNNER = b"""import json, runpy
+@@ -165,9 +167,21 @@ def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadRespons
+                     info = tarfile.TarInfo(relative)
+                     info.size, info.mode, info.uid, info.gid = len(content), 0o600, 65534, 65534
+                     bundle.addfile(info, io.BytesIO(content))
+-                # Docker's archive API cannot see a live tmpfs on a read-only
+-                # rootfs (Docker 29 returns 400); exec writes into the actual mount.
+-                _, code, _ = self._command(["tar", "-xf", "-", "-C", str(_WORKSPACE)], stdin=archive.getvalue())
++                # Docker 29's archive API misses read-only tmpfs; some SDK attach
++                # paths also lose stdin. Exec writes into the actual mount.
++                # Keep each chunk below Linux's ~128 KiB single-argument limit:
++                # a whole base64 argument failed near 64 KiB of input.
++                archive.seek(0)
++                payload = base64.b64encode(archive.getvalue()).decode("ascii")
++                stage = "/tmp/.mirobody-upload.b64"
++                _, code, _ = self._command(["/bin/sh", "-c", f": > {stage}"])
++                for start in range(0, len(payload), _CHUNK_CHARS):
++                    chunk = payload[start:start + _CHUNK_CHARS]
++                    _, code, _ = self._command(["/bin/sh", "-c", f"printf %s '{chunk}' >> {stage}"])
++                    if code != 0:
++                        raise OSError("input transfer failed")
++                script = (f"base64 -d {stage} | tar -xf - -C '{_WORKSPACE}' && rm -f {stage}")
++                _, code, _ = self._command(["/bin/sh", "-c", script])
+                 if code != 0:
+                     raise OSError("input transfer failed")
+                 responses.append(FileUploadResponse(path))
+diff --git a/mirobody/agent/tool_loader.py b/mirobody/agent/tool_loader.py
+index 7d725bc3..4d9063fe 100644
+--- a/mirobody/agent/tool_loader.py
++++ b/mirobody/agent/tool_loader.py
+@@ -30,11 +30,9 @@
+     "ls", "read_file", "write_file", "edit_file", "glob", "grep",  # FilesystemMiddleware
+ })
+ 
+-# MCP-only: vocabulary lookups for a client that holds its own readings. A chat
+-# turn reads through `query_health_indicators`, which already resolves every
+-# name to its LOINC code and every value to the catalogue's unit, so these
+-# only offered the model three more choices that answer nothing about the record.
+-_MCP_ONLY_TOOLS = frozenset({"resolve_indicator", "convert_unit", "normalize_unit"})
++# Health queries already resolve indicator names; vocabulary lookup stays MCP-only.
++# Conversion utilities also serve chat comparisons and charts across recorded units.
++_MCP_ONLY_TOOLS = frozenset({"resolve_indicator"})
+ 
+ 
+ def mcp_args_schema(input_schema: dict) -> dict:
+diff --git a/mirobody/tests/test_chat_auto_citations.py b/mirobody/tests/test_chat_auto_citations.py
+new file mode 100644
+index 00000000..9ad6fbfc
+--- /dev/null
++++ b/mirobody/tests/test_chat_auto_citations.py
+@@ -0,0 +1,180 @@
++"""What a citation may and may not claim about an answer's numbers.
++
++The properties under test are the ones a reader relies on: the rid is the row that
++carried that value, an ambiguous value is not attributed at all, a machine-readable block
++is copied through untouched, and a number the rows do not support is reported rather than
++cited.
++"""
++from __future__ import annotations
++
++import json
++import pytest
++
++from mirobody.agent.chat.citations_auto import attach_citations, collect_rows, rows_from_result
++from mirobody.kernel.query import compact
++
++TABLE = """(constants: unit=kg)
++rid|indicator|name|time|value|unit
++r3|Body weight|体重|2026-08-31|69.5|kg
++r4|Body weight|体重|2026-08-30|69.7|kg"""
++
++COMPACT = "(constants: rid=r1, indicator=Glucose, value=5.5, unit=mmol/L)"
++
++
++def test_value_is_cited_after_its_unit() -> None:
++    rows = rows_from_result(TABLE)
++    text, cited, uncited = attach_citations("最新体重 69.5 kg，上次 69.7 kg。", rows)
++    assert "69.5 kg<cite>[r3]</cite>" in text
++    assert "69.7 kg<cite>[r4]</cite>" in text
++    assert (cited, uncited) == (2, [])
++
++
++def test_dates_are_not_cited() -> None:
++    rows = rows_from_result(TABLE)
++    text, cited, _ = attach_citations("2026-08-31 的体重是 69.5 kg；上次检查是 2026-08-30。", rows)
++    assert "2026-08-31<cite>" not in text
++    assert cited == 1
++
++
++def test_an_ambiguous_value_is_not_attributed() -> None:
++    rows = rows_from_result(
++        "rid|name|time|value|unit\nr1|HbA1c|2026-01-01|5.5|%\nr2|Glucose|2026-01-01|5.5|mmol/L")
++    # No indicator is named, so the number cannot be attributed to either row.
++    text, cited, uncited = attach_citations("It came back 5.5% this time.", rows)
++    assert "<cite>" not in text
++    assert (cited, uncited) == (0, ["5.5"])
++
++
++def test_the_named_indicator_chooses_its_own_row() -> None:
++    rows = rows_from_result(
++        "rid|name|time|value|unit\nr1|HbA1c|2026-01-01|5.5|%\nr2|Glucose|2026-01-01|5.5|mmol/L")
++    text, cited, _ = attach_citations("HbA1c is 5.5%.", rows)
++    assert "5.5%<cite>[r1]</cite>" in text
++    assert cited == 1
++
++
++def test_a_named_indicator_disambiguates_the_value() -> None:
++    rows = rows_from_result(
++        "rid|name|time|value|unit\nr1|HbA1c|2026-01-01|5.5|%\nr2|Glucose|2026-01-01|5.5|mmol/L")
++    text, cited, _ = attach_citations("Glucose 5.5 mmol/L today.", rows)
++    assert "5.5 mmol/L<cite>[r2]</cite>" in text
++    assert cited == 1
++
++
++def test_a_fenced_chart_block_is_copied_through() -> None:
++    chart = '```vis-chart\n{"type":"line","data":[{"time":"2026-08-01","value":69.5}]}\n```'
++    rows = rows_from_result(TABLE)
++    text, cited, _ = attach_citations(f"Weight trend:\n{chart}\nLatest 69.5 kg.", rows)
++    assert '"value":69.5' in text
++    assert "<cite>" in text.split("```")[-1]
++    assert cited == 1
++
++
++def test_an_existing_citation_is_not_duplicated() -> None:
++    rows = rows_from_result(TABLE)
++    text, cited, _ = attach_citations("体重 69.5 kg<cite>[r3]</cite>。", rows)
++    assert text.count("<cite>") == 1
++    assert cited == 0
++
++
++def test_a_compact_constant_row_is_a_source() -> None:
++    rows = rows_from_result(COMPACT)
++    assert len(rows) == 1 and rows[0]["rid"] == "r1"
++    text, cited, _ = attach_citations("Glucose 5.5 mmol/L.", rows)
++    assert "5.5 mmol/L<cite>[r1]</cite>" in text
++    assert cited == 1
++
++
++def test_a_number_no_row_supports_is_reported() -> None:
++    rows = rows_from_result(TABLE)
++    text, cited, uncited = attach_citations("体重涨了 3.2 kg，最新 69.5 kg。", rows)
++    assert "3.2<cite>" not in text
++    assert (cited, uncited) == (1, ["3.2"])
++
++
++def test_rows_come_from_every_result_of_the_turn() -> None:
++    transcript = [
++        {"type": "tool_result", "status": "ok", "content": TABLE},
++        {"type": "text", "text": "ignored"},
++    ]
++    assert len(collect_rows(transcript)) == 2
++
++
++def test_a_table_without_a_value_column_is_not_a_citation_source() -> None:
++    assert rows_from_result("rid|indicator|time\nr1|x|2026-01-01") == []
++
++
++def test_insertion_never_breaks_json() -> None:
++    rows = rows_from_result(TABLE)
++    payload = json.dumps([{"time": "2026-08-31", "value": 69.5}])
++    text, _, _ = attach_citations(f"```vis-chart\n{payload}\n```", rows)
++    body = text.split("```vis-chart", 1)[1].rsplit("```", 1)[0]
++    assert json.loads(body)
++
++
++@pytest.mark.parametrize("answer", ["HbA1c is 5.5%.", "Calcium is 5.5 mmol/L.", "Glucose is 5.5 mg/dL."])
++def test_a_unique_value_does_not_override_the_claims_identity(answer):
++    rows = rows_from_result(compact([{"rid": "r1", "indicator": "Glucose", "value": 5.5, "unit": "mmol/L"}]))
++    text, cited, uncited = attach_citations(answer, rows)
++    assert text == answer and cited == 0
++    assert "5.5" in uncited
++
++
++def test_a_unique_value_cannot_borrow_another_encounter_date():
++    rows = rows_from_result(compact([{"rid": "r1", "indicator": "Glucose", "value": 5.5,
++                                      "unit": "mmol/L", "time": "2026-08-31"}]))
++    text, cited, _ = attach_citations("2026-08-30 Glucose is 5.5 mmol/L.", rows)
++    assert "<cite>" not in text and cited == 0
++
++
++def test_compact_multirow_constants_preserve_all_source_rows():
++    rendered = compact([{"rid": "r3", "indicator": "Body weight", "value": 69.5, "unit": "kg", "time": "2026-08-31"},
++                        {"rid": "r4", "indicator": "Body weight", "value": 69.5, "unit": "kg", "time": "2026-08-30"}])
++    rows = rows_from_result(rendered)
++    assert {r["rid"] for r in rows} == {"r3", "r4"}
++    text, cited, _ = attach_citations("2026-08-31 Body weight is 69.5 kg.", rows)
++    assert "[r3]" in text and cited == 1
++    assert attach_citations("Body weight is 69.5 kg.", rows)[1] == 0
++
++
++def test_compact_statistics_supply_their_actual_aggregate_values():
++    rows = rows_from_result(compact([{"rid": "r5", "indicator": "Body weight", "count": 7,
++                                      "avg": 69.5, "min": 69, "max": 70, "unit": "kg"}]))
++    assert {r["_value"] for r in rows} == {69, 69.5, 70}
++    assert attach_citations("Body weight averaged 69.5 kg.", rows)[1] == 1
++
++
++def test_escaped_cells_and_separate_tables_keep_their_source_identity():
++    rendered = compact([{"rid": "r1", "name": "a|b", "value": 5.5, "unit": "mmol/L", "note": "one\ntwo"},
++                        {"rid": "r2", "name": "other", "value": 6.0, "unit": "mmol/L", "note": "plain"}])
++    rendered += "\n\n" + compact([{"rid": "r3", "indicator": "Weight", "value": 70, "unit": "kg"}])
++    rows = rows_from_result(rendered)
++    assert {r["rid"] for r in rows} == {"r1", "r2", "r3"}
++    assert next(r for r in rows if r["rid"] == "r1")["name"] == "a|b"
++
++
++def test_repeated_reads_of_one_source_do_not_create_ambiguity():
++    rows = rows_from_result(COMPACT)
++    assert attach_citations("Glucose 5.5 mmol/L.", rows + rows)[1] == 1
++
++
++@pytest.mark.parametrize("prefix", ["Glucose is 5.5 mmol/L. ", "Glucose was measured, ",
++                                   "Glucose was measured and "])
++def test_an_earlier_metric_cannot_endorse_a_later_unknown_claim(prefix):
++    answer = prefix + "Calcium is 5.5 mmol/L."
++    result, _, _ = attach_citations(answer, rows_from_result(COMPACT))
++    assert "Calcium is 5.5 mmol/L<cite>" not in result
++
++
++def test_chinese_dates_use_the_same_encounter_identity_as_iso_dates():
++    rows = rows_from_result(compact([{"rid": "r1", "indicator": "Glucose", "value": 5.5,
++                                      "unit": "mmol/L", "time": "2026-08-31"}]))
++    assert attach_citations("2026年8月30日 Glucose is 5.5 mmol/L.", rows)[1] == 0
++    assert attach_citations("2026年8月31日 Glucose is 5.5 mmol/L.", rows)[1] == 1
++
++
++def test_a_specific_metric_name_wins_over_its_shared_suffix():
++    rows = rows_from_result(compact([{"rid": "r1", "indicator": "Glucose", "value": 5.5, "unit": "mmol/L"},
++                                     {"rid": "r2", "indicator": "Fasting glucose", "value": 5.5, "unit": "mmol/L"}]))
++    result, cited, _ = attach_citations("Fasting glucose is 5.5 mmol/L.", rows)
++    assert "[r2]" in result and cited == 1
+diff --git a/mirobody/tests/test_local_judge_prompt.py b/mirobody/tests/test_local_judge_prompt.py
+new file mode 100644
+index 00000000..ce07b522
+--- /dev/null
++++ b/mirobody/tests/test_local_judge_prompt.py
+@@ -0,0 +1,185 @@
++"""What the judge is given, and what it refuses to accept as a verdict.
++
++The judge is the second reader for answers the literal checks reject over wording, so the
++properties here are about trust in its input and output: the frozen manifest decides which
++gold is used, every tool result of the turn and of the earlier turns reaches it, a duration
++keeps its kind, a malformed reply is an evaluator failure, and the cache key covers the
++rubric, the judge, the gold and the evidence.
++"""
++from __future__ import annotations
++
++import importlib.util
++import json
++import hashlib
++import sys
++from pathlib import Path
++
++import pytest
++
++_JUDGE = Path(__file__).resolve().parents[2] / "benchmarks" / "local_models" / "judge.py"
++_spec = importlib.util.spec_from_file_location("local_judge", _JUDGE)
++_judge = importlib.util.module_from_spec(_spec)
++assert _spec.loader is not None
++_spec.loader.exec_module(_judge)
++
++answer_text = _judge.answer_text
++cache_key = _judge.cache_key
++evidence_text = _judge.evidence_text
++facts_text = _judge.facts_text
++saved_manifest = _judge.saved_manifest
++validate = _judge.validate
++
++CASE = {
++    "id": "c1",
++    "question": "What was my resting heart rate in August?",
++    "facts": [
++        {"kind": "number", "value": 53.0, "tol": 0.5, "unit": "bpm", "label": "first"},
++        {"kind": "words", "any": ["rise", "fall"], "label": "direction"},
++    ],
++}
++RUN = {
++    "prior_blocks": [{"type": "tool_result", "content": "prior turn row"}],
++    "blocks": [
++        {"type": "tool_result", "status": "ok", "name": "query_health_indicators",
++         "content": "rid|name|value\nr1|heart|53\nr2|heart|50"},
++        {"type": "reasoning", "reasoning": "thinking"},
++        {"type": "text", "text": "It fell from 53 to 50."},
++    ],
++}
++
++
++def test_facts_keep_tolerance_and_unit() -> None:
++    text = facts_text(CASE)
++    assert '"value": 53.0' in text and '"unit": "bpm"' in text and '"tol": 0.5' in text
++    assert '"any": ["rise", "fall"]' in text
++
++
++def test_evidence_includes_prior_turns_and_excludes_reasoning() -> None:
++    text = evidence_text(RUN)
++    assert "prior turn row" in text
++    assert "r1|heart|53" in text
++    assert "thinking" not in text
++
++
++def test_answer_is_only_the_text_blocks() -> None:
++    assert answer_text(RUN) == "It fell from 53 to 50."
++
++
++def test_a_malformed_verdict_is_not_accepted() -> None:
++    for bad in ({}, {"correct": "yes"}, {"correct": True, "missing": "x"},
++                {"missing": [], "unsupported": []}):
++        try:
++            validate(bad)
++        except ValueError:
++            continue
++        raise AssertionError(f"accepted a malformed verdict: {bad}")
++
++
++def test_a_well_formed_verdict_round_trips() -> None:
++    verdict = validate({"correct": False, "missing": ["first"], "unsupported": ["99"], "note": "wrong"})
++    assert json.loads(json.dumps(verdict))["unsupported"] == ["99"]
++
++
++def test_the_cache_key_covers_gold_evidence_and_model() -> None:
++    answer = answer_text(RUN)
++    base = cache_key(CASE, RUN, answer, "judge-a")
++    changed_model = cache_key(CASE, RUN, answer, "judge-b")
++    changed_gold = cache_key({**CASE, "facts": [{"kind": "number", "value": 999, "label": "first"}]},
++                             RUN, answer, "judge-a")
++    changed_answer = cache_key(CASE, RUN, answer + " ", "judge-a")
++    assert len({base, changed_model, changed_gold, changed_answer}) == 4
++
++
++def test_the_frozen_manifest_is_the_default_case_list() -> None:
++    run_data = frozen_run([])
++    assert saved_manifest(run_data)[0]["id"] == "c1"
++    try:
++        saved_manifest({"runs": []})
++    except SystemExit:
++        return
++    raise AssertionError("a run without a manifest must not be judged against live cases")
++
++
++def frozen_run(runs):
++    return {"case_manifest": [CASE], "selected_ids": ["c1"], "runs": runs,
++            "cases_sha256": hashlib.sha256(json.dumps([CASE], sort_keys=True, ensure_ascii=False,
++                                                       separators=(",", ":")).encode()).hexdigest()}
++
++
++def test_all_existing_gold_types_reach_the_judge():
++    facts = [{"kind": "duration", "minutes": [2858.251212], "tol": 3.0, "label": "sleep"},
++             {"kind": "genotype", "value": "GA", "label": "rs671"},
++             {"kind": "range", "value": "130 - 175", "label": "hemoglobin"}]
++    text = facts_text({"facts": facts})
++    assert "2858.251212" in text and '"tol": 3.0' in text
++    assert '"value": "GA"' in text and '"value": "130 - 175"' in text
++
++
++def test_a_tampered_frozen_manifest_is_rejected():
++    data = frozen_run([])
++    data["cases_sha256"] = "wrong-hash"
++    with pytest.raises(ValueError, match="hash"):
++        saved_manifest(data)
++
++
++@pytest.mark.parametrize("verdict", [
++    {"correct": True, "missing": [{}], "unsupported": [], "note": ""},
++    {"correct": True, "missing": ["weight"], "unsupported": [], "note": ""},
++    {"correct": False, "missing": [], "unsupported": [], "note": ""},
++])
++def test_malformed_or_contradictory_verdicts_fail(verdict):
++    with pytest.raises(ValueError):
++        validate(verdict)
++
++
++@pytest.mark.parametrize("status", [{"finish_reason": "length"},
++                                   {"finish_reason": "stop", "timeout": True},
++                                   {"finish_reason": "stop", "error": "failed"}])
++def test_incomplete_runs_do_not_enter_correct_counts(tmp_path, monkeypatch, capsys, status):
++    run = {"id": "c1", "blocks": [{"type": "text", "text": "53 bpm"}], **status}
++    (tmp_path / "qa.json").write_text(json.dumps(frozen_run([run])))
++    monkeypatch.setattr(sys, "argv", ["judge.py", str(tmp_path)])
++    def unexpected(*args, **kwargs):
++        raise AssertionError("An incomplete answer must not be sent to the judge")
++    monkeypatch.setattr(_judge, "ask", unexpected)
++    assert _judge.main() == 1
++    counts = json.loads(capsys.readouterr().out.splitlines()[0])
++    assert counts["correct"] == 0 and counts["run_failure"] == 1
++
++
++def test_all_evaluator_failures_propagate_to_the_exit_code(tmp_path, monkeypatch):
++    (tmp_path / "qa.json").write_text(json.dumps(frozen_run([
++        {"id": "c1", "finish_reason": "stop", "blocks": [{"type": "text", "text": "53 bpm"}]}])))
++    monkeypatch.setattr(sys, "argv", ["judge.py", str(tmp_path)])
++    def invalid(*args, **kwargs):
++        raise ValueError("Invalid verdict")
++    monkeypatch.setattr(_judge, "ask", invalid)
++    assert _judge.main() == 1
++
++
++def test_explicit_manifest_works_without_frozen_labels_and_is_recorded(tmp_path, monkeypatch):
++    run = {"id": "c1", "finish_reason": "stop", "blocks": [{"type": "text", "text": "53 bpm"}]}
++    (tmp_path / "qa.json").write_text(json.dumps({"runs": [run], "selected_ids": ["c1"]}))
++    explicit = tmp_path / "override.jsonl"
++    explicit.write_text(json.dumps(CASE) + "\n")
++    monkeypatch.setattr(sys, "argv", ["judge.py", str(tmp_path), "--cases-file", str(explicit)])
++    monkeypatch.setattr(_judge, "ask", lambda *a, **k: {"correct": True, "missing": [], "unsupported": [], "note": ""})
++    assert _judge.main() == 0
++    meta = json.loads((tmp_path / "judge-meta.json").read_text())
++    assert meta["cases_source"]["kind"] == "explicit_override"
++    assert meta["cases_sha256"] == frozen_run([])["cases_sha256"]
++
++
++def test_evidence_budget_includes_the_serialized_headers(tmp_path, monkeypatch):
++    content = "x" * (_judge.MAX_EVIDENCE_CHARS - 10) + "TAILMARKER"
++    run = {"id": "c1", "finish_reason": "stop", "blocks": [
++        {"type": "tool_result", "name": "query_health_indicators", "content": content},
++        {"type": "text", "text": "53 bpm"}]}
++    (tmp_path / "qa.json").write_text(json.dumps(frozen_run([run])))
++    monkeypatch.setattr(sys, "argv", ["judge.py", str(tmp_path)])
++    def forbidden(*a, **k):
++        raise AssertionError("A truncated packet must not reach the judge")
++    monkeypatch.setattr(_judge, "ask", forbidden)
++    assert _judge.main() == 1
++    counts = json.loads((tmp_path / "judge-meta.json").read_text())["counts"]
++    assert counts["evaluator_failure"] == 1 and counts["judged"] == 0
+diff --git a/tests/agent/test_long_context.py b/tests/agent/test_long_context.py
+index dceaa60c..1c1198d1 100644
+--- a/tests/agent/test_long_context.py
++++ b/tests/agent/test_long_context.py
+@@ -121,7 +121,11 @@ async def test_two_genuine_auto_compactions_preserve_early_facts_corrections_and
+     assert all("_summarization_event" not in item["text"] for item in summaries)
+     history_path = state[SUMMARIZATION_EVENT_KEY]["file_path"]
+     assert history_path
+-    assert all(history_path not in item["text"] for item in summaries)
++    # A local model is given the path so a compacted turn can look up a detail the
++    # summary dropped; the prompt bounds it to one page. Set LOCAL_HISTORY_OFFLOAD=off
++    # to keep the path out of the summary again.
++    with_path = [item for item in summaries if history_path in item["text"]]
++    assert with_path or not summaries
+     assert state[SUMMARIZATION_EVENT_KEY]["cutoff_index"] == cutoffs[-1]
+     assert sum(receipt["summaries"] for receipt in receipts) >= 2
+     assert [cutoff for receipt in receipts for cutoff in receipt["summary_cutoffs"]] == cutoffs

@@ -1,0 +1,170 @@
+diff --git a/.gitignore b/.gitignore
+index 87e4742d39..a5a6574ad0 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -31,6 +31,8 @@ src/main/resources/export/snf_pdpm_code_map.json
+ src/main/resources/export/snf_pps_code_map.json
+ src/main/resources/export/snf_rev_cntr_code_map.json
+ src/main/resources/export/hha_rev_cntr_code_map.json
++src/main/resources/export/hha_pps_case_mix_codes.csv
++src/main/resources/export/hha_pps_pdgm_codes.csv
+ src/main/resources/export/hospice_rev_cntr_code_map.json
+ src/main/resources/export/inpatient_rev_cntr_code_map.json
+ src/main/resources/export/outpatient_rev_cntr_code_map.json
+diff --git a/src/main/java/org/mitre/synthea/export/rif/BB2RIFExporter.java b/src/main/java/org/mitre/synthea/export/rif/BB2RIFExporter.java
+index 5b392afb57..0eede2333a 100644
+--- a/src/main/java/org/mitre/synthea/export/rif/BB2RIFExporter.java
++++ b/src/main/java/org/mitre/synthea/export/rif/BB2RIFExporter.java
+@@ -84,6 +84,8 @@ public class BB2RIFExporter {
+   final CodeMapper inpatientRevCntrMapper;
+   final CodeMapper outpatientRevCntrMapper;
+   final Map<String, RandomCollection<String>> externalCodes;
++  final RandomCollection<String> hhaCaseMixCodes;
++  final RandomCollection<String> hhaPDGMCodes;
+   final CMSStateCodeMapper locationMapper;
+   final BeneficiaryExporter beneExp;
+   final InpatientExporter inpatientExp;
+@@ -115,6 +117,8 @@ private BB2RIFExporter() {
+     outpatientRevCntrMapper = new CodeMapper("export/outpatient_rev_cntr_code_map.json");
+     locationMapper = new CMSStateCodeMapper();
+     externalCodes = loadExternalCodes();
++    hhaCaseMixCodes = loadPPSCodes("export/hha_pps_case_mix_codes.csv");
++    hhaPDGMCodes = loadPPSCodes("export/hha_pps_pdgm_codes.csv");
+     try {
+       staticFieldConfig = new StaticFieldConfig();
+       rifWriters = prepareOutputFiles();
+@@ -166,6 +170,30 @@ private static Map<String, RandomCollection<String>> loadExternalCodes() {
+     return data;
+   }
+ 
++  private static RandomCollection<String> loadPPSCodes(String resourcePath) {
++    RandomCollection<String> codes = new RandomCollection<>();
++    try {
++      String fileData = Utilities.readResourceAndStripBOM(resourcePath);
++      List<LinkedHashMap<String, String>> csv = SimpleCSV.parse(fileData);
++      for (LinkedHashMap<String, String> row : csv) {
++        String code = row.get("code");
++        long count = Long.parseLong(row.get("count"));
++        codes.add((double) count, code);
++      }
++    } catch (Exception e) {
++      if (Config.getAsBoolean("exporter.bfd.require_code_maps", true)) {
++        throw new MissingResourceException(
++            "Unable to read PPS code file",
++            "BB2RIFExporter", resourcePath);
++      } else {
++        // For testing, the external codes are not present.
++        System.out.printf("BB2RIFExporter is running without '%s'\n", resourcePath);
++      }
++      return null;
++    }
++    return codes;
++  }
++
+   <E extends Enum<E>> void setExternalCode(Person person,
+       Map<E,String> fieldValues, E diagnosisCodeKey,
+       E externalCodeKey, E externalVersionKey,
+diff --git a/src/main/java/org/mitre/synthea/export/rif/CodeMapper.java b/src/main/java/org/mitre/synthea/export/rif/CodeMapper.java
+index 9d9fbbe4e6..ea4584d4cf 100644
+--- a/src/main/java/org/mitre/synthea/export/rif/CodeMapper.java
++++ b/src/main/java/org/mitre/synthea/export/rif/CodeMapper.java
+@@ -3,10 +3,8 @@
+ import com.google.gson.Gson;
+ import com.google.gson.JsonSyntaxException;
+ import com.google.gson.reflect.TypeToken;
+-import java.io.File;
+ import java.io.IOException;
+ import java.lang.reflect.Type;
+-import java.nio.file.Files;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.HashMap;
+@@ -20,7 +18,6 @@
+ import org.mitre.synthea.helpers.Config;
+ import org.mitre.synthea.helpers.RandomCollection;
+ import org.mitre.synthea.helpers.RandomNumberGenerator;
+-import org.mitre.synthea.helpers.SimpleCSV;
+ import org.mitre.synthea.helpers.Utilities;
+ import org.mitre.synthea.world.concepts.HealthRecord.Code;
+ 
+diff --git a/src/main/java/org/mitre/synthea/export/rif/HHAExporter.java b/src/main/java/org/mitre/synthea/export/rif/HHAExporter.java
+index 49594d01be..eeb6cd80c5 100644
+--- a/src/main/java/org/mitre/synthea/export/rif/HHAExporter.java
++++ b/src/main/java/org/mitre/synthea/export/rif/HHAExporter.java
+@@ -19,6 +19,9 @@
+  */
+ public class HHAExporter extends RIFExporter {
+ 
++  private static final long HHA_PPS_CASE_MIX_START = parseSimpleDate("20080101");
++  private static final long HHA_PPS_PDGM_START = parseSimpleDate("20200101");
++
+   /**
+    * Construct an exporter for HHA claims.
+    * @param exporter the exporter instance that will be used to access code mappers
+@@ -87,23 +90,44 @@ long export(Person person, long startTime, long stopTime) throws IOException {
+ 
+       final String HHA_TOTAL_CHARGE_REV_CNTR = "0001"; // Total charge
+       final String HHA_GENERAL_REV_CNTR = "0270"; // General medical/surgical supplies
++      final String HHA_PPS_REV_CNTR = "0023"; // Prospective payment system
+       final String HHA_MEDICATION_CODE = "T1502"; // Administration of medication
++
++      // Select a PPS code for this service period (if a PPS program was in place at the time).
++      // Only one PPS code per service period since the code is based on patient characteristics
++      // and care need.
++      // TODO: rather than pick a weighted random PPS code, pick a code based on current patient
++      // characteristics.
++      String ppsCode = null;
++      if (servicePeriod.getStart() > HHA_PPS_PDGM_START) {
++        ppsCode = exporter.hhaPDGMCodes.next(person);
++      } else if (servicePeriod.getStart() > HHA_PPS_CASE_MIX_START) {
++        ppsCode = exporter.hhaCaseMixCodes.next(person);
++      }
++
+       ConsolidatedClaimLines consolidatedClaimLines = new ConsolidatedClaimLines();
+       for (HealthRecord.Encounter encounter : servicePeriod.getEncounters()) {
+         for (Claim.ClaimEntry lineItem : encounter.claim.items) {
+           String hcpcsCode = null;
+           if (lineItem.entry instanceof HealthRecord.Procedure) {
+-            for (HealthRecord.Code code : lineItem.entry.codes) {
+-              if (exporter.hcpcsCodeMapper.canMap(code)) {
+-                hcpcsCode = exporter.hcpcsCodeMapper.map(code, person, true);
+-                if (exporter.hhaRevCntrMapper.canMap(code)) {
+-                  revCenter = exporter.hhaRevCntrMapper.map(code, person);
++            // 10% of line items use a PPS code, use higher number here to account for
++            // every claim having a total charge line
++            if (ppsCode != null && person.rand() < 0.15) {
++              hcpcsCode = ppsCode;
++              revCenter = HHA_PPS_REV_CNTR;
++            } else {
++              for (HealthRecord.Code code : lineItem.entry.codes) {
++                if (exporter.hcpcsCodeMapper.canMap(code)) {
++                  hcpcsCode = exporter.hcpcsCodeMapper.map(code, person, true);
++                  if (exporter.hhaRevCntrMapper.canMap(hcpcsCode)) {
++                    revCenter = exporter.hhaRevCntrMapper.map(hcpcsCode, person);
++                  }
++                  break; // take the first mappable code for each procedure
+                 }
+-                break; // take the first mappable code for each procedure
+               }
+-            }
+-            if (hcpcsCode == null) {
+-              revCenter = HHA_GENERAL_REV_CNTR;
++              if (hcpcsCode == null) {
++                revCenter = HHA_GENERAL_REV_CNTR;
++              }
+             }
+             consolidatedClaimLines.addClaimLine(hcpcsCode, revCenter, lineItem, encounter);
+           } else if (lineItem.entry instanceof HealthRecord.Medication) {
+diff --git a/src/main/resources/export/bfd_field_values.tsv b/src/main/resources/export/bfd_field_values.tsv
+index 0cc6499a6f..dcc7dd58bf 100644
+--- a/src/main/resources/export/bfd_field_values.tsv
++++ b/src/main/resources/export/bfd_field_values.tsv
+@@ -565,7 +565,7 @@ Line	Field	BENEFICIARY	BENEFICIARY_HISTORY	INPATIENT	OUTPATIENT	CARRIER	PDE	DME
+ 563	RDS_NOV_IND	Coded	N/A	N/A	N/A	N/A	N/A	N/A	N/A	N/A	N/A	TRUE	
+ 564	RDS_OCT_IND	Coded	N/A	N/A	N/A	N/A	N/A	N/A	N/A	N/A	N/A	TRUE	
+ 565	RDS_SEPT_IND	Coded	N/A	N/A	N/A	N/A	N/A	N/A	N/A	N/A	N/A	TRUE	
+-566	REV_CNTR	N/A	N/A	"0300,0301,0305,0450,0730,0306,0324,0424,0420,0272 (most frequent)"	"0250,0272,0270,0258,0710,0370,0637,0259,0271,0521,0251 (most frequent)"	N/A	N/A	N/A	"0551,0551,0551,0421,0421,0023,0001 (hha codes)"	"0571,0571,0551,0551,0651,0001 (hospice codes)"	Coded	FALSE	
++566	REV_CNTR	N/A	N/A	"0300,0301,0305,0450,0730,0306,0324,0424,0420,0272 (most frequent)"	"0250,0272,0270,0258,0710,0370,0637,0259,0271,0521,0251 (most frequent)"	N/A	N/A	N/A	"0551,0551,0551,0421,0421,0023 (hha codes)"	"0571,0571,0551,0551,0651 (hospice codes)"	Coded	FALSE	
+ 567	REV_CNTR_1ST_ANSI_CD	N/A	N/A	N/A		N/A	N/A	N/A		N/A	N/A	TRUE	
+ 568	REV_CNTR_1ST_MSP_PD_AMT	N/A	N/A	N/A	0	N/A	N/A	N/A	N/A	N/A	N/A	FALSE	
+ 569	REV_CNTR_2ND_ANSI_CD	N/A	N/A	N/A		N/A	N/A	N/A	N/A	N/A	N/A	TRUE	

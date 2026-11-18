@@ -1,0 +1,1159 @@
+diff --git a/go/jsonformat/internal/protopath/proto_path.go b/go/jsonformat/internal/protopath/proto_path.go
+index d9561cdee0e..9109132af3b 100644
+--- a/go/jsonformat/internal/protopath/proto_path.go
++++ b/go/jsonformat/internal/protopath/proto_path.go
+@@ -49,6 +49,7 @@ type zeroType int
+ // Path is a selector for a proto field.
+ type Path struct {
+ 	parts []protoreflect.Name
++	err   error
+ }
+ 
+ // String implements the Stringer interface, returns a string representation of
+@@ -64,8 +65,34 @@ func (p Path) String() string {
+ // NewPath creates a Path from a string definition using proto field names.
+ func NewPath(p string) Path {
+ 	path := Path{}
+-	for _, part := range strings.Split(p, ".") {
+-		path.parts = append(path.parts, protoreflect.Name(part))
++
++	i := 0
++	for i < len(p) {
++		if i > 0 {
++			if p[i] != '.' {
++				return Path{err: fmt.Errorf("invalid path %q", p)}
++			}
++			i++
++			if i == len(p) {
++				return Path{err: fmt.Errorf("invalid path %q", p)}
++			}
++		}
++
++		prefix, err := strconv.QuotedPrefix(p[i:])
++		if p[i] != '\'' && err == nil { // single-quoted map string keys are not allowed
++			prefix, _ = strconv.Unquote(prefix)
++			path.parts = append(path.parts, protoreflect.Name(prefix))
++			i += len(prefix) + 2
++		} else {
++			n := strings.IndexRune(p[i:], '.')
++			if n == -1 {
++				path.parts = append(path.parts, protoreflect.Name(p[i:]))
++				break
++			} else {
++				path.parts = append(path.parts, protoreflect.Name(p[i:n+i]))
++				i = n + i
++			}
++		}
+ 	}
+ 	return path
+ }
+@@ -93,11 +120,16 @@ func (p Path) IsValid() bool {
+ }
+ 
+ func isValidPath(p Path) bool {
++	if p.err != nil {
++		return false
++	}
+ 	if len(p.parts) == 0 {
++		p.err = fmt.Errorf("path cannot be empty")
+ 		return false
+ 	}
+ 	for _, part := range p.parts {
+ 		if part == "" {
++			p.err = fmt.Errorf("found empty component in path")
+ 			return false
+ 		}
+ 	}
+@@ -117,11 +149,7 @@ func getMessageField(rpb protoreflect.Message, fieldName protoreflect.Name) (pro
+ 	return nil, fmt.Errorf("no field %s in %v", fieldName, desc.FullName())
+ }
+ 
+-func getSliceElement(m protoreflect.Message, fd protoreflect.FieldDescriptor, i protoreflect.Name, allowExtend bool) (protoreflect.Value, error) {
+-	idx, err := strconv.Atoi(string(i))
+-	if err != nil {
+-		return protoreflect.Value{}, err
+-	}
++func getSliceElement(m protoreflect.Message, fd protoreflect.FieldDescriptor, idx int, allowExtend bool) (protoreflect.Value, error) {
+ 	slice := m.Get(fd).List()
+ 	if idx == -1 {
+ 		if allowExtend {
+@@ -146,13 +174,74 @@ func getSliceElement(m protoreflect.Message, fd protoreflect.FieldDescriptor, i
+ 	return slice.Get(idx), nil
+ }
+ 
++func getMapKey(fd protoreflect.FieldDescriptor, key string) (protoreflect.MapKey, error) {
++	var ret any
++	var err error
++	switch keyKind := fd.MapKey().Kind(); keyKind {
++	case protoreflect.StringKind:
++		ret = key
++	case protoreflect.BoolKind:
++		ret, err = strconv.ParseBool(key)
++	case protoreflect.Int32Kind, protoreflect.Sint32Kind, protoreflect.Sfixed32Kind:
++		var k int64
++		k, err = strconv.ParseInt(key, 0, 32)
++		ret = int32(k)
++	case protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Sfixed64Kind:
++		ret, err = strconv.ParseInt(key, 0, 64)
++	case protoreflect.Uint32Kind, protoreflect.Fixed32Kind:
++		var k uint64
++		k, err = strconv.ParseUint(key, 0, 32)
++		ret = uint32(k)
++	case protoreflect.Uint64Kind, protoreflect.Fixed64Kind:
++		ret, err = strconv.ParseUint(key, 0, 64)
++	default:
++		return protoreflect.MapKey{}, fmt.Errorf("map field %v has unsupported key kind %v", fd.FullName(), keyKind)
++	}
++	if err != nil {
++		return protoreflect.MapKey{}, fmt.Errorf("invalid key %q: %v", key, err)
++	}
++	return protoreflect.ValueOf(ret).MapKey(), nil
++}
++
++func getMapElement(m protoreflect.Message, fd protoreflect.FieldDescriptor, k protoreflect.Name, allowAdd bool) (protoreflect.Value, error) {
++	key, err := getMapKey(fd, string(k))
++	if err != nil {
++		return protoreflect.Value{}, err
++	}
++	mp := m.Get(fd).Map()
++	if !m.Has(fd) {
++		mp = m.NewField(fd).Map()
++	}
++	if !mp.Has(key) {
++		if allowAdd {
++			v := mp.NewValue()
++			mp.Set(key, v)
++			m.Set(fd, protoreflect.ValueOfMap(mp))
++			return v, nil
++		}
++		return fd.MapValue().Default(), nil
++	}
++	return mp.Get(key), nil
++}
++
+ // fillField will populate the struct or slice at the next level of the path if
+ // the path refers to a field that is currently nil. The new value and path
+ // will be returned. A new path is returned when selecting into a slice because
+ // the field returned is an element of the slice.
+ func fillField(m protoreflect.Message, field protoreflect.FieldDescriptor, path []protoreflect.Name) (protoreflect.Value, []protoreflect.Name, error) {
+ 	if field.IsList() && len(path) > 1 {
+-		f, err := getSliceElement(m, field, path[1], true)
++		idx, err := strconv.Atoi(string(path[1]))
++		if err != nil {
++			return protoreflect.Value{}, nil, err
++		}
++		f, err := getSliceElement(m, field, idx, true)
++		if err != nil {
++			return f, nil, err
++		}
++		return f, path[1:], nil
++	}
++	if field.IsMap() && len(path) > 1 {
++		f, err := getMapElement(m, field, path[1], true)
+ 		if err != nil {
+ 			return f, nil, err
+ 		}
+@@ -240,7 +329,7 @@ func getEnumValueByName(ed protoreflect.EnumDescriptor, val string) (protoreflec
+ func canAssignValueToField(m protoreflect.Message, fd protoreflect.FieldDescriptor, val any) bool {
+ 	fdKind := fd.Kind()
+ 	if val == nil {
+-		return fdKind == protoreflect.MessageKind || fdKind == protoreflect.BytesKind || fd.IsList()
++		return fdKind == protoreflect.MessageKind || fdKind == protoreflect.BytesKind || fd.IsList() || fd.IsMap()
+ 	}
+ 
+ 	valType := reflect.TypeOf(val)
+@@ -254,12 +343,26 @@ func canAssignValueToField(m protoreflect.Message, fd protoreflect.FieldDescript
+ 		}
+ 		valType = valType.Elem()
+ 	}
++	if valType.Kind() == reflect.Map {
++		if !fd.IsMap() {
++			return false
++		}
++		k := reflect.ValueOf(fd.MapKey().Default().Interface())
++		v := reflect.ValueOf(fd.MapValue().Default().Interface())
++		if !k.IsValid() || !v.IsValid() {
++			return false
++		}
++		return valType.Key().AssignableTo(k.Type()) && valType.Elem().AssignableTo(v.Type())
++	}
+ 
+-	if fdKind == protoreflect.MessageKind {
++	if valType.Kind() == reflect.Ptr {
+ 		rpb, ok := valAsReflectMessage(reflect.Zero(valType).Interface())
+ 		if !ok {
+ 			return false
+ 		}
++		if fd.IsMap() {
++			return fd.MapValue().Message() == rpb.Descriptor()
++		}
+ 		return fd.Message() == rpb.Descriptor()
+ 	} else if fdKind == protoreflect.EnumKind {
+ 		switch val := val.(type) {
+@@ -276,6 +379,8 @@ func canAssignValueToField(m protoreflect.Message, fd protoreflect.FieldDescript
+ 	var def reflect.Value
+ 	if fd.IsList() {
+ 		def = reflect.ValueOf(m.Get(fd).List().NewElement().Interface())
++	} else if fd.IsMap() {
++		def = reflect.ValueOf(fd.MapValue().Default().Interface())
+ 	} else {
+ 		def = reflect.ValueOf(fd.Default().Interface())
+ 	}
+@@ -398,7 +503,9 @@ func assignValue(m protoreflect.Message, fd protoreflect.FieldDescriptor, path [
+ 	// Allow Zero to enables us to set proto fields to zero regardless of the
+ 	// underlying type.
+ 	if value == Zero {
+-		m.Clear(fd)
++		if !fd.IsMap() || fd.TextName() == string(path[0]) {
++			m.Clear(fd)
++		}
+ 		return nil
+ 	}
+ 
+@@ -410,8 +517,9 @@ func assignValue(m protoreflect.Message, fd protoreflect.FieldDescriptor, path [
+ 		return fmt.Errorf("cannot assign %T to %T", value, defVal)
+ 	}
+ 	v := protoValueFromGoValue(m, fd, value)
+-
+-	if _, valIsList := v.Interface().(protoreflect.List); !fd.IsList() || valIsList {
++	_, valIsMap := v.Interface().(protoreflect.Map)
++	_, valIsList := v.Interface().(protoreflect.List)
++	if (!fd.IsList() && !fd.IsMap()) || valIsList || valIsMap || value == nil {
+ 		if v.IsValid() {
+ 			m.Set(fd, v)
+ 		} else {
+@@ -419,22 +527,35 @@ func assignValue(m protoreflect.Message, fd protoreflect.FieldDescriptor, path [
+ 		}
+ 		return nil
+ 	}
+-	i, err := strconv.Atoi(string(path[0]))
+-	if err != nil {
+-		// Last element of path is not a valid index.
+-		defVal, err := goValueFromProtoValue(fd, fd.Default())
++
++	if fd.IsList() {
++		i, err := strconv.Atoi(string(path[0]))
++		if err != nil {
++			// Last element of path is not a valid index.
++			defVal, err := goValueFromProtoValue(fd, fd.Default())
++			if err != nil {
++				return err
++			}
++			return fmt.Errorf("cannot assign %T to %T", value, defVal)
++		}
++		slice := m.Get(fd).List()
++		// index has already been validated by `getSliceElement`, and the slice was
++		// extended, but we have to convert it again here.
++		if i == -1 {
++			i = slice.Len() - 1
++		}
++		slice.Set(i, v)
++	} else {
++		if fd.TextName() == string(path[0]) {
++			return fmt.Errorf("cannot assign %T to map", value)
++		}
++		key, err := getMapKey(fd, string(path[0]))
+ 		if err != nil {
+ 			return err
+ 		}
+-		return fmt.Errorf("cannot assign %T to %T", value, defVal)
++		mp := m.Get(fd).Map()
++		mp.Set(key, v)
+ 	}
+-	slice := m.Get(fd).List()
+-	// index has already been validated by `getSliceElement`, and the slice was
+-	// extended, but we have to convert it again here.
+-	if i == -1 {
+-		i = slice.Len() - 1
+-	}
+-	slice.Set(i, v)
+ 	return nil
+ }
+ 
+@@ -467,13 +588,24 @@ func protoValueFromGoValue(m protoreflect.Message, fd protoreflect.FieldDescript
+ 		return protoreflect.ValueOfEnum(v.Number())
+ 	}
+ 	rv := reflect.ValueOf(i)
+-	slice := m.NewField(fd).List()
+-	for i := 0; i < rv.Len(); i++ {
+-		e := rv.Index(i)
+-		eVal := protoValueFromGoValue(m, fd, e.Interface())
+-		slice.Append(eVal)
++	if fd.IsList() {
++		slice := m.NewField(fd).List()
++		for i := 0; i < rv.Len(); i++ {
++			e := rv.Index(i)
++			eVal := protoValueFromGoValue(m, fd, e.Interface())
++			slice.Append(eVal)
++		}
++		return protoreflect.ValueOfList(slice)
+ 	}
+-	return protoreflect.ValueOfList(slice)
++
++	mp := m.NewField(fd).Map()
++	iter := rv.MapRange()
++	for iter.Next() {
++		kVal := protoValueFromGoValue(m, fd, iter.Key().Interface())
++		vVal := protoValueFromGoValue(m, fd, iter.Value().Interface())
++		mp.Set(kVal.MapKey(), vVal)
++	}
++	return protoreflect.ValueOfMap(mp)
+ }
+ 
+ func goValueFromProtoValue(fd protoreflect.FieldDescriptor, v protoreflect.Value) (any, error) {
+@@ -494,8 +626,47 @@ func goValueFromProtoValue(fd protoreflect.FieldDescriptor, v protoreflect.Value
+ 			slice.Index(i).Set(reflect.ValueOf(v))
+ 		}
+ 		return slice.Interface(), nil
++	case protoreflect.Map:
++		key, err := goValueFromProtoValue(fd, protoreflect.ValueOf(fd.MapKey().Default().Interface()))
++		if err != nil {
++			return nil, err
++		}
++		var val any
++		if _, ok := v.NewValue().Interface().(protoreflect.Message); ok {
++			val = v.NewValue().Message().Interface()
++		} else {
++			val, err = goValueFromProtoValue(fd, fd.MapValue().Default())
++			if err != nil {
++				return nil, err
++			}
++		}
++		mp := reflect.MakeMap(reflect.MapOf(reflect.TypeOf(key), reflect.TypeOf(val)))
++		var mErr error
++		v.Range(func(mKey protoreflect.MapKey, mVal protoreflect.Value) bool {
++			var k, e any
++			k, mErr = goValueFromProtoValue(fd, mKey.Value())
++			if mErr != nil {
++				return false
++			}
++			e, mErr = goValueFromProtoValue(fd, protoreflect.Value(mVal))
++			if mErr != nil {
++				return false
++			}
++			mp.SetMapIndex(reflect.ValueOf(k), reflect.ValueOf(e))
++			return true
++		})
++		if mErr != nil {
++			return nil, mErr
++		}
++		return mp.Interface(), nil
+ 	case protoreflect.EnumNumber:
+-		enum, err := protoregistry.GlobalTypes.FindEnumByName(fd.Enum().FullName())
++		var n protoreflect.FullName
++		if fd.IsMap() {
++			n = fd.MapValue().Enum().FullName()
++		} else {
++			n = fd.Enum().FullName()
++		}
++		enum, err := protoregistry.GlobalTypes.FindEnumByName(n)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -537,6 +708,9 @@ func getDefaultValueAtPath(m protoreflect.Message, fd protoreflect.FieldDescript
+ 	v := m.NewField(fd)
+ 	if slice, ok := v.Interface().(protoreflect.List); ok {
+ 		m = slice.NewElement().Message()
++	} else if mp, ok := v.Interface().(protoreflect.Map); ok {
++		m = mp.NewValue().Message()
++		t = m.Descriptor()
+ 	} else {
+ 		m = v.Message()
+ 	}
+@@ -557,20 +731,65 @@ func getDefaultValueAtPath(m protoreflect.Message, fd protoreflect.FieldDescript
+ 	if len(path) == 1 {
+ 		return m, ft, nil
+ 	}
+-	if ft.Kind() != protoreflect.MessageKind && !ft.IsList() {
++	if ft.Kind() != protoreflect.MessageKind && !ft.IsList() && !ft.IsMap() {
+ 		return nil, nil, fmt.Errorf("found trailing path for scalar at %s", path[0])
+ 	}
+ 	if ft.IsList() {
+ 		path = path[1:]
++		_, err := strconv.Atoi(string(path[0]))
++		if err != nil {
++			return nil, nil, err
++		}
++	} else if ft.IsMap() {
++		path = path[1:]
++		if err := validateMapKeyInPath(ft, string(path[0])); err != nil {
++			return nil, nil, err
++		}
++		val := m.NewField(ft).Map().NewValue()
++		if _, ok := val.Interface().(protoreflect.Message); !ok {
++			return m, ft, nil
++		}
++		ft = ft.MapValue()
++		m = val.Message()
+ 	}
+ 	return getDefaultValueAtPath(m, ft, path[1:])
+ }
+ 
++func validateMapKeyInPath(fd protoreflect.FieldDescriptor, kStr string) error {
++	key, err := getMapKey(fd, kStr)
++	if err != nil {
++		return err
++	}
++	k := reflect.ValueOf(fd.MapKey().Default().Interface())
++	if !k.IsValid() {
++		return fmt.Errorf("found invalid map key type at %s", kStr)
++	}
++	if !reflect.TypeOf(key.Interface()).AssignableTo(k.Type()) {
++		return fmt.Errorf("found invalid map key type at %s", kStr)
++	}
++	return nil
++}
++
+ func checkDefaultValue(m protoreflect.Message, fd protoreflect.FieldDescriptor, path []protoreflect.Name, defVal any) (any, error) {
+-	m, ft, err := getDefaultValueAtPath(m, fd, path)
++	p := path
++	if fd.IsMap() || fd.IsList() {
++		p = p[2:]
++	}
++	m, ft, err := getDefaultValueAtPath(m, fd, p)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if (ft.IsMap() || ft.IsList()) && ft.TextName() != string(path[len(path)-1]) {
++		if defVal == Zero {
++			rv, _ := goValueFromProtoValue(ft, m.NewField(ft))
++			return reflect.Zero(reflect.TypeOf(rv).Elem()).Interface(), nil
++		}
++		if !canAssignValueToField(m, ft, defVal) {
++			return nil, fmt.Errorf("invalid type %T for default value, expected %v", defVal, ft.Name())
++		}
++		return defVal, nil
++	}
++
+ 	// Allow untyped nil pointers which enables us to set proto fields regardless
+ 	// of the underlying type.
+ 	if defVal == Zero || defVal == nil && ft.Kind() == protoreflect.MessageKind {
+@@ -630,20 +849,44 @@ func get(m protoreflect.Message, defVal any, path []protoreflect.Name) (any, err
+ 		path = path[1:]
+ 	} else {
+ 		fd = field.(protoreflect.FieldDescriptor)
+-		if m.Has(fd) || fd.IsList() && len(path) == 1 {
++		if m.Has(fd) || (fd.IsList() || fd.IsMap()) && len(path) == 1 {
+ 			if fd.IsList() && len(path) > 1 {
+-				v, err = getSliceElement(m, fd, path[1], false)
++				idx, err := strconv.Atoi(string(path[1]))
++				if err != nil {
++					return nil, err
++				}
++				if idx < -1 || idx >= m.Get(fd).List().Len() {
++					return checkDefaultValue(m, fd, path, defVal)
++				}
++				v, err = getSliceElement(m, fd, idx, false)
+ 				if err != nil {
+ 					return nil, err
+ 				}
+ 				path = path[1:]
++			} else if fd.IsMap() && len(path) > 1 {
++				v, err = getMapElement(m, fd, path[1], false)
++				if err != nil {
++					return nil, err
++				}
++				if _, ok := v.Interface().(protoreflect.Message); ok {
++					m = v.Message()
++					fd = fd.MapValue()
++				}
++				path = path[1:]
+ 			} else {
+ 				v = m.Get(fd)
+ 			}
+ 		} else if fd.IsList() {
+-			// Strip off the index (len of path must be greater than 1) so that we can
+-			// find the correct default value.
+-			path = path[1:]
++			_, err := strconv.Atoi(string(path[1]))
++			if err != nil {
++				return nil, err
++			}
++			return checkDefaultValue(m, fd, path, defVal)
++		} else if fd.IsMap() {
++			if err := validateMapKeyInPath(fd, string(path[1])); err != nil {
++				return nil, err
++			}
++			return checkDefaultValue(m, fd, path, defVal)
+ 		}
+ 	}
+ 
+@@ -728,5 +971,14 @@ func getUntyped[T any](m proto.Message, path Path, defVal any) (T, error) {
+ 		}
+ 		return ret.Interface().(T), nil
+ 	}
++	if retType.Kind() == reflect.Map && valType.Kind() == reflect.Map && valType.Elem().AssignableTo(retType.Elem()) {
++		valRef := reflect.ValueOf(val)
++		ret := reflect.MakeMap(retType)
++		iter := valRef.MapRange()
++		for iter.Next() {
++			ret.SetMapIndex(iter.Key(), iter.Value())
++		}
++		return ret.Interface().(T), nil
++	}
+ 	return zero, fmt.Errorf("value at path is a %T, want %T", val, zero)
+ }
+diff --git a/go/jsonformat/internal/protopath/proto_path_test.go b/go/jsonformat/internal/protopath/proto_path_test.go
+index 8a41725cfd5..220073a4945 100644
+--- a/go/jsonformat/internal/protopath/proto_path_test.go
++++ b/go/jsonformat/internal/protopath/proto_path_test.go
+@@ -299,6 +299,61 @@ func TestSet(t *testing.T) {
+ 				}),
+ 			},
+ 		},
++		{
++			"set nil map",
++			NewPath("map_string_string_field"),
++			nil,
++			&pptpb.Message{},
++			&pptpb.Message{MapStringStringField: nil}},
++		{
++			"set zero map value",
++			NewPath("map_string_message_field.`foo`.map_int32_enum_field.1"),
++			Zero,
++			&pptpb.Message{MapStringMessageField: map[string]*pptpb.Message_InnerMessage{}},
++			&pptpb.Message{MapStringMessageField: map[string]*pptpb.Message_InnerMessage{"foo": &pptpb.Message_InnerMessage{MapInt32EnumField: map[int32]pptpb.MessageType{1: pptpb.MessageType_INVALID_UNINITIALIZED}}}},
++		},
++		{
++			"map<string, string> field",
++			NewPath("map_string_string_field"),
++			map[string]string{"foo": "bar"},
++			&pptpb.Message{},
++			&pptpb.Message{MapStringStringField: map[string]string{"foo": "bar"}},
++		},
++		{
++			"map<int32, bytes> field - update",
++			NewPath("map_int32_bytes_field"),
++			map[int32][]byte{1: []byte("bar"), 2: []byte("baz")},
++			&pptpb.Message{MapInt32BytesField: map[int32][]byte{1: []byte("foo")}},
++			&pptpb.Message{MapInt32BytesField: map[int32][]byte{1: []byte("bar"), 2: []byte("baz")}},
++		},
++		{
++			"set value in map<bool, int32>",
++			NewPath("map_bool_int32_field.true"),
++			int32(1),
++			&pptpb.Message{},
++			&pptpb.Message{MapBoolInt32Field: map[bool]int32{true: 1}},
++		},
++		{
++			"update value in map<string, InnerMessage>",
++			NewPath("map_string_message_field.foo"),
++			&pptpb.Message_InnerMessage{InnerField: 1},
++			&pptpb.Message{MapStringMessageField: map[string]*pptpb.Message_InnerMessage{"foo": nil}},
++			&pptpb.Message{MapStringMessageField: map[string]*pptpb.Message_InnerMessage{"foo": &pptpb.Message_InnerMessage{InnerField: 1}}},
++		},
++		{
++			"clear value in map<string, string>",
++			NewPath(`map_string_string_field`),
++			Zero,
++			&pptpb.Message{MapStringStringField: map[string]string{"foo": "bar"}},
++			&pptpb.Message{MapStringStringField: nil},
++		},
++		{
++			"add zero value map - no parent",
++			NewPath(`repeated_message_field.-1.map_int32_enum_field.10`),
++			Zero,
++			&pptpb.Message{},
++			&pptpb.Message{RepeatedMessageField: []*pptpb.Message_InnerMessage{{MapInt32EnumField: map[int32]pptpb.MessageType{10: pptpb.MessageType_INVALID_UNINITIALIZED}}}},
++		},
+ 	}
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+@@ -501,6 +556,72 @@ func TestSet_Errors(t *testing.T) {
+ 			int32(1),
+ 			&pptpb.Message{AnyField: &anypb.Any{}},
+ 		},
++		{
++			"map - set list value",
++			NewPath("map_int32_bytes_field"),
++			[][]byte{[]byte("foo")},
++			&pptpb.Message{},
++		},
++		{
++			"map - set message value",
++			NewPath("map_string_message_field"),
++			&pptpb.Message_InnerMessage{},
++			&pptpb.Message{},
++		},
++		{
++			"map - set scalar value",
++			NewPath("map_string_string_field"),
++			"foo",
++			&pptpb.Message{},
++		},
++		{
++			"map - invalid key type",
++			NewPath("map_int32_bytes_field"),
++			map[int64][]byte{1: []byte("foo")},
++			&pptpb.Message{},
++		},
++		{
++			"map - invalid value type",
++			NewPath("map_string_string_field"),
++			map[string]bool{"foo": true},
++			&pptpb.Message{},
++		},
++		{
++			"map - invalid key and value types",
++			NewPath("map_string_message_field"),
++			map[pptpb.MessageType]string{pptpb.MessageType_TYPE_1: "foo"},
++			&pptpb.Message{},
++		},
++		{
++			"map key - empty",
++			NewPath(`map_string_string_field.`),
++			"foo",
++			&pptpb.Message{},
++		},
++		{
++			"map key - unparseable type",
++			NewPath(`map_int32_bytes_field.$$$`),
++			[]byte("foo"),
++			&pptpb.Message{},
++		},
++		{
++			"map value - wrong scalar type",
++			NewPath(`map_string_string_field."foo"`),
++			int32(1),
++			&pptpb.Message{MapStringStringField: map[string]string{"foo": "bar"}},
++		},
++		{
++			"map value - scalar for message type",
++			NewPath(`map_string_message_field.foo`),
++			int32(1),
++			&pptpb.Message{},
++		},
++		{
++			"map value - message for scalar type",
++			NewPath(`map_string_string_field.foo`),
++			&pptpb.Message_InnerMessage{},
++			&pptpb.Message{},
++		},
+ 	}
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+@@ -588,6 +709,42 @@ func TestGet(t *testing.T) {
+ 			},
+ 			want: []int32{1, 2},
+ 		},
++		{
++			name: "map",
++			msg:  &pptpb.Message{MapStringStringField: map[string]string{"foo": "bar"}},
++			path: NewPath("map_string_string_field"),
++			fn: func(m proto.Message, path Path) (any, error) {
++				return Get[map[string]string](m, path)
++			},
++			want: map[string]string{"foo": "bar"},
++		},
++		{
++			name: "map value - scalar",
++			msg:  &pptpb.Message{MapBoolInt32Field: map[bool]int32{false: 7}},
++			path: NewPath("map_bool_int32_field.false"),
++			fn: func(m proto.Message, path Path) (any, error) {
++				return Get[int32](m, path)
++			},
++			want: int32(7),
++		},
++		{
++			name: "map value - message",
++			msg:  &pptpb.Message{MapStringMessageField: map[string]*pptpb.Message_InnerMessage{"foo.bar": innerMsg}},
++			path: NewPath(`map_string_message_field."foo.bar"`),
++			fn: func(m proto.Message, path Path) (any, error) {
++				return Get[proto.Message](m, path)
++			},
++			want: innerMsg,
++		},
++		{
++			name: "map value - missing key",
++			msg:  &pptpb.Message{MapStringStringField: map[string]string{"foo": "bar"}},
++			path: NewPath(`map_string_string_field."missing"`),
++			fn: func(m proto.Message, path Path) (any, error) {
++				return Get[string](m, path)
++			},
++			want: "",
++		},
+ 	}
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+@@ -710,6 +867,20 @@ func TestGetWithDefault(t *testing.T) {
+ 			&pptpb.Message{},
+ 			[]int32{},
+ 		},
++		{
++			"repeated field - index out of bounds",
++			NewPath("repeated_message_field.2.repeated_inner_field.0"),
++			Zero,
++			&pptpb.Message{RepeatedMessageField: []*pptpb.Message_InnerMessage{{}}},
++			int32(0),
++		},
++		{
++			"repeated field - not specified - index out of bounds",
++			NewPath("repeated_message_field.0.repeated_inner_field.0"),
++			Zero,
++			&pptpb.Message{},
++			int32(0),
++		},
+ 		{
+ 			"missing field - zero",
+ 			NewPath("message_field"),
+@@ -848,6 +1019,76 @@ func TestGetWithDefault(t *testing.T) {
+ 			},
+ 			int32(1),
+ 		},
++		{
++			"map",
++			NewPath("map_string_string_field"),
++			Zero,
++			&pptpb.Message{MapStringStringField: map[string]string{"foo": "bar"}},
++			map[string]string{"foo": "bar"},
++		},
++		{
++			"map - proto value",
++			NewPath("map_string_message_field"),
++			Zero,
++			&pptpb.Message{MapStringMessageField: map[string]*pptpb.Message_InnerMessage{}},
++			map[string]*pptpb.Message_InnerMessage{},
++		},
++		{
++			"scalar map value",
++			NewPath("map_bool_int32_field.true"),
++			Zero,
++			&pptpb.Message{MapBoolInt32Field: map[bool]int32{true: 3}},
++			int32(3),
++		},
++		{
++			"scalar map value - empty",
++			NewPath("map_bool_int32_field.true"),
++			Zero,
++			&pptpb.Message{},
++			int32(0),
++		},
++		{
++			"nested map value",
++			NewPath("map_string_message_field.foo.map_int32_enum_field.1"),
++			Zero,
++			&pptpb.Message{MapStringMessageField: map[string]*pptpb.Message_InnerMessage{"foo": &pptpb.Message_InnerMessage{MapInt32EnumField: map[int32]pptpb.MessageType{1: pptpb.MessageType_TYPE_1}}}},
++			pptpb.MessageType_TYPE_1,
++		},
++		{
++			"map value - enum",
++			NewPath("map_int32_enum_field.1"),
++			Zero,
++			&pptpb.Message_InnerMessage{MapInt32EnumField: map[int32]pptpb.MessageType{1: pptpb.MessageType_TYPE_1}},
++			pptpb.MessageType_TYPE_1,
++		},
++		{
++			"proto map value",
++			NewPath("map_string_message_field.`bar`"),
++			Zero,
++			&pptpb.Message{MapStringMessageField: map[string]*pptpb.Message_InnerMessage{"bar": &pptpb.Message_InnerMessage{InnerField: 1}}},
++			&pptpb.Message_InnerMessage{InnerField: 1},
++		},
++		{
++			"missing map value - parent exists",
++			NewPath("map_string_message_field.foo.inner_field"),
++			Zero,
++			&pptpb.Message{},
++			int32(0),
++		},
++		{
++			"missing enum map value - parent exists",
++			NewPath("message_field.map_int32_enum_field.0"),
++			Zero,
++			&pptpb.Message{},
++			pptpb.MessageType_INVALID_UNINITIALIZED,
++		},
++		{
++			"missing enum map - parent exists",
++			NewPath("message_field.map_int32_enum_field"),
++			Zero,
++			&pptpb.Message{},
++			map[int32]pptpb.MessageType{},
++		},
+ 	}
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+@@ -930,12 +1171,6 @@ func TestGetWithDefault_Errors(t *testing.T) {
+ 			Zero,
+ 			&pptpb.Message{},
+ 		},
+-		{
+-			"repeated field - negative index",
+-			NewPath("repeated_message_field.-2.inner_field"),
+-			int32(1),
+-			&pptpb.Message{RepeatedMessageField: []*pptpb.Message_InnerMessage{{InnerField: 1}}},
+-		},
+ 		{
+ 			"repeated field - invalid index",
+ 			NewPath("repeated_message_field.foo.inner_field"),
+@@ -960,6 +1195,24 @@ func TestGetWithDefault_Errors(t *testing.T) {
+ 			Zero,
+ 			&pptpb.Message{AnyField: &anypb.Any{}},
+ 		},
++		{
++			"map key - invalid string",
++			NewPath("map_string_string_field.```"),
++			Zero,
++			&pptpb.Message{MapStringStringField: map[string]string{"1": "2"}},
++		},
++		{
++			"map key - unparseable type",
++			NewPath("map_int32_bytes_field.___"),
++			Zero,
++			&pptpb.Message{MapInt32BytesField: map[int32][]byte{}},
++		},
++		{
++			"map key - wrong type",
++			NewPath(`map_string_message_field.foo.map_int32_enum_field.true`),
++			Zero,
++			&pptpb.Message{MapStringMessageField: map[string]*pptpb.Message_InnerMessage{"foo": &pptpb.Message_InnerMessage{MapInt32EnumField: map[int32]pptpb.MessageType{}}}},
++		},
+ 	}
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+diff --git a/go/jsonformat/internal/protopath/protopathtest.proto b/go/jsonformat/internal/protopath/protopathtest.proto
+index 627607d5979..49eb1686de3 100644
+--- a/go/jsonformat/internal/protopath/protopathtest.proto
++++ b/go/jsonformat/internal/protopath/protopathtest.proto
+@@ -41,6 +41,7 @@ message Message {
+     oneof inner_oneof {
+       InnerMessage2 inner_oneof_message_field = 4;
+     }
++    map<int32, MessageType> map_int32_enum_field = 5;
+   }
+ 
+   message InnerMessage2 {
+@@ -74,4 +75,10 @@ message Message {
+   bytes bytes_field = 13;
+ 
+   protobuf.Any any_field = 14;
++
++  map<string, string> map_string_string_field = 15;
++  map<int32, bytes> map_int32_bytes_field = 16;
++  map<bool, int32> map_bool_int32_field = 17;
++
++  map<string, InnerMessage> map_string_message_field = 18;
+ }
+diff --git a/go/jsonformat/internal/protopath/protopathtest_go_proto/protopathtest.pb.go b/go/jsonformat/internal/protopath/protopathtest_go_proto/protopathtest.pb.go
+index 7badec0338c..9a2fdb77c7e 100644
+--- a/go/jsonformat/internal/protopath/protopathtest_go_proto/protopathtest.pb.go
++++ b/go/jsonformat/internal/protopath/protopathtest_go_proto/protopathtest.pb.go
+@@ -139,14 +139,18 @@ type Message struct {
+ 	//	*Message_OneofMessageField
+ 	//	*Message_OneofConflictingMessageField_1
+ 	//	*Message_OneofConflictingMessageField_2
+-	Oneof                    isMessage_Oneof         `protobuf_oneof:"oneof"`
+-	Type                     MessageType             `protobuf:"varint,8,opt,name=type,proto3,enum=google.fhir.go.jsonformat.internal.protopath.MessageType" json:"type,omitempty"`
+-	MessageField             *Message_InnerMessage   `protobuf:"bytes,9,opt,name=message_field,json=messageField,proto3" json:"message_field,omitempty"`
+-	RepeatedMessageField     []*Message_InnerMessage `protobuf:"bytes,10,rep,name=repeated_message_field,json=repeatedMessageField,proto3" json:"repeated_message_field,omitempty"`
+-	StringField              string                  `protobuf:"bytes,11,opt,name=string_field,json=stringField,proto3" json:"string_field,omitempty"`
+-	JsonAnnotatedStringField string                  `protobuf:"bytes,12,opt,name=json_annotated_string_field,json=jsonAnnotated,proto3" json:"json_annotated_string_field,omitempty"`
+-	BytesField               []byte                  `protobuf:"bytes,13,opt,name=bytes_field,json=bytesField,proto3" json:"bytes_field,omitempty"`
+-	AnyField                 *anypb.Any              `protobuf:"bytes,14,opt,name=any_field,json=anyField,proto3" json:"any_field,omitempty"`
++	Oneof                    isMessage_Oneof                  `protobuf_oneof:"oneof"`
++	Type                     MessageType                      `protobuf:"varint,8,opt,name=type,proto3,enum=google.fhir.go.jsonformat.internal.protopath.MessageType" json:"type,omitempty"`
++	MessageField             *Message_InnerMessage            `protobuf:"bytes,9,opt,name=message_field,json=messageField,proto3" json:"message_field,omitempty"`
++	RepeatedMessageField     []*Message_InnerMessage          `protobuf:"bytes,10,rep,name=repeated_message_field,json=repeatedMessageField,proto3" json:"repeated_message_field,omitempty"`
++	StringField              string                           `protobuf:"bytes,11,opt,name=string_field,json=stringField,proto3" json:"string_field,omitempty"`
++	JsonAnnotatedStringField string                           `protobuf:"bytes,12,opt,name=json_annotated_string_field,json=jsonAnnotated,proto3" json:"json_annotated_string_field,omitempty"`
++	BytesField               []byte                           `protobuf:"bytes,13,opt,name=bytes_field,json=bytesField,proto3" json:"bytes_field,omitempty"`
++	AnyField                 *anypb.Any                       `protobuf:"bytes,14,opt,name=any_field,json=anyField,proto3" json:"any_field,omitempty"`
++	MapStringStringField     map[string]string                `protobuf:"bytes,15,rep,name=map_string_string_field,json=mapStringStringField,proto3" json:"map_string_string_field,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
++	MapInt32BytesField       map[int32][]byte                 `protobuf:"bytes,16,rep,name=map_int32_bytes_field,json=mapInt32BytesField,proto3" json:"map_int32_bytes_field,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
++	MapBoolInt32Field        map[bool]int32                   `protobuf:"bytes,17,rep,name=map_bool_int32_field,json=mapBoolInt32Field,proto3" json:"map_bool_int32_field,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"varint,2,opt,name=value,proto3"`
++	MapStringMessageField    map[string]*Message_InnerMessage `protobuf:"bytes,18,rep,name=map_string_message_field,json=mapStringMessageField,proto3" json:"map_string_message_field,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+ }
+ 
+ func (x *Message) Reset() {
+@@ -286,6 +290,34 @@ func (x *Message) GetAnyField() *anypb.Any {
+ 	return nil
+ }
+ 
++func (x *Message) GetMapStringStringField() map[string]string {
++	if x != nil {
++		return x.MapStringStringField
++	}
++	return nil
++}
++
++func (x *Message) GetMapInt32BytesField() map[int32][]byte {
++	if x != nil {
++		return x.MapInt32BytesField
++	}
++	return nil
++}
++
++func (x *Message) GetMapBoolInt32Field() map[bool]int32 {
++	if x != nil {
++		return x.MapBoolInt32Field
++	}
++	return nil
++}
++
++func (x *Message) GetMapStringMessageField() map[string]*Message_InnerMessage {
++	if x != nil {
++		return x.MapStringMessageField
++	}
++	return nil
++}
++
+ type isMessage_Oneof interface {
+ 	isMessage_Oneof()
+ }
+@@ -339,7 +371,8 @@ type Message_InnerMessage struct {
+ 	// Types that are assignable to InnerOneof:
+ 	//
+ 	//	*Message_InnerMessage_InnerOneofMessageField
+-	InnerOneof isMessage_InnerMessage_InnerOneof `protobuf_oneof:"inner_oneof"`
++	InnerOneof        isMessage_InnerMessage_InnerOneof `protobuf_oneof:"inner_oneof"`
++	MapInt32EnumField map[int32]MessageType             `protobuf:"bytes,5,rep,name=map_int32_enum_field,json=mapInt32EnumField,proto3" json:"map_int32_enum_field,omitempty" protobuf_key:"varint,1,opt,name=key,proto3" protobuf_val:"varint,2,opt,name=value,proto3,enum=google.fhir.go.jsonformat.internal.protopath.MessageType"`
+ }
+ 
+ func (x *Message_InnerMessage) Reset() {
+@@ -409,6 +442,13 @@ func (x *Message_InnerMessage) GetInnerOneofMessageField() *Message_InnerMessage
+ 	return nil
+ }
+ 
++func (x *Message_InnerMessage) GetMapInt32EnumField() map[int32]MessageType {
++	if x != nil {
++		return x.MapInt32EnumField
++	}
++	return nil
++}
++
+ type isMessage_InnerMessage_InnerOneof interface {
+ 	isMessage_InnerMessage_InnerOneof()
+ }
+@@ -477,7 +517,7 @@ var file_go_jsonformat_internal_protopath_protopathtest_proto_rawDesc = []byte{
+ 	0x74, 0x2e, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f,
+ 	0x70, 0x61, 0x74, 0x68, 0x1a, 0x19, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x2f, 0x70, 0x72, 0x6f,
+ 	0x74, 0x6f, 0x62, 0x75, 0x66, 0x2f, 0x61, 0x6e, 0x79, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x22,
+-	0x09, 0x0a, 0x07, 0x4d, 0x69, 0x73, 0x73, 0x69, 0x6e, 0x67, 0x22, 0xa6, 0x0c, 0x0a, 0x07, 0x4d,
++	0x09, 0x0a, 0x07, 0x4d, 0x69, 0x73, 0x73, 0x69, 0x6e, 0x67, 0x22, 0xb0, 0x15, 0x0a, 0x07, 0x4d,
+ 	0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x12, 0x14, 0x0a, 0x05, 0x69, 0x6e, 0x74, 0x33, 0x32, 0x18,
+ 	0x01, 0x20, 0x01, 0x28, 0x05, 0x52, 0x05, 0x69, 0x6e, 0x74, 0x33, 0x32, 0x12, 0x34, 0x0a, 0x15,
+ 	0x6f, 0x6e, 0x65, 0x6f, 0x66, 0x5f, 0x70, 0x72, 0x69, 0x6d, 0x69, 0x74, 0x69, 0x76, 0x65, 0x5f,
+@@ -548,44 +588,117 @@ var file_go_jsonformat_internal_protopath_protopathtest_proto_rawDesc = []byte{
+ 	0x73, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x12, 0x31, 0x0a, 0x09, 0x61, 0x6e, 0x79, 0x5f, 0x66, 0x69,
+ 	0x65, 0x6c, 0x64, 0x18, 0x0e, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x14, 0x2e, 0x67, 0x6f, 0x6f, 0x67,
+ 	0x6c, 0x65, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x62, 0x75, 0x66, 0x2e, 0x41, 0x6e, 0x79, 0x52,
+-	0x08, 0x61, 0x6e, 0x79, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x1a, 0xfa, 0x02, 0x0a, 0x0c, 0x49, 0x6e,
+-	0x6e, 0x65, 0x72, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x12, 0x1f, 0x0a, 0x0b, 0x69, 0x6e,
+-	0x6e, 0x65, 0x72, 0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x05, 0x52,
+-	0x0a, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x12, 0x30, 0x0a, 0x14, 0x72,
+-	0x65, 0x70, 0x65, 0x61, 0x74, 0x65, 0x64, 0x5f, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0x5f, 0x66, 0x69,
+-	0x65, 0x6c, 0x64, 0x18, 0x02, 0x20, 0x03, 0x28, 0x05, 0x52, 0x12, 0x72, 0x65, 0x70, 0x65, 0x61,
+-	0x74, 0x65, 0x64, 0x49, 0x6e, 0x6e, 0x65, 0x72, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x12, 0x84, 0x01,
+-	0x0a, 0x1c, 0x72, 0x65, 0x70, 0x65, 0x61, 0x74, 0x65, 0x64, 0x5f, 0x69, 0x6e, 0x6e, 0x65, 0x72,
+-	0x5f, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64, 0x18, 0x03,
+-	0x20, 0x03, 0x28, 0x0b, 0x32, 0x43, 0x2e, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x2e, 0x66, 0x68,
+-	0x69, 0x72, 0x2e, 0x67, 0x6f, 0x2e, 0x6a, 0x73, 0x6f, 0x6e, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74,
+-	0x2e, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x70,
+-	0x61, 0x74, 0x68, 0x2e, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x2e, 0x49, 0x6e, 0x6e, 0x65,
+-	0x72, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x32, 0x52, 0x19, 0x72, 0x65, 0x70, 0x65, 0x61,
+-	0x74, 0x65, 0x64, 0x49, 0x6e, 0x6e, 0x65, 0x72, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x46,
+-	0x69, 0x65, 0x6c, 0x64, 0x12, 0x80, 0x01, 0x0a, 0x19, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0x5f, 0x6f,
+-	0x6e, 0x65, 0x6f, 0x66, 0x5f, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x5f, 0x66, 0x69, 0x65,
+-	0x6c, 0x64, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x43, 0x2e, 0x67, 0x6f, 0x6f, 0x67, 0x6c,
+-	0x65, 0x2e, 0x66, 0x68, 0x69, 0x72, 0x2e, 0x67, 0x6f, 0x2e, 0x6a, 0x73, 0x6f, 0x6e, 0x66, 0x6f,
+-	0x72, 0x6d, 0x61, 0x74, 0x2e, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c, 0x2e, 0x70, 0x72,
+-	0x6f, 0x74, 0x6f, 0x70, 0x61, 0x74, 0x68, 0x2e, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x2e,
+-	0x49, 0x6e, 0x6e, 0x65, 0x72, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x32, 0x48, 0x00, 0x52,
+-	0x16, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0x4f, 0x6e, 0x65, 0x6f, 0x66, 0x4d, 0x65, 0x73, 0x73, 0x61,
+-	0x67, 0x65, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x42, 0x0d, 0x0a, 0x0b, 0x69, 0x6e, 0x6e, 0x65, 0x72,
+-	0x5f, 0x6f, 0x6e, 0x65, 0x6f, 0x66, 0x1a, 0x32, 0x0a, 0x0d, 0x49, 0x6e, 0x6e, 0x65, 0x72, 0x4d,
+-	0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x32, 0x12, 0x21, 0x0a, 0x0c, 0x69, 0x6e, 0x6e, 0x65, 0x72,
+-	0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64, 0x32, 0x18, 0x01, 0x20, 0x01, 0x28, 0x05, 0x52, 0x0b, 0x69,
+-	0x6e, 0x6e, 0x65, 0x72, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x32, 0x42, 0x07, 0x0a, 0x05, 0x6f, 0x6e,
+-	0x65, 0x6f, 0x66, 0x2a, 0x40, 0x0a, 0x0b, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x54, 0x79,
+-	0x70, 0x65, 0x12, 0x19, 0x0a, 0x15, 0x49, 0x4e, 0x56, 0x41, 0x4c, 0x49, 0x44, 0x5f, 0x55, 0x4e,
+-	0x49, 0x4e, 0x49, 0x54, 0x49, 0x41, 0x4c, 0x49, 0x5a, 0x45, 0x44, 0x10, 0x00, 0x12, 0x0a, 0x0a,
+-	0x06, 0x54, 0x59, 0x50, 0x45, 0x5f, 0x31, 0x10, 0x01, 0x12, 0x0a, 0x0a, 0x06, 0x54, 0x59, 0x50,
+-	0x45, 0x5f, 0x32, 0x10, 0x02, 0x42, 0x50, 0x5a, 0x4e, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e,
+-	0x63, 0x6f, 0x6d, 0x2f, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x2f, 0x66, 0x68, 0x69, 0x72, 0x2f,
+-	0x67, 0x6f, 0x2f, 0x6a, 0x73, 0x6f, 0x6e, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x2f, 0x69, 0x6e,
+-	0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x70, 0x61, 0x74, 0x68,
+-	0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x70, 0x61, 0x74, 0x68, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x67,
+-	0x6f, 0x5f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++	0x08, 0x61, 0x6e, 0x79, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x12, 0x86, 0x01, 0x0a, 0x17, 0x6d, 0x61,
++	0x70, 0x5f, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x5f, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x5f,
++	0x66, 0x69, 0x65, 0x6c, 0x64, 0x18, 0x0f, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x4f, 0x2e, 0x67, 0x6f,
++	0x6f, 0x67, 0x6c, 0x65, 0x2e, 0x66, 0x68, 0x69, 0x72, 0x2e, 0x67, 0x6f, 0x2e, 0x6a, 0x73, 0x6f,
++	0x6e, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x2e, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c,
++	0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x70, 0x61, 0x74, 0x68, 0x2e, 0x4d, 0x65, 0x73, 0x73, 0x61,
++	0x67, 0x65, 0x2e, 0x4d, 0x61, 0x70, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x53, 0x74, 0x72, 0x69,
++	0x6e, 0x67, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x52, 0x14, 0x6d, 0x61,
++	0x70, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x46, 0x69, 0x65,
++	0x6c, 0x64, 0x12, 0x80, 0x01, 0x0a, 0x15, 0x6d, 0x61, 0x70, 0x5f, 0x69, 0x6e, 0x74, 0x33, 0x32,
++	0x5f, 0x62, 0x79, 0x74, 0x65, 0x73, 0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64, 0x18, 0x10, 0x20, 0x03,
++	0x28, 0x0b, 0x32, 0x4d, 0x2e, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x2e, 0x66, 0x68, 0x69, 0x72,
++	0x2e, 0x67, 0x6f, 0x2e, 0x6a, 0x73, 0x6f, 0x6e, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x2e, 0x69,
++	0x6e, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x70, 0x61, 0x74,
++	0x68, 0x2e, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x2e, 0x4d, 0x61, 0x70, 0x49, 0x6e, 0x74,
++	0x33, 0x32, 0x42, 0x79, 0x74, 0x65, 0x73, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x45, 0x6e, 0x74, 0x72,
++	0x79, 0x52, 0x12, 0x6d, 0x61, 0x70, 0x49, 0x6e, 0x74, 0x33, 0x32, 0x42, 0x79, 0x74, 0x65, 0x73,
++	0x46, 0x69, 0x65, 0x6c, 0x64, 0x12, 0x7d, 0x0a, 0x14, 0x6d, 0x61, 0x70, 0x5f, 0x62, 0x6f, 0x6f,
++	0x6c, 0x5f, 0x69, 0x6e, 0x74, 0x33, 0x32, 0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64, 0x18, 0x11, 0x20,
++	0x03, 0x28, 0x0b, 0x32, 0x4c, 0x2e, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x2e, 0x66, 0x68, 0x69,
++	0x72, 0x2e, 0x67, 0x6f, 0x2e, 0x6a, 0x73, 0x6f, 0x6e, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x2e,
++	0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x70, 0x61,
++	0x74, 0x68, 0x2e, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x2e, 0x4d, 0x61, 0x70, 0x42, 0x6f,
++	0x6f, 0x6c, 0x49, 0x6e, 0x74, 0x33, 0x32, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x45, 0x6e, 0x74, 0x72,
++	0x79, 0x52, 0x11, 0x6d, 0x61, 0x70, 0x42, 0x6f, 0x6f, 0x6c, 0x49, 0x6e, 0x74, 0x33, 0x32, 0x46,
++	0x69, 0x65, 0x6c, 0x64, 0x12, 0x89, 0x01, 0x0a, 0x18, 0x6d, 0x61, 0x70, 0x5f, 0x73, 0x74, 0x72,
++	0x69, 0x6e, 0x67, 0x5f, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x5f, 0x66, 0x69, 0x65, 0x6c,
++	0x64, 0x18, 0x12, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x50, 0x2e, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65,
++	0x2e, 0x66, 0x68, 0x69, 0x72, 0x2e, 0x67, 0x6f, 0x2e, 0x6a, 0x73, 0x6f, 0x6e, 0x66, 0x6f, 0x72,
++	0x6d, 0x61, 0x74, 0x2e, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c, 0x2e, 0x70, 0x72, 0x6f,
++	0x74, 0x6f, 0x70, 0x61, 0x74, 0x68, 0x2e, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x2e, 0x4d,
++	0x61, 0x70, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x46,
++	0x69, 0x65, 0x6c, 0x64, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x52, 0x15, 0x6d, 0x61, 0x70, 0x53, 0x74,
++	0x72, 0x69, 0x6e, 0x67, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x46, 0x69, 0x65, 0x6c, 0x64,
++	0x1a, 0x88, 0x05, 0x0a, 0x0c, 0x49, 0x6e, 0x6e, 0x65, 0x72, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67,
++	0x65, 0x12, 0x1f, 0x0a, 0x0b, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64,
++	0x18, 0x01, 0x20, 0x01, 0x28, 0x05, 0x52, 0x0a, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0x46, 0x69, 0x65,
++	0x6c, 0x64, 0x12, 0x30, 0x0a, 0x14, 0x72, 0x65, 0x70, 0x65, 0x61, 0x74, 0x65, 0x64, 0x5f, 0x69,
++	0x6e, 0x6e, 0x65, 0x72, 0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64, 0x18, 0x02, 0x20, 0x03, 0x28, 0x05,
++	0x52, 0x12, 0x72, 0x65, 0x70, 0x65, 0x61, 0x74, 0x65, 0x64, 0x49, 0x6e, 0x6e, 0x65, 0x72, 0x46,
++	0x69, 0x65, 0x6c, 0x64, 0x12, 0x84, 0x01, 0x0a, 0x1c, 0x72, 0x65, 0x70, 0x65, 0x61, 0x74, 0x65,
++	0x64, 0x5f, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0x5f, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x5f,
++	0x66, 0x69, 0x65, 0x6c, 0x64, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x43, 0x2e, 0x67, 0x6f,
++	0x6f, 0x67, 0x6c, 0x65, 0x2e, 0x66, 0x68, 0x69, 0x72, 0x2e, 0x67, 0x6f, 0x2e, 0x6a, 0x73, 0x6f,
++	0x6e, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x2e, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c,
++	0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x70, 0x61, 0x74, 0x68, 0x2e, 0x4d, 0x65, 0x73, 0x73, 0x61,
++	0x67, 0x65, 0x2e, 0x49, 0x6e, 0x6e, 0x65, 0x72, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x32,
++	0x52, 0x19, 0x72, 0x65, 0x70, 0x65, 0x61, 0x74, 0x65, 0x64, 0x49, 0x6e, 0x6e, 0x65, 0x72, 0x4d,
++	0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x12, 0x80, 0x01, 0x0a, 0x19,
++	0x69, 0x6e, 0x6e, 0x65, 0x72, 0x5f, 0x6f, 0x6e, 0x65, 0x6f, 0x66, 0x5f, 0x6d, 0x65, 0x73, 0x73,
++	0x61, 0x67, 0x65, 0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0b, 0x32,
++	0x43, 0x2e, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x2e, 0x66, 0x68, 0x69, 0x72, 0x2e, 0x67, 0x6f,
++	0x2e, 0x6a, 0x73, 0x6f, 0x6e, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x2e, 0x69, 0x6e, 0x74, 0x65,
++	0x72, 0x6e, 0x61, 0x6c, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x70, 0x61, 0x74, 0x68, 0x2e, 0x4d,
++	0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x2e, 0x49, 0x6e, 0x6e, 0x65, 0x72, 0x4d, 0x65, 0x73, 0x73,
++	0x61, 0x67, 0x65, 0x32, 0x48, 0x00, 0x52, 0x16, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0x4f, 0x6e, 0x65,
++	0x6f, 0x66, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x12, 0x8a,
++	0x01, 0x0a, 0x14, 0x6d, 0x61, 0x70, 0x5f, 0x69, 0x6e, 0x74, 0x33, 0x32, 0x5f, 0x65, 0x6e, 0x75,
++	0x6d, 0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64, 0x18, 0x05, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x59, 0x2e,
++	0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x2e, 0x66, 0x68, 0x69, 0x72, 0x2e, 0x67, 0x6f, 0x2e, 0x6a,
++	0x73, 0x6f, 0x6e, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x2e, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e,
++	0x61, 0x6c, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x70, 0x61, 0x74, 0x68, 0x2e, 0x4d, 0x65, 0x73,
++	0x73, 0x61, 0x67, 0x65, 0x2e, 0x49, 0x6e, 0x6e, 0x65, 0x72, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67,
++	0x65, 0x2e, 0x4d, 0x61, 0x70, 0x49, 0x6e, 0x74, 0x33, 0x32, 0x45, 0x6e, 0x75, 0x6d, 0x46, 0x69,
++	0x65, 0x6c, 0x64, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x52, 0x11, 0x6d, 0x61, 0x70, 0x49, 0x6e, 0x74,
++	0x33, 0x32, 0x45, 0x6e, 0x75, 0x6d, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x1a, 0x7f, 0x0a, 0x16, 0x4d,
++	0x61, 0x70, 0x49, 0x6e, 0x74, 0x33, 0x32, 0x45, 0x6e, 0x75, 0x6d, 0x46, 0x69, 0x65, 0x6c, 0x64,
++	0x45, 0x6e, 0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79, 0x18, 0x01, 0x20, 0x01,
++	0x28, 0x05, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x4f, 0x0a, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65,
++	0x18, 0x02, 0x20, 0x01, 0x28, 0x0e, 0x32, 0x39, 0x2e, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x2e,
++	0x66, 0x68, 0x69, 0x72, 0x2e, 0x67, 0x6f, 0x2e, 0x6a, 0x73, 0x6f, 0x6e, 0x66, 0x6f, 0x72, 0x6d,
++	0x61, 0x74, 0x2e, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c, 0x2e, 0x70, 0x72, 0x6f, 0x74,
++	0x6f, 0x70, 0x61, 0x74, 0x68, 0x2e, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x54, 0x79, 0x70,
++	0x65, 0x52, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x3a, 0x02, 0x38, 0x01, 0x42, 0x0d, 0x0a, 0x0b,
++	0x69, 0x6e, 0x6e, 0x65, 0x72, 0x5f, 0x6f, 0x6e, 0x65, 0x6f, 0x66, 0x1a, 0x32, 0x0a, 0x0d, 0x49,
++	0x6e, 0x6e, 0x65, 0x72, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x32, 0x12, 0x21, 0x0a, 0x0c,
++	0x69, 0x6e, 0x6e, 0x65, 0x72, 0x5f, 0x66, 0x69, 0x65, 0x6c, 0x64, 0x32, 0x18, 0x01, 0x20, 0x01,
++	0x28, 0x05, 0x52, 0x0b, 0x69, 0x6e, 0x6e, 0x65, 0x72, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x32, 0x1a,
++	0x47, 0x0a, 0x19, 0x4d, 0x61, 0x70, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x53, 0x74, 0x72, 0x69,
++	0x6e, 0x67, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03,
++	0x6b, 0x65, 0x79, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x14,
++	0x0a, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x76,
++	0x61, 0x6c, 0x75, 0x65, 0x3a, 0x02, 0x38, 0x01, 0x1a, 0x45, 0x0a, 0x17, 0x4d, 0x61, 0x70, 0x49,
++	0x6e, 0x74, 0x33, 0x32, 0x42, 0x79, 0x74, 0x65, 0x73, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x45, 0x6e,
++	0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79, 0x18, 0x01, 0x20, 0x01, 0x28, 0x05,
++	0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x14, 0x0a, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x18, 0x02,
++	0x20, 0x01, 0x28, 0x0c, 0x52, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x3a, 0x02, 0x38, 0x01, 0x1a,
++	0x44, 0x0a, 0x16, 0x4d, 0x61, 0x70, 0x42, 0x6f, 0x6f, 0x6c, 0x49, 0x6e, 0x74, 0x33, 0x32, 0x46,
++	0x69, 0x65, 0x6c, 0x64, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79,
++	0x18, 0x01, 0x20, 0x01, 0x28, 0x08, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x14, 0x0a, 0x05, 0x76,
++	0x61, 0x6c, 0x75, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x05, 0x52, 0x05, 0x76, 0x61, 0x6c, 0x75,
++	0x65, 0x3a, 0x02, 0x38, 0x01, 0x1a, 0x8c, 0x01, 0x0a, 0x1a, 0x4d, 0x61, 0x70, 0x53, 0x74, 0x72,
++	0x69, 0x6e, 0x67, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x46, 0x69, 0x65, 0x6c, 0x64, 0x45,
++	0x6e, 0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79, 0x18, 0x01, 0x20, 0x01, 0x28,
++	0x09, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x58, 0x0a, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x18,
++	0x02, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x42, 0x2e, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x2e, 0x66,
++	0x68, 0x69, 0x72, 0x2e, 0x67, 0x6f, 0x2e, 0x6a, 0x73, 0x6f, 0x6e, 0x66, 0x6f, 0x72, 0x6d, 0x61,
++	0x74, 0x2e, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f,
++	0x70, 0x61, 0x74, 0x68, 0x2e, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x2e, 0x49, 0x6e, 0x6e,
++	0x65, 0x72, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x52, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65,
++	0x3a, 0x02, 0x38, 0x01, 0x42, 0x07, 0x0a, 0x05, 0x6f, 0x6e, 0x65, 0x6f, 0x66, 0x2a, 0x40, 0x0a,
++	0x0b, 0x4d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x54, 0x79, 0x70, 0x65, 0x12, 0x19, 0x0a, 0x15,
++	0x49, 0x4e, 0x56, 0x41, 0x4c, 0x49, 0x44, 0x5f, 0x55, 0x4e, 0x49, 0x4e, 0x49, 0x54, 0x49, 0x41,
++	0x4c, 0x49, 0x5a, 0x45, 0x44, 0x10, 0x00, 0x12, 0x0a, 0x0a, 0x06, 0x54, 0x59, 0x50, 0x45, 0x5f,
++	0x31, 0x10, 0x01, 0x12, 0x0a, 0x0a, 0x06, 0x54, 0x59, 0x50, 0x45, 0x5f, 0x32, 0x10, 0x02, 0x42,
++	0x50, 0x5a, 0x4e, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x67, 0x6f,
++	0x6f, 0x67, 0x6c, 0x65, 0x2f, 0x66, 0x68, 0x69, 0x72, 0x2f, 0x67, 0x6f, 0x2f, 0x6a, 0x73, 0x6f,
++	0x6e, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x2f, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x61, 0x6c,
++	0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x70, 0x61, 0x74, 0x68, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f,
++	0x70, 0x61, 0x74, 0x68, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x67, 0x6f, 0x5f, 0x70, 0x72, 0x6f, 0x74,
++	0x6f, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
+ }
+ 
+ var (
+@@ -601,30 +714,42 @@ func file_go_jsonformat_internal_protopath_protopathtest_proto_rawDescGZIP() []b
+ }
+ 
+ var file_go_jsonformat_internal_protopath_protopathtest_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+-var file_go_jsonformat_internal_protopath_protopathtest_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
++var file_go_jsonformat_internal_protopath_protopathtest_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+ var file_go_jsonformat_internal_protopath_protopathtest_proto_goTypes = []interface{}{
+ 	(MessageType)(0),              // 0: google.fhir.go.jsonformat.internal.protopath.MessageType
+ 	(*Missing)(nil),               // 1: google.fhir.go.jsonformat.internal.protopath.Missing
+ 	(*Message)(nil),               // 2: google.fhir.go.jsonformat.internal.protopath.Message
+ 	(*Message_InnerMessage)(nil),  // 3: google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage
+ 	(*Message_InnerMessage2)(nil), // 4: google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage2
+-	(*anypb.Any)(nil),             // 5: google.protobuf.Any
++	nil,                           // 5: google.fhir.go.jsonformat.internal.protopath.Message.MapStringStringFieldEntry
++	nil,                           // 6: google.fhir.go.jsonformat.internal.protopath.Message.MapInt32BytesFieldEntry
++	nil,                           // 7: google.fhir.go.jsonformat.internal.protopath.Message.MapBoolInt32FieldEntry
++	nil,                           // 8: google.fhir.go.jsonformat.internal.protopath.Message.MapStringMessageFieldEntry
++	nil,                           // 9: google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage.MapInt32EnumFieldEntry
++	(*anypb.Any)(nil),             // 10: google.protobuf.Any
+ }
+ var file_go_jsonformat_internal_protopath_protopathtest_proto_depIdxs = []int32{
+-	3, // 0: google.fhir.go.jsonformat.internal.protopath.Message.oneof_message_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage
+-	4, // 1: google.fhir.go.jsonformat.internal.protopath.Message.oneof_conflicting_message_field_1:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage2
+-	4, // 2: google.fhir.go.jsonformat.internal.protopath.Message.oneof_conflicting_message_field_2:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage2
+-	0, // 3: google.fhir.go.jsonformat.internal.protopath.Message.type:type_name -> google.fhir.go.jsonformat.internal.protopath.MessageType
+-	3, // 4: google.fhir.go.jsonformat.internal.protopath.Message.message_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage
+-	3, // 5: google.fhir.go.jsonformat.internal.protopath.Message.repeated_message_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage
+-	5, // 6: google.fhir.go.jsonformat.internal.protopath.Message.any_field:type_name -> google.protobuf.Any
+-	4, // 7: google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage.repeated_inner_message_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage2
+-	4, // 8: google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage.inner_oneof_message_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage2
+-	9, // [9:9] is the sub-list for method output_type
+-	9, // [9:9] is the sub-list for method input_type
+-	9, // [9:9] is the sub-list for extension type_name
+-	9, // [9:9] is the sub-list for extension extendee
+-	0, // [0:9] is the sub-list for field type_name
++	3,  // 0: google.fhir.go.jsonformat.internal.protopath.Message.oneof_message_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage
++	4,  // 1: google.fhir.go.jsonformat.internal.protopath.Message.oneof_conflicting_message_field_1:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage2
++	4,  // 2: google.fhir.go.jsonformat.internal.protopath.Message.oneof_conflicting_message_field_2:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage2
++	0,  // 3: google.fhir.go.jsonformat.internal.protopath.Message.type:type_name -> google.fhir.go.jsonformat.internal.protopath.MessageType
++	3,  // 4: google.fhir.go.jsonformat.internal.protopath.Message.message_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage
++	3,  // 5: google.fhir.go.jsonformat.internal.protopath.Message.repeated_message_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage
++	10, // 6: google.fhir.go.jsonformat.internal.protopath.Message.any_field:type_name -> google.protobuf.Any
++	5,  // 7: google.fhir.go.jsonformat.internal.protopath.Message.map_string_string_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.MapStringStringFieldEntry
++	6,  // 8: google.fhir.go.jsonformat.internal.protopath.Message.map_int32_bytes_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.MapInt32BytesFieldEntry
++	7,  // 9: google.fhir.go.jsonformat.internal.protopath.Message.map_bool_int32_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.MapBoolInt32FieldEntry
++	8,  // 10: google.fhir.go.jsonformat.internal.protopath.Message.map_string_message_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.MapStringMessageFieldEntry
++	4,  // 11: google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage.repeated_inner_message_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage2
++	4,  // 12: google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage.inner_oneof_message_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage2
++	9,  // 13: google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage.map_int32_enum_field:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage.MapInt32EnumFieldEntry
++	3,  // 14: google.fhir.go.jsonformat.internal.protopath.Message.MapStringMessageFieldEntry.value:type_name -> google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage
++	0,  // 15: google.fhir.go.jsonformat.internal.protopath.Message.InnerMessage.MapInt32EnumFieldEntry.value:type_name -> google.fhir.go.jsonformat.internal.protopath.MessageType
++	16, // [16:16] is the sub-list for method output_type
++	16, // [16:16] is the sub-list for method input_type
++	16, // [16:16] is the sub-list for extension type_name
++	16, // [16:16] is the sub-list for extension extendee
++	0,  // [0:16] is the sub-list for field type_name
+ }
+ 
+ func init() { file_go_jsonformat_internal_protopath_protopathtest_proto_init() }
+@@ -699,7 +824,7 @@ func file_go_jsonformat_internal_protopath_protopathtest_proto_init() {
+ 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+ 			RawDescriptor: file_go_jsonformat_internal_protopath_protopathtest_proto_rawDesc,
+ 			NumEnums:      1,
+-			NumMessages:   4,
++			NumMessages:   9,
+ 			NumExtensions: 0,
+ 			NumServices:   0,
+ 		},

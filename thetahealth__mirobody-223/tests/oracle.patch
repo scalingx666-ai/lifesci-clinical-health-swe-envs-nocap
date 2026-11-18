@@ -1,0 +1,154 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 642d54e3..2cf0e8ea 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,19 @@
+ ## Unreleased
+ 
++### Fixed
++
++- **"The last N days" reads N days, not N+1.** `query_health_indicators`
++  takes `start` and `end` as inclusive local dates, and the model wrote "the
++  last N days" as today minus N: asked about the last 60 days, DeepSeek V4.1
++  Flash read 61 and answered "61 of the last 61 days" (found by a local
++  evaluation). The `start` description,
++  which the chat agent and MCP clients both read, now says the window counts
++  both ends and gives a worked example: on 2026-03-10 the last 7 days start
++  2026-03-04, not 2026-03-03. How to tell: ask about "the last 7 days" and
++  check that the answer's window starts six days before today; `pytest
++  mirobody/tests/test_last_n_days_window.py` holds the example to the window
++  the server builds.
++
+ ## 1.5.10
+ 
+ ### Fixed
+diff --git a/docs/answers.md b/docs/answers.md
+index 1cc61354..76efb20e 100644
+--- a/docs/answers.md
++++ b/docs/answers.md
+@@ -246,7 +246,10 @@ blood pressures read 106.0 as `view="month"` and 111.0 over its readings
+ 
+ ## Windows
+ 
+-* Both `start` and `end` are local dates in the SUBJECT's zone, inclusive.
++* Both `start` and `end` are local dates in the SUBJECT's zone, inclusive,
++  so "the last N days" starts N-1 days before today. The schema says so
++  with a worked example: given "inclusive" alone, a model wrote the last
++  60 days as today minus 60 and read 61 (2026-10-31).
+ * Neither given means **the whole record**, and the answer says so
+   (`window=all recorded data`). It does not silently apply a default window and
+   then report that window as though the rows had come from it.
+diff --git a/docs/site/health-data-tools.md b/docs/site/health-data-tools.md
+index 2f03d892..ba1e7c90 100644
+--- a/docs/site/health-data-tools.md
++++ b/docs/site/health-data-tools.md
+@@ -37,7 +37,8 @@ query_health_indicators(indicators=["<name from the result>"], view="latest")
+ 
+ Without `keywords` or `indicators`, the result is a catalogue, even if a view
+ was requested. `start` and `end` are inclusive dates in the record owner's
+-timezone; omitted measurement dates mean the whole recorded history.
++timezone, so the last 7 days start six days before today; omitted
++measurement dates mean the whole recorded history.
+ 
+ ## Interpret results
+ 
+diff --git a/docs/site/health-data-tools.zh-CN.md b/docs/site/health-data-tools.zh-CN.md
+index c0ed4833..381085ac 100644
+--- a/docs/site/health-data-tools.zh-CN.md
++++ b/docs/site/health-data-tools.zh-CN.md
+@@ -35,7 +35,7 @@ query_health_indicators(indicators=["<从结果中复制的名称>"], view="late
+ | `latest` | 每个指标的最近一次结果。 |
+ 
+ 未提供 `keywords` 或 `indicators` 时，返回指标目录，指定的视图不会直接应用。
+-`start`、`end` 按记录所属用户的时区解释，包含起止当天；指标查询未指定日期时，范围为全部记录。
++`start`、`end` 按记录所属用户的时区解释，包含起止当天，所以“最近 7 天”从六天前开始；指标查询未指定日期时，范围为全部记录。
+ 
+ ## 阅读结果
+ 
+diff --git a/mirobody/kernel/query.py b/mirobody/kernel/query.py
+index c32a9154..8026a0ae 100644
+--- a/mirobody/kernel/query.py
++++ b/mirobody/kernel/query.py
+@@ -570,10 +570,17 @@ def trend_rows(daily: Sequence[Mapping[str, object]]) -> list[dict[str, object]]
+             "maxItems": 50,
+             "description": "Exact indicator names copied from a previous result. Preferred once known; several in one call.",
+         },
++        # "Inclusive" alone did not stop a model writing "the last N days" as
++        # today minus N: asked about the last 60 days, DeepSeek V4.1 Flash read
++        # 61 and answered "61 of the last 61 days" (2026-10-31). The worked
++        # example names both the right start and the one a day early.
+         "start": {
+             "type": "string",
+             "pattern": r"^\d{4}-\d{2}-\d{2}$",
+-            "description": "First local date, inclusive (YYYY-MM-DD, the person's time zone). Omit both dates for the whole record.",
++            "description": "First local date, inclusive (YYYY-MM-DD, the person's time zone). Both dates are "
++                           "counted, so 'the last N days' starts N-1 days before today: on 2026-03-10 the last 7 "
++                           "days are start=2026-03-04 (2026-03-03 would read 8 days). Omit both dates for the "
++                           "whole record.",
+         },
+         "end": {"type": "string", "pattern": r"^\d{4}-\d{2}-\d{2}$", "description": "Last local date, inclusive."},
+         "value_min": {
+diff --git a/mirobody/tests/test_last_n_days_window.py b/mirobody/tests/test_last_n_days_window.py
+new file mode 100644
+index 00000000..853b4fb6
+--- /dev/null
++++ b/mirobody/tests/test_last_n_days_window.py
+@@ -0,0 +1,58 @@
++"""'The last N days' is N calendar days ending today, both ends counted.
++
++`start` and `end` of `query_health_indicators` are inclusive local dates. A
++model that wrote the last 60 days as today minus 60 read 61 and said so in
++its answer ("61 of the last 61 days"). The schema now carries the conversion
++as a worked example; these tests hold that example to the window
++`resolve_window` actually builds, so the sentence the model copies from and
++the arithmetic the server does cannot drift apart.
++"""
++
++from __future__ import annotations
++
++import re
++from datetime import UTC, date, datetime, timedelta
++
++import pytest
++
++from mirobody.kernel import query
++
++DAY_MS = 86_400_000
++_EXAMPLE = re.compile(
++    r"on (\d{4}-\d{2}-\d{2}) the last (\d+) days are start=(\d{4}-\d{2}-\d{2}) "
++    r"\((\d{4}-\d{2}-\d{2}) would read (\d+) days\)"
++)
++
++
++def _example() -> tuple[str, int, str, str, int]:
++    text = query.TOOL_SCHEMA["properties"]["start"]["description"]  # type: ignore[index]
++    match = _EXAMPLE.search(text)
++    assert match, "the start description lost its worked 'last N days' example"
++    today, n, start, early, early_n = match.groups()
++    return today, int(n), start, early, int(early_n)
++
++
++def _days(start: str, end: str) -> float:
++    """Days the window between two inclusive dates spans. UTC, so every day
++    is 24 hours and the count is exact."""
++    window = query.resolve_window("UTC", start=start, end=end, hours=24, now=datetime(2026, 10, 31, tzinfo=UTC))
++    return (window.end_ms - window.start_ms) / DAY_MS
++
++
++def test_the_worked_example_reads_exactly_n_days():
++    today, n, start, _, _ = _example()
++    assert _days(start, today) == n
++
++
++def test_the_start_it_warns_against_reads_one_day_more():
++    today, n, _, early, early_n = _example()
++    assert early_n == n + 1
++    assert _days(early, today) == early_n
++
++
++@pytest.mark.parametrize("n", [1, 7, 14, 30, 60])
++def test_n_minus_one_days_before_today_is_n_days(n):
++    """The rule the example illustrates, for the windows people ask about."""
++    today = date(2022, 1, 16)
++    start = today - timedelta(days=n - 1)
++    assert _days(start.isoformat(), today.isoformat()) == n

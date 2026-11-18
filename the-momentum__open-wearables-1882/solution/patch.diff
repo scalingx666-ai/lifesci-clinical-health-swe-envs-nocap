@@ -1,0 +1,692 @@
+diff --git a/backend/app/constants/devices_map/device_types.py b/backend/app/constants/devices_map/device_types.py
+index ff214079e3..ce2b51a765 100644
+--- a/backend/app/constants/devices_map/device_types.py
++++ b/backend/app/constants/devices_map/device_types.py
+@@ -49,7 +49,10 @@
+ # Bundle id prefix of HealthKit sources written by Apple's own devices, whose productType is the
+ # producing device. Observed in SDK payloads (com.apple.health.<UUID>), not documented by Apple.
+ APPLE_SOURCE_APP_PREFIX = "com.apple.health."
+-APPLE_HARDWARE_PREFIXES = (*(prefix for prefix, _ in APPLE_PRODUCT_TYPE_PREFIXES), "iPod")
++# The relaying iPhone/Watch as a third-party record reports it: its productType code (older iOS SDKs),
++# or the bare HKDevice.model of a writer that attaches the local device (e.g. Cronometer). "Watch" is a
++# generic word other brands use, so only the code or the bare name counts (not e.g. "Watch GT 3").
++APPLE_HOST_MODEL = re.compile(r"(?:iPhone|iPad|iPod).*|Watch(?:\d+,\d+)?")
+ 
+ 
+ def is_apple_own_source(source_app_id: str | None) -> bool:
+@@ -57,11 +60,16 @@ def is_apple_own_source(source_app_id: str | None) -> bool:
+     return source_app_id is not None and source_app_id.startswith(APPLE_SOURCE_APP_PREFIX)
+ 
+ 
+-def is_host_model(source_app_id: str | None, device_model: str | None) -> bool:
+-    """Apple hardware code on a third-party writer's row: the iPhone/Watch that relayed it, not the producer."""
++def is_host_model(provider: str | None, source_app_id: str | None, device_model: str | None) -> bool:
++    """Apple hardware code on a third-party HealthKit writer's row: the iPhone/Watch that relayed it, not the producer.
++
++    Only HealthKit relays through a host; other providers' models are kept.
++    """
++    if provider != ProviderName.APPLE:
++        return False
+     if not source_app_id or is_apple_own_source(source_app_id) or not device_model:
+         return False
+-    return device_model.startswith(APPLE_HARDWARE_PREFIXES)
++    return APPLE_HOST_MODEL.fullmatch(device_model) is not None
+ 
+ 
+ # Samsung model code prefix (SM-X...); SM-R is skipped as it mixes watches, bands and buds
+@@ -221,7 +229,7 @@ def infer_device_type(
+ ) -> DeviceType:
+     """Resolve device type: single-device provider, then the reported type, then inference."""
+     # The iOS SDK derives both from the relaying iPhone/Watch, so only the source name is left
+-    if is_host_model(source_app_id, device_model):
++    if is_host_model(provider, source_app_id, device_model):
+         device_model, reported_type = None, None
+     device_type = _resolve_device_type(provider, device_model, original_source_name, reported_type)
+     if device_type == DeviceType.OTHER:
+diff --git a/backend/app/repositories/data_source_repository.py b/backend/app/repositories/data_source_repository.py
+index 20d5d1a83e..27ec5bf9e8 100644
+--- a/backend/app/repositories/data_source_repository.py
++++ b/backend/app/repositories/data_source_repository.py
+@@ -177,8 +177,8 @@ def _writer_match(rows: list[DataSource], identity: DataSourceIdentity) -> DataS
+         if len(writer_rows) != 1:
+             return None
+         row = writer_rows[0]
+-        incoming_unknown = device_model is None or is_host_model(source_app_id, device_model)
+-        stored_unknown = row.device_model is None or is_host_model(row.source_app_id, row.device_model)
++        incoming_unknown = device_model is None or is_host_model(row.provider, source_app_id, device_model)
++        stored_unknown = row.device_model is None or is_host_model(row.provider, row.source_app_id, row.device_model)
+         return row if incoming_unknown or stored_unknown else None
+ 
+     @staticmethod
+@@ -204,9 +204,29 @@ def _stampable(self, rows: list[DataSource], identity: DataSourceIdentity) -> Da
+         if identity.device_id and identity.source_app_id and (row := self._find(rows, app_id_row)):
+             return row
+         if identity.device_id or identity.source_app_id:
+-            return self._find(rows, identity._replace(device_id=None, source_app_id=None))
++            legacy = identity._replace(device_id=None, source_app_id=None)
++            return self._find(rows, legacy) or self._relayed_legacy_row(rows, identity)
+         return None
+ 
++    @staticmethod
++    def _relayed_legacy_row(rows: list[DataSource], identity: DataSourceIdentity) -> DataSource | None:
++        """A third-party writer's legacy row keyed by the relaying iPhone's code, for a record that no longer
++        carries it (iOS SDK fix, or the code dropped at ingest)."""
++        if identity.device_id:
++            return None
++        return next(
++            (
++                r
++                for r in rows
++                if r.user_id == identity.user_id
++                and r.device_id is None
++                and r.source_app_id is None
++                and (r.source or "") == (identity.source or "")
++                and is_host_model(r.provider, identity.source_app_id, r.device_model)
++            ),
++            None,
++        )
++
+     def get_by_identity(
+         self,
+         db_session: DbSession,
+@@ -390,10 +410,11 @@ def _apply_updates(
+         if keyed_by_app and source and source != app_id and source != existing.source:
+             updates["source"] = source
+         # Keyed rows learn their model later (Polar sleep before the exercise, a writer's first model);
+-        # a relaying host's code is replaced by the producing device's model
+-        host_row = is_host_model(existing.source_app_id, existing.device_model)
+-        replaces_host = host_row and not is_host_model(source_app_id, device_model)
+-        if device_model and (existing.device_model is None or replaces_host):
++        # a relaying host's code is replaced by the producing device's model, or cleared when there is none
++        host_row = is_host_model(provider, app_id, existing.device_model)
++        incoming_host = is_host_model(provider, app_id, device_model)
++        replaces_host = host_row and not incoming_host
++        if replaces_host or (device_model and existing.device_model is None and not incoming_host):
+             updates["device_model"] = device_model
+         model_replaced = "device_model" in updates
+         effective_model = device_model if model_replaced else existing.device_model or device_model
+diff --git a/backend/app/services/sdk/device_resolution.py b/backend/app/services/sdk/device_resolution.py
+index 7b04e67256..c3f5371069 100644
+--- a/backend/app/services/sdk/device_resolution.py
++++ b/backend/app/services/sdk/device_resolution.py
+@@ -1,6 +1,6 @@
+ """Device resolution utilities for mobile SDK data (HealthKit, Health Connect, Samsung Health)."""
+ 
+-from app.constants.devices_map import is_apple_own_source, map_reported_device_type
++from app.constants.devices_map import is_apple_own_source, is_host_model, map_reported_device_type
+ from app.schemas.enums import DeviceType
+ from app.schemas.providers.mobile_sdk import OSVersion, SourceInfo
+ 
+@@ -15,17 +15,24 @@ def _get_source_app_id(source: SourceInfo) -> str | None:
+     return source.app_id or source.bundle_identifier
+ 
+ 
+-def _get_device_model(source: SourceInfo | None) -> str | None:
++def _get_device_model(source: SourceInfo | None, provider: str | None) -> str | None:
+     if not source:
+         return None
++    app_id = _get_source_app_id(source)
+     # Apple's own sources tag some Watch samples with the paired iPhone's model; hardware is the producer
+-    if source.device_hardware_version and is_apple_own_source(_get_source_app_id(source)):
++    if source.device_hardware_version and is_apple_own_source(app_id):
+         return source.device_hardware_version
+-    if source.device_model:
+-        return source.device_model
+-    if source.product_type:
+-        return source.product_type
+-    return None
++    return None if _reports_relaying_host(source, provider) else _reported_model(source)
++
++
++def _reported_model(source: SourceInfo) -> str | None:
++    return source.device_model or source.product_type or None
++
++
++def _reports_relaying_host(source: SourceInfo, provider: str | None) -> bool:
++    """iOS SDKs before the fix for third-party writes report the relaying iPhone as the writer's model,
++    and its type (phone/watch) as the device type."""
++    return is_host_model(provider, _get_source_app_id(source), _reported_model(source))
+ 
+ 
+ def _get_original_source_name(source: SourceInfo | None) -> str | None:
+@@ -44,7 +51,7 @@ def _get_original_source_name(source: SourceInfo | None) -> str | None:
+     return _get_source_app_id(source)
+ 
+ 
+-def extract_device_info(source: SourceInfo | None) -> tuple[str | None, str | None, str | None]:
++def extract_device_info(source: SourceInfo | None, provider: str | None) -> tuple[str | None, str | None, str | None]:
+     """Extract device information from SourceInfo.
+ 
+     Returns:
+@@ -53,7 +60,7 @@ def extract_device_info(source: SourceInfo | None) -> tuple[str | None, str | No
+     if not source:
+         return None, None, None
+ 
+-    device_model = _get_device_model(source)
++    device_model = _get_device_model(source, provider)
+     software_version = _format_os_version(source.operating_system_version)
+     original_source_name = _get_original_source_name(source)  # e.g. "Apple Watch (Jan)" or "Zepp Life"
+ 
+@@ -71,6 +78,8 @@ def extract_device_ids(source: SourceInfo | None) -> tuple[str | None, str | Non
+     return source.device_id, _get_source_app_id(source), source.device_manufacturer
+ 
+ 
+-def extract_device_type(source: SourceInfo | None) -> DeviceType | None:
++def extract_device_type(source: SourceInfo | None, provider: str | None) -> DeviceType | None:
+     """Device type reported by the SDK, or None when absent or unknown."""
+-    return map_reported_device_type(source.device_type) if source else None
++    if not source or _reports_relaying_host(source, provider):
++        return None
++    return map_reported_device_type(source.device_type)
+diff --git a/backend/app/services/sdk/import_service.py b/backend/app/services/sdk/import_service.py
+index b2ec8b63c5..763b78e046 100644
+--- a/backend/app/services/sdk/import_service.py
++++ b/backend/app/services/sdk/import_service.py
+@@ -201,8 +201,8 @@ def _build_workout_bundles(
+             workout_id = uuid4()
+             external_id = wjson.id if wjson.id else None
+ 
+-            device_model, software_version, original_source_name = extract_device_info(wjson.source)
+-            device_type = extract_device_type(wjson.source)
++            device_model, software_version, original_source_name = extract_device_info(wjson.source, provider)
++            device_type = extract_device_type(wjson.source, provider)
+             device_id, source_app_id, device_manufacturer = extract_device_ids(wjson.source)
+ 
+             metrics, time_series_samples, duration = self._extract_metrics_from_workout_stats(
+@@ -275,7 +275,8 @@ def _build_meal_bundles(
+ 
+             meal_id = uuid4()
+             metadata = rjson.metadata if isinstance(rjson.metadata, dict) else {}
+-            device_model, software_version, original_source_name = extract_device_info(rjson.source)
++            device_model, software_version, original_source_name = extract_device_info(rjson.source, provider)
++            device_id, source_app_id, device_manufacturer = extract_device_ids(rjson.source)
+ 
+             record = EventRecordCreate(
+                 category=EventCategory.MEAL,
+@@ -289,6 +290,10 @@ def _build_meal_bundles(
+                 external_id=rjson.id,
+                 source=original_source_name,
+                 software_version=software_version,
++                device_type=extract_device_type(rjson.source, provider),
++                device_id=device_id,
++                source_app_id=source_app_id,
++                device_manufacturer=device_manufacturer,
+                 provider=provider,
+                 user_id=user_uuid,
+             )
+@@ -356,7 +361,7 @@ def _build_statistic_bundles(
+                 value = value / 1000
+ 
+             # Extract device info
+-            device_model, software_version, original_source_name = extract_device_info(rjson.source)
++            device_model, software_version, original_source_name = extract_device_info(rjson.source, provider)
+             device_id, source_app_id, device_manufacturer = extract_device_ids(rjson.source)
+ 
+             sample = TimeSeriesSampleCreate(
+@@ -366,7 +371,7 @@ def _build_statistic_bundles(
+                 source=original_source_name,
+                 device_model=device_model,
+                 software_version=software_version,
+-                device_type=extract_device_type(rjson.source),
++                device_type=extract_device_type(rjson.source, provider),
+                 device_id=device_id,
+                 source_app_id=source_app_id,
+                 device_manufacturer=device_manufacturer,
+diff --git a/backend/app/services/sdk/sleep_service.py b/backend/app/services/sdk/sleep_service.py
+index 85ee25f61b..177248af96 100644
+--- a/backend/app/services/sdk/sleep_service.py
++++ b/backend/app/services/sdk/sleep_service.py
+@@ -306,8 +306,8 @@ def handle_sleep_data(
+ 
+         for sjson in unique_data:
+             # Extract device info
+-            device_model, software_version, original_source_name = extract_device_info(sjson.source)
+-            device_type = extract_device_type(sjson.source)
++            device_model, software_version, original_source_name = extract_device_info(sjson.source, provider)
++            device_type = extract_device_type(sjson.source, provider)
+             device_id, source_app_id, device_manufacturer = extract_device_ids(sjson.source)
+ 
+             sleep_phase = get_apple_sleep_phase(sjson.stage)
+diff --git a/backend/scripts/data_migrations/backfill_device_types.py b/backend/scripts/data_migrations/backfill_device_types.py
+index 22db296794..999967f604 100644
+--- a/backend/scripts/data_migrations/backfill_device_types.py
++++ b/backend/scripts/data_migrations/backfill_device_types.py
+@@ -54,7 +54,7 @@ def backfill_device_types(db: Session, *, dry_run: bool) -> Counter[str]:
+             and (ds.device_model or "").startswith("iPad")
+         ):
+             new_type = DeviceType.TABLET.value
+-        if is_host_model(ds.source_app_id, ds.device_model):
++        if is_host_model(provider, ds.source_app_id, ds.device_model):
+             new_type = resolved.value if resolved != DeviceType.UNKNOWN else None
+         if new_type == ds.device_type:
+             continue
+diff --git a/backend/scripts/data_migrations/clear_relayed_host_models.py b/backend/scripts/data_migrations/clear_relayed_host_models.py
+new file mode 100644
+index 0000000000..71c0da71a8
+--- /dev/null
++++ b/backend/scripts/data_migrations/clear_relayed_host_models.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""Clear the relaying iPhone's model from third-party HealthKit data sources.
++
++iOS SDKs reported ``sourceRevision.productType`` as the model of every record, which for a
++third-party writer (Oura, Zepp Life, ...) is the iPhone or Watch the app ran on, not the device
++that produced the data. Its device type was inferred from that code too, so e.g. an Oura ring
++synced through Apple Health was stored as a phone. Ingest now drops that code, and the iOS SDK
++sends the writer's own ``HKDevice.model`` instead; this clears it from rows stored before.
++
++Only app-keyed rows are touched: without ``source_app_id`` a relayed row cannot be told apart
++from the iPhone's own, and live sync re-keys and clears those on the writer's next record.
++The model is set to NULL and the device type re-resolved from the writer's name. A row is
++skipped when the writer already has a source without a model, since clearing it would collide
++with that row.
++
++Runs once per instance (``data_migration``).
++
++Usage (inside Docker):
++    docker compose exec app uv run python scripts/data_migrations/clear_relayed_host_models.py --dry-run
++    docker compose exec app uv run python scripts/data_migrations/clear_relayed_host_models.py
++"""
++
++import argparse
++from collections import Counter
++
++from sqlalchemy.orm import Session
++
++from app.constants.devices_map import infer_device_type, is_host_model
++from app.database import engine
++from app.models import DataSource
++from app.schemas.enums import DeviceType, ProviderName
++from app.services.data_migration_service import data_migration_service
++
++
++def clear_relayed_host_models(db: Session, *, dry_run: bool) -> Counter[str]:
++    """Does not commit; the caller owns the transaction.
++
++    Returns counts keyed by ``"cleared"`` and ``"skipped"``.
++    """
++    rows = (
++        db.query(DataSource)
++        .filter(
++            DataSource.provider == ProviderName.APPLE,
++            DataSource.source_app_id.isnot(None),
++            DataSource.device_id.is_(None),
++        )
++        .all()
++    )
++    without_model = {(r.user_id, r.provider, r.source_app_id) for r in rows if r.device_model is None}
++    counts: Counter[str] = Counter()
++    for ds in rows:
++        if not is_host_model(ds.provider, ds.source_app_id, ds.device_model):
++            continue
++        if (ds.user_id, ds.provider, ds.source_app_id) in without_model:
++            counts["skipped"] += 1
++            continue
++        resolved = infer_device_type(ProviderName(ds.provider), None, ds.original_source_name or ds.source)
++        new_type = resolved.value if resolved != DeviceType.UNKNOWN else None
++        print(f"{ds.source_app_id}: {ds.device_model} ({ds.device_type}) -> NULL ({new_type})")
++        counts["cleared"] += 1
++        if not dry_run:
++            ds.device_model = None
++            ds.device_type = new_type
++        without_model.add((ds.user_id, ds.provider, ds.source_app_id))
++
++    verb = "Would clear" if dry_run else "Cleared"
++    print(
++        f"{verb} the relaying host model on {counts['cleared']} data source(s)"
++        + (
++            f"; skipped {counts['skipped']} whose writer already has a source without a model"
++            if counts["skipped"]
++            else ""
++        )
++    )
++    if dry_run:
++        print("\nDry run — no changes made.")
++    return counts
++
++
++def _migrate(db: Session, dry_run: bool) -> bool:
++    clear_relayed_host_models(db, dry_run=dry_run)
++    if dry_run:
++        return False
++    db.commit()
++    return True
++
++
++def main(dry_run: bool) -> None:
++    with engine.connect() as connection, Session(bind=connection) as db:
++        data_migration_service.run(db, "clear_relayed_host_models", lambda: _migrate(db, dry_run), dry_run=dry_run)
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--dry-run", action="store_true", help="Preview affected rows without modifying data")
++    args = parser.parse_args()
++    main(dry_run=args.dry_run)
+diff --git a/backend/scripts/start/app.sh b/backend/scripts/start/app.sh
+index f98aa727d5..257e780866 100755
+--- a/backend/scripts/start/app.sh
++++ b/backend/scripts/start/app.sh
+@@ -133,6 +133,13 @@ echo 'Running Polar sleep dedupe...'
+ uv run python scripts/data_migrations/dedupe_polar_sleep.py \
+     || echo "Warning: Polar sleep dedupe failed — will retry on next startup."
+ 
++# TODO: Remove this after ~2027-03-01 once all deployments have migrated.
++# Clears the relaying iPhone's model (and the phone type inferred from it) from third-party
++# HealthKit data sources. Runs once per instance (data_migration).
++echo 'Running relayed host model cleanup...'
++uv run python scripts/data_migrations/clear_relayed_host_models.py \
++    || echo "Warning: relayed host model cleanup failed — will retry on next startup."
++
+ # Initialize archival settings
+ echo 'Initializing archival settings...'
+ uv run python scripts/init/seed_archival_settings.py
+diff --git a/backend/tests/constants/test_device_types.py b/backend/tests/constants/test_device_types.py
+index 0a09d3945d..92491760bf 100644
+--- a/backend/tests/constants/test_device_types.py
++++ b/backend/tests/constants/test_device_types.py
+@@ -5,12 +5,13 @@
+ from app.constants.devices_map import (
+     infer_device_type,
+     infer_device_type_from_model,
++    is_host_model,
+     map_reported_device_type,
+     normalize_device_model,
+ )
+ from app.schemas.enums import DeviceType, ProviderName
+ from app.schemas.providers.mobile_sdk import SourceInfo
+-from app.services.sdk.device_resolution import extract_device_info
++from app.services.sdk.device_resolution import extract_device_info, extract_device_type
+ 
+ 
+ class TestInferDeviceTypeFromModel:
+@@ -163,12 +164,67 @@ def test_normalize_device_model(raw: str | None, expected: str | None) -> None:
+     [
+         ("com.apple.health.0BA80355-AAAA", "iPhone16,1", "Watch6,2", "Watch6,2"),
+         ("com.apple.health.0BA80355-AAAA", "iPhone16,1", None, "iPhone16,1"),
+-        ("com.apple.BTLEServer", "Watch7,9", "00760690.03", "Watch7,9"),
+-        ("com.ouraring.oura", "iPhone15,2", "iPhone15,2", "iPhone15,2"),
++        ("com.apple.BTLEServer", "Watch7,9", "00760690.03", None),
++        ("com.ouraring.oura", "iPhone15,2", "iPhone15,2", None),
++        ("com.ouraring.oura", "Oura Ring Gen3", None, "Oura Ring Gen3"),
+     ],
+ )
+ def test_sdk_device_model_uses_hardware_only_for_apple_own_sources(
+-    app_id: str, device_model: str, hardware: str | None, expected: str
++    app_id: str, device_model: str, hardware: str | None, expected: str | None
+ ) -> None:
+     source = SourceInfo(app_id=app_id, device_model=device_model, device_hardware_version=hardware)
+-    assert extract_device_info(source)[0] == expected
++    assert extract_device_info(source, ProviderName.APPLE)[0] == expected
++
++
++def test_sdk_drops_relaying_host_model_of_third_party_writer() -> None:
++    relayed = SourceInfo(app_id="com.ouraring.oura", name="Oura", device_model="iPhone16,1")
++    assert extract_device_info(relayed, ProviderName.APPLE)[0] is None
++
++
++@pytest.mark.parametrize(
++    ("app_id", "name", "device_model"),
++    [
++        ("com.garmin.connect.mobile", "Connect", "iPhone16,1"),
++        ("com.apple.shortcuts", "Shortcuts", "Watch7,9"),
++        # Cronometer attaches the local iPhone as its HKDevice, so even fixed SDKs send it
++        ("CRONOMETER-GOLD", "Cronometer", "iPhone"),
++    ],
++)
++def test_sdk_drops_relaying_host_type_of_third_party_writer(app_id: str, name: str, device_model: str) -> None:
++    relayed = SourceInfo(app_id=app_id, name=name, device_model=device_model, device_type="phone")
++    model, _, source_name = extract_device_info(relayed, ProviderName.APPLE)
++    reported = extract_device_type(relayed, ProviderName.APPLE)
++    assert reported is None
++    assert infer_device_type(ProviderName.APPLE, model, source_name, reported, app_id) == DeviceType.UNKNOWN
++
++
++def test_sdk_keeps_reported_type_of_apple_own_source() -> None:
++    watch = SourceInfo(app_id="com.apple.health.0BA80355-AAAA", device_model="Watch7,5", device_type="watch")
++    assert extract_device_type(watch, ProviderName.APPLE) == DeviceType.WATCH
++
++
++def test_sdk_keeps_apple_prefixed_model_outside_healthkit() -> None:
++    """Only HealthKit relays through a host, so a Health Connect "Watch GT 3" is the producing device."""
++    huawei = SourceInfo(app_id="com.huawei.health", device_model="Watch GT 3", device_type="watch")
++    assert extract_device_info(huawei, ProviderName.HEALTH_CONNECT)[0] == "Watch GT 3"
++    assert extract_device_type(huawei, ProviderName.HEALTH_CONNECT) == DeviceType.WATCH
++    assert not is_host_model(ProviderName.HEALTH_CONNECT, "com.huawei.health", "Watch GT 3")
++
++
++@pytest.mark.parametrize(
++    ("device_model", "expected"),
++    [
++        ("iPhone16,1", True),
++        ("Watch7,9", True),
++        ("iPad13,1", True),
++        ("iPod9,1", True),
++        ("iPhone", True),
++        ("Watch", True),
++        ("iPod touch", True),
++        # "Watch" is generic: another brand's watch is the producing device
++        ("Watch GT 3", False),
++        ("H10", False),
++    ],
++)
++def test_host_model_matches_apple_hardware_only(device_model: str, expected: bool) -> None:
++    assert is_host_model(ProviderName.APPLE, "com.huawei.health", device_model) is expected
+diff --git a/backend/tests/integrations/test_sdk_import.py b/backend/tests/integrations/test_sdk_import.py
+index 36a176a9f4..7e18afde86 100644
+--- a/backend/tests/integrations/test_sdk_import.py
++++ b/backend/tests/integrations/test_sdk_import.py
+@@ -16,12 +16,12 @@
+ 
+ from app.constants.series_types.sdk import get_series_type_from_metric_type
+ from app.models import DataSource, EventRecord, EventRecordAggregate, MealDetails, SeriesSample, WorkoutDetails
+-from app.schemas.enums import SeriesType, get_series_type_id
++from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
+ from app.schemas.model_crud.activities import EventRecordQueryParams
+ from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
+ from app.services.event_record_service import event_record_service
+ from app.services.sdk.import_service import ImportService
+-from tests.factories import UserFactory
++from tests.factories import DataSourceFactory, EventRecordFactory, UserFactory
+ 
+ SDK_ENVELOPE: dict[str, str] = {
+     "provider": "apple",
+@@ -1275,6 +1275,30 @@ def test_meals_sharing_the_same_interval_are_all_saved(self, db: Session, import
+         }
+         assert self._user_samples(db, user.id) == []
+ 
++    def test_meal_replay_joins_the_legacy_source_keyed_by_the_relaying_iphone(
++        self, db: Session, import_service: ImportService
++    ) -> None:
++        """Older iOS SDKs stored meals under the relaying iPhone's model; once the model is dropped at
++        ingest, the meal's app id re-keys that legacy source instead of storing the meal again."""
++        user = UserFactory()
++        legacy = DataSourceFactory(
++            user=user, provider=ProviderName.APPLE, device_model="iPhone16,1", source="MyFitnessPal"
++        )
++        EventRecordFactory(
++            data_source=legacy, category="meal", type="HKCorrelationTypeIdentifierFood", external_id="MEAL-1"
++        )
++        record = self._correlation_record("MEAL-1")
++        record["source"] = {**record["source"], "deviceModel": "iPhone16,1"}
++
++        import_service.load_data(db, self._build_payload([record]), str(user.id))
++        db.expire_all()
++
++        meal = db.query(EventRecord).filter(EventRecord.category == "meal").one()
++        assert meal.data_source_id == legacy.id
++        stamped = db.get(DataSource, legacy.id)
++        assert stamped.source_app_id == "com.myfitnesspal.mfp"
++        assert stamped.device_model is None
++
+     def test_food_correlation_resync_updates_the_meal_in_place(
+         self, db: Session, import_service: ImportService
+     ) -> None:
+diff --git a/backend/tests/repositories/test_data_source_repository.py b/backend/tests/repositories/test_data_source_repository.py
+index 5a308c7bfa..30c1e55772 100644
+--- a/backend/tests/repositories/test_data_source_repository.py
++++ b/backend/tests/repositories/test_data_source_repository.py
+@@ -276,6 +276,62 @@ def test_host_model_is_replaced_by_producer_model(self, db: Session) -> None:
+         assert produced.device_model == "Oura Ring Gen3"
+         assert produced.device_type == DeviceType.RING
+ 
++    def test_host_model_is_cleared_when_the_writer_reports_no_model(self, db: Session) -> None:
++        user = UserFactory()
++        repo = DataSourceRepository(DataSource)
++        ids = {
++            "user_id": user.id,
++            "provider": ProviderName.APPLE,
++            "source": "Oura",
++            "source_app_id": "com.ouraring.oura",
++        }
++
++        relayed = repo.ensure_data_source(db, **ids, device_model="iPhone16,1", reported_type=DeviceType.PHONE)
++        assert relayed.device_type == DeviceType.RING
++        unknown = repo.ensure_data_source(db, **ids)
++        old_client = repo.ensure_data_source(db, **ids, device_model="iPhone16,1", reported_type=DeviceType.PHONE)
++
++        assert relayed.id == unknown.id == old_client.id
++        assert unknown.device_model is None
++        assert unknown.device_type == DeviceType.RING
++
++    def test_legacy_relayed_row_is_stamped_by_a_record_without_the_host_model(self, db: Session) -> None:
++        user = UserFactory()
++        repo = DataSourceRepository(DataSource)
++        legacy = repo.ensure_data_source(
++            db, user_id=user.id, provider=ProviderName.APPLE, device_model="iPhone16,1", source="Oura"
++        )
++        iphone = repo.ensure_data_source(
++            db, user_id=user.id, provider=ProviderName.APPLE, device_model="iPhone16,1", source="Bart's iPhone"
++        )
++
++        stamped = repo.ensure_data_source(
++            db, user_id=user.id, provider=ProviderName.APPLE, source="Oura", source_app_id="com.ouraring.oura"
++        )
++
++        assert stamped.id == legacy.id != iphone.id
++        assert stamped.source_app_id == "com.ouraring.oura"
++        assert stamped.device_model is None
++        assert stamped.device_type == DeviceType.RING
++        assert iphone.device_model == "iPhone16,1"
++
++    def test_apple_prefixed_models_outside_healthkit_stay_separate(self, db: Session) -> None:
++        """Health Connect reports the producing device, so two "Watch ..." models of one app are two devices."""
++        user = UserFactory()
++        repo = DataSourceRepository(DataSource)
++        ids = {
++            "user_id": user.id,
++            "provider": ProviderName.HEALTH_CONNECT,
++            "source": "Huawei Health",
++            "source_app_id": "com.huawei.health",
++        }
++
++        gt3 = repo.ensure_data_source(db, **ids, device_model="Watch GT 3")
++        gt4 = repo.ensure_data_source(db, **ids, device_model="Watch GT 4")
++
++        assert gt3.id != gt4.id
++        assert (gt3.device_model, gt4.device_model) == ("Watch GT 3", "Watch GT 4")
++
+     def test_apple_own_source_keeps_product_type(self, db: Session) -> None:
+         user = UserFactory()
+         repo = DataSourceRepository(DataSource)
+diff --git a/backend/tests/scripts/test_clear_relayed_host_models.py b/backend/tests/scripts/test_clear_relayed_host_models.py
+new file mode 100644
+index 0000000000..5a06b0a06c
+--- /dev/null
++++ b/backend/tests/scripts/test_clear_relayed_host_models.py
+@@ -0,0 +1,95 @@
++"""Tests for the one-off clearing of relaying host models on third-party HealthKit sources."""
++
++import importlib.util
++from pathlib import Path
++from types import ModuleType
++
++from sqlalchemy.orm import Session
++
++from app.models import DataSource
++from app.schemas.enums import DeviceType, ProviderName
++from tests.factories import DataSourceFactory, UserFactory
++
++_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "data_migrations" / "clear_relayed_host_models.py"
++
++
++def _load_module() -> ModuleType:
++    spec = importlib.util.spec_from_file_location("clear_relayed_host_models", _SCRIPT_PATH)
++    assert spec is not None
++    assert spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++clear_relayed_host_models = _load_module().clear_relayed_host_models
++
++
++def _source(user: object, **fields: object) -> DataSource:
++    return DataSourceFactory(user=user, provider=ProviderName.APPLE, **fields)
++
++
++class TestClearRelayedHostModels:
++    def test_clears_host_model_and_re_resolves_type(self, db: Session) -> None:
++        user = UserFactory()
++        oura = _source(
++            user, device_model="iPhone16,1", device_type="phone", source="Oura", source_app_id="com.ouraring.oura"
++        )
++
++        counts = clear_relayed_host_models(db, dry_run=False)
++        db.flush()
++        db.refresh(oura)
++
++        assert counts["cleared"] == 1
++        assert oura.device_model is None
++        assert oura.device_type == DeviceType.RING
++
++    def test_leaves_apple_own_producer_and_legacy_rows(self, db: Session) -> None:
++        user = UserFactory()
++        watch = _source(user, device_model="Watch6,2", source="Apple Watch", source_app_id="com.apple.health.X")
++        ring = _source(user, device_model="Oura Ring Gen3", source="Oura", source_app_id="com.ouraring.oura")
++        legacy = _source(user, device_model="iPhone16,1", source="Zepp Life")
++
++        counts = clear_relayed_host_models(db, dry_run=False)
++        db.flush()
++
++        assert counts["cleared"] == 0
++        assert (watch.device_model, ring.device_model, legacy.device_model) == (
++            "Watch6,2",
++            "Oura Ring Gen3",
++            "iPhone16,1",
++        )
++
++    def test_skips_writer_that_already_has_a_source_without_model(self, db: Session) -> None:
++        user = UserFactory()
++        relayed = _source(user, device_model="iPhone16,1", source="Oura", source_app_id="com.ouraring.oura")
++        _source(user, device_model=None, source="Oura", source_app_id="com.ouraring.oura")
++
++        counts = clear_relayed_host_models(db, dry_run=False)
++        db.flush()
++
++        assert counts == {"skipped": 1}
++        assert relayed.device_model == "iPhone16,1"
++
++    def test_dry_run_changes_nothing(self, db: Session) -> None:
++        user = UserFactory()
++        oura = _source(user, device_model="iPhone16,1", source="Oura", source_app_id="com.ouraring.oura")
++
++        counts = clear_relayed_host_models(db, dry_run=True)
++
++        assert counts["cleared"] == 1
++        assert oura.device_model == "iPhone16,1"
++
++    def test_leaves_other_providers_alone(self, db: Session) -> None:
++        huawei = DataSourceFactory(
++            provider=ProviderName.HEALTH_CONNECT,
++            device_model="Watch GT 3",
++            source="Huawei Health",
++            source_app_id="com.huawei.health",
++        )
++
++        counts = clear_relayed_host_models(db, dry_run=False)
++        db.flush()
++
++        assert counts["cleared"] == 0
++        assert huawei.device_model == "Watch GT 3"

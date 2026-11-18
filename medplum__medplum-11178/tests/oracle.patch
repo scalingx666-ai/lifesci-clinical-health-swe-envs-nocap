@@ -1,0 +1,280 @@
+diff --git a/packages/server/src/migrations/data/data-version-manifest.json b/packages/server/src/migrations/data/data-version-manifest.json
+index 593f7cb8c6b..27ce0965a16 100644
+--- a/packages/server/src/migrations/data/data-version-manifest.json
++++ b/packages/server/src/migrations/data/data-version-manifest.json
+@@ -188,5 +188,8 @@
+   },
+   "v52": {
+     "serverVersion": "5.2.2"
++  },
++  "v53": {
++    "serverVersion": "5.2.11"
+   }
+ }
+diff --git a/packages/server/src/migrations/data/index.ts b/packages/server/src/migrations/data/index.ts
+index deff5ca1b9c..394eb766982 100644
+--- a/packages/server/src/migrations/data/index.ts
++++ b/packages/server/src/migrations/data/index.ts
+@@ -61,3 +61,4 @@ export * as v49 from './v49';
+ export * as v50 from './v50';
+ export * as v51 from './v51';
+ export * as v52 from './v52';
++export * as v53 from './v53';
+diff --git a/packages/server/src/migrations/data/v53.ts b/packages/server/src/migrations/data/v53.ts
+new file mode 100644
+index 00000000000..deb94507d3a
+--- /dev/null
++++ b/packages/server/src/migrations/data/v53.ts
+@@ -0,0 +1,23 @@
++// SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
++// SPDX-License-Identifier: Apache-2.0
++/*
++ * This is a generated file
++ * Do not edit manually.
++ */
++
++import type { PoolClient } from 'pg';
++import { prepareCustomMigrationJobData, runCustomMigration } from '../../workers/post-deploy-migration';
++import * as fns from '../migrate-functions';
++import type { MigrationActionResult } from '../types';
++import type { CustomPostDeployMigration } from './types';
++
++export const migration: CustomPostDeployMigration = {
++  type: 'custom',
++  prepareJobData: prepareCustomMigrationJobData,
++  run: async (repo, job, jobData) => runCustomMigration(repo, job, jobData, callback),
++};
++
++// prettier-ignore
++async function callback(client: PoolClient, results: MigrationActionResult[]): Promise<void> {
++  await fns.idempotentCreateIndex(client, results, 'Task_projectId_status____tag___code_not_completed_idx', `CREATE INDEX CONCURRENTLY IF NOT EXISTS "Task_projectId_status____tag___code_not_completed_idx" ON "Task" USING gin ("projectId", "status", "___tag", "__code") WITH (fastupdate = off) WHERE ((deleted = false) AND (status <> 'completed'::text))`);
++}
+diff --git a/packages/server/src/migrations/migrate-utils.test.ts b/packages/server/src/migrations/migrate-utils.test.ts
+index f53c881186b..0fc72d8d907 100644
+--- a/packages/server/src/migrations/migrate-utils.test.ts
++++ b/packages/server/src/migrations/migrate-utils.test.ts
+@@ -198,6 +198,45 @@ describe('migration-utils', () => {
+       expect(indexDefinitionsEqual(def, expected)).toBeTruthy();
+     });
+ 
++    test('parse WITH fastupdate before WHERE', () => {
++      const indexdef =
++        'CREATE INDEX "Task_projectId_status_idx" ON public."Task" USING gin ("projectId", status) WITH (fillfactor=90, fastupdate=off) WHERE (deleted = false)';
++      const def = parseIndexDefinition(indexdef);
++      const expected: IndexDefinition = {
++        columns: ['projectId', 'status'],
++        indexType: 'gin',
++        where: 'deleted = false',
++        fastupdate: false,
++        unique: false,
++        indexdef,
++      };
++      expect(def).toStrictEqual(expected);
++    });
++
++    test('fastupdate only differs when both definitions set it', () => {
++      const base: IndexDefinition = { columns: ['projectId', 'status'], indexType: 'gin' };
++      expect(indexDefinitionsEqual({ ...base, fastupdate: false }, base)).toBe(true);
++      expect(indexDefinitionsEqual({ ...base, fastupdate: false }, { ...base, fastupdate: false })).toBe(true);
++      expect(indexDefinitionsEqual({ ...base, fastupdate: false }, { ...base, fastupdate: true })).toBe(false);
++    });
++
++    test.each([
++      ['ye', true],
++      ['ON', true],
++      ['t', true],
++      ['of', false],
++      ["'false'", false],
++      ['0', false],
++    ])('parse fastupdate=%s', (value, expected) => {
++      const indexdef = `CREATE INDEX "Task_status_idx" ON public."Task" USING gin (status) WITH (fastupdate=${value})`;
++      expect(parseIndexDefinition(indexdef).fastupdate).toBe(expected);
++    });
++
++    test.each(['o', 'maybe', ''])('invalid fastupdate value %j', (value) => {
++      const indexdef = `CREATE INDEX "Task_status_idx" ON public."Task" USING gin (status) WITH (fastupdate=${value})`;
++      expect(() => parseIndexDefinition(indexdef)).toThrow('Could not parse boolean storage parameter value');
++    });
++
+     test('missing index type and columns', () => {
+       const indexdef = 'CREATE INDEX "DomainConfiguration_compartments_idx" ON "DomainConfiguration"';
+ 
+diff --git a/packages/server/src/migrations/migrate-utils.ts b/packages/server/src/migrations/migrate-utils.ts
+index 8444db7652a..69b7e87e76b 100644
+--- a/packages/server/src/migrations/migrate-utils.ts
++++ b/packages/server/src/migrations/migrate-utils.ts
+@@ -254,9 +254,16 @@ export function parseIndexDefinition(indexdef: string): IndexDefinition {
+     indexdef = indexdef.substring(0, whereMatch.index);
+   }
+ 
+-  // parse but ignore WITH clause since we don't want to consider any index settings in the official schema
++  // Only fastupdate is tracked; other storage parameters are ignored so that manual tuning doesn't cause schema drift
++  let fastupdate: boolean | undefined;
+   const withMatch = / WITH \((.+)\)$/.exec(indexdef);
+   if (withMatch) {
++    for (const option of withMatch[1].split(',')) {
++      const [key, value] = option.split('=').map((s) => s.trim().replaceAll("'", ''));
++      if (key === 'fastupdate') {
++        fastupdate = parseReloptionBoolean(value, indexdef);
++      }
++    }
+     indexdef = indexdef.substring(0, withMatch.index);
+   }
+ 
+@@ -316,9 +323,32 @@ export function parseIndexDefinition(indexdef: string): IndexDefinition {
+     indexDef.include = include;
+   }
+ 
++  if (fastupdate !== undefined) {
++    indexDef.fastupdate = fastupdate;
++  }
++
+   return indexDef;
+ }
+ 
++/**
++ * Parses a boolean storage parameter the way Postgres' `parse_bool` does. Postgres stores the value as written,
++ * so `WITH (fastupdate = ye)` is reported back as `fastupdate=ye`.
++ * @param value - The raw storage parameter value.
++ * @param indexdef - The full index definition, for error messages.
++ * @returns The parsed boolean.
++ */
++function parseReloptionBoolean(value: string | undefined, indexdef: string): boolean {
++  const v = value?.toLowerCase() ?? '';
++  const isPrefixOf = (word: string, minLength = 1): boolean => v.length >= minLength && word.startsWith(v);
++  if (isPrefixOf('true') || isPrefixOf('yes') || isPrefixOf('on', 2) || v === '1') {
++    return true;
++  }
++  if (isPrefixOf('false') || isPrefixOf('no') || isPrefixOf('off', 2) || v === '0') {
++    return false;
++  }
++  throw new Error(`Could not parse boolean storage parameter value "${value}" from ${indexdef}`);
++}
++
+ function expandAbbreviations(name: string, abbreviations: Record<string, string | undefined>): string {
+   let result = name;
+   for (const [original, abbrev] of Object.entries(abbreviations as Record<string, string>).reverse()) {
+diff --git a/packages/server/src/migrations/migrate.test.ts b/packages/server/src/migrations/migrate.test.ts
+index 5922cd89899..818bcbffd7a 100644
+--- a/packages/server/src/migrations/migrate.test.ts
++++ b/packages/server/src/migrations/migrate.test.ts
+@@ -629,6 +629,50 @@ describe('Generator', () => {
+         postDeploy: [],
+       });
+     });
++
++    test('creates GIN index with fastupdate before WHERE', () => {
++      const startTable: TableDefinition = { name: 'Task', columns: [], indexes: [] };
++      const targetTable: TableDefinition = {
++        name: 'Task',
++        columns: [],
++        indexes: [
++          {
++            indexNameOverride: 'Task_open_idx',
++            indexType: 'gin',
++            columns: ['projectId', 'status'],
++            where: 'deleted = false',
++            fastupdate: false,
++          },
++        ],
++      };
++
++      const result = generateIndexesActions(startTable, targetTable, {
++        dbClient: getDatabasePool(DatabaseMode.WRITER, shardId),
++      });
++
++      expect(result.postDeploy).toEqual([
++        {
++          type: 'CREATE_INDEX',
++          indexName: 'Task_open_idx',
++          createIndexSql:
++            'CREATE INDEX CONCURRENTLY IF NOT EXISTS "Task_open_idx" ON "Task" USING gin ("projectId", "status") WITH (fastupdate = off) WHERE (deleted = false)',
++        },
++      ]);
++    });
++
++    test('rejects fastupdate on non-GIN index', () => {
++      const targetTable: TableDefinition = {
++        name: 'Task',
++        columns: [],
++        indexes: [{ columns: ['status'], indexType: 'btree', fastupdate: false }],
++      };
++
++      expect(() =>
++        generateIndexesActions({ name: 'Task', columns: [], indexes: [] }, targetTable, {
++          dbClient: getDatabasePool(DatabaseMode.WRITER, shardId),
++        })
++      ).toThrow('fastupdate is only supported for GIN indexes');
++    });
+   });
+ 
+   describe('parseIndexName', () => {
+diff --git a/packages/server/src/migrations/migrate.ts b/packages/server/src/migrations/migrate.ts
+index 519e25dd22e..1773f14ec05 100644
+--- a/packages/server/src/migrations/migrate.ts
++++ b/packages/server/src/migrations/migrate.ts
+@@ -288,6 +288,16 @@ export function buildCreateTables(result: SchemaDefinition, resourceType: Resour
+     });
+   }
+ 
++  if (resourceType === 'Task') {
++    tableDefinition.indexes.push({
++      indexNameSuffix: 'not_completed_idx',
++      indexType: 'gin',
++      columns: ['projectId', 'status', '___tag', '__code'],
++      where: "(deleted = false) AND (status <> 'completed'::text)",
++      fastupdate: false,
++    });
++  }
++
+   buildSearchColumns(tableDefinition, resourceType);
+   buildSearchIndexes(tableDefinition, resourceType);
+   result.tables.push(
+@@ -1503,6 +1513,11 @@ function buildIndexSql(
+     result += ')';
+   }
+ 
++  if (index.fastupdate !== undefined) {
++    assert(index.indexType === 'gin', `fastupdate is only supported for GIN indexes: ${indexName}`);
++    result += ` WITH (fastupdate = ${index.fastupdate ? 'on' : 'off'})`;
++  }
++
+   if (index.where) {
+     result += ' WHERE (';
+     result += index.where;
+@@ -1513,6 +1528,11 @@ function buildIndexSql(
+ }
+ 
+ export function indexDefinitionsEqual(a: IndexDefinition, b: IndexDefinition): boolean {
++  // An unspecified fastupdate means "no opinion", so it only differs when both sides set it
++  if (a.fastupdate !== undefined && b.fastupdate !== undefined && a.fastupdate !== b.fastupdate) {
++    return false;
++  }
++
+   const [aPrime, bPrime] = [a, b].map((d) => {
+     return {
+       ...d,
+@@ -1525,6 +1545,7 @@ export function indexDefinitionsEqual(a: IndexDefinition, b: IndexDefinition): b
+       indexNameOverride: undefined,
+       indexNameSuffix: undefined,
+       indexdef: undefined,
++      fastupdate: undefined,
+     };
+   });
+ 
+diff --git a/packages/server/src/migrations/types.ts b/packages/server/src/migrations/types.ts
+index eda912313f8..105fc80188e 100644
+--- a/packages/server/src/migrations/types.ts
++++ b/packages/server/src/migrations/types.ts
+@@ -41,6 +41,11 @@ export interface IndexDefinition {
+   primaryKey?: boolean;
+   include?: string[];
+   where?: string;
++  /**
++   * GIN `fastupdate` storage parameter. Only valid for GIN indexes.
++   * When unset, the server default applies and an existing index's setting is not compared.
++   */
++  fastupdate?: boolean;
+   indexNameSuffix?: string;
+   indexNameOverride?: string;
+   indexdef?: string;

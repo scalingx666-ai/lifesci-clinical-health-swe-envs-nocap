@@ -1,0 +1,140 @@
+diff --git a/healthcare/healthcare/doctype/observation/observation.py b/healthcare/healthcare/doctype/observation/observation.py
+index d2327e3779e..3df6a84c172 100644
+--- a/healthcare/healthcare/doctype/observation/observation.py
++++ b/healthcare/healthcare/doctype/observation/observation.py
+@@ -116,7 +116,7 @@ def is_ready_for_approval(self):
+ 
+ 	def validate_input(self):
+ 		if self.permitted_data_type in NUMERIC_DATA_TYPES:
+-			if self.result and not is_numbers_with_exceptions(self.result):
++			if self.result and not is_numbers_with_exceptions(self.result, self.permitted_data_type):
+ 				frappe.throw(
+ 					_("Non numeric result {0} is not allowed for Permitted Data Type {1}").format(
+ 						frappe.bold(self.result), frappe.bold(self.permitted_data_type)
+@@ -462,6 +462,10 @@ def condition_threshold(condition):
+ 
+ 
+ def reference_band_matches_result(child, doc):
++	# An interval cannot be compared as a scalar: flt("12-15") becomes zero.
++	if doc.permitted_data_type == "Range" and is_range_result(doc.result):
++		return False
++
+ 	# An authored condition always takes priority: it can express things a
+ 	# plain from/to pair cannot (open-ended bounds, compound checks).
+ 	if child.conditions:
+@@ -613,7 +617,9 @@ def record_observation_result(values: str) -> None:
+ 				val["result"] = str(val["result"])
+ 
+ 			if observation_doc.get("permitted_data_type") in NUMERIC_DATA_TYPES:
+-				if val.get("result") and not is_numbers_with_exceptions(val.get("result")):
++				if val.get("result") and not is_numbers_with_exceptions(
++					val.get("result"), observation_doc.get("permitted_data_type")
++				):
+ 					frappe.msgprint(
+ 						_("Non numeric result {0} is not allowed for Permitted Type {1}").format(
+ 							frappe.bold(val.get("result")),
+@@ -680,7 +686,16 @@ def set_observation_idx(doc):
+ 			doc.observation_idx = idx
+ 
+ 
+-def is_numbers_with_exceptions(value):
++def is_range_result(value):
++	# Signed decimal endpoints, with optional spaces around the separator.
++	number = r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)"
++	return re.fullmatch(rf"\s*{number}\s*-\s*{number}\s*", str(value)) is not None
++
++
++def is_numbers_with_exceptions(value, permitted_data_type=None):
++	if permitted_data_type == "Range" and is_range_result(value):
++		return True
++
+ 	# Numeric-typed controls (Float/Percent) submit an actual
+ 	# JSON number, not a string, once decoded — only Data-style free text
+ 	# results ever reach here as a str.
+diff --git a/healthcare/healthcare/doctype/observation/test_observation.py b/healthcare/healthcare/doctype/observation/test_observation.py
+index 525beda4f1b..9045505394e 100644
+--- a/healthcare/healthcare/doctype/observation/test_observation.py
++++ b/healthcare/healthcare/doctype/observation/test_observation.py
+@@ -11,7 +11,7 @@
+ 	get_income_account,
+ 	get_receivable_account,
+ )
+-from healthcare.healthcare.doctype.observation.observation import add_note
++from healthcare.healthcare.doctype.observation.observation import add_note, record_observation_result
+ from healthcare.healthcare.doctype.observation_template.test_observation_template import (
+ 	create_observation_template,
+ )
+@@ -431,8 +431,15 @@ def test_period_result_stores_as_json_pair(self):
+ 	def test_new_permitted_data_types_accept_results(self):
+ 		patient = self.get_test_patient()
+ 		for data_type, value in (
++			("Quantity", "98.6"),
++			("Numeric", "42"),
+ 			("Duration", "3600"),
+ 			("Percent", "87.5"),
++			("Range", "12-15"),
++			("Ratio", "1:2"),
++			("Time", "10:30:00"),
++			("DateTime", "2026-01-15 10:30:00"),
++			("Attach", "/files/test_report.pdf"),
+ 		):
+ 			template = create_observation_template(f"_Test {data_type} Template", sample_required=False)
+ 			template.permitted_data_type = data_type
+@@ -443,6 +450,43 @@ def test_new_permitted_data_types_accept_results(self):
+ 
+ 			self.assertEqual(observation.result, value)
+ 
++	def test_select_result_matches_a_template_option(self):
++		template = create_observation_template("_Test Select Template", sample_required=False)
++		template.permitted_data_type = "Select"
++		template.abbr = "TSel"
++		template.options = "Positive\nNegative"
++		template.save()
++
++		observation = self.create_lab_observation(
++			self.get_test_patient(), template.name, "Positive", "Select"
++		)
++
++		self.assertEqual(observation.result, "Positive")
++
++	def test_boolean_result_matches_a_template_option(self):
++		template = create_observation_template("_Test Boolean Template", sample_required=False)
++		template.permitted_data_type = "Boolean"
++		template.abbr = "TBool"
++		template.options = "Yes\nNo"
++		template.save()
++
++		observation = self.create_lab_observation(self.get_test_patient(), template.name, "Yes", "Boolean")
++
++		self.assertEqual(observation.result, "Yes")
++
++	def test_range_result_saved_from_diagnostic_report(self):
++		template = create_observation_template("_Test Report Range Template", sample_required=False)
++		template.permitted_data_type = "Range"
++		template.abbr = "TRangeReport"
++		template.save()
++		observation = self.create_lab_observation(self.get_test_patient(), template.name, "", "Range")
++
++		# Diagnostic Report widgets submit their results through this endpoint.
++		record_observation_result(json.dumps([{"observation": observation.name, "result": "12-15"}]))
++		observation.reload()
++
++		self.assertEqual(observation.result, "12-15")
++
+ 	def create_lab_observation(self, patient, observation_template, result, data_type="Quantity"):
+ 		observation = frappe.get_doc(
+ 			{
+diff --git a/healthcare/public/js/observation_widget.js b/healthcare/public/js/observation_widget.js
+index 2fb0f35eb60..6421ae97c8c 100644
+--- a/healthcare/public/js/observation_widget.js
++++ b/healthcare/public/js/observation_widget.js
+@@ -8,7 +8,8 @@ frappe.provide("healthcare.observation");
+ healthcare.observation.CONTROL_FIELDTYPE_MAP = {
+ 	Quantity: "Float",
+ 	Numeric: "Float",
+-	Range: "Float",
++	// Keep ranges literal: Float evaluates "12-15" as subtraction.
++	Range: "Data",
+ 	Percent: "Percent",
+ 	Ratio: "Data",
+ 	Text: "Text Editor",

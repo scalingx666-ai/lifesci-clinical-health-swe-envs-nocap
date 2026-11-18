@@ -1,0 +1,506 @@
+diff --git a/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8750-searchurl-cleanup-batch-size-setting.yaml b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8750-searchurl-cleanup-batch-size-setting.yaml
+new file mode 100644
+index 000000000000..73c88c82188f
+--- /dev/null
++++ b/hapi-fhir-docs/src/main/resources/ca/uhn/hapi/fhir/changelog/9_0_0/8750-searchurl-cleanup-batch-size-setting.yaml
+@@ -0,0 +1,8 @@
++---
++type: perf
++issue: 8750
++jira: SMILE-13074
++title: "The scheduled cleanup of stale `HFJ_RES_SEARCH_URL` entries now removes each batch in a single
++  round trip to the database, so each batch finishes faster and holds its row locks for less time, without
++  locking the table. The batch size can now be set with `JpaStorageSettings#setSearchUrlCleanupBatchSize(int)`
++  (default 1000, between 500 and 2000)."
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/config/JpaConfig.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/config/JpaConfig.java
+index 2c9425814cd1..97471b5fa484 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/config/JpaConfig.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/config/JpaConfig.java
+@@ -1048,6 +1048,7 @@ public ResourceSearchUrlSvc resourceSearchUrlSvc(
+ 			MatchUrlService theMatchUrlService,
+ 			FhirContext theFhirContext,
+ 			PartitionSettings thePartitionSettings,
++			JpaStorageSettings theStorageSettings,
+ 			PlatformTransactionManager theTxManager) {
+ 		return new ResourceSearchUrlSvc(
+ 				thePersistenceContextProvider.getEntityManager(),
+@@ -1055,6 +1056,7 @@ public ResourceSearchUrlSvc resourceSearchUrlSvc(
+ 				theMatchUrlService,
+ 				theFhirContext,
+ 				thePartitionSettings,
++				theStorageSettings,
+ 				theTxManager);
+ 	}
+ 
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/IResourceSearchUrlDao.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/IResourceSearchUrlDao.java
+index a716a20aaaa2..7de33cfd92fa 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/IResourceSearchUrlDao.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/dao/data/IResourceSearchUrlDao.java
+@@ -20,8 +20,6 @@
+ package ca.uhn.fhir.jpa.dao.data;
+ 
+ import ca.uhn.fhir.jpa.model.entity.ResourceSearchUrlEntity;
+-import org.springframework.data.domain.Pageable;
+-import org.springframework.data.domain.Slice;
+ import org.springframework.data.jpa.repository.JpaRepository;
+ import org.springframework.data.jpa.repository.Modifying;
+ import org.springframework.data.jpa.repository.Query;
+@@ -32,8 +30,19 @@
+ 
+ public interface IResourceSearchUrlDao extends JpaRepository<ResourceSearchUrlEntity, Long>, IHapiFhirJpaRepository {
+ 
+-	@Query("SELECT s.myResourcePid FROM ResourceSearchUrlEntity s WHERE s.myCreatedTime < :cutoff")
+-	Slice<Long> findStaleIds(@Param("cutoff") Date theCutoff, Pageable thePageable);
++	/**
++	 * Deletes up to {@code theLimit} entries created before {@code theCutoff}, oldest first, in a single
++	 * statement. Hibernate renders the row limit in each vendor's own syntax ({@code TOP} on MSSQL,
++	 * {@code FETCH FIRST} elsewhere). It requires an {@code ORDER BY} with a limit in a subquery;
++	 * ordering by {@code CREATED_TIME} follows the {@code IDX_RESSEARCHURL_TIME} index the filter uses.
++	 *
++	 * @return the number of entries deleted
++	 */
++	@Modifying
++	@Query("DELETE FROM ResourceSearchUrlEntity s WHERE s.myResourcePid IN ("
++			+ "SELECT s2.myResourcePid FROM ResourceSearchUrlEntity s2 WHERE s2.myCreatedTime < :cutoff "
++			+ "ORDER BY s2.myCreatedTime LIMIT :limit)")
++	int deleteStaleEntries(@Param("cutoff") Date theCutoff, @Param("limit") int theLimit);
+ 
+ 	@Modifying
+ 	@Query("DELETE FROM ResourceSearchUrlEntity s WHERE (s.myResourcePid = :resID)")
+diff --git a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/ResourceSearchUrlSvc.java b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/ResourceSearchUrlSvc.java
+index 75f3d4e357da..0f47d2e4954a 100644
+--- a/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/ResourceSearchUrlSvc.java
++++ b/hapi-fhir-jpaserver-base/src/main/java/ca/uhn/fhir/jpa/search/ResourceSearchUrlSvc.java
+@@ -21,6 +21,7 @@
+ 
+ import ca.uhn.fhir.context.FhirContext;
+ import ca.uhn.fhir.context.RuntimeResourceDefinition;
++import ca.uhn.fhir.jpa.api.config.JpaStorageSettings;
+ import ca.uhn.fhir.jpa.dao.data.IResourceSearchUrlDao;
+ import ca.uhn.fhir.jpa.model.config.PartitionSettings;
+ import ca.uhn.fhir.jpa.model.dao.JpaPid;
+@@ -32,8 +33,6 @@
+ import org.apache.commons.lang3.Validate;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+-import org.springframework.data.domain.PageRequest;
+-import org.springframework.data.domain.Slice;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.PlatformTransactionManager;
+ import org.springframework.transaction.annotation.Propagation;
+@@ -55,15 +54,10 @@ public class ResourceSearchUrlSvc {
+ 	private static final Logger ourLog = LoggerFactory.getLogger(ResourceSearchUrlSvc.class);
+ 
+ 	/**
+-	 * Stale-entry deletion is paged so no single statement scans the whole table — that's what
+-	 * trips MSSQL's per-statement timeout on MegaScale deployments. Capped under MSSQL's
+-	 * 2,100-parameter-per-statement limit so the {@code DELETE … WHERE RES_ID IN (?, …)} doesn't overflow.
+-	 */
+-	static final int DELETE_PAGE_SIZE = 1_800;
+-
+-	/**
+-	 * Safety cap on page iterations per sweep (10,000 pages of 1,800 rows = 18M rows).
+-	 * ({@link SearchUrlJobMaintenanceSvcImpl}).
++	 * Safety cap on page iterations per scheduled sweep ({@link SearchUrlJobMaintenanceSvcImpl}): 10,000
++	 * pages of the default 1,000 rows = 10M rows, and never less than 5M rows at
++	 * {@link JpaStorageSettings#MIN_SEARCH_URL_CLEANUP_BATCH_SIZE}. Page size is
++	 * {@link JpaStorageSettings#getSearchUrlCleanupBatchSize()}.
+ 	 */
+ 	static final int MAX_DELETE_PAGES = 10_000;
+ 
+@@ -75,6 +69,7 @@ public class ResourceSearchUrlSvc {
+ 
+ 	private final FhirContext myFhirContext;
+ 	private final PartitionSettings myPartitionSettings;
++	private final JpaStorageSettings myStorageSettings;
+ 	private final TransactionTemplate myPageTxTemplate;
+ 
+ 	public ResourceSearchUrlSvc(
+@@ -83,29 +78,32 @@ public ResourceSearchUrlSvc(
+ 			MatchUrlService theMatchUrlService,
+ 			FhirContext theFhirContext,
+ 			PartitionSettings thePartitionSettings,
++			JpaStorageSettings theStorageSettings,
+ 			PlatformTransactionManager theTxManager) {
+ 		myEntityManager = theEntityManager;
+ 		myResourceSearchUrlDao = theResourceSearchUrlDao;
+ 		myMatchUrlService = theMatchUrlService;
+ 		myFhirContext = theFhirContext;
+ 		myPartitionSettings = thePartitionSettings;
++		myStorageSettings = theStorageSettings;
+ 		myPageTxTemplate = new TransactionTemplate(theTxManager);
+ 	}
+ 
+ 	/**
+-	 * Deletes search URL entries created before {@code theCutoffDate}, in fixed-size pages that each
+-	 * commit in their own transaction. A single sweep is capped at {@link #MAX_DELETE_PAGES} pages;
+-	 * any remaining stale entries are removed by the next scheduled run
+-	 * ({@link SearchUrlJobMaintenanceSvcImpl}).
++	 * Deletes search URL entries created before {@code theCutoffDate}, in pages of
++	 * {@link JpaStorageSettings#getSearchUrlCleanupBatchSize()} rows that each commit in their own
++	 * transaction. A single sweep is capped at {@link #MAX_DELETE_PAGES} pages; any remaining stale
++	 * entries are removed by the next scheduled run ({@link SearchUrlJobMaintenanceSvcImpl}).
+ 	 */
+ 	@Transactional(propagation = Propagation.NOT_SUPPORTED)
+ 	public void deleteEntriesOlderThan(Date theCutoffDate) {
+ 		ourLog.debug("Deleting SearchUrls older than {}", theCutoffDate);
+ 
++		int batchSize = myStorageSettings.getSearchUrlCleanupBatchSize();
+ 		long totalDeleted = 0;
+ 		boolean moreStaleRemain = true;
+ 		for (int pageIndex = 0; moreStaleRemain && pageIndex < MAX_DELETE_PAGES; pageIndex++) {
+-			StalePageOutcome outcome = deletePageOfStaleEntries(theCutoffDate);
++			StalePageOutcome outcome = deletePageOfStaleEntries(theCutoffDate, batchSize);
+ 			totalDeleted += outcome.deletedCount();
+ 			moreStaleRemain = outcome.moreStaleRemain();
+ 		}
+@@ -127,18 +125,15 @@ public void deleteEntriesOlderThan(Date theCutoffDate) {
+ 	/**
+ 	 * Deletes one page of stale entries in its own transaction — the repository is
+ 	 * {@code @Transactional(MANDATORY)}, so it needs an enclosing tx, and we want that tx to commit
+-	 * between pages, not span the sweep.
++	 * between pages, not span the sweep. The page is one bounded {@code DELETE} statement, so no rows are
++	 * read or locked ahead of it. A page that deletes fewer than {@code theBatchSize} rows means no more stale
++	 * entries remain.
+ 	 */
+-	private StalePageOutcome deletePageOfStaleEntries(Date theCutoffDate) {
+-		PageRequest page = PageRequest.of(0, DELETE_PAGE_SIZE);
++	private StalePageOutcome deletePageOfStaleEntries(Date theCutoffDate, int theBatchSize) {
+ 		return myPageTxTemplate.execute(theStatus -> {
+-			Slice<Long> stale = myResourceSearchUrlDao.findStaleIds(theCutoffDate, page);
+-			if (stale.isEmpty()) {
+-				return new StalePageOutcome(0, false);
+-			}
+-			int deleted = myResourceSearchUrlDao.deleteByResIds(stale.getContent());
+-			ourLog.debug("Deleted page of {} stale SearchUrls", deleted);
+-			return new StalePageOutcome(deleted, stale.hasNext());
++			int deletedCount = myResourceSearchUrlDao.deleteStaleEntries(theCutoffDate, theBatchSize);
++			ourLog.debug("Deleted page of {} stale SearchUrls", deletedCount);
++			return new StalePageOutcome(deletedCount, deletedCount >= theBatchSize);
+ 		});
+ 	}
+ 
+diff --git a/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/search/ResourceSearchUrlSvcTest.java b/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/search/ResourceSearchUrlSvcTest.java
+index 52623867e4b1..d0804bc9a662 100644
+--- a/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/search/ResourceSearchUrlSvcTest.java
++++ b/hapi-fhir-jpaserver-base/src/test/java/ca/uhn/fhir/jpa/search/ResourceSearchUrlSvcTest.java
+@@ -1,5 +1,6 @@
+ package ca.uhn.fhir.jpa.search;
+ 
++import ca.uhn.fhir.jpa.api.config.JpaStorageSettings;
+ import ca.uhn.fhir.jpa.dao.data.IResourceSearchUrlDao;
+ import ca.uhn.test.util.LogbackTestExtension;
+ import ca.uhn.test.util.LogbackTestExtensionAssert;
+@@ -10,23 +11,19 @@
+ import org.junit.jupiter.api.extension.RegisterExtension;
+ import org.mockito.Mock;
+ import org.mockito.junit.jupiter.MockitoExtension;
+-import org.springframework.data.domain.PageRequest;
+-import org.springframework.data.domain.Pageable;
+-import org.springframework.data.domain.SliceImpl;
+ import org.springframework.transaction.TransactionDefinition;
+ import org.springframework.transaction.support.AbstractPlatformTransactionManager;
+ import org.springframework.transaction.support.DefaultTransactionStatus;
+ 
+ import java.util.Date;
+-import java.util.List;
+ import java.util.concurrent.atomic.AtomicInteger;
+-import java.util.stream.LongStream;
+ 
+-import static ca.uhn.fhir.jpa.search.ResourceSearchUrlSvc.DELETE_PAGE_SIZE;
++import static ca.uhn.fhir.jpa.api.config.JpaStorageSettings.DEFAULT_SEARCH_URL_CLEANUP_BATCH_SIZE;
+ import static ca.uhn.fhir.jpa.search.ResourceSearchUrlSvc.MAX_DELETE_PAGES;
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.mockito.ArgumentMatchers.any;
+-import static org.mockito.ArgumentMatchers.anyList;
++import static org.mockito.ArgumentMatchers.anyInt;
++import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+@@ -41,51 +38,72 @@ class ResourceSearchUrlSvcTest {
+ 	@Mock
+ 	private IResourceSearchUrlDao myResourceSearchUrlDao;
+ 
++	private final JpaStorageSettings myStorageSettings = new JpaStorageSettings();
++
+ 	private ResourceSearchUrlSvc mySvc;
+ 
+ 	@BeforeEach
+ 	void beforeEach() {
++		myStorageSettings.setSearchUrlCleanupBatchSize(DEFAULT_SEARCH_URL_CLEANUP_BATCH_SIZE);
+ 		mySvc = new ResourceSearchUrlSvc(
+-				null, myResourceSearchUrlDao, null, null, null, new NoopTransactionManager());
++				null, myResourceSearchUrlDao, null, null, null, myStorageSettings, new NoopTransactionManager());
+ 	}
+ 
+ 	@Test
+ 	void deleteEntriesOlderThan_staleSetNeverDrains_stopsAtMaxPages() {
+-		// simulate a pathological non-draining table: every page reads back a full slice
+-		List<Long> fullPage = LongStream.range(0, DELETE_PAGE_SIZE).boxed().toList();
+-		AtomicInteger findCount = new AtomicInteger();
+-		when(myResourceSearchUrlDao.findStaleIds(any(Date.class), any(Pageable.class))).thenAnswer(invocation -> {
+-			if (findCount.incrementAndGet() > MAX_DELETE_PAGES) {
++		// simulate a pathological non-draining table: every page deletes a full batch
++		AtomicInteger deleteCount = new AtomicInteger();
++		when(myResourceSearchUrlDao.deleteStaleEntries(any(Date.class), anyInt())).thenAnswer(invocation -> {
++			if (deleteCount.incrementAndGet() > MAX_DELETE_PAGES) {
+ 				throw new IllegalStateException("Loop did not stop at MAX_DELETE_PAGES");
+ 			}
+-			return new SliceImpl<>(fullPage, PageRequest.of(0, DELETE_PAGE_SIZE), true);
++			return DEFAULT_SEARCH_URL_CLEANUP_BATCH_SIZE;
+ 		});
+-		when(myResourceSearchUrlDao.deleteByResIds(anyList())).thenReturn(DELETE_PAGE_SIZE);
+ 
+ 		mySvc.deleteEntriesOlderThan(new Date());
+ 
+-		verify(myResourceSearchUrlDao, times(MAX_DELETE_PAGES)).findStaleIds(any(Date.class), any(Pageable.class));
++		verify(myResourceSearchUrlDao, times(MAX_DELETE_PAGES)).deleteStaleEntries(any(Date.class), anyInt());
+ 		LogbackTestExtensionAssert.assertThat(myLogCapture).hasWarnMessage("Reached the maximum of");
+ 	}
+ 
+ 	@Test
+ 	void deleteEntriesOlderThan_staleSetDrains_deletesAllPagesWithoutWarning() {
+-		List<Long> fullPage = LongStream.range(0, DELETE_PAGE_SIZE).boxed().toList();
+-		List<Long> lastPage = List.of(1L, 2L, 3L);
+-		when(myResourceSearchUrlDao.findStaleIds(any(Date.class), any(Pageable.class)))
+-				.thenReturn(new SliceImpl<>(fullPage, PageRequest.of(0, DELETE_PAGE_SIZE), true))
+-				.thenReturn(new SliceImpl<>(lastPage, PageRequest.of(0, DELETE_PAGE_SIZE), false));
+-		when(myResourceSearchUrlDao.deleteByResIds(fullPage)).thenReturn(DELETE_PAGE_SIZE);
+-		when(myResourceSearchUrlDao.deleteByResIds(lastPage)).thenReturn(lastPage.size());
++		when(myResourceSearchUrlDao.deleteStaleEntries(any(Date.class), eq(DEFAULT_SEARCH_URL_CLEANUP_BATCH_SIZE)))
++				.thenReturn(DEFAULT_SEARCH_URL_CLEANUP_BATCH_SIZE)
++				.thenReturn(3);
+ 
+ 		mySvc.deleteEntriesOlderThan(new Date());
+ 
+-		verify(myResourceSearchUrlDao, times(2)).findStaleIds(any(Date.class), any(Pageable.class));
+-		verify(myResourceSearchUrlDao).deleteByResIds(fullPage);
+-		verify(myResourceSearchUrlDao).deleteByResIds(lastPage);
++		verify(myResourceSearchUrlDao, times(2)).deleteStaleEntries(any(Date.class), eq(DEFAULT_SEARCH_URL_CLEANUP_BATCH_SIZE));
+ 		assertThat(myLogCapture.getLogEvents(theEvent -> theEvent.getLevel() == Level.WARN)).isEmpty();
+-		LogbackTestExtensionAssert.assertThat(myLogCapture).hasDebugMessage("Deleted page of");
+-		LogbackTestExtensionAssert.assertThat(myLogCapture).hasInfoMessage("Deleted 1803 SearchUrls");
++		LogbackTestExtensionAssert.assertThat(myLogCapture)
++				.hasDebugMessage("Deleted page of")
++				.hasInfoMessage("Deleted 1003 SearchUrls");
++	}
++
++	@Test
++	void deleteEntriesOlderThan_nothingStale_logsAtDebugOnly() {
++		when(myResourceSearchUrlDao.deleteStaleEntries(any(Date.class), anyInt())).thenReturn(0);
++
++		mySvc.deleteEntriesOlderThan(new Date());
++
++		verify(myResourceSearchUrlDao).deleteStaleEntries(any(Date.class), anyInt());
++		assertThat(myLogCapture.getLogEvents(theEvent -> theEvent.getLevel() == Level.INFO))
++				.isEmpty();
++		LogbackTestExtensionAssert.assertThat(myLogCapture).hasDebugMessage("Deleted 0 SearchUrls");
++	}
++
++	@Test
++	void deleteEntriesOlderThan_batchSizeConfigured_usesItAsPageSize() {
++		myStorageSettings.setSearchUrlCleanupBatchSize(600);
++		when(myResourceSearchUrlDao.deleteStaleEntries(any(Date.class), eq(600)))
++				.thenReturn(600)
++				.thenReturn(1);
++
++		mySvc.deleteEntriesOlderThan(new Date());
++
++		verify(myResourceSearchUrlDao, times(2)).deleteStaleEntries(any(Date.class), eq(600));
++		LogbackTestExtensionAssert.assertThat(myLogCapture).hasInfoMessage("Deleted 601 SearchUrls");
+ 	}
+ 
+ 	private static class NoopTransactionManager extends AbstractPlatformTransactionManager {
+diff --git a/hapi-fhir-jpaserver-model/src/main/java/ca/uhn/fhir/jpa/api/config/JpaStorageSettings.java b/hapi-fhir-jpaserver-model/src/main/java/ca/uhn/fhir/jpa/api/config/JpaStorageSettings.java
+index cb420078038e..77abd5f50950 100644
+--- a/hapi-fhir-jpaserver-model/src/main/java/ca/uhn/fhir/jpa/api/config/JpaStorageSettings.java
++++ b/hapi-fhir-jpaserver-model/src/main/java/ca/uhn/fhir/jpa/api/config/JpaStorageSettings.java
+@@ -107,6 +107,29 @@ public class JpaStorageSettings extends StorageSettings {
+ 	public static final int DEFAULT_MAXIMUM_INCLUDES_TO_LOAD_PER_PAGE = 1000;
+ 
+ 	public static final int DEFAULT_EXPUNGE_BATCH_SIZE = 800;
++
++	/**
++	 * Default value for {@link #setSearchUrlCleanupBatchSize(int)}
++	 *
++	 * @since 9.0.0
++	 */
++	public static final int DEFAULT_SEARCH_URL_CLEANUP_BATCH_SIZE = 1_000;
++
++	/**
++	 * Smallest value accepted by {@link #setSearchUrlCleanupBatchSize(int)}.
++	 *
++	 * @since 9.0.0
++	 */
++	public static final int MIN_SEARCH_URL_CLEANUP_BATCH_SIZE = 500;
++
++	/**
++	 * Largest value accepted by {@link #setSearchUrlCleanupBatchSize(int)}. Keeps each batch's row locks well
++	 * under the ~5,000 locks per index at which MSSQL escalates row locks to a table lock.
++	 *
++	 * @since 9.0.0
++	 */
++	public static final int MAX_SEARCH_URL_CLEANUP_BATCH_SIZE = 2_000;
++
+ 	public static final int DEFAULT_BUNDLE_BATCH_QUEUE_CAPACITY = 200;
+ 
+ 	public static final int DEFAULT_BULK_EXPORT_FILE_MAXIMUM_CAPACITY = 1_000;
+@@ -214,6 +237,7 @@ public class JpaStorageSettings extends StorageSettings {
+ 	private boolean myExpungeEnabled;
+ 	private boolean myDeleteExpungeEnabled;
+ 	private int myExpungeBatchSize = DEFAULT_EXPUNGE_BATCH_SIZE;
++	private int mySearchUrlCleanupBatchSize = DEFAULT_SEARCH_URL_CLEANUP_BATCH_SIZE;
+ 	private int myReindexThreadCount;
+ 	private int myExpungeThreadCount;
+ 	private Set<String> myBundleTypesAllowedForStorage;
+@@ -1630,6 +1654,39 @@ public void setExpungeBatchSize(int theExpungeBatchSize) {
+ 		myExpungeBatchSize = theExpungeBatchSize;
+ 	}
+ 
++	/**
++	 * The number of stale <code>HFJ_RES_SEARCH_URL</code> rows (conditional create guards past the cleanup cutoff)
++	 * that the scheduled cleanup deletes per database transaction. Each batch is deleted and committed before
++	 * the next one starts, so smaller values shorten the time any single batch holds row locks. The default is
++	 * {@link #DEFAULT_SEARCH_URL_CLEANUP_BATCH_SIZE}.
++	 *
++	 * @since 9.0.0
++	 */
++	public int getSearchUrlCleanupBatchSize() {
++		return mySearchUrlCleanupBatchSize;
++	}
++
++	/**
++	 * The number of stale <code>HFJ_RES_SEARCH_URL</code> rows (conditional create guards past the cleanup cutoff)
++	 * that the scheduled cleanup deletes per database transaction. Each batch is deleted and committed before
++	 * the next one starts, so smaller values shorten the time any single batch holds row locks. The default is
++	 * {@link #DEFAULT_SEARCH_URL_CLEANUP_BATCH_SIZE}.
++	 *
++	 * @param theSearchUrlCleanupBatchSize Must be between {@link #MIN_SEARCH_URL_CLEANUP_BATCH_SIZE} and
++	 *                                     {@link #MAX_SEARCH_URL_CLEANUP_BATCH_SIZE}
++	 * @throws IllegalArgumentException If the value is out of range
++	 * @since 9.0.0
++	 */
++	public void setSearchUrlCleanupBatchSize(int theSearchUrlCleanupBatchSize) {
++		Validate.inclusiveBetween(
++				MIN_SEARCH_URL_CLEANUP_BATCH_SIZE,
++				MAX_SEARCH_URL_CLEANUP_BATCH_SIZE,
++				theSearchUrlCleanupBatchSize,
++				"theSearchUrlCleanupBatchSize must be between " + MIN_SEARCH_URL_CLEANUP_BATCH_SIZE + " and "
++						+ MAX_SEARCH_URL_CLEANUP_BATCH_SIZE);
++		mySearchUrlCleanupBatchSize = theSearchUrlCleanupBatchSize;
++	}
++
+ 	/**
+ 	 * Should resources be marked as needing reindexing when a
+ 	 * SearchParameter resource is added or changed. This should generally
+diff --git a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/database/SearchUrlMaintenanceSlowDeleteMsSqlIT.java b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/database/SearchUrlMaintenanceSlowDeleteMsSqlIT.java
+index 0e7794d8578d..758ed3f5b3ee 100644
+--- a/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/database/SearchUrlMaintenanceSlowDeleteMsSqlIT.java
++++ b/hapi-fhir-jpaserver-test-r4/src/test/java/ca/uhn/fhir/jpa/dao/r4/database/SearchUrlMaintenanceSlowDeleteMsSqlIT.java
+@@ -1,5 +1,6 @@
+ package ca.uhn.fhir.jpa.dao.r4.database;
+ 
++import ca.uhn.fhir.jpa.api.config.JpaStorageSettings;
+ import ca.uhn.fhir.jpa.api.svc.ISearchUrlJobMaintenanceSvc;
+ import ca.uhn.fhir.jpa.embedded.JpaEmbeddedDatabase;
+ import ca.uhn.fhir.jpa.embedded.MsSqlEmbeddedDatabase;
+@@ -108,6 +109,10 @@ public class SearchUrlMaintenanceSlowDeleteMsSqlIT {
+ 
+ 	private static final String TRUNCATE_SQL = "TRUNCATE TABLE HFJ_RES_SEARCH_URL";
+ 	private static final String COUNT_LIVE_SQL = "SELECT COUNT_BIG(*) FROM HFJ_RES_SEARCH_URL";
++	// Cumulative count of successful lock escalations (row/page locks promoted to a table lock) on the table
++	private static final String LOCK_ESCALATION_COUNT_SQL =
++		"SELECT COALESCE(SUM(index_lock_promotion_count), 0) "
++			+ "FROM sys.dm_db_index_operational_stats(DB_ID(), OBJECT_ID('HFJ_RES_SEARCH_URL'), NULL, NULL)";
+ 	// Distinguishes truly-stale leftovers (cleanup bug) from rows that were simply within the 1h cutoff.
+ 	private static final String DIAGNOSTIC_BREAKDOWN_SQL =
+ 		"SELECT "
+@@ -123,6 +128,9 @@ public class SearchUrlMaintenanceSlowDeleteMsSqlIT {
+ 	@Autowired
+ 	private ISearchUrlJobMaintenanceSvc myMaintenanceSvc;
+ 
++	@Autowired
++	private JpaStorageSettings myStorageSettings;
++
+ 	@BeforeEach
+ 	void seedFreshDataset() throws Exception {
+ 		runWithProgress("seed", () -> {
+@@ -188,6 +196,35 @@ void cleanup_completesWithoutPerStatementTimeout_andDrainsStaleRows() throws Exc
+ 			.isEqualTo(RECENT_ROW_COUNT);
+ 	}
+ 
++	@Test
++	void cleanup_atMaxBatchSize_neverEscalatesToTableLock() throws Exception {
++		// The largest page holds the most row locks, so it is the closest a page gets to SQL Server's
++		// lock escalation threshold
++		myStorageSettings.setSearchUrlCleanupBatchSize(JpaStorageSettings.MAX_SEARCH_URL_CLEANUP_BATCH_SIZE);
++		long escalationsBefore = countLockEscalations();
++		try {
++			myMaintenanceSvc.removeStaleEntries();
++		} finally {
++			myStorageSettings.setSearchUrlCleanupBatchSize(JpaStorageSettings.DEFAULT_SEARCH_URL_CLEANUP_BATCH_SIZE);
++		}
++
++		assertThat(countLockEscalations() - escalationsBefore)
++			.as("row locks escalated to a table lock on HFJ_RES_SEARCH_URL")
++			.isZero();
++		assertThat(countLiveRows()).isEqualTo(RECENT_ROW_COUNT);
++	}
++
++	private long countLockEscalations() throws Exception {
++		try (Connection conn = myDataSource.getConnection();
++		     Statement st = conn.createStatement()) {
++			st.setQueryTimeout(0);
++			try (ResultSet rs = st.executeQuery(LOCK_ESCALATION_COUNT_SQL)) {
++				rs.next();
++				return rs.getLong(1);
++			}
++		}
++	}
++
+ 	private long countLiveRows() throws Exception {
+ 		try (Connection conn = myDataSource.getConnection();
+ 		     Statement st = conn.createStatement()) {
+diff --git a/hapi-fhir-jpaserver-test-utilities/src/test/java/ca/uhn/fhir/jpa/dao/JpaStorageSettingsTest.java b/hapi-fhir-jpaserver-test-utilities/src/test/java/ca/uhn/fhir/jpa/dao/JpaStorageSettingsTest.java
+index 135cc41f1be4..08eb3c36f8af 100644
+--- a/hapi-fhir-jpaserver-test-utilities/src/test/java/ca/uhn/fhir/jpa/dao/JpaStorageSettingsTest.java
++++ b/hapi-fhir-jpaserver-test-utilities/src/test/java/ca/uhn/fhir/jpa/dao/JpaStorageSettingsTest.java
+@@ -8,6 +8,9 @@
+ import java.util.HashSet;
+ import java.util.List;
+ 
++import static ca.uhn.fhir.jpa.api.config.JpaStorageSettings.MIN_SEARCH_URL_CLEANUP_BATCH_SIZE;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.fail;
+ 
+@@ -43,4 +46,27 @@ public void testDisableStatusBasedReindexUsingSystemProperty() {
+ 		HapiSystemProperties.enableStatusBasedReindex();
+ 	}
+ 
++	@Test
++	void testSearchUrlCleanupBatchSize_defaultAndBounds_areAccepted() {
++		JpaStorageSettings settings = new JpaStorageSettings();
++		assertThat(settings.getSearchUrlCleanupBatchSize())
++				.isEqualTo(JpaStorageSettings.DEFAULT_SEARCH_URL_CLEANUP_BATCH_SIZE);
++
++		settings.setSearchUrlCleanupBatchSize(MIN_SEARCH_URL_CLEANUP_BATCH_SIZE);
++		assertThat(settings.getSearchUrlCleanupBatchSize()).isEqualTo(MIN_SEARCH_URL_CLEANUP_BATCH_SIZE);
++		settings.setSearchUrlCleanupBatchSize(JpaStorageSettings.MAX_SEARCH_URL_CLEANUP_BATCH_SIZE);
++		assertThat(settings.getSearchUrlCleanupBatchSize())
++				.isEqualTo(JpaStorageSettings.MAX_SEARCH_URL_CLEANUP_BATCH_SIZE);
++	}
++
++	@Test
++	void testSearchUrlCleanupBatchSize_outOfRange_isRejected() {
++		JpaStorageSettings settings = new JpaStorageSettings();
++		assertThatThrownBy(() -> settings.setSearchUrlCleanupBatchSize(MIN_SEARCH_URL_CLEANUP_BATCH_SIZE - 1))
++				.isInstanceOf(IllegalArgumentException.class);
++		assertThatThrownBy(() ->
++				settings.setSearchUrlCleanupBatchSize(JpaStorageSettings.MAX_SEARCH_URL_CLEANUP_BATCH_SIZE + 1))
++				.isInstanceOf(IllegalArgumentException.class);
++	}
++
+ }

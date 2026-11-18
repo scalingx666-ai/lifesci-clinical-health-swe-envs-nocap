@@ -1,0 +1,691 @@
+diff --git a/backend/app/config.py b/backend/app/config.py
+index eca49af4b4..6fe6de3a95 100644
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -245,6 +245,9 @@ class Settings(BaseSettings):
+     strava_webhook_signature_tolerance_seconds: int = Field(300, ge=0)
+     # Strava API max is 200 activities per page
+     strava_events_per_page: int = 200
++    # Delayed stream re-fetch when the webhook beats stream processing; delay triples per attempt.
++    strava_stream_retry_max_attempts: int = Field(3, ge=0)
++    strava_stream_retry_base_delay_seconds: int = Field(300, gt=0)
+ 
+     # ULTRAHUMAN OAUTH SETTINGS
+     ultrahuman_client_id: str | None = None
+diff --git a/backend/app/constants/celery_tasks.py b/backend/app/constants/celery_tasks.py
+index 365cad4392..55067c0c38 100644
+--- a/backend/app/constants/celery_tasks.py
++++ b/backend/app/constants/celery_tasks.py
+@@ -32,6 +32,7 @@ class CeleryTask(StrEnum):
+     REFRESH_DASHBOARD_TOTAL_DATA_POINTS = f"{_PREFIX}.refresh_dashboard_stats_task.refresh_dashboard_total_data_points"
+     RENEW_OURA_WEBHOOKS = f"{_PREFIX}.renew_oura_webhooks_task.renew_oura_webhooks"
+     GENERATE_SEED_DATA = f"{_PREFIX}.seed_data_task.generate_seed_data"
++    RETRY_STRAVA_STREAM_INGEST = f"{_PREFIX}.strava_stream_retry_task.retry_strava_stream_ingest"
+     SEND_INVITATION_EMAIL = f"{_PREFIX}.send_email_task.send_invitation_email_task"
+     SYNC_VENDOR_DATA = f"{_PREFIX}.sync_vendor_data_task.sync_vendor_data"
+     SEND_TELEMETRY_PING = f"{_PREFIX}.telemetry_task.send_telemetry_ping"
+diff --git a/backend/app/integrations/celery/tasks/__init__.py b/backend/app/integrations/celery/tasks/__init__.py
+index 0d2d02c5ab..ced7a3ec3e 100644
+--- a/backend/app/integrations/celery/tasks/__init__.py
++++ b/backend/app/integrations/celery/tasks/__init__.py
+@@ -39,6 +39,7 @@
+ from .renew_oura_webhooks_task import renew_oura_webhooks
+ from .seed_data_task import generate_seed_data
+ from .send_email_task import send_invitation_email_task
++from .strava_stream_retry_task import retry_strava_stream_ingest
+ from .sync_vendor_data_task import sync_vendor_data
+ from .telemetry_task import send_telemetry_ping
+ from .webhook_push_task import process_webhook_push
+@@ -75,6 +76,7 @@
+     "sync_vendor_data",
+     "sync_all_users",
+     "refresh_dashboard_total_data_points",
++    "retry_strava_stream_ingest",
+     "generate_seed_data",
+     "send_invitation_email_task",
+     "process_webhook_push",
+diff --git a/backend/app/integrations/celery/tasks/strava_stream_retry_task.py b/backend/app/integrations/celery/tasks/strava_stream_retry_task.py
+new file mode 100644
+index 0000000000..b4ad470d38
+--- /dev/null
++++ b/backend/app/integrations/celery/tasks/strava_stream_retry_task.py
+@@ -0,0 +1,65 @@
++"""Delayed Strava stream re-fetch for webhooks that arrive before Strava finishes processing streams."""
++
++from typing import cast
++from uuid import UUID
++
++from celery import shared_task
++
++from app.config import settings
++from app.constants.celery_tasks import CeleryTask
++from app.database import DbSession, SessionLocal
++from app.schemas.providers.strava import ActivityJSON as StravaActivityJSON
++from app.services.providers.strava.strategy import StravaStrategy
++from app.services.providers.strava.workouts import StravaWorkouts, schedule_stream_retry
++from app.utils.exceptions import ProviderConnectionError, ProviderError, is_provider_state_error
++from app.utils.structured_logging import get_logger
++
++logger = get_logger(__name__)
++
++
++def _is_transient(exc: Exception) -> bool:
++    """An outage or a database hiccup; not a deleted activity, a lost connection or a rejected request."""
++    if isinstance(exc, ProviderConnectionError):
++        return False
++    if isinstance(exc, ProviderError):
++        return not exc.request_rejected and not is_provider_state_error(exc)
++    return True
++
++
++@shared_task(name=CeleryTask.RETRY_STRAVA_STREAM_INGEST)
++def retry_strava_stream_ingest(user_id: str, activity_id: str, attempt: int = 1) -> None:
++    """Re-run the webhook processing flow for an activity whose streams weren't ready."""
++    try:
++        with SessionLocal() as db:
++            _retry_ingest(db, UUID(user_id), str(activity_id), attempt)
++            # Bulk sample writes defer their commit to the caller.
++            db.commit()
++    except Exception as exc:
++        retry = _is_transient(exc) and attempt < settings.strava_stream_retry_max_attempts
++        logger.error(
++            "Strava stream retry failed",
++            exc_info=exc,
++            provider="strava",
++            activity_id=activity_id,
++            attempt=attempt,
++            retry=retry,
++        )
++        if retry:
++            schedule_stream_retry(user_id, str(activity_id), attempt + 1)
++
++
++def _retry_ingest(db: DbSession, user_uuid: UUID, activity_id: str, attempt: int) -> None:
++    workouts = cast("StravaWorkouts", StravaStrategy().workouts)
++    activity_data = workouts.get_workout_detail_from_api(db, user_uuid, activity_id)
++    if not activity_data:
++        logger.warning(
++            "Strava stream retry: no data returned for activity, giving up",
++            provider="strava",
++            action="stream_retry_no_activity",
++            activity_id=activity_id,
++        )
++        return
++
++    activity = StravaActivityJSON(**activity_data)
++    # Schedules the next attempt itself if streams are still empty.
++    workouts.process_push_activity(db=db, activity=activity, user_id=user_uuid, stream_retry_attempt=attempt + 1)
+diff --git a/backend/app/repositories/data_point_series_repository.py b/backend/app/repositories/data_point_series_repository.py
+index 98dd707bc5..ddf8ed28a6 100644
+--- a/backend/app/repositories/data_point_series_repository.py
++++ b/backend/app/repositories/data_point_series_repository.py
+@@ -954,6 +954,34 @@ def _aggregated_value(self, types: list[SeriesType]) -> ColumnElement:
+             return func.avg(self.model.value)
+         return case(*branches, else_=func.avg(self.model.value))
+ 
++    def has_samples_in_range(
++        self,
++        db_session: DbSession,
++        user_id: UUID,
++        source: str,
++        device_model: str | None,
++        series_types: Iterable[SeriesType],
++        start_datetime: datetime,
++        end_datetime: datetime,
++    ) -> bool:
++        """Whether a sample of `series_types` from `source` and `device_model` exists for the user in [start, end).
++
++        The types bound the (source, type, time) index to the window; without them it reads the source's history.
++        """
++        query = (
++            db_session.query(self.model.id)
++            .join(DataSource, self.model.data_source_id == DataSource.id)
++            .filter(
++                DataSource.user_id == user_id,
++                DataSource.source == source,
++                DataSource.device_model.is_(None) if device_model is None else DataSource.device_model == device_model,
++                self.model.series_type_definition_id.in_([get_series_type_id(t) for t in series_types]),
++                self.model.recorded_at >= start_datetime,
++                self.model.recorded_at < end_datetime,
++            )
++        )
++        return bool(db_session.query(query.exists()).scalar())
++
+     def get_total_count(self, db_session: DbSession) -> int:
+         """Get total count of all data points."""
+         return db_session.query(func.count(self.model.id)).scalar() or 0
+diff --git a/backend/app/services/providers/strava/workouts.py b/backend/app/services/providers/strava/workouts.py
+index 1c6c7a7492..d5a9d5137f 100644
+--- a/backend/app/services/providers/strava/workouts.py
++++ b/backend/app/services/providers/strava/workouts.py
+@@ -3,7 +3,10 @@
+ from typing import Any
+ from uuid import UUID, uuid4
+ 
++from celery import current_app as celery_app
++
+ from app.config import settings
++from app.constants.celery_tasks import CeleryTask
+ from app.constants.entry_source import get_unified_strava_entry_source
+ from app.constants.workout_types import get_unified_strava_workout_type
+ from app.database import DbSession
+@@ -30,6 +33,8 @@
+ 
+ logger = get_logger(__name__)
+ 
++_STREAM_SERIES_TYPES = frozenset(STREAM_KEY_SERIES_TYPE.values())
++
+ 
+ class StravaWorkouts(BaseWorkoutsTemplate):
+     """Strava implementation of workouts template."""
+@@ -325,10 +330,16 @@ def _ingest_workout_streams(
+         activity: StravaActivityJSON,
+         user_id: UUID,
+         record: EventRecordCreate,
+-    ) -> int:
+-        """Fetch + persist per-sample streams on workout arrival, flag-gated and failure-isolated."""
++    ) -> int | None:
++        """Fetch + persist per-sample streams on workout arrival, flag-gated and failure-isolated.
++
++        Returns the samples saved, or None when Strava has no streams for the workout (yet).
++        """
+         if not settings.ingest_workout_samples:
+             return 0
++        # Stored streams aren't fetched again; an activity cropped in Strava keeps its earlier ones.
++        if self._has_stored_streams(db, user_id, activity, record):
++            return 0
+         try:
+             samples = self._build_workout_samples(
+                 db,
+@@ -344,7 +355,7 @@ def _ingest_workout_streams(
+             )
+             return 0
+         if not samples:
+-            return 0
++            return None
+         # Savepoint so a failed bulk insert rolls back only the samples and
+         # leaves the workout's outer transaction usable (no PendingRollbackError).
+         nested = db.begin_nested()
+@@ -362,6 +373,27 @@ def _ingest_workout_streams(
+             )
+             return 0
+ 
++    def _has_stored_streams(
++        self, db: DbSession, user_id: UUID, activity: StravaActivityJSON, record: EventRecordCreate
++    ) -> bool:
++        """A failed probe reads as nothing stored, so the streams are fetched as before."""
++        if record.end_datetime is None:
++            return False
++        try:
++            with db.begin_nested():
++                return timeseries_service.has_samples_in_range(
++                    db,
++                    user_id,
++                    "strava",
++                    activity.device_name or None,
++                    _STREAM_SERIES_TYPES,
++                    record.start_datetime,
++                    record.end_datetime,
++                )
++        except Exception as exc:
++            logger.error("Failed to check stored Strava workout streams", exc_info=exc, activity_id=activity.id)
++            return False
++
+     def load_data(
+         self,
+         db: DbSession,
+@@ -429,6 +461,8 @@ def process_push_activity(
+         db: DbSession,
+         activity: StravaActivityJSON,
+         user_id: UUID,
++        *,
++        stream_retry_attempt: int = 1,
+     ) -> list[UUID]:
+         """Process a single activity from webhook and save to database.
+ 
+@@ -436,6 +470,7 @@ def process_push_activity(
+             db: Database session
+             activity: Parsed Strava activity data
+             user_id: Internal user ID (already mapped from Strava athlete ID)
++            stream_retry_attempt: Retry attempt to schedule if streams are still empty
+ 
+         Returns:
+             List of created event record IDs
+@@ -444,9 +479,43 @@ def process_push_activity(
+ 
+         record, detail = self._normalize_workout(activity, user_id)
+         created_record = event_record_service.create(db, record)
+-        detail_for_record = detail.model_copy(update={"record_id": created_record.id})
+-        event_record_service.create_detail(db, detail_for_record)
++        # Retries re-run this flow; skip the detail (and its workout webhook) when it already exists.
++        if (
++            event_record_service.event_record_detail_repo.get_by_record_id(db, created_record.id, EventCategory.WORKOUT)
++            is None
++        ):
++            detail_for_record = detail.model_copy(update={"record_id": created_record.id})
++            event_record_service.create_detail(db, detail_for_record)
+         created_ids.append(created_record.id)
+-        self._ingest_workout_streams(db, activity, user_id, record)
++        # The webhook often beats Strava's stream processing and the pull won't re-cover it, so retry later.
++        # A manual activity never gets streams.
++        if self._ingest_workout_streams(db, activity, user_id, record) is None and not activity.manual:
++            if stream_retry_attempt <= settings.strava_stream_retry_max_attempts:
++                schedule_stream_retry(str(user_id), str(activity.id), attempt=stream_retry_attempt)
++            else:
++                logger.warning(
++                    "Strava streams still empty after final retry, giving up",
++                    provider="strava",
++                    action="stream_retry_exhausted",
++                    activity_id=str(activity.id),
++                )
+ 
+         return created_ids
++
++
++def schedule_stream_retry(user_id: str, activity_id: str, attempt: int) -> None:
++    """Schedule stream re-fetch attempt N, delayed by base * 3^(N-1) seconds."""
++    countdown = settings.strava_stream_retry_base_delay_seconds * 3 ** (attempt - 1)
++    celery_app.send_task(
++        CeleryTask.RETRY_STRAVA_STREAM_INGEST,
++        kwargs={"user_id": user_id, "activity_id": activity_id, "attempt": attempt},
++        countdown=countdown,
++    )
++    logger.info(
++        "Strava streams not ready; scheduled delayed ingest",
++        provider="strava",
++        action="stream_retry_scheduled",
++        activity_id=activity_id,
++        attempt=attempt,
++        countdown_seconds=countdown,
++    )
+diff --git a/backend/app/services/timeseries_service.py b/backend/app/services/timeseries_service.py
+index 72e76b74f6..adfbbcfad2 100644
+--- a/backend/app/services/timeseries_service.py
++++ b/backend/app/services/timeseries_service.py
+@@ -1,6 +1,6 @@
+ import threading
+ from collections import defaultdict
+-from collections.abc import Sequence
++from collections.abc import Iterable, Sequence
+ from dataclasses import dataclass
+ from datetime import date, datetime, time, timedelta
+ from decimal import Decimal
+@@ -288,6 +288,20 @@ def _start_webhook_thread(session: DbSession) -> None:  # noqa: ARG001
+ 
+         return counts
+ 
++    def has_samples_in_range(
++        self,
++        db_session: DbSession,
++        user_id: UUID,
++        source: str,
++        device_model: str | None,
++        series_types: Iterable[SeriesType],
++        start_datetime: datetime,
++        end_datetime: datetime,
++    ) -> bool:
++        return self.crud.has_samples_in_range(
++            db_session, user_id, source, device_model, series_types, start_datetime, end_datetime
++        )
++
+     @staticmethod
+     def _emit_timeseries_webhooks(
+         samples: list[TimeSeriesSampleCreate] | list[HeartRateSampleCreate] | list[StepSampleCreate],
+diff --git a/backend/config/.env.example b/backend/config/.env.example
+index 9573f83588..e6ae820ab9 100644
+--- a/backend/config/.env.example
++++ b/backend/config/.env.example
+@@ -235,6 +235,8 @@ STRAVA_DEFAULT_SCOPE=activity:read_all,profile:read_all
+ # STRAVA_WEBHOOK_VERIFY_TOKEN=  # Optional: derived from SECRET_KEY; sent to Strava when the webhook subscription is created
+ # STRAVA_WEBHOOK_SIGNATURE_TOLERANCE_SECONDS=300  # Max allowed webhook signature timestamp skew
+ # STRAVA_EVENTS_PER_PAGE=200  # Strava API max is 200 activities per page
++# STRAVA_STREAM_RETRY_MAX_ATTEMPTS=3  # Delayed stream re-fetches when the webhook beats stream processing
++# STRAVA_STREAM_RETRY_BASE_DELAY_SECONDS=300  # First retry delay; triples per attempt
+ 
+ #--- Fitbit ---#
+ FITBIT_CLIENT_ID=your-fitbit-client-id
+diff --git a/backend/tests/providers/strava/test_strava_stream_retry.py b/backend/tests/providers/strava/test_strava_stream_retry.py
+new file mode 100644
+index 0000000000..95fbb540a7
+--- /dev/null
++++ b/backend/tests/providers/strava/test_strava_stream_retry.py
+@@ -0,0 +1,150 @@
++"""Tests for the delayed Strava stream re-fetch when the webhook beats stream processing."""
++
++from unittest.mock import MagicMock, patch
++from uuid import uuid4
++
++import pytest
++
++from app.config import settings
++from app.integrations.celery.tasks.strava_stream_retry_task import retry_strava_stream_ingest
++from app.schemas.providers.strava import ActivityJSON as StravaActivityJSON
++from app.services.providers.strava.workouts import StravaWorkouts, schedule_stream_retry
++from app.utils.exceptions import ProviderError, ReauthRequiredError
++
++_ACTIVITY = StravaActivityJSON(
++    id=19769960003,
++    name="Evening Ride",
++    type="Ride",
++    sport_type="Ride",
++    start_date="2026-08-16T15:39:19Z",
++    elapsed_time=5800,
++    utc_offset=7200.0,
++    device_name="Apple Watch",
++)
++
++
++@pytest.fixture
++def workouts() -> StravaWorkouts:
++    return StravaWorkouts(
++        workout_repo=MagicMock(),
++        connection_repo=MagicMock(),
++        provider_name="strava",
++        api_base_url="https://www.strava.com",
++        oauth=MagicMock(),
++    )
++
++
++class TestWebhookSchedulesRetry:
++    def _process(
++        self,
++        workouts: StravaWorkouts,
++        ingested: int | None,
++        attempt: int = 1,
++        activity: StravaActivityJSON = _ACTIVITY,
++    ) -> MagicMock:
++        with (
++            patch("app.services.providers.strava.workouts.event_record_service") as mock_service,
++            patch.object(workouts, "_ingest_workout_streams", return_value=ingested),
++            patch("app.services.providers.strava.workouts.schedule_stream_retry") as mock_schedule,
++        ):
++            mock_service.create.return_value = MagicMock(id=uuid4())
++            workouts.process_push_activity(
++                db=MagicMock(), activity=activity, user_id=uuid4(), stream_retry_attempt=attempt
++            )
++        return mock_schedule
++
++    def test_empty_streams_schedule_delayed_retry(self, workouts: StravaWorkouts) -> None:
++        mock_schedule = self._process(workouts, ingested=None)
++
++        mock_schedule.assert_called_once()
++        assert mock_schedule.call_args.args[1] == str(_ACTIVITY.id)
++        assert mock_schedule.call_args.kwargs["attempt"] == 1
++
++    def test_retry_attempt_is_propagated(self, workouts: StravaWorkouts) -> None:
++        mock_schedule = self._process(workouts, ingested=None, attempt=2)
++
++        assert mock_schedule.call_args.kwargs["attempt"] == 2
++
++    @pytest.mark.parametrize("ingested", [4752, 0], ids=["saved", "already_stored"])
++    def test_no_retry_when_streams_are_stored(self, workouts: StravaWorkouts, ingested: int) -> None:
++        self._process(workouts, ingested=ingested).assert_not_called()
++
++    def test_no_retry_for_a_manual_activity(self, workouts: StravaWorkouts) -> None:
++        manual = _ACTIVITY.model_copy(update={"manual": True})
++
++        self._process(workouts, ingested=None, activity=manual).assert_not_called()
++
++    def test_gives_up_after_attempt_budget(self, workouts: StravaWorkouts) -> None:
++        exhausted = settings.strava_stream_retry_max_attempts + 1
++
++        self._process(workouts, ingested=None, attempt=exhausted).assert_not_called()
++
++
++class TestRetryTask:
++    """The task must reuse the regular workouts-module flow, not reimplement it."""
++
++    def _run(self, activity_data: dict | None, attempt: int = 1) -> MagicMock:
++        mock_workouts = MagicMock()
++        mock_workouts.get_workout_detail_from_api.return_value = activity_data
++        with (
++            patch("app.integrations.celery.tasks.strava_stream_retry_task.StravaStrategy") as mock_strategy,
++            patch("app.integrations.celery.tasks.strava_stream_retry_task.SessionLocal"),
++        ):
++            mock_strategy.return_value.workouts = mock_workouts
++            retry_strava_stream_ingest(str(uuid4()), str(_ACTIVITY.id), attempt=attempt)
++        return mock_workouts
++
++    def test_reruns_webhook_flow_with_next_attempt(self) -> None:
++        mock_workouts = self._run(_ACTIVITY.model_dump(), attempt=1)
++        mock_workouts.process_push_activity.assert_called_once()
++        kwargs = mock_workouts.process_push_activity.call_args.kwargs
++        assert str(kwargs["activity"].id) == str(_ACTIVITY.id)
++        assert kwargs["stream_retry_attempt"] == 2
++
++    def test_gives_up_when_activity_gone(self) -> None:
++        mock_workouts = self._run(None, attempt=1)
++        mock_workouts.process_push_activity.assert_not_called()
++
++
++class TestFailureReschedule:
++    def _run_with_error(self, error: Exception, attempt: int = 1) -> MagicMock:
++        with (
++            patch("app.integrations.celery.tasks.strava_stream_retry_task._retry_ingest", side_effect=error),
++            patch("app.integrations.celery.tasks.strava_stream_retry_task.SessionLocal"),
++            patch("app.integrations.celery.tasks.strava_stream_retry_task.schedule_stream_retry") as mock_schedule,
++        ):
++            retry_strava_stream_ingest(str(uuid4()), "a-1", attempt=attempt)
++        return mock_schedule
++
++    @pytest.mark.parametrize(
++        "error",
++        [ProviderError("strava", upstream_status=503), ProviderError("strava"), RuntimeError("db down")],
++        ids=["5xx", "no_response", "other"],
++    )
++    def test_transient_error_reschedules(self, error: Exception) -> None:
++        mock_schedule = self._run_with_error(error)
++
++        mock_schedule.assert_called_once()
++        assert mock_schedule.call_args.args[2] == 2
++
++    @pytest.mark.parametrize(
++        "error",
++        [ProviderError("strava", upstream_status=404), ReauthRequiredError("strava", uuid4(), "gone")],
++        ids=["activity_deleted", "connection_lost"],
++    )
++    def test_lasting_error_gives_up(self, error: Exception) -> None:
++        self._run_with_error(error).assert_not_called()
++
++    def test_transient_error_gives_up_at_budget(self) -> None:
++        mock_schedule = self._run_with_error(RuntimeError("db down"), attempt=settings.strava_stream_retry_max_attempts)
++
++        mock_schedule.assert_not_called()
++
++
++class TestScheduleStreamRetry:
++    def test_uses_configured_backoff_per_attempt(self) -> None:
++        with patch("app.services.providers.strava.workouts.celery_app.send_task") as mock_send:
++            schedule_stream_retry("u-1", "a-1", attempt=2)
++        kwargs = mock_send.call_args.kwargs
++        assert kwargs["countdown"] == settings.strava_stream_retry_base_delay_seconds * 3
++        assert kwargs["kwargs"]["attempt"] == 2
+diff --git a/backend/tests/providers/strava/test_strava_workout_samples.py b/backend/tests/providers/strava/test_strava_workout_samples.py
+index 18363cd9a6..4c6113400e 100644
+--- a/backend/tests/providers/strava/test_strava_workout_samples.py
++++ b/backend/tests/providers/strava/test_strava_workout_samples.py
+@@ -15,6 +15,7 @@
+ from app.schemas.enums import SeriesType
+ from app.schemas.model_crud.activities import TimeSeriesSampleCreate
+ from app.schemas.providers.strava import ActivityJSON as StravaActivityJSON
++from app.services.providers.strava.coverage import STREAM_KEY_SERIES_TYPE
+ from app.services.providers.strava.oauth import StravaOAuth
+ from app.services.providers.strava.workouts import StravaWorkouts
+ 
+@@ -265,6 +266,7 @@ def test_flag_on_calls_bulk_create_samples(
+             patch.object(strava_workouts, "_make_api_request", return_value=_STRAVA_STREAMS_3S),
+             patch("app.services.providers.strava.workouts.timeseries_service") as mock_ts,
+         ):
++            mock_ts.has_samples_in_range.return_value = False
+             count = strava_workouts._ingest_workout_streams(db, _SAMPLE_ACTIVITY, user_id, record_mock)
+ 
+         mock_ts.bulk_create_samples.assert_called_once()
+@@ -274,6 +276,93 @@ def test_flag_on_calls_bulk_create_samples(
+         assert count == 6
+         assert all(s.device_model == _DEVICE_MODEL for s in saved_samples)
+ 
++    def test_existing_samples_skip_fetch(
++        self,
++        strava_workouts: StravaWorkouts,
++        db: Session,
++    ) -> None:
++        """Samples already in the workout window: no API call, no save, 0 returned."""
++        user_id = uuid4()
++        record_mock = MagicMock()
++        record_mock.start_datetime = _START_DT
++        record_mock.end_datetime = _START_DT + timedelta(seconds=3600)
++        record_mock.zone_offset = _ZONE_OFFSET
++
++        with (
++            patch(
++                "app.services.providers.strava.workouts.settings",
++                ingest_workout_samples=True,
++            ),
++            patch.object(strava_workouts, "_make_api_request") as mock_api,
++            patch("app.services.providers.strava.workouts.timeseries_service") as mock_ts,
++        ):
++            mock_ts.has_samples_in_range.return_value = True
++            count = strava_workouts._ingest_workout_streams(db, _SAMPLE_ACTIVITY, user_id, record_mock)
++
++        mock_api.assert_not_called()
++        mock_ts.bulk_create_samples.assert_not_called()
++        assert count == 0
++        mock_ts.has_samples_in_range.assert_called_once_with(
++            db,
++            user_id,
++            "strava",
++            _SAMPLE_ACTIVITY.device_name or None,
++            frozenset(STREAM_KEY_SERIES_TYPE.values()),
++            record_mock.start_datetime,
++            record_mock.end_datetime,
++        )
++
++    def test_failed_probe_still_fetches(
++        self,
++        strava_workouts: StravaWorkouts,
++        db: Session,
++    ) -> None:
++        """The probe failing must not cost the workout its samples."""
++        record_mock = MagicMock()
++        record_mock.start_datetime = _START_DT
++        record_mock.end_datetime = _START_DT + timedelta(seconds=3600)
++        record_mock.zone_offset = _ZONE_OFFSET
++
++        with (
++            patch(
++                "app.services.providers.strava.workouts.settings",
++                ingest_workout_samples=True,
++            ),
++            patch.object(strava_workouts, "_make_api_request", return_value=_STRAVA_STREAMS_3S),
++            patch("app.services.providers.strava.workouts.timeseries_service") as mock_ts,
++        ):
++            mock_ts.has_samples_in_range.side_effect = RuntimeError("probe failed")
++            count = strava_workouts._ingest_workout_streams(db, _SAMPLE_ACTIVITY, uuid4(), record_mock)
++
++        mock_ts.bulk_create_samples.assert_called_once()
++        assert count == 6
++
++    def test_no_end_datetime_skips_probe_and_fetches(
++        self,
++        strava_workouts: StravaWorkouts,
++        db: Session,
++    ) -> None:
++        """Record without end_datetime: existence probe bypassed, streams fetched as before."""
++        user_id = uuid4()
++        record_mock = MagicMock()
++        record_mock.start_datetime = _START_DT
++        record_mock.end_datetime = None
++        record_mock.zone_offset = _ZONE_OFFSET
++
++        with (
++            patch(
++                "app.services.providers.strava.workouts.settings",
++                ingest_workout_samples=True,
++            ),
++            patch.object(strava_workouts, "_make_api_request", return_value=_STRAVA_STREAMS_3S),
++            patch("app.services.providers.strava.workouts.timeseries_service") as mock_ts,
++        ):
++            count = strava_workouts._ingest_workout_streams(db, _SAMPLE_ACTIVITY, user_id, record_mock)
++
++        mock_ts.has_samples_in_range.assert_not_called()
++        mock_ts.bulk_create_samples.assert_called_once()
++        assert count == 6
++
+     def test_save_raises_swallowed_returns_zero(
+         self,
+         strava_workouts: StravaWorkouts,
+@@ -293,6 +382,7 @@ def test_save_raises_swallowed_returns_zero(
+             patch.object(strava_workouts, "_make_api_request", return_value=_STRAVA_STREAMS_3S),
+             patch("app.services.providers.strava.workouts.timeseries_service") as mock_ts,
+         ):
++            mock_ts.has_samples_in_range.return_value = False
+             mock_ts.bulk_create_samples.side_effect = RuntimeError("db write failure")
+             count = strava_workouts._ingest_workout_streams(db, _SAMPLE_ACTIVITY, user_id, record_mock)
+ 
+@@ -321,6 +411,7 @@ def test_fetch_raises_swallowed_returns_zero(
+             ),
+             patch("app.services.providers.strava.workouts.timeseries_service") as mock_ts,
+         ):
++            mock_ts.has_samples_in_range.return_value = False
+             count = strava_workouts._ingest_workout_streams(db, _SAMPLE_ACTIVITY, user_id, record_mock)
+ 
+         mock_ts.bulk_create_samples.assert_not_called()
+@@ -346,7 +437,8 @@ def test_empty_samples_no_save(
+             patch.object(strava_workouts, "_make_api_request", return_value=streams_no_time),
+             patch("app.services.providers.strava.workouts.timeseries_service") as mock_ts,
+         ):
++            mock_ts.has_samples_in_range.return_value = False
+             count = strava_workouts._ingest_workout_streams(db, _SAMPLE_ACTIVITY, user_id, record_mock)
+ 
+         mock_ts.bulk_create_samples.assert_not_called()
+-        assert count == 0
++        assert count is None
+diff --git a/backend/tests/repositories/test_data_point_series_repository.py b/backend/tests/repositories/test_data_point_series_repository.py
+index 17f2422725..76247a68bd 100644
+--- a/backend/tests/repositories/test_data_point_series_repository.py
++++ b/backend/tests/repositories/test_data_point_series_repository.py
+@@ -1031,3 +1031,44 @@ def test_adding_counts_keeps_the_split_types_and_span_but_a_plain_int_only_the_t
+         assert (merged.covered_start, merged.covered_end) == (start - timedelta(days=1), start + timedelta(days=2))
+         # A plain int has no split to keep, so the sum is a plain int.
+         assert (type(with_int), with_int) == (int, 8)
++
++
++class TestHasSamplesInRange:
++    START = datetime(2026, 3, 1, 8, tzinfo=timezone.utc)
++
++    def _probe(self, db: Session, source: DataSource, device_model: str | None) -> bool:
++        return DataPointSeriesRepository(SeriesSample).has_samples_in_range(
++            db,
++            source.user_id,
++            "strava",
++            device_model,
++            [SeriesType.heart_rate, SeriesType.power],
++            self.START,
++            self.START + timedelta(hours=1),
++        )
++
++    def _sample(self, db: Session, source: DataSource, series_type: SeriesType, at: datetime) -> None:
++        db.add(
++            SeriesSample(
++                id=uuid4(),
++                data_source_id=source.id,
++                series_type_definition_id=get_series_type_id(series_type),
++                recorded_at=at,
++                value=Decimal(1),
++            )
++        )
++        db.flush()
++
++    def test_a_sample_of_the_types_in_the_window_counts(self, db: Session) -> None:
++        source = DataSourceFactory(user=UserFactory(), provider="strava", source="strava", device_model="Edge")
++        self._sample(db, source, SeriesType.power, self.START + timedelta(minutes=5))
++
++        assert self._probe(db, source, "Edge")
++        assert not self._probe(db, source, "Watch")
++
++    def test_other_types_and_times_dont(self, db: Session) -> None:
++        source = DataSourceFactory(user=UserFactory(), provider="strava", source="strava", device_model="Edge")
++        self._sample(db, source, SeriesType.steps, self.START + timedelta(minutes=5))
++        self._sample(db, source, SeriesType.heart_rate, self.START + timedelta(hours=1))
++
++        assert not self._probe(db, source, "Edge")

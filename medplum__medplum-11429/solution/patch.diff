@@ -1,0 +1,433 @@
+diff --git a/packages/docs/content/docs/auth/external-identity-providers/index.md b/packages/docs/content/docs/auth/external-identity-providers/index.md
+index d3783c08698..f350a98b2f1 100644
+--- a/packages/docs/content/docs/auth/external-identity-providers/index.md
++++ b/packages/docs/content/docs/auth/external-identity-providers/index.md
+@@ -55,7 +55,9 @@ Medplum provides a minimal example application which demonstrates using Auth0 as
+ 
+ ## Setup
+ 
+-Setup your external authentication provider (Auth0, AWS Cognito, Okta, etc). Use "https://api.medplum.com/auth/external" as the "redirect URI" (also known as the "callback URL" in some systems).
++Setup your external authentication provider (Auth0, AWS Cognito, Okta, etc). Use `https://api.medplum.com/auth/external/<client-id>` as the "redirect URI" (also known as the "callback URL" in some systems), where `<client-id>` is the ID of your Medplum `ClientApplication`.
++
++If your identity provider is registered with the shared callback `https://api.medplum.com/auth/external`, register the per-client URL above, pass it as the `redirectUri` to `signInWithExternalAuth`, and then remove the shared URL. The shared callback only accepts `ClientApplication` identity providers in Projects with the `legacyExternalAuth` system setting; for all others it returns `400 Client identity provider must use the per-client callback`. Domain-level identity providers (`DomainConfiguration`) keep using the shared callback.
+ 
+ The provider must support OIDC and return an `id_token` from its token endpoint. Request the `openid` scope; the SDK helper defaults to `openid profile email`. Configure the provider to return `email` for email matching or `sub` for subject matching.
+ 
+diff --git a/packages/docs/content/docs/self-hosting/project-settings.md b/packages/docs/content/docs/self-hosting/project-settings.md
+index a38eebb1473..6528c21bda5 100644
+--- a/packages/docs/content/docs/self-hosting/project-settings.md
++++ b/packages/docs/content/docs/self-hosting/project-settings.md
+@@ -65,6 +65,7 @@ The supported options that can be specified by a Super Admin in `Project.systemS
+ | `graphqlBatchedSearchSize`     | integer | For some GraphQL nested searches, the maximum number of searches to batch per SQL query                                                                                                                                                   | 0       |
+ | `graphqlMaxDepth`              | integer | The maximum allowed depth of a GraphQL query                                                                                                                                                                                              | 12      |
+ | `graphqlMaxSearches`           | integer | The maximum number of searches allowed in a GraphQL query                                                                                                                                                                                 | none    |
++| `legacyExternalAuth`           | boolean | If true, ClientApplication identity providers in this Project may keep using the shared `/auth/external` callback instead of `/auth/external/<clientId>`. Temporary, for migration                                                        | false   |
+ | `legacyFhirJsonResponseFormat` | boolean | If true, plain JSON formatting is incorrectly used instead of [FHIR JSON](https://hl7.org/fhir/R4/json.html) for some responses with content type `application/fhir+json`                                                                 | false   |
+ | `rateLimit`                    | integer | The maximum requests per minute allowed per IP address                                                                                                                                                                                    | 60000   |
+ | `userFhirQuota`                | integer | The maximum number of FHIR interactions that can be performed in a minute by any single User in the project. See [Fhir Interaction Quota](/docs/rate-limits#fhir-interaction-load-rate-limit). To enforce, set `enableFhirQuota` to true. | 50000   |
+diff --git a/packages/examples/src/auth/external-identity-providers.ts b/packages/examples/src/auth/external-identity-providers.ts
+index 04278f0176b..e05617358b2 100644
+--- a/packages/examples/src/auth/external-identity-providers.ts
++++ b/packages/examples/src/auth/external-identity-providers.ts
+@@ -44,10 +44,10 @@ const EXTERNAL_CLIENT_ID = 'MY_EXTERNAL_CLIENT_ID';
+ /**
+  * External OAuth2 redirect URI.
+  * This must match the redirect URI configured in your external auth provider.
+- * If using Medplum's hosted API server, the redirect URI must be "https://api.medplum.com/auth/external".
+- * If using your own Medplum server, the redirect URI must be "https://<your server>/auth/external".
++ * If using Medplum's hosted API server, the redirect URI must be "https://api.medplum.com/auth/external/<client-id>".
++ * If using your own Medplum server, the redirect URI must be "https://<your server>/auth/external/<client-id>".
+  */
+-const EXTERNAL_REDIRECT_URI = MEDPLUM_BASE_URL + 'auth/external';
++const EXTERNAL_REDIRECT_URI = MEDPLUM_BASE_URL + 'auth/external/' + MEDPLUM_CLIENT_ID;
+ 
+ const medplum = new MedplumClient({
+   baseUrl: MEDPLUM_BASE_URL,
+diff --git a/packages/server/src/auth/external.test.ts b/packages/server/src/auth/external.test.ts
+index 66732b40f40..fe6a4777137 100644
+--- a/packages/server/src/auth/external.test.ts
++++ b/packages/server/src/auth/external.test.ts
+@@ -1,7 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+ // SPDX-License-Identifier: Apache-2.0
+ import type { WithId } from '@medplum/core';
+-import { ContentType, OAuthTokenAuthMethod } from '@medplum/core';
++import { ContentType, Logger, OAuthTokenAuthMethod } from '@medplum/core';
+ import type { ClientApplication, DomainConfiguration, Project, ProjectMembership, User } from '@medplum/fhirtypes';
+ import { randomUUID } from 'crypto';
+ import express from 'express';
+@@ -13,7 +13,7 @@ import { inviteUser } from '../admin/invite';
+ import { initApp, shutdownApp } from '../app';
+ import { getConfig, loadTestConfig } from '../config/loader';
+ import type { SystemRepository } from '../fhir/repo';
+-import { getProjectSystemRepo } from '../fhir/repo';
++import { getGlobalSystemRepo, getProjectSystemRepo } from '../fhir/repo';
+ import { getUserByEmailWithoutProject } from '../oauth/utils';
+ import { withTestContext } from '../test.setup';
+ import { mockFetchJson, mockFetchText } from '../test.setup.fetch';
+@@ -38,6 +38,10 @@ let project: WithId<Project>;
+ let systemRepo: SystemRepository;
+ let defaultClient: ClientApplication;
+ let externalAuthClient: ClientApplication;
++// A client in a Project without the legacyExternalAuth system setting
++let otherProject: WithId<Project>;
++let otherClient: ClientApplication;
++const otherEmail = `other-${randomUUID()}@example.com`;
+ 
+ describe('External', () => {
+   beforeAll(async () => {
+@@ -55,10 +59,13 @@ describe('External', () => {
+         remoteAddress: '5.5.5.5',
+         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/107.0.0.0',
+       });
+-      project = registerResult.project;
+       defaultClient = registerResult.client;
+ 
+-      systemRepo = await getProjectSystemRepo(project);
++      systemRepo = await getProjectSystemRepo(registerResult.project);
++      project = await systemRepo.updateResource<Project>({
++        ...registerResult.project,
++        systemSetting: [{ name: 'legacyExternalAuth', valueBoolean: true }],
++      });
+ 
+       // Create a domain configuration with external identity provider
+       await systemRepo.createResource<DomainConfiguration>({
+@@ -90,6 +97,23 @@ describe('External', () => {
+         },
+       });
+ 
++      const otherResult = await registerNew({
++        firstName: 'Other',
++        lastName: 'User',
++        projectName: 'Other External Test Project',
++        email: otherEmail,
++        password: 'password!@#',
++        remoteAddress: '5.5.5.5',
++        userAgent: 'Mozilla/5.0',
++      });
++      otherProject = otherResult.project;
++      otherClient = await createClient(await getProjectSystemRepo(otherProject), {
++        project: otherProject,
++        name: 'Other External Auth Client',
++        redirectUri,
++        identityProvider: { ...identityProvider, identitySource: 'email', identityMappingMode: 'user-email' },
++      });
++
+       // Invite user with external ID
+       await inviteUser({
+         project,
+@@ -559,6 +583,132 @@ describe('External', () => {
+     expect(res.body.issue[0].details.text).toBe('Identity provider not found');
+   });
+ 
++  test('Client callback path success', async () => {
++    const warnSpy = vi.spyOn(Logger.prototype, 'warn');
++    const url = appendQueryParams(`/auth/external/${otherClient.id}`, {
++      code: randomUUID(),
++      state: JSON.stringify({ redirectUri, clientId: otherClient.id }),
++    });
++    fetchMock.mockClear();
++    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(otherEmail)));
++
++    const res = await request(app).get(url);
++    expect(res).toHaveStatus(302);
++    expect(new URL(res.header.location).searchParams.get('code')).toBeTruthy();
++
++    // The token request repeats the per-client redirect URI
++    const body = new URLSearchParams(fetchMock.mock.calls[0][1]?.body as string);
++    expect(body.get('redirect_uri')).toBe(getConfig().baseUrl + 'auth/external/' + otherClient.id);
++    expect(warnSpy).not.toHaveBeenCalledWith(
++      'Client identity provider signed in through the shared external auth callback',
++      expect.anything()
++    );
++    warnSpy.mockRestore();
++  });
++
++  test('Shared callback path logs client identity provider sign-ins', async () => {
++    const warnSpy = vi.spyOn(Logger.prototype, 'warn');
++    const url = appendQueryParams('/auth/external', {
++      code: randomUUID(),
++      state: JSON.stringify({ redirectUri, clientId: externalAuthClient.id }),
++    });
++    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
++
++    const res = await request(app).get(url);
++    expect(res).toHaveStatus(302);
++    expect(warnSpy).toHaveBeenCalledWith(
++      'Client identity provider signed in through the shared external auth callback',
++      { clientId: externalAuthClient.id, projectId: project.id }
++    );
++    warnSpy.mockRestore();
++  });
++
++  test('Shared callback path requires the legacyExternalAuth system setting', async () => {
++    const warnSpy = vi.spyOn(Logger.prototype, 'warn');
++    const url = appendQueryParams('/auth/external', {
++      code: randomUUID(),
++      state: JSON.stringify({ redirectUri, clientId: otherClient.id }),
++    });
++    fetchMock.mockClear();
++
++    const res = await request(app).get(url);
++    expect(res).toHaveStatus(400);
++    expect(res.body.issue[0].details.text).toBe(
++      `Client identity provider must use the per-client callback ${getConfig().baseUrl}auth/external/${otherClient.id}`
++    );
++    expect(fetchMock).not.toHaveBeenCalled();
++    expect(warnSpy).toHaveBeenCalledWith('Client identity provider refused on the shared external auth callback', {
++      clientId: otherClient.id,
++      projectId: otherProject.id,
++    });
++    warnSpy.mockRestore();
++
++    // A Project admin cannot enable it through Project.setting
++    await withTestContext(async () => {
++      const otherRepo = await getProjectSystemRepo(otherProject);
++      otherProject = await otherRepo.updateResource<Project>({
++        ...otherProject,
++        setting: [{ name: 'legacyExternalAuth', valueBoolean: true }],
++      });
++    });
++    const res2 = await request(app).get(url);
++    expect(res2).toHaveStatus(400);
++    expect(fetchMock).not.toHaveBeenCalled();
++
++    await withTestContext(async () => {
++      const otherRepo = await getProjectSystemRepo(otherProject);
++      otherProject = await otherRepo.updateResource<Project>({ ...otherProject, setting: undefined });
++    });
++  });
++
++  test('Shared callback path allows client identity providers without a project', async () => {
++    const projectlessClient = await withTestContext(() =>
++      getGlobalSystemRepo().createResource<ClientApplication>({
++        resourceType: 'ClientApplication',
++        name: 'Projectless External Auth Client',
++        identityProvider,
++      })
++    );
++    expect(projectlessClient.meta?.project).toBeUndefined();
++
++    const url = appendQueryParams('/auth/external', {
++      code: randomUUID(),
++      state: JSON.stringify({ clientId: projectlessClient.id }),
++    });
++    fetchMock.mockClear();
++    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
++
++    const res = await request(app).get(url);
++    expect(res).toHaveStatus(302);
++    expect(fetchMock).toHaveBeenCalled();
++  });
++
++  test('Client callback path requires the state client', async () => {
++    const url = appendQueryParams(`/auth/external/${externalAuthClient.id}`, {
++      code: randomUUID(),
++      state: JSON.stringify({ redirectUri, clientId: defaultClient.id }),
++    });
++    fetchMock.mockClear();
++
++    const res = await request(app).get(url);
++    expect(res).toHaveStatus(400);
++    expect(res.body.issue[0].details.text).toBe('Invalid client');
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++
++  test('Client callback path does not fall back to other identity providers', async () => {
++    const url = appendQueryParams(`/auth/external/${defaultClient.id}`, {
++      code: randomUUID(),
++      state: JSON.stringify({ domain, redirectUri, clientId: defaultClient.id }),
++    });
++    fetchMock.mockClear();
++
++    const res = await request(app).get(url);
++    expect(res).toHaveStatus(400);
++    expect(res.body.issue[0].details.text).toBe('Identity provider not found');
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++
+   test('Missing token URL', async () => {
+     const client = await createClient(systemRepo, {
+       project,
+@@ -1081,7 +1231,7 @@ describe('External', () => {
+     });
+ 
+     // Now try to login with the external ID
+-    const url = appendQueryParams('/auth/external', {
++    const url = appendQueryParams(`/auth/external/${client.id}`, {
+       code: randomUUID(),
+       state: JSON.stringify({ clientId: client.id, redirectUri }),
+     });
+diff --git a/packages/server/src/auth/external.ts b/packages/server/src/auth/external.ts
+index 161ebf9ad5f..236521774d4 100644
+--- a/packages/server/src/auth/external.ts
++++ b/packages/server/src/auth/external.ts
+@@ -54,6 +54,9 @@ export interface ExternalLoginIdentity {
+ }
+ 
+ export async function externalCallbackHandler(req: Request, res: Response): Promise<void> {
++  // Set when the identity provider redirected to the per-client callback path /auth/external/:clientId
++  const callbackClientId = req.params.clientId as string | undefined;
++
+   const code = req.query.code as string;
+   if (!code) {
+     sendOutcome(res, badRequest('Missing code'));
+@@ -74,12 +77,18 @@ export async function externalCallbackHandler(req: Request, res: Response): Prom
+     return;
+   }
+ 
++  if (callbackClientId !== undefined && body.clientId !== callbackClientId) {
++    sendOutcome(res, badRequest('Invalid client'));
++    return;
++  }
++
++  // The per-client path only uses its client's identity provider and redirect URIs
+   let domainConfig: DomainConfiguration | undefined;
+-  if (body.domain) {
++  if (body.domain && callbackClientId === undefined) {
+     domainConfig = await getDomainConfiguration(body.domain);
+   }
+ 
+-  const { idp, client } = await getIdentityProvider(body, domainConfig);
++  const { idp, client } = await getIdentityProvider(body, domainConfig, callbackClientId);
+   if (!idp) {
+     sendOutcome(res, badRequest('Identity provider not found'));
+     return;
+@@ -92,7 +101,7 @@ export async function externalCallbackHandler(req: Request, res: Response): Prom
+     return;
+   }
+ 
+-  const userInfo = await verifyExternalCode(idp, code, body.codeChallenge);
++  const userInfo = await verifyExternalCode(idp, code, body.codeChallenge, callbackClientId);
+ 
+   let identity: ExternalLoginIdentity;
+   try {
+@@ -143,6 +152,13 @@ export async function externalCallbackHandler(req: Request, res: Response): Prom
+     userAgent: req.get('User-Agent'),
+   });
+ 
++  if (callbackClientId === undefined && client?.identityProvider) {
++    getLogger().warn('Client identity provider signed in through the shared external auth callback', {
++      clientId: client.id,
++      projectId: client.meta?.project,
++    });
++  }
++
+   // The identity provider authenticated the user, which is the control this flag records.
+   await getGlobalSystemRepo().patchResource<User>('User', resolveId(login.user) as string, [
+     { op: 'add', path: '/emailVerified', value: true },
+@@ -202,18 +218,37 @@ export async function externalCallbackHandler(req: Request, res: Response): Prom
+  * Tries to find the identity provider configuration.
+  * @param state - The external auth state.
+  * @param domainConfig - The domain configuration.
++ * @param callbackClientId - The client ID from the per-client callback path, if any.
+  * @returns External identity provider definition if found.
+  */
+ async function getIdentityProvider(
+   state: ExternalAuthState,
+-  domainConfig: DomainConfiguration | undefined
++  domainConfig: DomainConfiguration | undefined,
++  callbackClientId: string | undefined
+ ): Promise<{ idp?: IdentityProvider; client?: ClientApplication }> {
+   let idp: IdentityProvider | undefined;
+   let client: ClientApplication | undefined;
+ 
++  if (callbackClientId !== undefined) {
++    // The per-client path only serves that client's identity provider
++    client = await getClientApplication(callbackClientId);
++    return { idp: client.identityProvider, client };
++  }
++
+   if (state.clientId) {
+     client = await getClientApplication(state.clientId);
+     if (client.identityProvider) {
++      if (!(await isLegacyExternalAuthAllowed(client))) {
++        getLogger().warn('Client identity provider refused on the shared external auth callback', {
++          clientId: client.id,
++          projectId: client.meta?.project,
++        });
++        throw new OperationOutcomeError(
++          badRequest(
++            `Client identity provider must use the per-client callback ${getConfig().baseUrl}auth/external/${client.id}`
++          )
++        );
++      }
+       return { idp: client.identityProvider, client };
+     }
+   }
+@@ -283,12 +318,14 @@ function getIdentityMappingMode(idp: IdentityProvider): IdentityMappingMode {
+  * @param idp - The identity provider configuration.
+  * @param code - The authorization code.
+  * @param codeVerifier - The code verifier.
++ * @param callbackClientId - The client ID from the per-client callback path, if any.
+  * @returns ID token claims.
+  */
+ async function verifyExternalCode(
+   idp: IdentityProvider,
+   code: string,
+-  codeVerifier: string | undefined
++  codeVerifier: string | undefined,
++  callbackClientId: string | undefined
+ ): Promise<Record<string, unknown>> {
+   if (!idp.tokenUrl) {
+     throw new OperationOutcomeError(badRequest('Missing token URL for external identity provider'));
+@@ -302,7 +339,11 @@ async function verifyExternalCode(
+ 
+   const params = new URLSearchParams();
+   params.append('grant_type', OAuthGrantType.AuthorizationCode);
+-  params.append('redirect_uri', getConfig().baseUrl + 'auth/external');
++  // Must match the redirect_uri of the authorization request
++  params.append(
++    'redirect_uri',
++    getConfig().baseUrl + 'auth/external' + (callbackClientId === undefined ? '' : '/' + callbackClientId)
++  );
+   params.append('code', code);
+ 
+   if (idp.usePkce && codeVerifier) {
+@@ -414,6 +455,21 @@ function isValidReturnToUrl(
+   }
+ }
+ 
++/**
++ * Returns true if the client's Project may use the shared /auth/external callback for its client identity providers.
++ * Read from Project.systemSetting, which only super admins can set.
++ * Clients without a Project (server config `defaultOAuthClients`, or created by a super admin) are always allowed.
++ * @param client - The client application.
++ * @returns True if the shared callback is allowed for the client.
++ */
++async function isLegacyExternalAuthAllowed(client: ClientApplication): Promise<boolean> {
++  if (!client.meta?.project) {
++    return true;
++  }
++  const project = await getGlobalSystemRepo().readResource<Project>('Project', client.meta.project);
++  return project.systemSetting?.find((s) => s.name === 'legacyExternalAuth')?.valueBoolean === true;
++}
++
+ /**
+  * Returns true if the client application allows partial matching of redirect URIs, false otherwise.
+  * @param client - The client application.
+diff --git a/packages/server/src/auth/routes.ts b/packages/server/src/auth/routes.ts
+index 38686f2743b..52019fcf242 100644
+--- a/packages/server/src/auth/routes.ts
++++ b/packages/server/src/auth/routes.ts
+@@ -28,6 +28,7 @@ export const authRouter = Router();
+ authRouter.use('/mfa', mfaRouter);
+ authRouter.post('/method', methodValidator, methodHandler);
+ authRouter.get('/external', externalCallbackHandler);
++authRouter.get('/external/:clientId', externalCallbackHandler);
+ authRouter.get('/me', authenticateRequest, meHandler);
+ authRouter.post('/newuser', newUserValidator, validateRecaptcha(projectRegistrationAllowed), newUserHandler);
+ authRouter.post('/newproject', newProjectValidator, newProjectHandler);
+diff --git a/packages/server/src/oauth/auth-strategies.test.ts b/packages/server/src/oauth/auth-strategies.test.ts
+index 7ba9a58c06e..13f7f82198a 100644
+--- a/packages/server/src/oauth/auth-strategies.test.ts
++++ b/packages/server/src/oauth/auth-strategies.test.ts
+@@ -215,7 +215,7 @@ describe('External/OIDC login', () => {
+       codeChallenge: 'xyz',
+       codeChallengeMethod: 'plain',
+     });
+-    const callbackUrl = `/auth/external?code=${randomUUID()}&state=${encodeURIComponent(state)}`;
++    const callbackUrl = `/auth/external/${client.id}?code=${randomUUID()}&state=${encodeURIComponent(state)}`;
+ 
+     // Mock the external identity provider's token endpoint response
+     const idToken = 'header.' + Buffer.from(JSON.stringify({ email }), 'ascii').toString('base64url') + '.signature';

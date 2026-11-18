@@ -1,0 +1,641 @@
+diff --git a/packages/docs/content/docs/api/fhir/operations/resend.md b/packages/docs/content/docs/api/fhir/operations/resend.md
+index 7a430a300c8..19a6833cb00 100644
+--- a/packages/docs/content/docs/api/fhir/operations/resend.md
++++ b/packages/docs/content/docs/api/fhir/operations/resend.md
+@@ -24,13 +24,15 @@ The User, Bot, or ClientApplication invoking this operation must have [project a
+ 
+ ## Parameters
+ 
+-The operation takes an optional `option` parameter, which is an object containing three fields:
++The operation takes an optional request body, which is an object containing the following fields:
+ 
+-| Option         | Description                                                                                                                                                                                                                       | Data Type                                | Default Value |
+-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | ------------- |
+-| `verbose`      | Indicates if verbose logging should be enabled.                                                                                                                                                                                   | `boolean`                                | `false`       |
+-| `interaction`  | [`Subscriptions`](/docs/api/fhir/resources/subscription) can be configured to trigger only when a resource is created or deleted as opposed to any update. This option allows you to specify which interaction type will be sent. | `update` &#124; `create` &#124; `delete` | `update`      |
+-| `subscription` | A specific [`Subscription`](/docs/api/fhir/resources/subscription) to trigger, formatted as `Subscription/<id>`. If left undefined, all [`Subscriptions`](/docs/api/fhir/resources/subscription) will be triggered.               | `string`                                 | `undefined`   |
++| Option              | Description                                                                                                                                                                                                                                                          | Data Type                                | Default Value |
++| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | ------------- |
++| `verbose`           | Indicates if verbose logging should be enabled.                                                                                                                                                                                                                      | `boolean`                                | `false`       |
++| `interaction`       | [`Subscriptions`](/docs/api/fhir/resources/subscription) can be configured to trigger only when a resource is created or deleted as opposed to any update. This option allows you to specify which interaction type will be sent. For `delete`, the resource must currently be deleted, and the last version before the delete is sent. | `update` &#124; `create` &#124; `delete` | `update`      |
++| `subscription`      | A specific [`Subscription`](/docs/api/fhir/resources/subscription) to trigger, formatted as `Subscription/<id>`. If left undefined, all [`Subscriptions`](/docs/api/fhir/resources/subscription) will be triggered.                                                   | `string`                                 | `undefined`   |
++
++By default, `$resend` sends the current version of the resource. With the `update` interaction, the resource must not have changed since the version being resent, and the previous version in the resource history is used when evaluating subscription criteria.
+ 
+ ## Invoke the `$resend` operation
+ 
+@@ -67,6 +69,47 @@ curl 'https://api.medplum.com/fhir/R4/<resourceType>/<resourceId>/$resend' \
+   {{< /tab >}}
+ {{< /tabs >}}
+ 
++## Resend a specific version
++
++To replay the original event for a historical version of a resource, for example after a webhook endpoint outage, invoke `$resend` on the version URL:
++
++```
++POST /fhir/R4/<resourceType>/<id>/_history/<versionId>/$resend
++```
++
++The subscription criteria are evaluated against that version, and that version is delivered, even if the resource has changed since. The version before it in the resource history is used as the previous version (`%previous`), so the same subscriptions match as for the original event.
++
++- **Create**: pass `"interaction": "create"` to replay the event for the version that was created.
++- **Update**: pass `"interaction": "update"` (the default).
++- **Delete**: pass `"interaction": "delete"`. The resource must currently be deleted. The server sends the last version before the delete, so the version can be omitted by using the instance URL (`/<resourceType>/<id>/$resend`). If a version is specified, it must be the last version before the delete.
++
++{{< tabs >}}
++  {{< tab value="ts" label="TypeScript" >}}
++{{< highlight ts >}}
++await medplum.post(medplum.fhirUrl(<resourceType>, <id>, '_history', <versionId>, '$resend'), {
++  interaction: 'update',
++  subscription: 'Subscription/123'
++});
++{{< /highlight >}}
++  {{< /tab >}}
++  {{< tab value="curl" label="cURL" >}}
++
++```bash
++curl 'https://api.medplum.com/fhir/R4/<resourceType>/<resourceId>/_history/<versionId>/$resend' \
++-X 'POST' \
++-H 'authorization: Bearer MY_ACCESS_TOKEN' \
++-H 'content-type: application/fhir+json' \
++--data-raw '{"interaction":"update","subscription":"Subscription/123"}'
++```
++
++  {{< /tab >}}
++{{< /tabs >}}
++
++{{< note title="Limitations" >}}
++- A historical version is delivered with a single attempt. Retries are skipped once the resource has changed since that version, so check the subscription's AuditEvents after a replay and resend again if needed.
++- A `create` or `update` replay is not delivered if the resource has been deleted since.
++{{< /note >}}
++
+ ### Output
+ 
+ If successful, you will receive the following OperationOutcome
+diff --git a/packages/server/src/fhir/repo.ts b/packages/server/src/fhir/repo.ts
+index 8ee7a1ec0b9..a6308cfc5eb 100644
+--- a/packages/server/src/fhir/repo.ts
++++ b/packages/server/src/fhir/repo.ts
+@@ -174,6 +174,14 @@ export interface ReadResourceOptions extends InteractionOptions {
+ export interface ResendSubscriptionsOptions extends InteractionOptions {
+   interaction?: BackgroundJobInteraction;
+   subscription?: string;
++  /**
++   * Optional version ID of the resource to resend.
++   * When specified, subscriptions are evaluated and delivered for that historical version,
++   * rather than the current version, and the version before it is used as the previous version.
++   * For the `delete` interaction, the server uses the last version before the delete;
++   * if specified, `versionId` must match it.
++   */
++  versionId?: string;
+ }
+ 
+ export interface ProcessAllResourcesOptions {
+@@ -1468,6 +1476,10 @@ export class Repository extends FhirRepository implements Disposable {
+    * Resends subscriptions for the resource.
+    * This is only available to the admin accounts.
+    * This should not result in any change to the resource or its history.
++   *
++   * By default, subscriptions are resent for the current version of the resource.
++   * If `options.versionId` is specified, subscriptions are resent for that historical version,
++   * which allows replaying the original event after a delivery outage.
+    * @param resourceType - The resource type.
+    * @param id - The resource ID.
+    * @param options - Additional options.
+@@ -1483,16 +1495,48 @@ export class Repository extends FhirRepository implements Disposable {
+       throw new OperationOutcomeError(forbidden);
+     }
+ 
+-    const resource = await this.readResourceImpl<T>(resourceType, id);
+     const interaction = options?.interaction ?? 'update';
++    const versionId = options?.versionId;
++    let resource: WithId<T>;
+     let previousVersion: T | undefined;
+ 
+-    if (interaction === 'update') {
+-      const history = await this.readHistory(resourceType, id, { limit: 2 });
+-      if (history.entry?.[0]?.resource?.meta?.versionId !== resource.meta?.versionId) {
++    if (interaction === 'delete') {
++      // The newest history entry must be the delete, and the entry before it is the version that was deleted.
++      // Reading history with the caller's repo applies the caller's access checks.
++      const history = await this.readHistory<T>(resourceType, id, { limit: 2 });
++      const deletedVersionId = history.entry?.[1]?.resource?.meta?.versionId;
++      if (history.entry?.[0]?.request?.method !== 'DELETE' || !deletedVersionId) {
+         throw new OperationOutcomeError(preconditionFailed);
+       }
+-      previousVersion = history.entry?.[1]?.resource;
++      if (versionId && versionId !== deletedVersionId) {
++        throw new OperationOutcomeError(badRequest('versionId must be the last version before the delete'));
++      }
++      // Load the unredacted version, exactly as the subscription worker does for delivery.
++      resource = await this.getSystemRepo().readVersion<T>(resourceType, id, deletedVersionId);
++      // Matches deleteResource, which uses the deleted resource as both the current and previous version.
++      previousVersion = resource;
++    } else if (versionId) {
++      // Authorize with the caller's access checks first.
++      await this.readVersion<T>(resourceType, id, versionId);
++      // Then load the unredacted versions, exactly as the subscription worker does for delivery,
++      // so that meta.project is present and criteria are evaluated against the delivered payload.
++      const systemRepo = this.getSystemRepo();
++      resource = await systemRepo.readVersion<T>(resourceType, id, versionId);
++      if (interaction === 'update') {
++        const previousVersionId = await findPreviousVersionId(systemRepo, resourceType, id, versionId);
++        if (previousVersionId) {
++          previousVersion = await systemRepo.readVersion<T>(resourceType, id, previousVersionId);
++        }
++      }
++    } else {
++      resource = await this.readResourceImpl<T>(resourceType, id);
++      if (interaction === 'update') {
++        const history = await this.readHistory(resourceType, id, { limit: 2 });
++        if (history.entry?.[0]?.resource?.meta?.versionId !== resource.meta?.versionId) {
++          throw new OperationOutcomeError(preconditionFailed);
++        }
++        previousVersion = history.entry?.[1]?.resource;
++      }
+     }
+ 
+     return addSubscriptionJobs(
+@@ -3215,3 +3259,38 @@ function replaceSuperAdminProjectFields(project: Project, existing: Project | un
+   }
+   return result;
+ }
++
++const RESEND_HISTORY_PAGE_SIZE = 100;
++
++/**
++ * Returns the version ID immediately before the specified version in the resource history.
++ * Returns undefined if the version is the first version, or if the previous history entry is a delete.
++ * The caller is responsible for authorizing access to the resource.
++ * @param repo - The repository used to read history.
++ * @param resourceType - The resource type.
++ * @param id - The resource ID.
++ * @param versionId - The version ID.
++ * @returns The previous version ID, if available.
++ */
++async function findPreviousVersionId(
++  repo: Repository,
++  resourceType: ResourceType,
++  id: string,
++  versionId: string
++): Promise<string | undefined> {
++  // History is sorted newest first, so the previous version is the entry after the target version.
++  let found = false;
++  for (let offset = 0; ; offset += RESEND_HISTORY_PAGE_SIZE) {
++    const history = await repo.readHistory(resourceType, id, { limit: RESEND_HISTORY_PAGE_SIZE, offset });
++    const entries = history.entry ?? [];
++    for (const entry of entries) {
++      if (found) {
++        return entry.resource?.meta?.versionId;
++      }
++      found = entry.resource?.meta?.versionId === versionId;
++    }
++    if (entries.length < RESEND_HISTORY_PAGE_SIZE) {
++      return undefined;
++    }
++  }
++}
+diff --git a/packages/server/src/fhir/resend.test.ts b/packages/server/src/fhir/resend.test.ts
+new file mode 100644
+index 00000000000..8ba709c3260
+--- /dev/null
++++ b/packages/server/src/fhir/resend.test.ts
+@@ -0,0 +1,308 @@
++// SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
++// SPDX-License-Identifier: Apache-2.0
++import type { WithId } from '@medplum/core';
++import { getReferenceString } from '@medplum/core';
++import type { Patient, Subscription } from '@medplum/fhirtypes';
++import type { Mock } from 'vitest';
++import { initAppServices, shutdownApp } from '../app';
++import { getConfig, loadTestConfig } from '../config/loader';
++import { createTestProject, withTestContext } from '../test.setup';
++import type { SubscriptionJobData } from '../workers/subscription';
++import { getSubscriptionQueue } from '../workers/subscription';
++import type { Repository } from './repo';
++
++const FHIRPATH_CRITERIA_URL = 'https://medplum.com/fhir/StructureDefinition/fhir-path-criteria-expression';
++const INTERACTION_URL = 'https://medplum.com/fhir/StructureDefinition/subscription-supported-interaction';
++
++describe('Resend subscriptions', () => {
++  let repo: Repository;
++
++  beforeAll(async () => {
++    const config = await loadTestConfig();
++    await initAppServices(config);
++  });
++
++  afterAll(async () => {
++    await shutdownApp();
++  });
++
++  beforeEach(async () => {
++    getConfig().subscriptionsEnabled = true;
++    ({ repo } = await withTestContext(() => createTestProject({ withRepo: true, membership: { admin: true } })));
++  });
++
++  function createSubscription(
++    extension?: Subscription['extension'],
++    targetRepo: Repository = repo,
++    criteria = 'Patient'
++  ): Promise<WithId<Subscription>> {
++    return targetRepo.createResource<Subscription>({
++      resourceType: 'Subscription',
++      reason: 'test',
++      status: 'active',
++      criteria,
++      channel: { type: 'rest-hook', endpoint: 'https://example.com/subscription' },
++      extension,
++    });
++  }
++
++  function clearQueue(): Mock {
++    const add = getSubscriptionQueue()?.add as Mock;
++    add.mockClear();
++    return add;
++  }
++
++  function getQueuedJobs(add: Mock): SubscriptionJobData[] {
++    return add.mock.calls.map((call) => call[1] as SubscriptionJobData);
++  }
++
++  describe('Current version', () => {
++    test('Resend current version', () =>
++      withTestContext(async () => {
++        await createSubscription();
++        const v1 = await repo.createResource<Patient>({ resourceType: 'Patient', name: [{ family: 'One' }] });
++        const v2 = await repo.updateResource<Patient>({ ...v1, name: [{ family: 'Two' }] });
++
++        const add = clearQueue();
++        await repo.resendSubscriptions('Patient', v1.id);
++        const jobs = getQueuedJobs(add);
++        expect(jobs).toHaveLength(1);
++        expect(jobs[0].versionId).toBe(v2.meta?.versionId);
++      }));
++  });
++
++  describe('Historical version', () => {
++    test('Resend historical version of update', () =>
++      withTestContext(async () => {
++        const subscription = await createSubscription();
++        const v1 = await repo.createResource<Patient>({ resourceType: 'Patient', name: [{ family: 'One' }] });
++        const v2 = await repo.updateResource<Patient>({ ...v1, name: [{ family: 'Two' }] });
++        await repo.updateResource<Patient>({ ...v2, name: [{ family: 'Three' }] });
++
++        const add = clearQueue();
++        await repo.resendSubscriptions('Patient', v1.id, { versionId: v2.meta?.versionId, interaction: 'update' });
++
++        const jobs = getQueuedJobs(add);
++        expect(jobs).toHaveLength(1);
++        expect(jobs[0]).toMatchObject({
++          subscriptionId: subscription.id,
++          resourceType: 'Patient',
++          id: v1.id,
++          versionId: v2.meta?.versionId,
++          interaction: 'update',
++        });
++      }));
++
++    test('Historical version is compared against the version before it', () =>
++      withTestContext(async () => {
++        // Only fires when the family name changed from the previous version
++        await createSubscription([
++          { url: FHIRPATH_CRITERIA_URL, valueString: '%previous.name.family != %current.name.family' },
++        ]);
++        const v1 = await repo.createResource<Patient>({ resourceType: 'Patient', name: [{ family: 'One' }] });
++        const v2 = await repo.updateResource<Patient>({ ...v1, name: [{ family: 'Two' }] });
++        const v3 = await repo.updateResource<Patient>({ ...v2, name: [{ family: 'Two' }], gender: 'female' });
++        await repo.updateResource<Patient>({ ...v3, name: [{ family: 'Four' }] });
++
++        // v2 changed the family name relative to v1, so it matches
++        let add = clearQueue();
++        await repo.resendSubscriptions('Patient', v1.id, { versionId: v2.meta?.versionId });
++        expect(getQueuedJobs(add)).toHaveLength(1);
++
++        // v3 did not change the family name relative to v2, so it does not match
++        add = clearQueue();
++        await repo.resendSubscriptions('Patient', v1.id, { versionId: v3.meta?.versionId });
++        expect(getQueuedJobs(add)).toHaveLength(0);
++      }));
++
++    test('Previous version is found across history pages', () =>
++      withTestContext(async () => {
++        await createSubscription([
++          {
++            url: FHIRPATH_CRITERIA_URL,
++            valueString: "%previous.name.family = 'F1' and %current.name.family = 'F2'",
++          },
++        ]);
++
++        // 102 versions, F0 through F101. History is newest first with 100 entries per page,
++        // so F2 is the last entry on the first page and F1 is the first entry on the second page.
++        let patient = await repo.createResource<Patient>({ resourceType: 'Patient', name: [{ family: 'F0' }] });
++        let target: WithId<Patient> | undefined;
++        for (let i = 1; i <= 101; i++) {
++          patient = await repo.updateResource<Patient>({ ...patient, name: [{ family: `F${i}` }] });
++          if (i === 2) {
++            target = patient;
++          }
++        }
++
++        const add = clearQueue();
++        await repo.resendSubscriptions('Patient', patient.id, { versionId: target?.meta?.versionId });
++        expect(getQueuedJobs(add)).toHaveLength(1);
++      }));
++
++    test('Resend historical version of create', () =>
++      withTestContext(async () => {
++        await createSubscription([{ url: INTERACTION_URL, valueCode: 'create' }]);
++        const v1 = await repo.createResource<Patient>({ resourceType: 'Patient', name: [{ family: 'One' }] });
++        await repo.updateResource<Patient>({ ...v1, name: [{ family: 'Two' }] });
++
++        const add = clearQueue();
++        await repo.resendSubscriptions('Patient', v1.id, { versionId: v1.meta?.versionId, interaction: 'create' });
++
++        const jobs = getQueuedJobs(add);
++        expect(jobs).toHaveLength(1);
++        expect(jobs[0]).toMatchObject({ versionId: v1.meta?.versionId, interaction: 'create' });
++      }));
++
++    test('Resend subscription filter with historical version', () =>
++      withTestContext(async () => {
++        const sub1 = await createSubscription();
++        await createSubscription();
++        const v1 = await repo.createResource<Patient>({ resourceType: 'Patient', name: [{ family: 'One' }] });
++        const v2 = await repo.updateResource<Patient>({ ...v1, name: [{ family: 'Two' }] });
++
++        let add = clearQueue();
++        await repo.resendSubscriptions('Patient', v1.id, { versionId: v2.meta?.versionId });
++        expect(getQueuedJobs(add)).toHaveLength(2);
++
++        add = clearQueue();
++        await repo.resendSubscriptions('Patient', v1.id, {
++          versionId: v2.meta?.versionId,
++          subscription: getReferenceString(sub1),
++        });
++        const jobs = getQueuedJobs(add);
++        expect(jobs).toHaveLength(1);
++        expect(jobs[0].subscriptionId).toBe(sub1.id);
++      }));
++
++    test('Resend unknown version', () =>
++      withTestContext(async () => {
++        const patient = await repo.createResource<Patient>({ resourceType: 'Patient' });
++        await expect(
++          repo.resendSubscriptions('Patient', patient.id, { versionId: '00000000-0000-0000-0000-000000000000' })
++        ).rejects.toThrow('Not found');
++      }));
++
++    test('Resend historical version without extended mode', () =>
++      withTestContext(async () => {
++        // Normal API requests do not use extended mode, which strips meta.project from read results
++        const { repo: nonExtendedRepo } = await createTestProject({
++          withRepo: true,
++          membership: { admin: true },
++          extendedMode: false,
++        });
++        const subscription = await createSubscription(undefined, nonExtendedRepo);
++        const v1 = await nonExtendedRepo.createResource<Patient>({
++          resourceType: 'Patient',
++          name: [{ family: 'One' }],
++        });
++        const v2 = await nonExtendedRepo.updateResource<Patient>({ ...v1, name: [{ family: 'Two' }] });
++        await nonExtendedRepo.deleteResource('Patient', v1.id);
++
++        const add = clearQueue();
++        await nonExtendedRepo.resendSubscriptions('Patient', v1.id, {
++          versionId: v1.meta?.versionId,
++          interaction: 'create',
++        });
++        await nonExtendedRepo.resendSubscriptions('Patient', v1.id, { versionId: v2.meta?.versionId });
++        await nonExtendedRepo.resendSubscriptions('Patient', v1.id, { interaction: 'delete' });
++
++        const jobs = getQueuedJobs(add);
++        expect(jobs).toHaveLength(3);
++        expect(jobs[0]).toMatchObject({ subscriptionId: subscription.id, versionId: v1.meta?.versionId });
++        expect(jobs[1]).toMatchObject({ subscriptionId: subscription.id, versionId: v2.meta?.versionId });
++        expect(jobs[2]).toMatchObject({ subscriptionId: subscription.id, versionId: v2.meta?.versionId });
++      }));
++
++    test('Historical version criteria are evaluated against hidden fields', () =>
++      withTestContext(async () => {
++        // The subscription worker delivers the full version, so criteria must see the full version too
++        const { repo: policyRepo } = await createTestProject({
++          withRepo: true,
++          membership: { admin: true },
++          accessPolicy: {
++            resource: [{ resourceType: 'Patient', hiddenFields: ['gender'] }, { resourceType: 'Subscription' }],
++          },
++        });
++        await createSubscription(undefined, policyRepo, 'Patient?gender=female');
++        const patient = await policyRepo.getSystemRepo().createResource<Patient>({
++          resourceType: 'Patient',
++          meta: { project: policyRepo.currentProject()?.id },
++          gender: 'female',
++        });
++
++        const add = clearQueue();
++        await policyRepo.resendSubscriptions('Patient', patient.id, {
++          versionId: patient.meta?.versionId,
++          interaction: 'create',
++        });
++        expect(getQueuedJobs(add)).toHaveLength(1);
++      }));
++  });
++
++  describe('Delete', () => {
++    async function createAndDeletePatient(): Promise<{ v1: WithId<Patient>; v2: WithId<Patient> }> {
++      const v1 = await repo.createResource<Patient>({ resourceType: 'Patient', name: [{ family: 'One' }] });
++      const v2 = await repo.updateResource<Patient>({ ...v1, name: [{ family: 'Two' }] });
++      await repo.deleteResource('Patient', v1.id);
++      return { v1, v2 };
++    }
++
++    test('Resend delete without versionId', () =>
++      withTestContext(async () => {
++        await createSubscription([{ url: INTERACTION_URL, valueCode: 'delete' }]);
++        const { v1, v2 } = await createAndDeletePatient();
++
++        const add = clearQueue();
++        await repo.resendSubscriptions('Patient', v1.id, { interaction: 'delete' });
++
++        const jobs = getQueuedJobs(add);
++        expect(jobs).toHaveLength(1);
++        expect(jobs[0]).toMatchObject({ id: v1.id, versionId: v2.meta?.versionId, interaction: 'delete' });
++      }));
++
++    test('Resend delete with the last version before the delete', () =>
++      withTestContext(async () => {
++        await createSubscription([{ url: INTERACTION_URL, valueCode: 'delete' }]);
++        const { v1, v2 } = await createAndDeletePatient();
++
++        const add = clearQueue();
++        await repo.resendSubscriptions('Patient', v1.id, { versionId: v2.meta?.versionId, interaction: 'delete' });
++
++        const jobs = getQueuedJobs(add);
++        expect(jobs).toHaveLength(1);
++        expect(jobs[0]).toMatchObject({ id: v1.id, versionId: v2.meta?.versionId, interaction: 'delete' });
++      }));
++
++    test('Resend delete evaluates %previous like the original delete', () =>
++      withTestContext(async () => {
++        // The original delete uses the deleted resource as both %previous and %current
++        await createSubscription([{ url: INTERACTION_URL, valueCode: 'delete' }]);
++        await createSubscription([
++          { url: INTERACTION_URL, valueCode: 'delete' },
++          { url: FHIRPATH_CRITERIA_URL, valueString: '%previous.name.family = %current.name.family' },
++        ]);
++        const { v1 } = await createAndDeletePatient();
++
++        const add = clearQueue();
++        await repo.resendSubscriptions('Patient', v1.id, { interaction: 'delete' });
++        expect(getQueuedJobs(add)).toHaveLength(2);
++      }));
++
++    test('Resend delete rejects a version other than the last version before the delete', () =>
++      withTestContext(async () => {
++        const { v1 } = await createAndDeletePatient();
++        await expect(
++          repo.resendSubscriptions('Patient', v1.id, { versionId: v1.meta?.versionId, interaction: 'delete' })
++        ).rejects.toThrow('versionId must be the last version before the delete');
++      }));
++
++    test('Resend delete rejects resource that is not deleted', () =>
++      withTestContext(async () => {
++        const patient = await repo.createResource<Patient>({ resourceType: 'Patient' });
++        await expect(repo.resendSubscriptions('Patient', patient.id, { interaction: 'delete' })).rejects.toThrow(
++          'Precondition Failed'
++        );
++      }));
++  });
++});
+diff --git a/packages/server/src/fhir/routes.test.ts b/packages/server/src/fhir/routes.test.ts
+index 9046dec9c8b..0ae4f717153 100644
+--- a/packages/server/src/fhir/routes.test.ts
++++ b/packages/server/src/fhir/routes.test.ts
+@@ -6,13 +6,14 @@ import type { Bundle, Meta, Organization, Parameters, Patient, Reference } from
+ import { randomUUID } from 'crypto';
+ import express from 'express';
+ import request from 'supertest';
+-import type { MockInstance } from 'vitest';
++import type { Mock, MockInstance } from 'vitest';
+ import { vi } from 'vitest';
+ import { initApp, shutdownApp } from '../app';
+ import { registerNew } from '../auth/register';
+ import { loadTestConfig } from '../config/loader';
+ import { DatabaseMode, getDatabasePool } from '../database';
+ import { addTestUser, bundleContains, createTestProject, initTestAuth, withTestContext } from '../test.setup';
++import { getSubscriptionQueue } from '../workers/subscription';
+ 
+ const app = express();
+ let accessToken: string;
+@@ -898,6 +899,80 @@ describe('FHIR Routes', () => {
+       .set('Authorization', 'Bearer ' + accessToken)
+       .send({ subscription: 'Subscription/123' });
+     expect(res3).toHaveStatus(200);
++
++    // Resend a specific version
++    const res4 = await request(app)
++      .post(`/fhir/R4/${getReferenceString(profile)}/_history/${profile.meta?.versionId}/$resend`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .send({ interaction: 'create' });
++    expect(res4).toHaveStatus(200);
++
++    // Resend an unknown version
++    const res5 = await request(app)
++      .post(`/fhir/R4/${getReferenceString(profile)}/_history/${randomUUID()}/$resend`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .send({});
++    expect(res5).toHaveStatus(404);
++  });
++
++  test('Resend specific version queues subscription job', async () => {
++    const { accessToken } = await withTestContext(() =>
++      registerNew({
++        firstName: 'Alice',
++        lastName: 'Smith',
++        projectName: 'Alice Project',
++        email: `alice${randomUUID()}@example.com`,
++        password: 'password!@#',
++      })
++    );
++
++    // No X-Medplum: extended header, like a normal API client
++    const subRes = await request(app)
++      .post(`/fhir/R4/Subscription`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .send({
++        resourceType: 'Subscription',
++        reason: 'test',
++        status: 'active',
++        criteria: 'Patient',
++        channel: { type: 'rest-hook', endpoint: 'https://example.com/subscription' },
++      });
++    expect(subRes).toHaveStatus(201);
++
++    const patientRes = await request(app)
++      .post(`/fhir/R4/Patient`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .set('Content-Type', ContentType.FHIR_JSON)
++      .send({ resourceType: 'Patient', name: [{ family: 'Smith' }] });
++    expect(patientRes).toHaveStatus(201);
++    const patient = patientRes.body as WithId<Patient>;
++
++    const add = getSubscriptionQueue()?.add as Mock;
++    add.mockClear();
++
++    const res = await request(app)
++      .post(`/fhir/R4/Patient/${patient.id}/_history/${patient.meta?.versionId}/$resend`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .send({ interaction: 'create', subscription: `Subscription/${subRes.body.id}` });
++    expect(res).toHaveStatus(200);
++    expect(add).toHaveBeenCalledWith(
++      expect.any(String),
++      expect.objectContaining({
++        subscriptionId: subRes.body.id,
++        id: patient.id,
++        versionId: patient.meta?.versionId,
++        interaction: 'create',
++      })
++    );
++  });
++
++  test('Resend specific version access denied', async () => {
++    const res = await request(app)
++      .post(`/fhir/R4/Patient/${patientId}/_history/${patientVersionId}/$resend`)
++      .set('Authorization', 'Bearer ' + accessToken)
++      .send({});
++    expect(res).toHaveStatus(403);
+   });
+ 
+   test('ProjectMembership with null access policy', async () =>
+diff --git a/packages/server/src/fhir/routes.ts b/packages/server/src/fhir/routes.ts
+index 972ed13958a..cb38fb4d319 100644
+--- a/packages/server/src/fhir/routes.ts
++++ b/packages/server/src/fhir/routes.ts
+@@ -455,12 +455,22 @@ function initInternalFhirRouter(): FhirRouter {
+     return [allOk];
+   });
+ 
+-  // Resend subscriptions
++  // Resend subscriptions for the current version
+   router.add('POST', '/:resourceType/:id/$resend', async (req: FhirRequest) => {
+     const ctx = getAuthenticatedContext();
+     const { resourceType, id } = req.params as { resourceType: ResourceType; id: string };
+     const options = req.body as ResendSubscriptionsOptions | undefined;
+-    await ctx.repo.resendSubscriptions(resourceType, id, options);
++    // The version is only specified in the URL, using the versioned route below
++    await ctx.repo.resendSubscriptions(resourceType, id, { ...options, versionId: undefined });
++    return [allOk];
++  });
++
++  // Resend subscriptions for a specific historical version
++  router.add('POST', '/:resourceType/:id/_history/:vid/$resend', async (req: FhirRequest) => {
++    const ctx = getAuthenticatedContext();
++    const { resourceType, id, vid } = req.params as { resourceType: ResourceType; id: string; vid: string };
++    const options = req.body as ResendSubscriptionsOptions | undefined;
++    await ctx.repo.resendSubscriptions(resourceType, id, { ...options, versionId: vid });
+     return [allOk];
+   });
+ 

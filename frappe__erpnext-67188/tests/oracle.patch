@@ -1,0 +1,193 @@
+diff --git a/erpnext/controllers/buying_controller.py b/erpnext/controllers/buying_controller.py
+index 61d8aaf014e3..361f9792941f 100644
+--- a/erpnext/controllers/buying_controller.py
++++ b/erpnext/controllers/buying_controller.py
+@@ -237,7 +237,7 @@ def make_accepted_package(self, row, package) -> str:
+ 		the entry it belongs to; the material leaving the in-transit warehouse gets a package of its
+ 		own when the receipt is submitted.
+ 		"""
+-		if not (self.is_internal_receipt() and flt(row.rejected_qty)):
++		if not self.has_rejected_stock(row):
+ 			return self.make_package_for_transfer(
+ 				package,
+ 				row.from_warehouse,
+@@ -273,7 +273,7 @@ def set_rejected_package(self, row, package) -> None:
+ 		A receipt of an internal transfer builds no package for it on its own, so rejected material
+ 		of a tracked item would have nothing to say where it came from.
+ 		"""
+-		if not (self.is_internal_receipt() and flt(row.rejected_qty)) or self.is_return:
++		if not self.has_rejected_stock(row) or self.is_return:
+ 			return
+ 
+ 		if row.get("rejected_serial_and_batch_bundle") or not row.rejected_warehouse:
+@@ -324,7 +324,7 @@ def sync_accepted_packages(self) -> None:
+ 			if not details or details.docstatus != 0:
+ 				continue
+ 
+-			if flt(row.rejected_qty):
++			if self.has_rejected_stock(row):
+ 				wanted = (row.warehouse, "Inward")
+ 			else:
+ 				wanted = (row.from_warehouse, "Outward")
+@@ -1192,8 +1192,12 @@ def get_internal_transfer_qty(self, row) -> float:
+ 	def is_internal_receipt(self) -> bool:
+ 		return self.is_internal_transfer() and self.is_stock_receipt()
+ 
++	def has_rejected_stock(self, row) -> bool:
++		"""An internal receipt row whose rejected qty doesn't round to 0 in the stock UOM."""
++		return self.is_internal_receipt() and bool(get_stock_qty(row, row.rejected_qty))
++
+ 	def get_source_warehouse_qty(self, row, accepted_qty):
+-		if not (self.is_internal_receipt() and flt(row.rejected_qty)):
++		if not self.has_rejected_stock(row):
+ 			return accepted_qty
+ 
+ 		if row.get("serial_and_batch_bundle") and not row.get("rejected_serial_and_batch_bundle"):
+@@ -1204,7 +1208,7 @@ def get_source_warehouse_qty(self, row, accepted_qty):
+ 	def get_accepted_warehouse_package(self, row, type_of_transaction, via_landed_cost_voucher):
+ 		"""Package for the entry into the accepted warehouse, which is the package of the row itself
+ 		when the row rejects material."""
+-		if flt(row.rejected_qty) and self.is_internal_receipt() and not self.is_return:
++		if self.has_rejected_stock(row) and not self.is_return:
+ 			return row.serial_and_batch_bundle
+ 
+ 		if self.is_internal_transfer() and not self.is_return and self.docstatus != 2:
+diff --git a/erpnext/controllers/stock_controller.py b/erpnext/controllers/stock_controller.py
+index 0ec88dacb995..5d503fe04402 100644
+--- a/erpnext/controllers/stock_controller.py
++++ b/erpnext/controllers/stock_controller.py
+@@ -536,7 +536,7 @@ def make_bundle_using_old_serial_batch_fields(self, table_name=None, via_landed_
+ 					self.update_bundle_details(bundle_details, table_name, row, parent_details=parent_details)
+ 					self.create_auto_picked_bundle(bundle_details, row, picked_serial_nos, picked_batches)
+ 
+-				if row.get("rejected_qty"):
++				if self.get_rejected_stock_qty(row):
+ 					self.update_bundle_details(bundle_details, table_name, row, is_rejected=True)
+ 					self.create_serial_batch_bundle(bundle_details, row)
+ 
+@@ -738,10 +738,17 @@ def needs_rejected_bundle(self, row) -> bool:
+ 
+ 		return bool(
+ 			row.get("rejected_warehouse")
+-			and row.get("rejected_qty")
++			and self.get_rejected_stock_qty(row)
+ 			and not row.get("rejected_serial_and_batch_bundle")
+ 		)
+ 
++	def get_rejected_stock_qty(self, row) -> float:
++		"""Rejected qty of a row in the stock UOM, rounded as its bundle holds it."""
++		return flt(
++			flt(row.get("rejected_qty")) * flt(row.get("conversion_factor", 1.0)),
++			frappe.get_precision("Serial and Batch Entry", "qty"),
++		)
++
+ 	def get_value_for_packed_item(self, row, reference_field):
+ 		parent_items = self.get("items", {"name": row.parent_detail_docname})
+ 		if parent_items:
+@@ -851,10 +858,7 @@ def update_bundle_details(self, bundle_details, table_name, row, is_rejected=Fal
+ 		if is_rejected:
+ 			serial_nos = row.get("rejected_serial_no")
+ 			type_of_transaction = "Inward" if not self.is_return else "Outward"
+-			qty = flt(
+-				row.get("rejected_qty") * row.get("conversion_factor", 1.0),
+-				frappe.get_precision("Serial and Batch Entry", "qty"),
+-			)
++			qty = self.get_rejected_stock_qty(row)
+ 			warehouse = row.get("rejected_warehouse")
+ 
+ 		if (
+diff --git a/erpnext/stock/doctype/purchase_receipt/purchase_receipt.py b/erpnext/stock/doctype/purchase_receipt/purchase_receipt.py
+index 8f7e4574dd18..54d0c797d8f5 100644
+--- a/erpnext/stock/doctype/purchase_receipt/purchase_receipt.py
++++ b/erpnext/stock/doctype/purchase_receipt/purchase_receipt.py
+@@ -1202,16 +1202,19 @@ def enable_recalculate_rate_in_sles(self):
+ 
+ 
+ def get_stock_value_difference(voucher_no, voucher_detail_no, warehouse):
+-	return frappe.db.get_value(
+-		"Stock Ledger Entry",
+-		{
+-			"voucher_type": "Purchase Receipt",
+-			"voucher_no": voucher_no,
+-			"voucher_detail_no": voucher_detail_no,
+-			"warehouse": warehouse,
+-			"is_cancelled": 0,
+-		},
+-		"stock_value_difference",
++	"""0 when the row posts nothing to the warehouse, e.g. a rejected qty that rounds to 0 in the stock UOM."""
++	return flt(
++		frappe.db.get_value(
++			"Stock Ledger Entry",
++			{
++				"voucher_type": "Purchase Receipt",
++				"voucher_no": voucher_no,
++				"voucher_detail_no": voucher_detail_no,
++				"warehouse": warehouse,
++				"is_cancelled": 0,
++			},
++			"stock_value_difference",
++		)
+ 	)
+ 
+ 
+diff --git a/erpnext/stock/doctype/purchase_receipt/test_purchase_receipt.py b/erpnext/stock/doctype/purchase_receipt/test_purchase_receipt.py
+index 865e81f65b95..6b565090e8ac 100644
+--- a/erpnext/stock/doctype/purchase_receipt/test_purchase_receipt.py
++++ b/erpnext/stock/doctype/purchase_receipt/test_purchase_receipt.py
+@@ -4137,7 +4137,7 @@ def test_internal_transfer_package_holds_the_rounded_stock_qty(self):
+ 			sle.actual_qty,
+ 		)
+ 
+-	def make_transfer_receipt(self, tag, item_doc, qty, rejected):
++	def make_transfer_receipt(self, tag, item_doc, qty, rejected, uom=None, conversion_factor=None):
+ 		from erpnext.stock.doctype.delivery_note.delivery_note import make_inter_company_purchase_receipt
+ 		from erpnext.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
+ 
+@@ -4166,7 +4166,13 @@ def make_transfer_receipt(self, tag, item_doc, qty, rejected):
+ 			warehouse=wh.source,
+ 			target_warehouse=wh.transit,
+ 			batch_no=batch_no,
++			use_serial_batch_fields=bool(uom),
++			do_not_submit=bool(uom),
+ 		)
++		if uom:
++			dn.items[0].update({"uom": uom, "conversion_factor": conversion_factor})
++			dn.submit()
++
+ 		pr = make_inter_company_purchase_receipt(dn.name)
+ 		pr.items[0].warehouse = wh.accepted
+ 		pr.items[0].qty = qty
+@@ -4175,6 +4181,33 @@ def make_transfer_receipt(self, tag, item_doc, qty, rejected):
+ 		pr.items[0].rejected_warehouse = wh.rejected
+ 		return pr, wh, company, batch_no
+ 
++	def test_internal_pr_with_rejected_stock_qty_rounding_to_zero(self):
++		"""A rejected qty that rounds to 0 in the stock UOM posts no rejected stock, and can be returned."""
++		from erpnext.controllers.sales_and_purchase_return import make_return_doc
++
++		for tag, properties in (
++			("Plain", {}),
++			("Batch", {"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BT-BIRZ-.####"}),
++		):
++			with self.subTest(tag):
++				item_doc = make_item(
++					f"_Test {tag} Item For Zero Rejected Stock Qty",
++					{"stock_uom": "Kg", "uoms": [{"uom": "Gram", "conversion_factor": 0.001}], **properties},
++				)
++				pr, warehouses, *_ = self.make_transfer_receipt(
++					f"Zero Rejected {tag}", item_doc, 999, 1, uom="Gram", conversion_factor=0.001
++				)
++				pr.submit()
++
++				self.assertFalse(pr.items[0].rejected_serial_and_batch_bundle)
++				self.assertFalse(
++					frappe.db.exists(
++						"Stock Ledger Entry", {"voucher_no": pr.name, "warehouse": warehouses.rejected}
++					)
++				)
++
++				make_return_doc("Purchase Receipt", pr.name).submit()
++
+ 	def test_removing_the_rejection_moves_the_package_back(self):
+ 		"""A row that no longer rejects anything carries the package of the in-transit warehouse
+ 		again, which is the entry it belongs to."""

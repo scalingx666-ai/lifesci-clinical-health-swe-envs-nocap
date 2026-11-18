@@ -1,0 +1,881 @@
+diff --git a/backend/AGENTS.md b/backend/AGENTS.md
+index 485e6ddfc1..a44027384e 100644
+--- a/backend/AGENTS.md
++++ b/backend/AGENTS.md
+@@ -215,6 +215,7 @@ log_structured(
+ 
+ - Pass the message as a stable, human-readable string and put the variable parts in `**attributes` (don't f-string them into the message).
+ - `trace_id` is injected automatically from context when not supplied.
++- Output format follows `LOG_FORMAT` (`legacy` default, `json`, `text`) and `LOG_LEVEL` (see `app/utils/logging_setup.py`). Keep attribute values JSON-serializable: an unserializable value raises `TypeError` at the call site in every mode, also when `LOG_LEVEL` filters the call out.
+ - For handled exceptions in background tasks you still want in Sentry, use `log_and_capture_error` (see above) rather than plain `logger.error`. Keep its `message` stable there too and pass variables via `extra` - note that `extra` becomes Sentry event context, not queryable log attributes.
+ 
+ ### Provider Strategy Pattern
+diff --git a/backend/app/config.py b/backend/app/config.py
+index 53bcfb5f2e..7c110e7e63 100644
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -20,6 +20,8 @@
+     EncryptedField,
+     EnvironmentType,
+     FernetDecryptorField,
++    LogFormat,
++    LogLevel,
+     parse_duration,
+ )
+ 
+@@ -53,6 +55,13 @@ class Settings(BaseSettings):
+     log_error_response_body_max_bytes: int = 8192  # truncate a logged body
+     log_error_response_body_max_per_minute: int = 60  # cap logged bodies/min
+ 
++    # LOGGING SETTINGS
++    # legacy: JSON from log_structured, plain text from stdlib loggers (the output before
++    # LOG_FORMAT existed). json: every line JSON. text: every line human-readable.
++    log_format: LogFormat = LogFormat.LEGACY
++    # None keeps the per-logger defaults (stdlib INFO, log_structured unfiltered).
++    log_level: LogLevel | None = None
++
+     # DATABASE SETTINGS
+     db_host: str = "db"
+     db_port: int = 5432
+@@ -391,6 +400,33 @@ def assemble_cors_origins(cls, v: str | list[str]) -> list[str] | str:
+         # This should never be reached given the type annotation, but ensures type safety
+         raise ValueError(f"Unexpected type for cors_origins: {type(v)}")
+ 
++    @field_validator("log_format", mode="before")
++    @classmethod
++    def _parse_log_format(cls, v: Any) -> Any:
++        if isinstance(v, str):
++            return v.strip().lower() or LogFormat.LEGACY
++        return v
++
++    @field_validator("log_level", mode="before")
++    @classmethod
++    def _parse_log_level(cls, v: Any) -> Any:
++        if not isinstance(v, str):
++            return v
++        name = v.strip().upper()
++        # Aliases the logging module accepts, common in shared LOG_LEVEL variables.
++        name = {"WARN": "WARNING", "FATAL": "CRITICAL"}.get(name, name)
++        if not name:
++            return None
++        if name not in LogLevel.__members__:
++            # LOG_LEVEL is a common variable name; a value meant for another tool (TRACE,
++            # NOTSET, ...) must not stop the backend from starting.
++            warnings.warn(
++                f"Ignoring LOG_LEVEL={v!r}: expected DEBUG, INFO, WARNING, ERROR or CRITICAL",
++                stacklevel=2,
++            )
++            return None
++        return name
++
+     @field_validator("pull_sync_lookback", mode="before")
+     @classmethod
+     def _parse_pull_sync_lookback(cls, v: Any) -> timedelta | None:
+diff --git a/backend/app/integrations/celery/core.py b/backend/app/integrations/celery/core.py
+index 243f9d2757..fb566f7cab 100644
+--- a/backend/app/integrations/celery/core.py
++++ b/backend/app/integrations/celery/core.py
+@@ -10,6 +10,8 @@
+ 
+ from app.config import settings
+ from app.services import raw_payload_storage
++from app.utils.config_utils import LogFormat
++from app.utils.logging_setup import configure_logging
+ 
+ _WEBHOOK_TASK = "emit_webhook_event_task.emit_webhook_event"
+ 
+@@ -35,33 +37,38 @@ def setup_celery_logging(**kwargs) -> None:
+     Some platforms convert stderr logs to level.error automatically, so we must use stdout
+     to ensure platforms correctly identify log levels from JSON structured logs.
+ 
+-    This signal is called when Celery sets up its logging configuration.
++    This signal is called when Celery sets up its logging configuration. With
++    LOG_FORMAT=json or text the Celery logger has no handler of its own and its records
++    go through the root handler instead, so every line shares one format.
+     """
+     # Get Celery's logger
+     celery_logger = getLogger("celery")
+ 
+     # Remove existing handlers that might use stderr
+     celery_logger.handlers.clear()
++    celery_logger.setLevel(logging.INFO)
+ 
+-    # Create a handler that uses stdout
+-    stdout_handler = StreamHandler(sys.stdout)
+-    stdout_handler.setFormatter(
+-        Formatter(
+-            "[%(asctime)s - %(name)s] (%(levelname)s) %(message)s",
+-            datefmt="%Y-%m-%d %H:%M:%S",
++    if settings.log_format is LogFormat.LEGACY:
++        # Create a handler that uses stdout
++        stdout_handler = StreamHandler(sys.stdout)
++        stdout_handler.setFormatter(
++            Formatter(
++                "[%(asctime)s - %(name)s] (%(levelname)s) %(message)s",
++                datefmt="%Y-%m-%d %H:%M:%S",
++            )
+         )
+-    )
+-
+-    # Add stdout handler to Celery logger
+-    celery_logger.addHandler(stdout_handler)
+-    celery_logger.setLevel(logging.INFO)
+-    celery_logger.propagate = False
++        celery_logger.addHandler(stdout_handler)
++        celery_logger.propagate = False
++    else:
++        celery_logger.propagate = True
+ 
+     # celery.app.trace logs "Task ... succeeded in Xs: {result}" at INFO for
+     # every task execution.  Suppress those lines only for the high-frequency
+     # webhook emit task to avoid log spam while keeping traces for all others.
+     getLogger("celery.app.trace").addFilter(_WebhookTraceFilter())
+ 
++    configure_logging()
++
+ 
+ @signals.worker_ready.connect
+ def enqueue_startup_telemetry_ping(sender: Any, **kwargs) -> None:
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 4427f99901..f6de198591 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -24,6 +24,7 @@
+ from app.services.endpoint_usage import endpoint_usage
+ from app.services.outgoing_webhooks import svix as svix_service
+ from app.utils.exceptions import DatetimeParseError, handle_exception
++from app.utils.logging_setup import configure_logging
+ 
+ # Configure logging to use stdout instead of stderr
+ # Some platforms convert stderr logs to level.error automatically, so we must use stdout
+@@ -46,6 +47,8 @@
+ for _name in ("httpx", "httpcore"):
+     logging.getLogger(_name).setLevel(logging.WARNING)
+ 
++configure_logging()
++
+ 
+ @asynccontextmanager
+ async def _lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
+@@ -53,6 +56,8 @@ async def _lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
+     # dictConfig that re-creates the logger and undoes an import-time disable. Lifespan
+     # runs after it, so add_access_log_middleware stays the single access-log source.
+     logging.getLogger("uvicorn.access").disabled = True
++    # The same dictConfig resets the uvicorn loggers, so apply LOG_FORMAT/LOG_LEVEL again.
++    configure_logging()
+     svix_service.register_event_types()
+     yield
+     # Hand the last partial interval of telemetry counters to Redis before exiting.
+diff --git a/backend/app/utils/config_utils.py b/backend/app/utils/config_utils.py
+index aaa361796b..d725cba21e 100644
+--- a/backend/app/utils/config_utils.py
++++ b/backend/app/utils/config_utils.py
+@@ -52,6 +52,20 @@ class AccessLogLevel(str, Enum):
+     OFF = "off"  # log nothing
+ 
+ 
++class LogFormat(str, Enum):
++    LEGACY = "legacy"
++    JSON = "json"
++    TEXT = "text"
++
++
++class LogLevel(str, Enum):
++    DEBUG = "DEBUG"
++    INFO = "INFO"
++    WARNING = "WARNING"
++    ERROR = "ERROR"
++    CRITICAL = "CRITICAL"
++
++
+ class Decryptor(Protocol):
+     def decrypt(self, value: bytes) -> bytes: ...
+ 
+diff --git a/backend/app/utils/logging_setup.py b/backend/app/utils/logging_setup.py
+new file mode 100644
+index 0000000000..7ee73b2fa2
+--- /dev/null
++++ b/backend/app/utils/logging_setup.py
+@@ -0,0 +1,118 @@
++"""Process-wide log output selected by LOG_FORMAT and LOG_LEVEL.
++
++``legacy`` (the default) leaves the output exactly as it was before these settings
++existed: ``log_structured`` prints JSON lines, stdlib loggers print plain text through
++the handlers set up in ``app.main`` and the Celery ``setup_logging`` signal. ``json`` and
++``text`` route every stdlib record through one stdout handler with a matching formatter;
++``log_structured`` renders its own lines (see ``app.utils.structured_logging``).
++"""
++
++import json
++import logging
++import sys
++from datetime import datetime, timezone
++from typing import Any
++
++from app.config import settings
++from app.utils.config_utils import LogFormat
++
++# Loggers that come with their own level from uvicorn's or Celery's logging setup, so the
++# root level alone would not apply LOG_LEVEL to them.
++_FRAMEWORK_LOGGERS = ("uvicorn", "uvicorn.error", "celery")
++
++
++def level_number(level: str) -> int:
++    """Map a ``log_structured`` level string to a logging level. Unknown strings count as INFO."""
++    return logging.getLevelNamesMapping().get(level.upper(), logging.INFO)
++
++
++def min_log_level() -> int | None:
++    """The LOG_LEVEL threshold, or None when LOG_LEVEL is not set."""
++    if settings.log_level is None:
++        return None
++    return logging.getLevelNamesMapping()[settings.log_level.value]
++
++
++def _text_value(value: Any) -> str:
++    if isinstance(value, (dict, list, tuple)):
++        # Already JSON, so only quote it when it contains whitespace.
++        text = json.dumps(value, default=str, separators=(",", ":"))
++        return json.dumps(text) if any(char.isspace() for char in text) else text
++    text = value if isinstance(value, str) else str(value)
++    if not text or any(char in text for char in ' ="\n'):
++        return json.dumps(text)
++    return text
++
++
++def format_text_line(created: float, level: str, logger_name: str, message: str, fields: dict[str, Any]) -> str:
++    """One human-readable line: local time, level, logger, message, then ``key=value`` pairs.
++
++    Fields with a None value are left out.
++    """
++    timestamp = datetime.fromtimestamp(created).strftime("%H:%M:%S.%f")[:-3]
++    line = f"{timestamp} {level.upper():<8} {logger_name}  {message}"
++    pairs = " ".join(f"{key}={_text_value(value)}" for key, value in fields.items() if value is not None)
++    return f"{line}  {pairs}" if pairs else line
++
++
++class TextFormatter(logging.Formatter):
++    def format(self, record: logging.LogRecord) -> str:
++        line = format_text_line(record.created, record.levelname, record.name, record.getMessage(), {})
++        if record.exc_info:
++            line = f"{line}\n{self.formatException(record.exc_info)}"
++        if record.stack_info:
++            line = f"{line}\n{self.formatStack(record.stack_info)}"
++        return line
++
++
++class JsonFormatter(logging.Formatter):
++    def format(self, record: logging.LogRecord) -> str:
++        entry: dict[str, Any] = {
++            "timestamp": datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
++            "level": record.levelname.lower(),
++            "message": record.getMessage(),
++            "logger": record.name,
++        }
++        if record.exc_info:
++            entry["exception"] = self.formatException(record.exc_info)
++        if record.stack_info:
++            entry["stack"] = self.formatStack(record.stack_info)
++        return json.dumps(entry, default=repr)
++
++
++_FORMATTERS: dict[LogFormat, type[logging.Formatter]] = {
++    LogFormat.JSON: JsonFormatter,
++    LogFormat.TEXT: TextFormatter,
++}
++
++
++def configure_logging() -> None:
++    """Apply LOG_FORMAT and LOG_LEVEL to the root, uvicorn and Celery loggers.
++
++    Safe to call repeatedly. uvicorn re-applies its own logging config after the app
++    module is imported (``fastapi run``), so the app lifespan calls this again, and so
++    does the Celery ``setup_logging`` signal after it set up the ``celery`` logger.
++    """
++    root = logging.getLogger()
++    level = min_log_level()
++
++    if settings.log_format is not LogFormat.LEGACY:
++        handler = logging.StreamHandler(sys.stdout)
++        handler.setFormatter(_FORMATTERS[settings.log_format]())
++        for existing in root.handlers[:]:
++            root.removeHandler(existing)
++        root.addHandler(handler)
++        root.setLevel(logging.INFO if level is None else level)
++        for name in ("uvicorn", "uvicorn.error"):
++            uvicorn_logger = logging.getLogger(name)
++            uvicorn_logger.handlers.clear()
++            uvicorn_logger.propagate = True
++
++    if level is not None:
++        for name in ("", *_FRAMEWORK_LOGGERS):
++            target = logging.getLogger(name)
++            target.setLevel(level)
++            # Records from loggers with a level of their own (httpx, httpcore) reach the
++            # handlers without passing these loggers' level, so filter at the handlers too.
++            for handler in target.handlers:
++                handler.setLevel(level)
+diff --git a/backend/app/utils/structured_logging.py b/backend/app/utils/structured_logging.py
+index 9fa681dcd9..7f59cddbfb 100644
+--- a/backend/app/utils/structured_logging.py
++++ b/backend/app/utils/structured_logging.py
+@@ -2,12 +2,16 @@
+ 
+ import json
+ import sys
++import time
+ from datetime import datetime, timezone
+ from logging import Logger
+ from typing import Any, NamedTuple
+ from uuid import UUID
+ 
++from app.config import settings
++from app.utils.config_utils import LogFormat
+ from app.utils.context import trace_id_var
++from app.utils.logging_setup import format_text_line, level_number, min_log_level
+ 
+ 
+ class LogContext(NamedTuple):
+@@ -39,6 +43,10 @@ def log_structured(
+     """
+     Emit structured JSON log compatible with various logging platforms.
+ 
++    With ``LOG_FORMAT=legacy`` (default) or ``json`` this prints one JSON line to stdout;
++    with ``LOG_FORMAT=text`` it prints a human-readable line instead. ``LOG_LEVEL``, when
++    set, drops calls below that level.
++
+     This function emits logs in JSON format on a single line, making them compatible
+     with platforms that support structured logging, including (but not limited to):
+     - Railway
+@@ -50,7 +58,7 @@ def log_structured(
+ 
+ 
+     Args:
+-        logger: Logger instance (used for compatibility, but output goes directly to stdout)
++        logger: Logger whose name appears in text output; output goes directly to stdout
+         level: Log level (debug, info, warning, error)
+         message: Log message (required)
+         provider: Provider name (optional)
+@@ -90,15 +98,22 @@ def log_structured(
+     # Emit as single-line JSON directly to stdout
+     # This bypasses logger formatters (like Celery's) that add prefixes
+     # Platforms will parse this JSON string correctly
++    # Serialized in every mode and before filtering, so an unserializable value raises the
++    # same TypeError whatever LOG_FORMAT and LOG_LEVEL are set to.
+     json_str = json.dumps(log_entry, default=json_serial)
+ 
++    threshold = min_log_level()
++    if threshold is not None and level_number(level) < threshold:
++        return
++
++    if settings.log_format is LogFormat.TEXT:
++        line = format_text_line(time.time(), level, logger.name, message, {"provider": provider, **attributes})
++        print(line, file=sys.stdout, flush=True)
++        return
++
+     # Always use stdout to avoid Railway's automatic level conversion
+     # Platforms can convert stderr logs to level.error automatically, which creates
+     # "attributes":{"level":"error"} that overrides our JSON level field.
+     # By using stdout, platforms sets level.info by default, but our JSON level
+     # field in the structured log should take precedence.
+-    #
+-    # IMPORTANT: Celery workers and other services must redirect stderr to stdout
+-    # in their startup scripts (using `exec 2>&1`) to prevent platforms from
+-    # converting all logs to level.error. See scripts/start/*.sh for examples.
+     print(json_str, file=sys.stdout, flush=True)
+diff --git a/backend/config/.env.example b/backend/config/.env.example
+index 7b3b86b9f9..b310d05a22 100644
+--- a/backend/config/.env.example
++++ b/backend/config/.env.example
+@@ -11,6 +11,8 @@ CORS_ORIGINS=["http://localhost:3000"]
+ # LOG_ERROR_RESPONSE_BODY=false  # include the 4xx response body the client saw in the access log
+ # LOG_ERROR_RESPONSE_BODY_MAX_BYTES=8192  # truncate a logged body to this size
+ # LOG_ERROR_RESPONSE_BODY_MAX_PER_MINUTE=60  # cap logged bodies/min so a client hammering 4xx can't flood logs
++# LOG_FORMAT=legacy  # legacy (default) | json (one JSON object per log line, for log collectors) | text (readable, for development)
++# LOG_LEVEL=INFO  # DEBUG | INFO | WARNING | ERROR | CRITICAL. Unset: stdlib logs from INFO, log_structured unfiltered
+ 
+ # EMAIL SETTINGS - set either SMTP_HOST (any SMTP provider) or RESEND_API_KEY.
+ # SMTP is used when SMTP_HOST is set.
+diff --git a/backend/tests/__init__.py b/backend/tests/__init__.py
+index f73e12cd89..fb63ba4062 100644
+--- a/backend/tests/__init__.py
++++ b/backend/tests/__init__.py
+@@ -1 +1,7 @@
+ # Tests package for Open Wearables backend
++import os
++
++# Runs before conftest imports the app, so a developer's config/.env cannot change the
++# log output the tests parse (environment variables take precedence over the .env file).
++os.environ["LOG_FORMAT"] = "legacy"
++os.environ["LOG_LEVEL"] = ""
+diff --git a/backend/tests/utils_tests/test_logging_setup.py b/backend/tests/utils_tests/test_logging_setup.py
+new file mode 100644
+index 0000000000..44f11aab6e
+--- /dev/null
++++ b/backend/tests/utils_tests/test_logging_setup.py
+@@ -0,0 +1,405 @@
++"""Tests for LOG_FORMAT / LOG_LEVEL and their effect on log_structured and stdlib logging.
++
++The default (LOG_FORMAT=legacy, LOG_LEVEL unset) must keep the output exactly as it was
++before these settings existed; the expected lines below were recorded from that code.
++"""
++
++import json
++import logging
++import os
++import re
++import subprocess
++import sys
++from collections.abc import Iterator
++from datetime import datetime
++from pathlib import Path
++from unittest.mock import patch
++from uuid import UUID
++
++import pytest
++import uvicorn
++from fastapi.testclient import TestClient
++from freezegun import freeze_time
++from pydantic import ValidationError
++
++from app.config import Settings, settings
++from app.integrations.celery.core import setup_celery_logging
++from app.main import api
++from app.utils.config_utils import LogFormat, LogLevel
++from app.utils.context import trace_id_var
++from app.utils.logging_setup import JsonFormatter, TextFormatter, configure_logging
++from app.utils.structured_logging import log_structured
++
++FROZEN_AT = "2026-01-02T03:04:05.123456+00:00"
++BACKEND_DIR = Path(__file__).resolve().parents[2]
++LEGACY_FORMAT = "[%(asctime)s - %(name)s] (%(levelname)s) %(message)s"
++
++logger = logging.getLogger("app.test_logging")
++
++
++@pytest.fixture(autouse=True)
++def _no_trace_id() -> Iterator[None]:
++    """Other tests can leave a trace id in the context; these assert exact output."""
++    token = trace_id_var.set(None)
++    yield
++    trace_id_var.reset(token)
++
++
++@pytest.fixture
++def restore_logging() -> Iterator[None]:
++    """Snapshot and restore the logger and handler state that configure_logging and Celery change."""
++    names = ["", "uvicorn", "uvicorn.error", "uvicorn.access", "celery", "httpx"]
++    saved = {}
++    for name in names:
++        target = logging.getLogger(name)
++        handlers = [(handler, handler.level) for handler in target.handlers]
++        saved[name] = (handlers, target.level, target.propagate, target.disabled)
++    trace_logger = logging.getLogger("celery.app.trace")
++    saved_filters = trace_logger.filters[:]
++    yield
++    for name, (handlers, level, propagate, disabled) in saved.items():
++        target = logging.getLogger(name)
++        target.handlers[:] = [handler for handler, _ in handlers]
++        for handler, handler_level in handlers:
++            handler.setLevel(handler_level)
++        target.setLevel(level)
++        target.propagate = propagate
++        target.disabled = disabled
++    trace_logger.filters[:] = saved_filters
++
++
++def _record(message: str, *args: object, exc: BaseException | None = None) -> logging.LogRecord:
++    exc_info = (type(exc), exc, exc.__traceback__) if exc else None
++    return logging.LogRecord("app.test_logging", logging.ERROR, __file__, 1, message, args, exc_info)
++
++
++class TestLegacyOutputUnchanged:
++    """With the defaults, log_structured prints exactly what it printed before."""
++
++    @freeze_time(FROZEN_AT)
++    @pytest.mark.parametrize(
++        ("level", "message", "attributes", "expected"),
++        [
++            (
++                "info",
++                "Sync done",
++                {"provider": "garmin", "user_id": "u1"},
++                '{"timestamp": "2026-01-02T03:04:05.123456+00:00", "level": "info", "message": "Sync done", '
++                '"provider": "garmin", "user_id": "u1"}',
++            ),
++            (
++                "debug",
++                "Debug lines are not filtered",
++                {},
++                '{"timestamp": "2026-01-02T03:04:05.123456+00:00", "level": "debug", '
++                '"message": "Debug lines are not filtered", "provider": null}',
++            ),
++            (
++                "WARN",
++                "Level strings are lowercased, aliases kept",
++                {},
++                '{"timestamp": "2026-01-02T03:04:05.123456+00:00", "level": "warn", '
++                '"message": "Level strings are lowercased, aliases kept", "provider": null}',
++            ),
++            (
++                "bogus",
++                "Unknown levels pass through",
++                {},
++                '{"timestamp": "2026-01-02T03:04:05.123456+00:00", "level": "bogus", '
++                '"message": "Unknown levels pass through", "provider": null}',
++            ),
++            (
++                "info",
++                "msg %s literal",
++                {"filename": "f.fit", "created": "c", "name": "n", "args": "a", "module": "m"},
++                '{"timestamp": "2026-01-02T03:04:05.123456+00:00", "level": "info", "message": "msg %s literal", '
++                '"provider": null, "filename": "f.fit", "created": "c", "name": "n", "args": "a", "module": "m"}',
++            ),
++            (
++                "info",
++                "uuid and nested values",
++                {"id": UUID(int=1), "nested": {"a": [1, 2]}},
++                '{"timestamp": "2026-01-02T03:04:05.123456+00:00", "level": "info", '
++                '"message": "uuid and nested values", "provider": null, '
++                '"id": "00000000-0000-0000-0000-000000000001", "nested": {"a": [1, 2]}}',
++            ),
++            (
++                "info",
++                "explicit none",
++                {"trace_id": None},
++                '{"timestamp": "2026-01-02T03:04:05.123456+00:00", "level": "info", "message": "explicit none", '
++                '"provider": null, "trace_id": null}',
++            ),
++        ],
++    )
++    def test_line_matches_recorded_output(
++        self,
++        capsys: pytest.CaptureFixture[str],
++        level: str,
++        message: str,
++        attributes: dict,
++        expected: str,
++    ) -> None:
++        log_structured(logger, level, message, **attributes)
++
++        assert capsys.readouterr().out == expected + "\n"
++
++    @freeze_time(FROZEN_AT)
++    def test_trace_id_from_context_keeps_the_caller_key_order(self, capsys: pytest.CaptureFixture[str]) -> None:
++        token = trace_id_var.set("abcd1234")
++        try:
++            log_structured(logger, "info", "ctx trace", trace_id=None, after="x")
++            log_structured(logger, "info", "explicit trace", trace_id="zz")
++        finally:
++            trace_id_var.reset(token)
++
++        assert capsys.readouterr().out.splitlines() == [
++            '{"timestamp": "2026-01-02T03:04:05.123456+00:00", "level": "info", "message": "ctx trace", '
++            '"provider": null, "trace_id": "abcd1234", "after": "x"}',
++            '{"timestamp": "2026-01-02T03:04:05.123456+00:00", "level": "info", "message": "explicit trace", '
++            '"provider": null, "trace_id": "zz"}',
++        ]
++
++    def test_output_does_not_go_through_logging_handlers(self, caplog: pytest.LogCaptureFixture) -> None:
++        with caplog.at_level(logging.DEBUG):
++            log_structured(logger, "error", "not a log record")
++
++        assert caplog.records == []
++
++    def test_app_import_keeps_the_previous_stdlib_setup(self) -> None:
++        """Importing app.main in a fresh process prints stdlib and structured lines as before."""
++        code = (
++            "import logging\n"
++            "import app.main\n"
++            "from app.utils.structured_logging import log_structured\n"
++            "log = logging.getLogger('app.check')\n"
++            "log.info('stdlib %s', 'line')\n"
++            "log.debug('hidden')\n"
++            "log_structured(log, 'debug', 'structured line')\n"
++        )
++        # Explicit values so a developer's config/.env cannot change the outcome.
++        env = os.environ | {"LOG_FORMAT": "legacy", "LOG_LEVEL": "", "TELEMETRY_ENABLED": "false"}
++        result = subprocess.run(
++            [sys.executable, "-c", code], cwd=BACKEND_DIR, env=env, capture_output=True, text=True, timeout=120
++        )
++
++        assert result.returncode == 0, result.stderr
++        lines = [line for line in result.stdout.splitlines() if "app.check" in line or "structured line" in line]
++        assert len(lines) == 2, result.stdout
++        assert re.fullmatch(r"\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} - app\.check\] \(INFO\) stdlib line", lines[0])
++        assert re.fullmatch(
++            r'\{"timestamp": "[^"]+", "level": "debug", "message": "structured line", "provider": null\}', lines[1]
++        )
++        assert "hidden" not in result.stdout
++
++    def test_legacy_without_level_changes_nothing(self, restore_logging: None) -> None:
++        root = logging.getLogger()
++        handlers, level = root.handlers[:], root.level
++
++        configure_logging()
++
++        assert root.handlers == handlers
++        assert root.level == level
++
++
++class TestUnserializableValues:
++    """An unserializable attribute raises in the caller in every mode, so text mode in
++    development does not hide a crash that legacy or json mode would hit in production."""
++
++    @pytest.mark.parametrize("log_format", [LogFormat.LEGACY, LogFormat.JSON, LogFormat.TEXT])
++    def test_raises_in_every_format(self, log_format: LogFormat) -> None:
++        with patch.object(settings, "log_format", log_format), pytest.raises(TypeError, match="not JSON serializable"):
++            log_structured(logger, "info", "bad", value=datetime(2026, 1, 1))
++
++    def test_raises_even_when_the_level_is_filtered_out(self) -> None:
++        with patch.object(settings, "log_level", LogLevel.ERROR), pytest.raises(TypeError):
++            log_structured(logger, "debug", "bad", value=object())
++
++
++class TestLogLevel:
++    @pytest.mark.parametrize(
++        ("level", "printed"),
++        [("debug", False), ("info", False), ("bogus", False), ("warning", True), ("warn", True), ("error", True)],
++    )
++    def test_log_structured_respects_log_level(
++        self, capsys: pytest.CaptureFixture[str], level: str, printed: bool
++    ) -> None:
++        with patch.object(settings, "log_level", LogLevel.WARNING):
++            log_structured(logger, level, "gated")
++
++        assert bool(capsys.readouterr().out) is printed
++
++    def test_applied_to_root_and_framework_loggers(self, restore_logging: None) -> None:
++        with patch.object(settings, "log_level", LogLevel.WARNING):
++            configure_logging()
++
++        for name in ("", "uvicorn", "uvicorn.error", "celery"):
++            assert logging.getLogger(name).level == logging.WARNING
++
++    @pytest.mark.parametrize("log_format", [LogFormat.LEGACY, LogFormat.JSON])
++    def test_applies_to_loggers_with_their_own_level(
++        self, restore_logging: None, capsys: pytest.CaptureFixture[str], log_format: LogFormat
++    ) -> None:
++        """httpx keeps WARNING from app.main; LOG_LEVEL=ERROR still hides its warnings."""
++        root = logging.getLogger()
++        root.handlers[:] = [logging.StreamHandler(sys.stdout)]
++        with patch.object(settings, "log_format", log_format), patch.object(settings, "log_level", LogLevel.ERROR):
++            configure_logging()
++            logging.getLogger("httpx").warning("httpx warning")
++            logging.getLogger("app.test_logging").error("app error")
++
++        out = capsys.readouterr().out
++        assert "httpx warning" not in out
++        assert "app error" in out
++
++
++class TestSettings:
++    @pytest.mark.parametrize(
++        ("raw", "expected"), [("warning", LogLevel.WARNING), (" Debug ", LogLevel.DEBUG), ("", None)]
++    )
++    def test_log_level_is_normalized(self, raw: str, expected: LogLevel | None) -> None:
++        assert Settings(log_level=raw).log_level == expected
++
++    @pytest.mark.parametrize(("raw", "expected"), [("warn", LogLevel.WARNING), ("FATAL", LogLevel.CRITICAL)])
++    def test_logging_aliases_are_accepted(self, raw: str, expected: LogLevel) -> None:
++        assert Settings(log_level=raw).log_level == expected
++
++    @pytest.mark.parametrize("raw", ["verbose", "NOTSET", "trace"])
++    def test_unknown_log_level_is_ignored_with_a_warning(self, raw: str) -> None:
++        with pytest.warns(UserWarning, match="Ignoring LOG_LEVEL"):
++            assert Settings(log_level=raw).log_level is None
++
++    @pytest.mark.parametrize(
++        ("raw", "expected"), [("JSON", LogFormat.JSON), (" text ", LogFormat.TEXT), ("", LogFormat.LEGACY)]
++    )
++    def test_log_format_is_normalized(self, raw: str, expected: LogFormat) -> None:
++        assert Settings(log_format=raw).log_format is expected
++
++    def test_invalid_log_format_is_rejected(self) -> None:
++        with pytest.raises(ValidationError):
++            Settings(log_format="xml")
++
++    def test_defaults_keep_legacy_behaviour(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        monkeypatch.delenv("LOG_FORMAT", raising=False)
++        monkeypatch.delenv("LOG_LEVEL", raising=False)
++
++        defaults = Settings(_env_file=None)  # ty: ignore[unknown-argument]
++
++        assert defaults.log_format is LogFormat.LEGACY
++        assert defaults.log_level is None
++
++
++class TestTextFormat:
++    def test_log_structured_prints_a_readable_line(self, capsys: pytest.CaptureFixture[str]) -> None:
++        with patch.object(settings, "log_format", LogFormat.TEXT):
++            log_structured(
++                logger,
++                "warning",
++                "Sync failed",
++                provider="garmin",
++                user_id="u1",
++                error="timed out after 30s",
++                details={"retry": 2},
++                trace_id=None,
++            )
++
++        line = capsys.readouterr().out.rstrip("\n")
++        assert re.fullmatch(
++            r"\d\d:\d\d:\d\d\.\d{3} WARNING  app\.test_logging  Sync failed  "
++            r'provider=garmin user_id=u1 error="timed out after 30s" details=\{"retry":2\}',
++            line,
++        ), line
++
++    def test_stdlib_formatter(self) -> None:
++        try:
++            raise ValueError("boom")
++        except ValueError as error:
++            line = TextFormatter().format(_record("failed %s", "x", exc=error))
++
++        first, *rest = line.splitlines()
++        assert re.fullmatch(r"\d\d:\d\d:\d\d\.\d{3} ERROR    app\.test_logging  failed x", first)
++        assert rest[-1] == "ValueError: boom"
++
++
++class TestJsonFormat:
++    @freeze_time(FROZEN_AT)
++    def test_log_structured_output_matches_legacy(self, capsys: pytest.CaptureFixture[str]) -> None:
++        with patch.object(settings, "log_format", LogFormat.JSON):
++            log_structured(logger, "info", "Sync done", provider="garmin", user_id="u1")
++
++        assert capsys.readouterr().out == (
++            '{"timestamp": "2026-01-02T03:04:05.123456+00:00", "level": "info", "message": "Sync done", '
++            '"provider": "garmin", "user_id": "u1"}\n'
++        )
++
++    def test_stdlib_formatter(self) -> None:
++        try:
++            raise ValueError("boom")
++        except ValueError as error:
++            entry = json.loads(JsonFormatter().format(_record("failed %s", "x", exc=error)))
++
++        assert entry["level"] == "error"
++        assert entry["message"] == "failed x"
++        assert entry["logger"] == "app.test_logging"
++        assert entry["exception"].endswith("ValueError: boom")
++        assert entry["timestamp"].endswith("+00:00")
++
++
++class TestConfigureLogging:
++    @pytest.mark.parametrize("log_format", [LogFormat.JSON, LogFormat.TEXT])
++    def test_routes_everything_through_one_stdout_handler(self, restore_logging: None, log_format: LogFormat) -> None:
++        uvicorn_logger = logging.getLogger("uvicorn")
++        uvicorn_logger.addHandler(logging.StreamHandler(sys.stderr))
++        uvicorn_logger.propagate = False
++
++        with patch.object(settings, "log_format", log_format):
++            configure_logging()
++            configure_logging()
++
++        root = logging.getLogger()
++        assert len(root.handlers) == 1
++        assert root.handlers[0].stream is sys.stdout  # ty: ignore[unresolved-attribute]
++        expected = JsonFormatter if log_format is LogFormat.JSON else TextFormatter
++        assert isinstance(root.handlers[0].formatter, expected)
++        assert root.level == logging.INFO
++        for name in ("uvicorn", "uvicorn.error"):
++            assert logging.getLogger(name).handlers == []
++            assert logging.getLogger(name).propagate is True
++
++    def test_lifespan_reapplies_the_format_after_uvicorn_configures_logging(self, restore_logging: None) -> None:
++        """`fastapi run` imports the app, then uvicorn applies its own logging config."""
++        with patch.object(settings, "log_format", LogFormat.JSON):
++            configure_logging()
++            uvicorn.Config(api).configure_logging()
++            assert logging.getLogger("uvicorn").handlers != []
++
++            with TestClient(api):
++                pass
++
++        for name in ("uvicorn", "uvicorn.error"):
++            assert logging.getLogger(name).handlers == []
++            assert logging.getLogger(name).propagate is True
++        assert isinstance(logging.getLogger().handlers[0].formatter, JsonFormatter)
++
++
++class TestCeleryLogging:
++    def test_legacy_keeps_the_celery_handler(self, restore_logging: None) -> None:
++        setup_celery_logging()
++
++        celery_logger = logging.getLogger("celery")
++        assert celery_logger.propagate is False
++        assert len(celery_logger.handlers) == 1
++        formatter = celery_logger.handlers[0].formatter
++        assert formatter is not None
++        assert formatter._fmt == LEGACY_FORMAT
++        assert formatter.datefmt == "%Y-%m-%d %H:%M:%S"
++        assert celery_logger.level == logging.INFO
++
++    @pytest.mark.parametrize("log_format", [LogFormat.JSON, LogFormat.TEXT])
++    def test_other_formats_propagate_to_the_root_handler(self, restore_logging: None, log_format: LogFormat) -> None:
++        with patch.object(settings, "log_format", log_format):
++            setup_celery_logging()
++
++        celery_logger = logging.getLogger("celery")
++        assert celery_logger.handlers == []
++        assert celery_logger.propagate is True
+diff --git a/docs/deployment/docker.mdx b/docs/deployment/docker.mdx
+index 58d7edf5c0..f00d74ba3a 100644
+--- a/docs/deployment/docker.mdx
++++ b/docs/deployment/docker.mdx
+@@ -158,6 +158,7 @@ The defaults in `.env.example` are development values. Override at least these f
+ | `FRONTEND_URL` | public URL of the frontend |
+ | `API_BASE_URL` | public URL of the API, used for provider OAuth redirect URIs |
+ | `VITE_API_URL` | URL of the API as reached from the browser |
++| `LOG_FORMAT` | `json` if a log collector reads the container output (see [Logs](#logs)) |
+ 
+ `VITE_API_URL` is a frontend variable and is not part of `.env.example`—add it to the same `.env`. For a local trial of this stack, set it to `http://localhost:8000`; in production it is typically the same value as `API_BASE_URL`.
+ 
+@@ -193,6 +194,34 @@ In practice you will put the API and frontend behind a reverse proxy with TLS in
+ 
+ To add Flower, run another backend container with `command: scripts/start/flower.sh` and publish port `5555`. To enable outgoing webhooks, add a `svix-server` service and a `svix` database; the development `docker-compose.yml` shows the wiring.
+ 
++## Logs
++
++The backend writes its application logs to stdout (in `legacy`, uvicorn's own lines go to stderr, as before). `LOG_FORMAT` selects their format:
++
++| Value | Output |
++|-------|--------|
++| `legacy` (default) | Structured app logs as JSON lines, framework and library logs as plain text (`[time - logger] (LEVEL) message`) |
++| `json` | Every line is one JSON object, for log collectors such as Loki, Datadog, CloudWatch or Azure Monitor |
++| `text` | Readable lines, for local development |
++
++Structured app log lines keep the same fields in `legacy` and `json`: `timestamp`, `level`, `message`, `provider`, then the attributes of the event (`user_id`, `action`, ...). Other lines in `json` carry `timestamp`, `level`, `message`, `logger` and, for errors, `exception`.
++
++`LOG_LEVEL` (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`, case-insensitive) drops log lines below that level, structured app logs included. It cannot lower the level of libraries that are kept quieter on purpose (`httpx` and `httpcore` stay at `WARNING`). When it is not set, other logs start at `INFO` and structured app logs are not filtered.
++
++`LOG_LEVEL` also changes what Sentry sees from standard-library log records (`logger.error(...)` and similar) of app, Celery and uvicorn code: with `CRITICAL`, their errors no longer create Sentry events, and above `INFO` their `INFO` records no longer become breadcrumbs. Libraries with a level of their own (`httpx`, `httpcore`) still report to Sentry as before. `log_structured` lines never reach Sentry, whatever the level, and exceptions captured explicitly (`capture_exception`) or left unhandled always do. `WARN` and `FATAL` are accepted as aliases. Any other value, for example one your platform sets for another tool, is ignored with a warning at startup, as if `LOG_LEVEL` were not set.
++
++<Note>
++  The default will change from `legacy` to `text` in a future release. Set `LOG_FORMAT` explicitly if you depend on the current output.
++</Note>
++
++Output printed outside the logging setup keeps its own format, and some of it goes to stderr:
++
++- startup banners of the FastAPI CLI, Celery workers and Celery beat, and Celery's `worker: Warm shutdown` lines;
++- uvicorn's first lines (`Started server process`, `Waiting for application startup.`) and, with `ENVIRONMENT=local`, its reloader messages;
++- what the start scripts print before the service starts: shell traces, Alembic migrations and the seed scripts;
++- raw payloads printed with `RAW_PAYLOAD_STORAGE=log`, which ignore `LOG_FORMAT` and `LOG_LEVEL`;
++- Python warnings (`warnings.warn`), printed to stderr.
++
+ ## Configuring the frontend API URL at runtime
+ 
+ The frontend resolves its API URL at runtime, so the same published image works against any backend without rebuilding. Set `VITE_API_URL` as an environment variable on the frontend container. The Nitro server reads it at request time and injects it into the served HTML before the app loads:
+diff --git a/docs/deployment/railway.mdx b/docs/deployment/railway.mdx
+index a5a44388ef..d4dd731d4d 100644
+--- a/docs/deployment/railway.mdx
++++ b/docs/deployment/railway.mdx
+@@ -84,6 +84,8 @@ Key variables you may want to customize on the **Backend** service:
+ | `SECRET_KEY` | JWT signing key | Auto-generated by template |
+ | `CORS_ORIGINS` | Allowed CORS origins (comma-separated) | Frontend Railway URL |
+ | `ACCESS_LOG_LEVEL` | Per-request access logging: `all`, `errors` (4xx/5xx only), or `off` | `errors` in production, `all` otherwise |
++| `LOG_FORMAT` | Log output: `legacy` (structured app logs as JSON, other logs as text), `json` (every line JSON) or `text` (readable). See [Logs](/deployment/docker#logs) | `legacy` |
++| `LOG_LEVEL` | Drop log lines below this level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | not set |
+ | `REDIS_SSL` | Enable TLS for Redis connections (`rediss://`). Required for managed Redis with transit encryption (e.g. AWS ElastiCache, Upstash with TLS). | `false` |
+ 
+ <Note>
